@@ -43,3 +43,28 @@ pub struct Sketch {
     pub entities: Vec<SketchEntity>,
     pub constraints: Vec<Constraint>,
 }
+
+impl Sketch {
+    /// Add a free point and return its index (the solver's future unknown).
+    pub fn add_point(&mut self, x: f64, y: f64) -> usize {
+        self.points.push(Point2 { x, y });
+        self.points.len() - 1
+    }
+
+    /// Add a line between two existing points.
+    pub fn add_line(&mut self, a: usize, b: usize, construction: bool) {
+        self.entities.push(SketchEntity::Line { a, b, construction });
+    }
+
+    /// Add a circle from a center point and radius.
+    pub fn add_circle(&mut self, center: usize, radius: f64) {
+        self.entities.push(SketchEntity::Circle { center, radius });
+    }
+
+    /// Remove all geometry, leaving an empty sketch (used when (re)entering a plane).
+    pub fn clear(&mut self) {
+        self.points.clear();
+        self.entities.clear();
+        self.constraints.clear();
+    }
+}
