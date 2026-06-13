@@ -1,0 +1,16 @@
+[package]
+name = "hworks-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "hcad"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { workspace = true }
+hworks-document = { path = "../hworks-document" }
+hworks-sketch = { path = "../hworks-sketch" }
+hworks-geometry = { path = "../hworks-geometry" }

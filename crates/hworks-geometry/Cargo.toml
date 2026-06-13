@@ -1,0 +1,9 @@
+[package]
+name = "hworks-geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# truck (B-rep kernel) arrives at milestone M3, behind the GeometryKernel trait.
