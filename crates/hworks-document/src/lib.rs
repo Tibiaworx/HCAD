@@ -31,7 +31,11 @@ pub struct Plane {
 pub enum FeatureKind {
     Plane(Plane),
     Sketch(Sketch),
-    // Extrude / Cut / Revolve / … arrive at M3+.
+    /// Boss extrude: add material by sweeping the preceding sketch.
+    Extrude { distance: f64 },
+    /// Cut: subtract a swept profile from the body.
+    Cut { distance: f64 },
+    // Revolve / Fillet / … arrive at M8+.
 }
 
 /// One node in the feature timeline.
@@ -77,11 +81,40 @@ impl Document {
     }
 
     fn push_plane(&mut self, plane: Plane) -> FeatureId {
+        self.add_feature(FeatureKind::Plane(plane))
+    }
+
+    /// Append a feature to the timeline, returning its stable id.
+    pub fn add_feature(&mut self, kind: FeatureKind) -> FeatureId {
         let id = FeatureId(self.next_id);
         self.next_id += 1;
-        self.features.push(Feature { id, kind: FeatureKind::Plane(plane) });
+        self.features.push(Feature { id, kind });
         self.rollback = self.features.len();
         id
+    }
+
+    /// One display label per feature, in timeline order (for the feature-tree
+    /// panel). Sketches/extrudes/cuts are numbered in the order they appear.
+    pub fn tree_labels(&self) -> Vec<String> {
+        let (mut sk, mut ex, mut ct) = (0, 0, 0);
+        self.features
+            .iter()
+            .map(|f| match &f.kind {
+                FeatureKind::Plane(p) => format!("[plane]   {}", p.name),
+                FeatureKind::Sketch(_) => {
+                    sk += 1;
+                    format!("[sketch]  Sketch{sk}")
+                }
+                FeatureKind::Extrude { distance } => {
+                    ex += 1;
+                    format!("[extrude] Extrude{ex}  (h={distance:.1})")
+                }
+                FeatureKind::Cut { distance } => {
+                    ct += 1;
+                    format!("[cut]     Cut{ct}  (h={distance:.1})")
+                }
+            })
+            .collect()
     }
 
     /// Iterate the datum planes currently in the document.

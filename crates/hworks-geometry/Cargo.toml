@@ -9,3 +9,5 @@ authors.workspace = true
 truck-modeling = "0.6"
 truck-meshalgo = "0.4"
 truck-polymesh = "0.6"
+truck-topology = "0.6"
+truck-shapeops = "0.4"

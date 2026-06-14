@@ -17,11 +17,11 @@ use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::window::PrimaryWindow;
-use hworks_document::{Document, Plane};
-use hworks_geometry::{extrude, PlaneBasis, TriMesh};
+use hworks_document::{Document, FeatureKind, Plane};
+use hworks_geometry::{cut, extrude_solid, tessellate, union, KSolid, PlaneBasis, Tessellation, TriMesh};
 use hworks_sketch::{Constraint, Sketch, SketchEntity};
 
-/// How far an extrude pushes the profile along the plane normal (M3 fixed default).
+/// How far a boss/cut pushes the profile along the plane normal (fixed default).
 const EXTRUDE_DISTANCE: f64 = 2.0;
 
 /// Edge length of the square reference-plane quads (world units).
@@ -33,7 +33,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "HCAD — M3: Extrude".into(),
+                title: "HCAD — M4: Cut + Feature Tree".into(),
                 ..default()
             }),
             ..default()
@@ -41,15 +41,17 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
         .insert_resource(DocRes(Document::with_default_planes()))
         .init_resource::<SketchSession>()
+        .init_resource::<Part>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
                 sketch_interaction,
                 handle_keys,
-                do_extrude,
+                do_solid_op,
                 orbit_camera,
                 update_hud,
+                update_tree,
                 draw_world_axes,
                 draw_sketch,
             ),
@@ -117,15 +119,32 @@ struct SketchSession {
     drag: Option<usize>,
     /// Re-solve requested after a structural change.
     dirty: bool,
-    /// An extrude was requested (E key); consumed by `do_extrude`.
-    extrude_request: bool,
+    /// A solid operation was requested (E boss / D cut); consumed by `do_solid_op`.
+    op_request: Option<SolidOp>,
     cursor_uv: Option<Vec2>,
     sketch: Sketch,
+}
+
+/// A requested boolean solid operation from the active sketch.
+#[derive(Clone, Copy)]
+enum SolidOp {
+    Boss,
+    Cut,
+}
+
+/// The current accumulated 3D body (a truck B-rep behind the kernel seam).
+#[derive(Resource, Default)]
+struct Part {
+    solid: Option<KSolid>,
 }
 
 /// Marks entities that make up generated 3D solids (so they can be cleared later).
 #[derive(Component)]
 struct SolidPart;
+
+/// Marks the feature-tree panel text.
+#[derive(Component)]
+struct TreeText;
 
 #[derive(Component)]
 struct OrbitCamera {
@@ -206,7 +225,30 @@ fn setup(
         HudText,
     ));
 
-    println!("HCAD M3 ready. Left-click a plane, draw a closed profile (e.g. R for rectangle), then E to extrude.");
+    // Feature-tree panel (left side).
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(58.0),
+                left: Val::Px(8.0),
+                width: Val::Px(250.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
+        ))
+        .with_children(|panel| {
+            panel.spawn((
+                Text::new("Feature tree"),
+                TextFont { font_size: 13.0, ..default() },
+                TextColor(Color::srgb(0.85, 0.88, 0.95)),
+                TreeText,
+            ));
+        });
+
+    println!("HCAD M4 ready. Draw a closed profile on a plane, then E to boss-extrude or D to cut.");
 }
 
 fn camera_transform(cam: &OrbitCamera) -> Transform {
@@ -425,7 +467,10 @@ fn handle_keys(
         session.construction = !session.construction;
     }
     if keys.just_pressed(KeyCode::KeyE) {
-        session.extrude_request = true;
+        session.op_request = Some(SolidOp::Boss);
+    }
+    if keys.just_pressed(KeyCode::KeyD) {
+        session.op_request = Some(SolidOp::Cut);
     }
     if keys.just_pressed(KeyCode::Escape) {
         if session.pending.is_some() {
@@ -442,26 +487,27 @@ fn handle_keys(
     }
 }
 
-/// Consume an extrude request: turn the sketch's closed loop into a truck solid,
-/// spawn it shaded with edges, and drop back to the 3D view to see it.
-fn do_extrude(
+/// Consume a solid-op request (boss/cut): turn the sketch's closed loop into a
+/// truck solid, union/subtract it against the current body, record the feature,
+/// re-tessellate, and drop back to the 3D view.
+#[allow(clippy::too_many_arguments)]
+fn do_solid_op(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut session: ResMut<SketchSession>,
+    mut part: ResMut<Part>,
+    mut doc: ResMut<DocRes>,
+    existing: Query<Entity, With<SolidPart>>,
     mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
 ) {
-    if !session.extrude_request {
-        return;
-    }
-    session.extrude_request = false;
-
+    let Some(op) = session.op_request.take() else { return };
     let Some(ap) = session.plane.clone() else { return };
+
     let Some(loop_idx) = session.sketch.closed_loop() else {
-        warn!("Extrude: the sketch has no single closed profile (need a closed loop of lines).");
+        warn!("Need a single closed profile (a closed loop of lines) for this operation.");
         return;
     };
-
     let profile: Vec<[f64; 2]> = loop_idx
         .iter()
         .map(|&i| {
@@ -475,14 +521,72 @@ fn do_extrude(
         v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
         normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
     };
+    let dist = EXTRUDE_DISTANCE;
 
-    let Some(result) = extrude(&profile, &basis, EXTRUDE_DISTANCE) else {
-        warn!("Extrude: the kernel could not build a solid from this profile.");
+    // Compute the new body.
+    let new_body: Option<KSolid> = match op {
+        SolidOp::Boss => match extrude_solid(&profile, &basis, dist) {
+            Some(solid) => match &part.solid {
+                Some(existing) => union(existing, &solid),
+                None => Some(solid),
+            },
+            None => None,
+        },
+        SolidOp::Cut => match &part.solid {
+            Some(existing) => cut(existing, &profile, &basis, dist),
+            None => {
+                warn!("Cut: there is no body yet — extrude a boss first.");
+                return;
+            }
+        },
+    };
+
+    let Some(body) = new_body else {
+        warn!("The kernel could not complete that {} operation.", match op {
+            SolidOp::Boss => "boss",
+            SolidOp::Cut => "cut",
+        });
         return;
     };
 
-    // Shaded solid.
-    let mesh = meshes.add(trimesh_to_bevy(result.mesh));
+    // Record the feature(s) in the timeline.
+    doc.0.add_feature(FeatureKind::Sketch(session.sketch.clone()));
+    doc.0.add_feature(match op {
+        SolidOp::Boss => FeatureKind::Extrude { distance: dist },
+        SolidOp::Cut => FeatureKind::Cut { distance: dist },
+    });
+
+    // Replace the rendered solid.
+    part.solid = Some(body);
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    let tess = tessellate(part.solid.as_ref().unwrap(), 0.03);
+    spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+
+    info!("Applied {} operation; {} features in tree.", match op {
+        SolidOp::Boss => "boss",
+        SolidOp::Cut => "cut",
+    }, doc.0.features.len());
+
+    // Drop back to the orbit view to inspect the body.
+    session.plane = None;
+    session.pending = None;
+    session.drag = None;
+    session.cursor_uv = None;
+    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
+        *tf = camera_transform(orbit);
+    }
+}
+
+/// Spawn the shaded solid mesh + a black wireframe overlay for a tessellation.
+fn spawn_solid(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    tess: Tessellation,
+) {
+    let mesh = meshes.add(trimesh_to_bevy(tess.mesh));
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.62, 0.66, 0.74),
         metallic: 0.1,
@@ -491,27 +595,15 @@ fn do_extrude(
         double_sided: true,
         ..default()
     });
-    commands.spawn((Mesh3d(mesh), MeshMaterial3d(material), SolidPart, Name::new("Extrude")));
+    commands.spawn((Mesh3d(mesh), MeshMaterial3d(material), SolidPart, Name::new("Body")));
 
-    // Black wireframe over the faces.
-    let edge_mesh = meshes.add(edges_to_bevy(&result.edges));
+    let edge_mesh = meshes.add(edges_to_bevy(&tess.edges));
     let edge_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.05, 0.05, 0.07),
+        base_color: Color::srgb(0.04, 0.04, 0.06),
         unlit: true,
         ..default()
     });
-    commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("ExtrudeEdges")));
-
-    info!("Extruded a {}-sided profile by {} units.", profile.len(), EXTRUDE_DISTANCE);
-
-    // Drop back to the orbit view to inspect the solid.
-    session.plane = None;
-    session.pending = None;
-    session.drag = None;
-    session.cursor_uv = None;
-    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
-        *tf = camera_transform(orbit);
-    }
+    commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("BodyEdges")));
 }
 
 /// Convert our kernel [`TriMesh`] into a Bevy render mesh.
@@ -573,13 +665,24 @@ fn update_hud(session: Res<SketchSession>, mut q: Query<&mut Text, With<HudText>
         Some(ap) => {
             let con = if session.construction { " · CONSTRUCTION on" } else { "" };
             format!(
-                "Sketch on {} — tool: {}{}\nS select · L line · C circle · R rect · X construction · E extrude · Esc cancel/exit",
+                "Sketch on {} — tool: {}{}\nS select · L line · C circle · R rect · X constr · E boss · D cut · Esc cancel/exit",
                 ap.name,
                 session.tool.label(),
                 con,
             )
         }
     };
+    *text = Text::new(s);
+}
+
+/// Rebuild the feature-tree panel text from the document timeline.
+fn update_tree(doc: Res<DocRes>, mut q: Query<&mut Text, With<TreeText>>) {
+    let Ok(mut text) = q.single_mut() else { return };
+    let mut s = String::from("Feature tree\n");
+    for line in doc.0.tree_labels() {
+        s.push('\n');
+        s.push_str(&line);
+    }
     *text = Text::new(s);
 }
 

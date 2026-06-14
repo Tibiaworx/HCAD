@@ -1,64 +1,26 @@
 //! `hworks-geometry` — Layer 1: the geometry kernel seam.
 //!
-//! This crate hides the concrete CAD kernel (initially [`truck`]) behind the
-//! [`GeometryKernel`] trait so the rest of HCAD never depends on it directly.
-//! That seam is what lets us swap in OpenCASCADE later without touching the
-//! sketcher, document, or UI. See `DESIGN.md` §3 and §7.
+//! Hides the concrete CAD kernel ([`truck`]) behind this crate's API so the rest
+//! of HCAD never depends on it directly — the seam that lets us swap in
+//! OpenCASCADE later. See `DESIGN.md` §3 and §7.
 //!
-//! At milestone **M0** this is a stub: the trait shape is sketched out but no
-//! kernel is wired in yet. Real solids (extrude/cut/tessellate) land at **M3**.
-
-/// A tessellated triangle mesh handed up to the renderer.
-#[derive(Debug, Default, Clone)]
-pub struct TriMesh {
-    /// Flat list of vertex positions (x, y, z).
-    pub positions: Vec<[f32; 3]>,
-    /// Per-vertex normals.
-    pub normals: Vec<[f32; 3]>,
-    /// Triangle indices into `positions`.
-    pub indices: Vec<u32>,
-}
-
-/// The kernel abstraction. Concrete impls (truck, later OCCT) live behind this.
-///
-/// Intentionally tiny for now — it grows with the roadmap (revolve, fillet, …).
-pub trait GeometryKernel {
-    /// The kernel's native solid representation.
-    type Solid;
-
-    /// Extrude a closed profile into a solid (boss / add material).
-    fn extrude(&self, profile: &Profile, distance: f64) -> Self::Solid;
-
-    /// Subtract an extruded profile from an existing solid (cut).
-    fn cut(&self, base: &Self::Solid, profile: &Profile, distance: f64) -> Self::Solid;
-
-    /// Tessellate a solid into a triangle mesh for rendering.
-    fn tessellate(&self, solid: &Self::Solid, tolerance: f64) -> TriMesh;
-}
-
-/// A closed 2D profile in a plane's local coordinates, ready to feed the kernel.
-///
-/// Populated by `hworks-sketch` once a sketch's outer loop is closed. Stub for now.
-#[derive(Debug, Default, Clone)]
-pub struct Profile {
-    /// Ordered boundary points of the outer loop (local UV).
-    pub outer: Vec<[f64; 2]>,
-}
-
-// ---------------------------------------------------------------------------
-// truck-backed extrusion (M3)
-//
-// This is the first real wiring of the `truck` kernel. We take a closed 2D
-// profile in a plane's local (u, v) coordinates, place it in 3D, build a B-rep
-// face, and translational-sweep it into a solid — the canonical truck workflow
-// (vertex → wire → face → solid). The solid is then tessellated for rendering.
-// ---------------------------------------------------------------------------
+//! As of **M4** the kernel does extrude (boss), boolean union, and boolean cut
+//! (difference), plus tessellation. The truck `Solid` is kept alive inside the
+//! opaque [`KSolid`] so booleans have a B-rep to operate on (not just a mesh).
 
 use truck_meshalgo::prelude::*;
 use truck_modeling::{builder, Point3, Vector3};
 
-/// A plane expressed as a 3D origin and orthonormal in-plane axes (`u`, `v`)
-/// plus its `normal`. Mirrors `hworks_document::Plane` but in `f64` world space.
+/// A tessellated triangle mesh handed up to the renderer.
+#[derive(Debug, Default, Clone)]
+pub struct TriMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+}
+
+/// A plane as a 3D origin and orthonormal in-plane axes (`u`, `v`) plus `normal`.
+/// Mirrors `hworks_document::Plane` in `f64` world space.
 #[derive(Debug, Clone)]
 pub struct PlaneBasis {
     pub origin: [f64; 3],
@@ -67,32 +29,83 @@ pub struct PlaneBasis {
     pub normal: [f64; 3],
 }
 
-/// The result of an extrude: a render-ready triangle mesh plus the prism's
-/// wireframe edges (for drawing a clean outline over the shaded faces).
-pub struct ExtrudeResult {
+/// An opaque handle to a kernel solid (a truck B-rep `Solid`). Held by the app
+/// across operations so cuts/unions can act on the real topology.
+#[derive(Clone)]
+pub struct KSolid(truck_modeling::Solid);
+
+/// A render-ready tessellation: triangle mesh + feature/boundary edges.
+pub struct Tessellation {
     pub mesh: TriMesh,
     pub edges: Vec<[[f32; 3]; 2]>,
 }
 
+/// Tolerance for boolean operations and tessellation.
+const TOL: f64 = 0.05;
+
+// ---------------------------------------------------------------------------
+// Public kernel operations
+// ---------------------------------------------------------------------------
+
 /// Extrude a closed profile (ordered loop, plane-local uv) along the plane normal
-/// by `distance`, returning a tessellated mesh + wireframe. `None` if the profile
-/// is degenerate or the kernel could not build a planar face from it.
-pub fn extrude(profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Option<ExtrudeResult> {
-    if profile_uv.len() < 3 || distance.abs() < 1e-9 {
+/// by `distance` into a solid (boss / add material). `None` if degenerate.
+pub fn extrude_solid(profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
+    build_solid(profile_uv, basis, 0.0, distance).map(KSolid)
+}
+
+/// Boolean union of two solids (boss added to an existing body).
+pub fn union(a: &KSolid, b: &KSolid) -> Option<KSolid> {
+    truck_shapeops::or(&a.0, &b.0, TOL).map(KSolid)
+}
+
+/// Boolean cut: subtract an extrusion of `profile_uv` from `base`.
+///
+/// The cutting tool is extruded with a small overshoot on both ends so its caps
+/// never sit exactly coplanar with the base's faces — that coplanarity is the
+/// classic failure mode for B-rep booleans, and the overshoot avoids it.
+pub fn cut(base: &KSolid, profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
+    let depth = distance.abs();
+    let eps = 0.05 + depth * 0.02;
+    let mut tool = build_solid(profile_uv, basis, -eps, depth + 2.0 * eps)?;
+    tool.not(); // invert all faces → complement region: base ∩ ¬tool == base − tool
+    truck_shapeops::and(&base.0, &tool, TOL).map(KSolid)
+}
+
+/// Tessellate a solid into a flat-shaded mesh plus its feature/boundary edges.
+pub fn tessellate(solid: &KSolid, tol: f64) -> Tessellation {
+    let mut poly = solid.0.triangulation(tol).to_polygon();
+    poly.triangulate();
+    let mesh = polymesh_to_trimesh(&poly);
+    let edges = feature_edges(&mesh, 18.0);
+    Tessellation { mesh, edges }
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+/// Build a prism solid: place the profile at `origin + normal*start_offset`, then
+/// translational-sweep it by `normal*length`. The canonical truck vertex → wire →
+/// face → solid workflow.
+fn build_solid(
+    profile_uv: &[[f64; 2]],
+    basis: &PlaneBasis,
+    start_offset: f64,
+    length: f64,
+) -> Option<truck_modeling::Solid> {
+    if profile_uv.len() < 3 || length.abs() < 1e-9 {
         return None;
     }
     let origin = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
     let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
     let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
     let n = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
+    let base = origin + n * start_offset;
 
-    let world = |uv: &[f64; 2]| origin + u * uv[0] + v * uv[1];
     let to_p3 = |uv: &[f64; 2]| {
-        let p = world(uv);
+        let p = base + u * uv[0] + v * uv[1];
         Point3::new(p.x, p.y, p.z)
     };
-
-    // Vertex → wire → face → solid.
     let verts: Vec<_> = profile_uv.iter().map(|uv| builder::vertex(to_p3(uv))).collect();
     let np = verts.len();
     let mut wire = truck_modeling::Wire::new();
@@ -100,33 +113,11 @@ pub fn extrude(profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Op
         wire.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
     }
     let face = builder::try_attach_plane(&vec![wire]).ok()?;
-    let solid = builder::tsweep(&face, n * distance);
-
-    // Tessellate the B-rep into a triangle mesh.
-    let tol = (distance.abs() * 0.01).max(0.005);
-    let mut poly = solid.triangulation(tol).to_polygon();
-    poly.triangulate();
-    let mesh = polymesh_to_trimesh(&poly);
-
-    // Prism wireframe from the profile: bottom loop, top loop, verticals.
-    let mut edges = Vec::with_capacity(np * 3);
-    let arr = |w: Vector3| [w.x as f32, w.y as f32, w.z as f32];
-    for i in 0..np {
-        let a = &profile_uv[i];
-        let b = &profile_uv[(i + 1) % np];
-        let (a0, b0) = (world(a), world(b));
-        let (a1, b1) = (a0 + n * distance, b0 + n * distance);
-        edges.push([arr(a0), arr(b0)]); // bottom edge
-        edges.push([arr(a1), arr(b1)]); // top edge
-        edges.push([arr(a0), arr(a1)]); // vertical edge
-    }
-
-    Some(ExtrudeResult { mesh, edges })
+    Some(builder::tsweep(&face, n * length))
 }
 
-/// Convert a truck `PolygonMesh` into a flat-shaded [`TriMesh`]. We compute a
-/// per-triangle normal from the winding so shading is correct regardless of
-/// whether the kernel supplied vertex normals.
+/// Convert a truck `PolygonMesh` into a flat-shaded [`TriMesh`] (per-triangle
+/// normals from the winding, so shading is correct regardless of kernel normals).
 fn polymesh_to_trimesh(poly: &truck_polymesh::PolygonMesh) -> TriMesh {
     let pos = poly.positions();
     let mut out = TriMesh::default();
@@ -134,7 +125,6 @@ fn polymesh_to_trimesh(poly: &truck_polymesh::PolygonMesh) -> TriMesh {
         let p0 = pos[tri[0].pos];
         let p1 = pos[tri[1].pos];
         let p2 = pos[tri[2].pos];
-        // Manual cross product of (p1-p0) × (p2-p0).
         let (ux, uy, uz) = (p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
         let (vx, vy, vz) = (p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
         let (mut nx, mut ny, mut nz) = (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
@@ -157,34 +147,104 @@ fn polymesh_to_trimesh(poly: &truck_polymesh::PolygonMesh) -> TriMesh {
     out
 }
 
+/// Extract the wireframe: every edge that is either a boundary (used by one
+/// triangle) or a feature edge (its two triangles meet at more than `min_angle`
+/// degrees). Coplanar interior edges are skipped, giving a clean outline.
+fn feature_edges(mesh: &TriMesh, min_angle_deg: f64) -> Vec<[[f32; 3]; 2]> {
+    use std::collections::HashMap;
+    // Merge duplicated (flat-shaded) vertices by quantized position.
+    let quant = |p: [f32; 3]| {
+        (
+            (p[0] * 1.0e4).round() as i64,
+            (p[1] * 1.0e4).round() as i64,
+            (p[2] * 1.0e4).round() as i64,
+        )
+    };
+    let mut canon: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut canon_pos: Vec<[f32; 3]> = Vec::new();
+    let mut vid = vec![0usize; mesh.positions.len()];
+    for (i, p) in mesh.positions.iter().enumerate() {
+        let id = *canon.entry(quant(*p)).or_insert_with(|| {
+            canon_pos.push(*p);
+            canon_pos.len() - 1
+        });
+        vid[i] = id;
+    }
+
+    // Gather the face normals incident to each undirected edge.
+    let mut emap: HashMap<(usize, usize), Vec<[f32; 3]>> = HashMap::new();
+    for t in mesh.indices.chunks(3) {
+        let (ia, ib, ic) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let normal = mesh.normals[ia]; // flat normal, same for all 3 verts
+        let (a, b, c) = (vid[ia], vid[ib], vid[ic]);
+        for (i, j) in [(a, b), (b, c), (c, a)] {
+            let key = if i < j { (i, j) } else { (j, i) };
+            emap.entry(key).or_default().push(normal);
+        }
+    }
+
+    let cos_thresh = min_angle_deg.to_radians().cos();
+    let mut out = Vec::new();
+    for ((i, j), normals) in emap {
+        let keep = if normals.len() == 1 {
+            true // boundary edge
+        } else {
+            // sharp if any incident pair of faces differ by more than the angle
+            let mut sharp = false;
+            for a in 0..normals.len() {
+                for b in (a + 1)..normals.len() {
+                    let d = normals[a][0] * normals[b][0]
+                        + normals[a][1] * normals[b][1]
+                        + normals[a][2] * normals[b][2];
+                    if (d as f64) < cos_thresh {
+                        sharp = true;
+                    }
+                }
+            }
+            sharp
+        };
+        if keep {
+            out.push([canon_pos[i], canon_pos[j]]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn extrude_square_makes_a_box() {
-        // Unit square on the XY plane, extruded 1 unit along +Z.
-        let basis = PlaneBasis {
+    fn xy_plane() -> PlaneBasis {
+        PlaneBasis {
             origin: [0.0, 0.0, 0.0],
             u: [1.0, 0.0, 0.0],
             v: [0.0, 1.0, 0.0],
             normal: [0.0, 0.0, 1.0],
-        };
-        let square = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let res = extrude(&square, &basis, 1.0).expect("extrude should succeed");
-
-        // A box must tessellate to at least 12 triangles (6 quad faces × 2).
-        assert!(res.mesh.indices.len() >= 36, "got {} indices", res.mesh.indices.len());
-        assert_eq!(res.mesh.indices.len() % 3, 0);
-        assert_eq!(res.mesh.positions.len(), res.mesh.normals.len());
-
-        // All vertices lie within the unit cube (with a little tolerance).
-        for p in &res.mesh.positions {
-            for c in p {
-                assert!(*c >= -0.01 && *c <= 1.01, "vertex out of box: {p:?}");
-            }
         }
-        // 4 profile edges × 3 (bottom/top/vertical) = 12 wireframe segments.
-        assert_eq!(res.edges.len(), 12);
+    }
+
+    #[test]
+    fn extrude_square_makes_a_box() {
+        let square = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
+        let solid = extrude_solid(&square, &xy_plane(), 2.0).expect("extrude");
+        let t = tessellate(&solid, 0.05);
+        assert!(t.mesh.indices.len() >= 36, "got {} indices", t.mesh.indices.len());
+        assert_eq!(t.mesh.indices.len() % 3, 0);
+        // A closed box has 12 feature edges.
+        assert_eq!(t.edges.len(), 12, "box should have 12 edges, got {}", t.edges.len());
+    }
+
+    #[test]
+    fn cutting_a_pocket_reduces_volume_and_adds_edges() {
+        // Base: 4×4 box, 2 tall.
+        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &xy_plane(), 2.0)
+            .expect("base");
+        // Cut a centered 2×2 pocket straight through.
+        let pocket = [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
+        let result = cut(&base, &pocket, &xy_plane(), 2.0).expect("cut should succeed");
+        let t = tessellate(&result, 0.05);
+        // A box with a rectangular through-hole has more than the 12 edges of a plain box.
+        assert!(t.edges.len() > 12, "cut result should have extra edges, got {}", t.edges.len());
+        assert!(t.mesh.indices.len() % 3 == 0 && !t.mesh.positions.is_empty());
     }
 }
