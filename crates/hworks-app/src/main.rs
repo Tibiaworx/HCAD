@@ -56,6 +56,7 @@ fn main() {
                 sketch_interaction,
                 handle_keys,
                 do_solid_op,
+                do_regenerate,
                 handle_new_part,
                 orbit_camera,
                 draw_world_axes,
@@ -119,6 +120,10 @@ struct UiState {
     themed: bool,
     /// "New Part" was clicked; consumed by `handle_new_part`.
     new_part: bool,
+    /// The model needs rebuilding from the timeline; consumed by `do_regenerate`.
+    regen: bool,
+    /// Selected feature index in the tree (for editing).
+    selected: Option<usize>,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -247,7 +252,7 @@ fn ui_system(
     mut session: ResMut<SketchSession>,
     mut ui_state: ResMut<UiState>,
     mut blocking: ResMut<UiBlocking>,
-    doc: Res<DocRes>,
+    mut doc: ResMut<DocRes>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -391,12 +396,70 @@ fn ui_system(
             ui_state.pending = if keep { Some(op) } else { None };
         } else {
             ui.heading("HCAD Part");
+
+            // Rollback bar: replay only features[..rollback].
+            let n = doc.0.features.len();
+            if n > 0 {
+                let mut rb = doc.0.rollback.min(n);
+                ui.horizontal(|ui| {
+                    ui.label("Rollback");
+                    if ui.add(egui::Slider::new(&mut rb, 0..=n)).changed() {
+                        doc.0.rollback = rb;
+                        ui_state.regen = true;
+                    }
+                });
+            }
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for line in doc.0.tree_labels() {
-                    ui.label(egui::RichText::new(line).monospace());
+
+            // Clickable feature rows.
+            let labels = doc.0.tree_labels();
+            let rollback = doc.0.rollback;
+            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                for (i, line) in labels.iter().enumerate() {
+                    let mut text = egui::RichText::new(line).monospace();
+                    if i >= rollback {
+                        text = text.weak().strikethrough(); // rolled-back / suppressed
+                    }
+                    if ui.selectable_label(ui_state.selected == Some(i), text).clicked() {
+                        ui_state.selected = Some(i);
+                    }
                 }
             });
+
+            // Edit the selected Extrude/Cut feature.
+            if let Some(i) = ui_state.selected {
+                let info = doc.0.features.get(i).and_then(|f| match &f.kind {
+                    FeatureKind::Extrude { distance, .. } => Some(("Extrude", *distance)),
+                    FeatureKind::Cut { distance, .. } => Some(("Cut", *distance)),
+                    FeatureKind::Plane(_) => None,
+                });
+                if let Some((kind, depth)) = info {
+                    ui.separator();
+                    ui.label(egui::RichText::new(format!("Edit {kind}")).strong());
+                    let mut d = depth as f32;
+                    ui.horizontal(|ui| {
+                        ui.label("Depth (mm):");
+                        if ui.add(egui::DragValue::new(&mut d).speed(0.1).range(0.1..=200.0)).changed() {
+                            if let Some(f) = doc.0.features.get_mut(i) {
+                                match &mut f.kind {
+                                    FeatureKind::Extrude { distance, .. }
+                                    | FeatureKind::Cut { distance, .. } => *distance = d as f64,
+                                    FeatureKind::Plane(_) => {}
+                                }
+                            }
+                            ui_state.regen = true;
+                        }
+                    });
+                    if ui.button("Delete feature").clicked() {
+                        doc.0.features.remove(i);
+                        if doc.0.rollback > doc.0.features.len() {
+                            doc.0.rollback = doc.0.features.len();
+                        }
+                        ui_state.selected = None;
+                        ui_state.regen = true;
+                    }
+                }
+            }
         }
     });
 
@@ -563,16 +626,6 @@ fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
 /// `PlaneRef` (document-side) from an active plane (app-side).
 fn plane_ref(ap: &ActivePlane) -> PlaneRef {
     PlaneRef {
-        origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
-        u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
-        v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
-        normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
-    }
-}
-
-/// `PlaneBasis` (kernel-side) from an active plane.
-fn plane_basis(ap: &ActivePlane) -> PlaneBasis {
-    PlaneBasis {
         origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
         u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
         v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
@@ -786,69 +839,36 @@ fn handle_keys(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Turn the active sketch into a timeline feature, then request a regenerate.
+/// The kernel work happens in `do_regenerate` by replaying the whole timeline —
+/// so the document, not this op, is the source of truth.
 fn do_solid_op(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut session: ResMut<SketchSession>,
-    mut part: ResMut<Part>,
+    part: Res<Part>,
     mut doc: ResMut<DocRes>,
-    existing: Query<Entity, With<SolidPart>>,
+    mut ui_state: ResMut<UiState>,
     mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
 ) {
     let Some(op) = session.op_request.take() else { return };
     let Some(ap) = session.plane.clone() else { return };
 
-    let Some(profile) = session.sketch.outer_profile() else {
+    if session.sketch.outer_profile().is_none() {
         warn!("Need a closed profile (a closed loop of lines, or a circle) for this operation.");
         return;
-    };
-    let basis = plane_basis(&ap);
-
-    let new_body: Option<KSolid> = match op {
-        SolidOp::Boss(d) => match &part.solid {
-            // Boss onto an existing body: overlap into it so the union is robust.
-            Some(existing) => extrude_solid_with_overlap(&profile, &basis, d, BOSS_OVERLAP)
-                .and_then(|boss| union(existing, &boss)),
-            // First solid: a clean prism.
-            None => extrude_solid(&profile, &basis, d),
-        },
-        SolidOp::Cut(d) => {
-            let Some(existing) = &part.solid else {
-                warn!("Cut: there is no body yet — extrude a boss first.");
-                return;
-            };
-            // Cut *into* the material: pick the sign that points at the body.
-            let signed = match &part.mesh {
-                Some(mesh) => {
-                    let into = (mesh_centroid(mesh) - ap.origin).dot(ap.n);
-                    if into < 0.0 { -d } else { d }
-                }
-                None => d,
-            };
-            cut(existing, &profile, &basis, signed)
-        }
-    };
-
-    let Some(body) = new_body else {
-        warn!("The kernel could not complete that operation.");
-        return;
-    };
-
-    doc.0.add_feature(FeatureKind::Sketch { sketch: session.sketch.clone(), plane: plane_ref(&ap) });
-    doc.0.add_feature(match op {
-        SolidOp::Boss(d) => FeatureKind::Extrude { distance: d },
-        SolidOp::Cut(d) => FeatureKind::Cut { distance: d },
-    });
-
-    part.solid = Some(body);
-    for e in &existing {
-        commands.entity(e).despawn();
     }
-    let tess = tessellate(part.solid.as_ref().unwrap(), 0.03);
-    part.mesh = Some(tess.mesh.clone());
-    spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+    if matches!(op, SolidOp::Cut(_)) && part.solid.is_none() {
+        warn!("Cut: there is no body yet — extrude a boss first.");
+        return;
+    }
+
+    let sketch = session.sketch.clone();
+    let plane = plane_ref(&ap);
+    doc.0.add_feature(match op {
+        SolidOp::Boss(d) => FeatureKind::Extrude { sketch, plane, distance: d },
+        SolidOp::Cut(d) => FeatureKind::Cut { sketch, plane, distance: d },
+    });
+    ui_state.regen = true;
+    ui_state.selected = Some(doc.0.features.len() - 1);
 
     session.plane = None;
     session.pending = None;
@@ -857,6 +877,88 @@ fn do_solid_op(
     if let Ok((mut tf, orbit)) = cam_q.single_mut() {
         *tf = camera_transform(orbit);
     }
+}
+
+/// Replay the feature timeline (up to the rollback bar) into a solid. This is the
+/// heart of M6: editing any feature and re-running this rebuilds everything
+/// downstream. Faces are referenced geometrically via each sketch's `PlaneRef`.
+fn regenerate(doc: &Document) -> Option<KSolid> {
+    let mut body: Option<KSolid> = None;
+    let end = doc.rollback.min(doc.features.len());
+    for feature in &doc.features[..end] {
+        match &feature.kind {
+            FeatureKind::Plane(_) => {}
+            FeatureKind::Extrude { sketch, plane, distance } => {
+                let Some(profile) = sketch.outer_profile() else { continue };
+                let basis = basis_from_ref(plane);
+                let next = match &body {
+                    Some(b) => extrude_solid_with_overlap(&profile, &basis, *distance, BOSS_OVERLAP)
+                        .and_then(|boss| union(b, &boss)),
+                    None => extrude_solid(&profile, &basis, *distance),
+                };
+                if let Some(s) = next {
+                    body = Some(s);
+                } else {
+                    warn!("Regen: an extrude could not be built.");
+                }
+            }
+            FeatureKind::Cut { sketch, plane, distance } => {
+                let Some(b) = &body else { continue };
+                let Some(profile) = sketch.outer_profile() else { continue };
+                let basis = basis_from_ref(plane);
+                // Pick the cut direction from the *current* body, so it stays
+                // correct even after upstream edits move things around.
+                let centroid = mesh_centroid(&tessellate(b, 0.06).mesh);
+                let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+                let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+                let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
+                if let Some(s) = cut(b, &profile, &basis, signed) {
+                    body = Some(s);
+                } else {
+                    warn!("Regen: a cut could not be built.");
+                }
+            }
+        }
+    }
+    body
+}
+
+/// Consume a regenerate request: rebuild the solid from the timeline and refresh
+/// the rendered meshes.
+fn do_regenerate(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ui_state: ResMut<UiState>,
+    mut part: ResMut<Part>,
+    doc: Res<DocRes>,
+    existing: Query<Entity, With<SolidPart>>,
+) {
+    if !ui_state.regen {
+        return;
+    }
+    ui_state.regen = false;
+
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    match regenerate(&doc.0) {
+        Some(solid) => {
+            let tess = tessellate(&solid, 0.03);
+            part.mesh = Some(tess.mesh.clone());
+            spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+            part.solid = Some(solid);
+        }
+        None => {
+            part.solid = None;
+            part.mesh = None;
+        }
+    }
+}
+
+/// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
+fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
+    PlaneBasis { origin: p.origin, u: p.u, v: p.v, normal: p.normal }
 }
 
 /// Reset the model to an empty part with the three default planes.
@@ -885,6 +987,7 @@ fn handle_new_part(
     session.cursor_uv = None;
     session.sketch.clear();
     ui_state.pending = None;
+    ui_state.selected = None;
     if let Ok((mut tf, orbit)) = cam_q.single_mut() {
         *tf = camera_transform(orbit);
     }
@@ -1053,4 +1156,88 @@ fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color) {
     const S: f32 = 0.08;
     gizmos.line(ap.to_world(uv + Vec2::new(-S, 0.0)), ap.to_world(uv + Vec2::new(S, 0.0)), color);
     gizmos.line(ap.to_world(uv + Vec2::new(0.0, -S)), ap.to_world(uv + Vec2::new(0.0, S)), color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hworks_document::{Document, FeatureKind, PlaneRef};
+    use hworks_sketch::Sketch;
+
+    fn rect_sketch(w: f64, h: f64) -> Sketch {
+        let mut s = Sketch::default();
+        let p0 = s.add_point(0.0, 0.0);
+        let p1 = s.add_point(w, 0.0);
+        let p2 = s.add_point(w, h);
+        let p3 = s.add_point(0.0, h);
+        s.add_line(p0, p1, false);
+        s.add_line(p1, p2, false);
+        s.add_line(p2, p3, false);
+        s.add_line(p3, p0, false);
+        s
+    }
+
+    fn xy() -> PlaneRef {
+        PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
+    }
+
+    fn height(solid: &KSolid) -> f32 {
+        let m = tessellate(solid, 0.05).mesh;
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in &m.positions {
+            lo = lo.min(p[2]);
+            hi = hi.max(p[2]);
+        }
+        hi - lo
+    }
+
+    #[test]
+    fn regenerate_replays_an_extrude_into_a_box() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), plane: xy(), distance: 2.0 });
+        let solid = regenerate(&doc).expect("regen should produce a body");
+        assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
+    }
+
+    #[test]
+    fn editing_a_distance_rebuilds_taller() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), plane: xy(), distance: 2.0 });
+        let h2 = height(&regenerate(&doc).unwrap());
+        if let FeatureKind::Extrude { distance, .. } = &mut doc.features.last_mut().unwrap().kind {
+            *distance = 6.0;
+        }
+        let h6 = height(&regenerate(&doc).unwrap());
+        assert!((h2 - 2.0).abs() < 0.1, "h2 was {h2}");
+        assert!((h6 - 6.0).abs() < 0.1, "h6 was {h6}");
+    }
+
+    #[test]
+    fn rollback_suppresses_downstream_features() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), plane: xy(), distance: 2.0 });
+        assert!(regenerate(&doc).is_some());
+        // Roll the bar back before the extrude → no body.
+        doc.rollback = doc.features.len() - 1;
+        assert!(regenerate(&doc).is_none(), "rolled-back model should have no body");
+    }
+
+    #[test]
+    fn regenerate_replays_a_cut_through_the_box() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), plane: xy(), distance: 2.0 });
+        // Cut a centred 2x2 pocket from the same plane (body is on the +normal side).
+        let mut pocket = Sketch::default();
+        let a = pocket.add_point(1.0, 1.0);
+        let b = pocket.add_point(3.0, 1.0);
+        let c = pocket.add_point(3.0, 3.0);
+        let d = pocket.add_point(1.0, 3.0);
+        pocket.add_line(a, b, false);
+        pocket.add_line(b, c, false);
+        pocket.add_line(c, d, false);
+        pocket.add_line(d, a, false);
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, plane: xy(), distance: 2.0 });
+        let solid = regenerate(&doc).expect("regen with a cut should produce a body");
+        assert!(tessellate(&solid, 0.05).edges.len() > 12, "cut should add edges");
+    }
 }

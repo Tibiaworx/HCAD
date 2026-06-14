@@ -39,15 +39,17 @@ pub struct PlaneRef {
 }
 
 /// The kinds of feature a timeline can hold. Grows along the roadmap.
+///
+/// Operation features are *self-contained* — they carry the sketch and the plane
+/// they were drawn on — so the whole timeline can be replayed from scratch to
+/// regenerate the solid (M6). That replay is what makes editing parametric.
 #[derive(Debug, Clone)]
 pub enum FeatureKind {
     Plane(Plane),
-    /// A 2D sketch together with the plane (or face) it lives on.
-    Sketch { sketch: Sketch, plane: PlaneRef },
-    /// Boss extrude: add material by sweeping the preceding sketch.
-    Extrude { distance: f64 },
+    /// Boss extrude: add material by sweeping a sketch on a plane/face.
+    Extrude { sketch: Sketch, plane: PlaneRef, distance: f64 },
     /// Cut: subtract a swept profile from the body.
-    Cut { distance: f64 },
+    Cut { sketch: Sketch, plane: PlaneRef, distance: f64 },
     // Revolve / Fillet / … arrive at M8+.
 }
 
@@ -107,24 +109,20 @@ impl Document {
     }
 
     /// One display label per feature, in timeline order (for the feature-tree
-    /// panel). Sketches/extrudes/cuts are numbered in the order they appear.
+    /// panel). Extrudes/cuts are numbered in the order they appear.
     pub fn tree_labels(&self) -> Vec<String> {
-        let (mut sk, mut ex, mut ct) = (0, 0, 0);
+        let (mut ex, mut ct) = (0, 0);
         self.features
             .iter()
             .map(|f| match &f.kind {
-                FeatureKind::Plane(p) => format!("[plane]   {}", p.name),
-                FeatureKind::Sketch { .. } => {
-                    sk += 1;
-                    format!("[sketch]  Sketch{sk}")
-                }
-                FeatureKind::Extrude { distance } => {
+                FeatureKind::Plane(p) => format!("[plane] {}", p.name),
+                FeatureKind::Extrude { distance, .. } => {
                     ex += 1;
-                    format!("[extrude] Extrude{ex}  (h={distance:.1})")
+                    format!("[boss]  Extrude{ex}  h={distance:.1}")
                 }
-                FeatureKind::Cut { distance } => {
+                FeatureKind::Cut { distance, .. } => {
                     ct += 1;
-                    format!("[cut]     Cut{ct}  (h={distance:.1})")
+                    format!("[cut]   Cut{ct}  h={distance:.1}")
                 }
             })
             .collect()
