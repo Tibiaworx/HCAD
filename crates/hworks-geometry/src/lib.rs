@@ -53,21 +53,43 @@ pub fn extrude_solid(profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64)
     build_solid(profile_uv, basis, 0.0, distance).map(KSolid)
 }
 
+/// Like [`extrude_solid`] but the prism starts `back` units *behind* the plane,
+/// so a boss built on a face overlaps the body it sits on — avoiding a coplanar
+/// shared face that would make the following union fail.
+pub fn extrude_solid_with_overlap(
+    profile_uv: &[[f64; 2]],
+    basis: &PlaneBasis,
+    distance: f64,
+    back: f64,
+) -> Option<KSolid> {
+    build_solid(profile_uv, basis, -back, distance + back).map(KSolid)
+}
+
 /// Boolean union of two solids (boss added to an existing body).
 pub fn union(a: &KSolid, b: &KSolid) -> Option<KSolid> {
     truck_shapeops::or(&a.0, &b.0, TOL).map(KSolid)
 }
 
-/// Boolean cut: subtract an extrusion of `profile_uv` from `base`.
+/// Boolean cut: subtract a swept profile from `base`.
 ///
-/// The cutting tool is extruded with a small overshoot on both ends so its caps
-/// never sit exactly coplanar with the base's faces — that coplanarity is the
-/// classic failure mode for B-rep booleans, and the overshoot avoids it.
+/// `distance` is *signed*: positive sweeps the tool along the plane normal,
+/// negative sweeps against it. The caller picks the sign so the tool extends
+/// *into* the material. Either way the tool overshoots both caps so they are
+/// never coplanar with the body's faces (the classic B-rep boolean failure), and
+/// the tool is inverted so `base ∩ ¬tool == base − tool`.
 pub fn cut(base: &KSolid, profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
     let depth = distance.abs();
+    if depth < 1e-9 {
+        return None;
+    }
     let eps = 0.05 + depth * 0.02;
-    let mut tool = build_solid(profile_uv, basis, -eps, depth + 2.0 * eps)?;
-    tool.not(); // invert all faces → complement region: base ∩ ¬tool == base − tool
+    let (start_offset, length) = if distance >= 0.0 {
+        (-eps, depth + 2.0 * eps)
+    } else {
+        (-(depth + eps), depth + 2.0 * eps)
+    };
+    let mut tool = build_solid(profile_uv, basis, start_offset, length)?;
+    tool.not(); // invert all faces → complement region
     truck_shapeops::and(&base.0, &tool, TOL).map(KSolid)
 }
 
@@ -232,6 +254,44 @@ mod tests {
         assert_eq!(t.mesh.indices.len() % 3, 0);
         // A closed box has 12 feature edges.
         assert_eq!(t.edges.len(), 12, "box should have 12 edges, got {}", t.edges.len());
+    }
+
+    #[test]
+    fn boss_on_a_top_face_unions_into_a_stepped_solid() {
+        // 4×4×2 base on the XY plane.
+        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &xy_plane(), 2.0)
+            .expect("base");
+        // A 2×2 boss on the top face (z = 2), overlapping back into the base.
+        let top = PlaneBasis {
+            origin: [0.0, 0.0, 2.0],
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 1.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+        };
+        let boss = extrude_solid_with_overlap(&[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]], &top, 2.0, 0.1)
+            .expect("boss");
+        let combined = union(&base, &boss).expect("union should succeed");
+        let t = tessellate(&combined, 0.05);
+        assert!(t.mesh.indices.len() % 3 == 0 && !t.mesh.positions.is_empty());
+        assert!(t.edges.len() > 12, "a stepped solid has more than 12 edges, got {}", t.edges.len());
+    }
+
+    #[test]
+    fn cut_into_a_top_face_with_negative_distance() {
+        // 4×4×2 base; cut downward from the top face (body is on the −normal side).
+        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &xy_plane(), 2.0)
+            .expect("base");
+        let top = PlaneBasis {
+            origin: [0.0, 0.0, 2.0],
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 1.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+        };
+        // Negative distance ⇒ tool sweeps against the normal, i.e. down into the body.
+        let result = cut(&base, &[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]], &top, -2.0)
+            .expect("downward cut should succeed");
+        let t = tessellate(&result, 0.05);
+        assert!(t.edges.len() > 12, "pocketed solid should have extra edges, got {}", t.edges.len());
     }
 
     #[test]

@@ -17,8 +17,14 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Document, FeatureKind, Plane};
-use hworks_geometry::{cut, extrude_solid, tessellate, union, KSolid, PlaneBasis, Tessellation, TriMesh};
+use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
+use hworks_geometry::{
+    cut, extrude_solid, extrude_solid_with_overlap, tessellate, union, KSolid, PlaneBasis,
+    Tessellation, TriMesh,
+};
+
+/// How far a boss reaches back into the body it's built on, so the union is robust.
+const BOSS_OVERLAP: f64 = 0.1;
 use hworks_sketch::{Constraint, Sketch, SketchEntity};
 
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
@@ -122,6 +128,8 @@ struct UiBlocking(bool);
 #[derive(Resource, Default)]
 struct Part {
     solid: Option<KSolid>,
+    /// Last tessellation, kept in world space so faces can be ray-picked.
+    mesh: Option<TriMesh>,
 }
 
 #[derive(Clone)]
@@ -466,6 +474,122 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
     nearest_point(sketch, uv, SNAP).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
+/// Möller–Trumbore ray/triangle intersection. Returns the ray parameter `t` of a
+/// front-facing hit, if any.
+fn ray_triangle(orig: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    const EPS: f32 = 1e-7;
+    let e1 = b - a;
+    let e2 = c - a;
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < EPS {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tv = orig - a;
+    let u = tv.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = tv.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    (t > EPS).then_some(t)
+}
+
+/// Ray-pick a planar face of a tessellated body. Returns the hit distance and the
+/// sketch plane on that face (origin at the face centroid, normal facing the
+/// camera, with derived in-plane axes).
+fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
+    let dir = ray.direction.as_vec3();
+    let pos = &mesh.positions;
+
+    let mut best_t = f32::INFINITY;
+    let mut hit = Vec3::ZERO;
+    let mut normal = Vec3::ZERO;
+    for tri in mesh.indices.chunks(3) {
+        let a = Vec3::from_array(pos[tri[0] as usize]);
+        let b = Vec3::from_array(pos[tri[1] as usize]);
+        let c = Vec3::from_array(pos[tri[2] as usize]);
+        if let Some(t) = ray_triangle(ray.origin, dir, a, b, c) {
+            if t < best_t {
+                best_t = t;
+                hit = ray.origin + dir * t;
+                normal = (b - a).cross(c - a).normalize_or_zero();
+            }
+        }
+    }
+    if !best_t.is_finite() || normal == Vec3::ZERO {
+        return None;
+    }
+    // Normal should face the camera.
+    let mut n = normal;
+    if n.dot(dir) > 0.0 {
+        n = -n;
+    }
+
+    // Average the centroids of all triangles coplanar with the hit → face origin.
+    let plane_d = n.dot(hit);
+    let mut sum = Vec3::ZERO;
+    let mut count = 0.0_f32;
+    for tri in mesh.indices.chunks(3) {
+        let a = Vec3::from_array(pos[tri[0] as usize]);
+        let b = Vec3::from_array(pos[tri[1] as usize]);
+        let c = Vec3::from_array(pos[tri[2] as usize]);
+        let mut tn = (b - a).cross(c - a).normalize_or_zero();
+        if tn.dot(n) < 0.0 {
+            tn = -tn;
+        }
+        let centroid = (a + b + c) / 3.0;
+        if tn.dot(n) > 0.99 && (n.dot(centroid) - plane_d).abs() < 0.01 {
+            sum += centroid;
+            count += 1.0;
+        }
+    }
+    let mut origin = if count > 0.0 { sum / count } else { hit };
+    origin -= n * (n.dot(origin) - plane_d); // snap exactly onto the plane
+
+    // In-plane axes from the normal.
+    let seed = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Z };
+    let u = (seed - n * seed.dot(n)).normalize();
+    let v = n.cross(u).normalize();
+
+    Some((best_t, ActivePlane { name: "Face".into(), origin, u, v, n }))
+}
+
+/// `PlaneRef` (document-side) from an active plane (app-side).
+fn plane_ref(ap: &ActivePlane) -> PlaneRef {
+    PlaneRef {
+        origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
+        u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
+        v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
+        normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
+    }
+}
+
+/// `PlaneBasis` (kernel-side) from an active plane.
+fn plane_basis(ap: &ActivePlane) -> PlaneBasis {
+    PlaneBasis {
+        origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
+        u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
+        v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
+        normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
+    }
+}
+
+/// Average of a mesh's vertices — used to decide which side of a sketch plane the
+/// body sits on (so a cut removes material in the right direction).
+fn mesh_centroid(mesh: &TriMesh) -> Vec3 {
+    if mesh.positions.is_empty() {
+        return Vec3::ZERO;
+    }
+    let sum: Vec3 = mesh.positions.iter().map(|p| Vec3::from_array(*p)).sum();
+    sum / mesh.positions.len() as f32
+}
+
 // ---------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------
@@ -476,6 +600,7 @@ fn sketch_interaction(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &OrbitCamera)>,
     doc: Res<DocRes>,
+    part: Res<Part>,
     mut session: ResMut<SketchSession>,
 ) {
     if blocking.0 {
@@ -497,6 +622,7 @@ fn sketch_interaction(
     if session.plane.is_none() {
         if just_pressed {
             let mut best: Option<(f32, ActivePlane)> = None;
+            // Reference planes.
             for (_id, p) in doc.0.planes() {
                 let ap = ActivePlane::from_doc(p);
                 if let Some((t, uv)) = ray_plane(&ap, &ray) {
@@ -505,6 +631,14 @@ fn sketch_interaction(
                         if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
                             best = Some((t, ap));
                         }
+                    }
+                }
+            }
+            // Planar faces of the body (M5) — usually in front, so they win.
+            if let Some(mesh) = &part.mesh {
+                if let Some((t, ap)) = pick_face(mesh, &ray) {
+                    if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                        best = Some((t, ap));
                     }
                 }
             }
@@ -670,28 +804,31 @@ fn do_solid_op(
         warn!("Need a closed profile (a closed loop of lines, or a circle) for this operation.");
         return;
     };
-    let basis = PlaneBasis {
-        origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
-        u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
-        v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
-        normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
-    };
+    let basis = plane_basis(&ap);
 
     let new_body: Option<KSolid> = match op {
-        SolidOp::Boss(d) => match extrude_solid(&profile, &basis, d) {
-            Some(solid) => match &part.solid {
-                Some(existing) => union(existing, &solid),
-                None => Some(solid),
-            },
-            None => None,
+        SolidOp::Boss(d) => match &part.solid {
+            // Boss onto an existing body: overlap into it so the union is robust.
+            Some(existing) => extrude_solid_with_overlap(&profile, &basis, d, BOSS_OVERLAP)
+                .and_then(|boss| union(existing, &boss)),
+            // First solid: a clean prism.
+            None => extrude_solid(&profile, &basis, d),
         },
-        SolidOp::Cut(d) => match &part.solid {
-            Some(existing) => cut(existing, &profile, &basis, d),
-            None => {
+        SolidOp::Cut(d) => {
+            let Some(existing) = &part.solid else {
                 warn!("Cut: there is no body yet — extrude a boss first.");
                 return;
-            }
-        },
+            };
+            // Cut *into* the material: pick the sign that points at the body.
+            let signed = match &part.mesh {
+                Some(mesh) => {
+                    let into = (mesh_centroid(mesh) - ap.origin).dot(ap.n);
+                    if into < 0.0 { -d } else { d }
+                }
+                None => d,
+            };
+            cut(existing, &profile, &basis, signed)
+        }
     };
 
     let Some(body) = new_body else {
@@ -699,7 +836,7 @@ fn do_solid_op(
         return;
     };
 
-    doc.0.add_feature(FeatureKind::Sketch(session.sketch.clone()));
+    doc.0.add_feature(FeatureKind::Sketch { sketch: session.sketch.clone(), plane: plane_ref(&ap) });
     doc.0.add_feature(match op {
         SolidOp::Boss(d) => FeatureKind::Extrude { distance: d },
         SolidOp::Cut(d) => FeatureKind::Cut { distance: d },
@@ -710,6 +847,7 @@ fn do_solid_op(
         commands.entity(e).despawn();
     }
     let tess = tessellate(part.solid.as_ref().unwrap(), 0.03);
+    part.mesh = Some(tess.mesh.clone());
     spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
 
     session.plane = None;
@@ -739,6 +877,7 @@ fn handle_new_part(
         commands.entity(e).despawn();
     }
     part.solid = None;
+    part.mesh = None;
     doc.0 = Document::with_default_planes();
     session.plane = None;
     session.pending = None;

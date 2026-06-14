@@ -26,11 +26,24 @@ pub struct Plane {
     pub v: [f32; 3],
 }
 
+/// A geometric reference to the plane a sketch was made on — a reference plane
+/// or a planar face of the body. Recording it (rather than a face index) is the
+/// start of surviving regeneration: after a rebuild, the face is re-matched by
+/// geometry (normal + a point on it). See `DESIGN.md` §4.3. (M5 groundwork.)
+#[derive(Debug, Clone)]
+pub struct PlaneRef {
+    pub origin: [f64; 3],
+    pub u: [f64; 3],
+    pub v: [f64; 3],
+    pub normal: [f64; 3],
+}
+
 /// The kinds of feature a timeline can hold. Grows along the roadmap.
 #[derive(Debug, Clone)]
 pub enum FeatureKind {
     Plane(Plane),
-    Sketch(Sketch),
+    /// A 2D sketch together with the plane (or face) it lives on.
+    Sketch { sketch: Sketch, plane: PlaneRef },
     /// Boss extrude: add material by sweeping the preceding sketch.
     Extrude { distance: f64 },
     /// Cut: subtract a swept profile from the body.
@@ -101,7 +114,7 @@ impl Document {
             .iter()
             .map(|f| match &f.kind {
                 FeatureKind::Plane(p) => format!("[plane]   {}", p.name),
-                FeatureKind::Sketch(_) => {
+                FeatureKind::Sketch { .. } => {
                     sk += 1;
                     format!("[sketch]  Sketch{sk}")
                 }
