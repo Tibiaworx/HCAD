@@ -1,33 +1,33 @@
 //! HCAD — Layer 4: the Bevy viewport.
 //!
-//! Milestone **M1**: pick a reference plane and sketch on it.
-//!  - Left-click a reference plane → the camera snaps face-on and enters sketch mode.
-//!  - Draw raw (unconstrained) geometry on the plane: lines and circles.
-//!  - Constraints/dimensions and the solver arrive at M2.
+//! Milestone **M2**: constraints. The sketch is no longer raw points — it's a
+//! constraint system the solver keeps satisfied. New in M2:
+//!  - **Rectangle tool** built from 4 lines + horizontal/vertical constraints.
+//!  - **Construction lines** (toggle), and endpoint **snapping** (shared points
+//!    = implicit coincidence) so geometry connects.
+//!  - **Select/drag**: grab a point and the rest of the sketch re-solves live.
 //!
 //! Controls:
-//!   View mode:   right-drag = orbit · scroll = zoom · left-click a plane = sketch on it
-//!   Sketch mode: L = line tool · C = circle tool · left-click = place points
-//!                Esc = cancel current draw, or (again) leave sketch mode
-//!
-//! Picking and the draw cursor are done with manual ray/plane intersection so the
-//! drawing surface is the *infinite* plane, not just the visible quad. The active
-//! [`Sketch`] (in `hworks-sketch`) is the data; the gizmos are throwaway rendering.
+//!   View mode:   right-drag = orbit · scroll = zoom · left-click a plane = sketch
+//!   Sketch mode: S = select/drag · L = line · C = circle · R = rectangle
+//!                X = toggle construction · left-click = place · Esc = cancel / exit
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use hworks_document::{Document, Plane};
-use hworks_sketch::{Sketch, SketchEntity};
+use hworks_sketch::{Constraint, Sketch, SketchEntity};
 
 /// Edge length of the square reference-plane quads (world units).
 const PLANE_SIZE: f32 = 8.0;
+/// How close (world units) a click must be to an existing point to snap/grab it.
+const SNAP: f32 = 0.18;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "HCAD — M1: Sketch on a Plane".into(),
+                title: "HCAD — M2: Constraints".into(),
                 ..default()
             }),
             ..default()
@@ -42,6 +42,7 @@ fn main() {
                 sketch_interaction,
                 handle_keys,
                 orbit_camera,
+                update_hud,
                 draw_world_axes,
                 draw_sketch,
             ),
@@ -53,16 +54,27 @@ fn main() {
 // Resources & state
 // ---------------------------------------------------------------------------
 
-/// The document (feature tree) held as a Bevy resource. Source of truth.
 #[derive(Resource)]
 struct DocRes(Document);
 
-/// Which draw tool is active while sketching.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Tool {
+    Select,
     #[default]
     Line,
     Circle,
+    Rectangle,
+}
+
+impl Tool {
+    fn label(self) -> &'static str {
+        match self {
+            Tool::Select => "Select/drag",
+            Tool::Line => "Line",
+            Tool::Circle => "Circle",
+            Tool::Rectangle => "Rectangle",
+        }
+    }
 }
 
 /// A reference plane resolved into world-space vectors, ready for ray math.
@@ -82,25 +94,26 @@ impl ActivePlane {
         Self { name: p.name.clone(), origin: Vec3::from_array(p.origin), u, v, n: u.cross(v) }
     }
 
-    /// Convert plane-local (u, v) coordinates to a world position.
     fn to_world(&self, uv: Vec2) -> Vec3 {
         self.origin + self.u * uv.x + self.v * uv.y
     }
 }
 
-/// The active sketching session. When `plane` is `None` we're in view mode.
 #[derive(Resource, Default)]
 struct SketchSession {
     plane: Option<ActivePlane>,
     tool: Tool,
-    /// First placed point of the in-progress line/circle, if any (plane-local uv).
+    construction: bool,
+    /// First placed point of the in-progress entity (plane-local uv).
     pending: Option<Vec2>,
-    /// Where the cursor currently projects onto the active plane (for rubber-banding).
+    /// Point index currently being dragged (Select tool).
+    drag: Option<usize>,
+    /// Re-solve requested after a structural change.
+    dirty: bool,
     cursor_uv: Option<Vec2>,
     sketch: Sketch,
 }
 
-/// Orbit-camera state: spherical position (`yaw`, `pitch`, `radius`) about a `focus`.
 #[derive(Component)]
 struct OrbitCamera {
     focus: Vec3,
@@ -115,6 +128,9 @@ impl Default for OrbitCamera {
     }
 }
 
+#[derive(Component)]
+struct HudText;
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -127,9 +143,9 @@ fn setup(
 ) {
     let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
     let colors = [
-        Color::srgba(0.85, 0.25, 0.25, 0.18), // Front (XY)
-        Color::srgba(0.25, 0.75, 0.30, 0.18), // Top   (XZ)
-        Color::srgba(0.25, 0.45, 0.90, 0.18), // Right (YZ)
+        Color::srgba(0.85, 0.25, 0.25, 0.18),
+        Color::srgba(0.25, 0.75, 0.30, 0.18),
+        Color::srgba(0.25, 0.45, 0.90, 0.18),
     ];
 
     for (i, (_id, plane)) in doc.0.planes().enumerate() {
@@ -163,9 +179,21 @@ fn setup(
         AmbientLight { color: Color::WHITE, brightness: 250.0, ..default() },
     ));
 
-    println!("HCAD M1 ready.");
-    println!("  View:   right-drag = orbit, scroll = zoom, left-click a plane to sketch on it.");
-    println!("  Sketch: L = line, C = circle, left-click = place points, Esc = cancel / exit.");
+    // On-screen heads-up text.
+    commands.spawn((
+        Text::new(""),
+        TextFont { font_size: 15.0, ..default() },
+        TextColor(Color::srgb(0.88, 0.90, 0.96)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(8.0),
+            left: Val::Px(10.0),
+            ..default()
+        },
+        HudText,
+    ));
+
+    println!("HCAD M2 ready. Left-click a plane, then S/L/C/R to pick a tool, X for construction.");
 }
 
 fn camera_transform(cam: &OrbitCamera) -> Transform {
@@ -175,41 +203,50 @@ fn camera_transform(cam: &OrbitCamera) -> Transform {
 }
 
 // ---------------------------------------------------------------------------
-// Ray / plane math
+// Ray / plane math + point helpers
 // ---------------------------------------------------------------------------
 
-/// Intersect a world-space ray with a plane. Returns `(t, uv)` where `t` is the
-/// ray parameter and `uv` is the hit point in the plane's local coordinates.
 fn ray_plane(ap: &ActivePlane, ray: &Ray3d) -> Option<(f32, Vec2)> {
     let dir = ray.direction.as_vec3();
     let denom = ap.n.dot(dir);
     if denom.abs() < 1e-6 {
-        return None; // ray parallel to plane
+        return None;
     }
     let t = (ap.origin - ray.origin).dot(ap.n) / denom;
     if t <= 0.0 {
-        return None; // plane is behind the camera
+        return None;
     }
     let hit = ray.origin + dir * t;
     let d = hit - ap.origin;
     Some((t, Vec2::new(d.dot(ap.u), d.dot(ap.v))))
 }
 
-/// Build the world-space ray under the cursor, if available.
-fn cursor_ray(
-    window: &Window,
-    camera: &Camera,
-    cam_transform: &GlobalTransform,
-) -> Option<Ray3d> {
+fn cursor_ray(window: &Window, camera: &Camera, cam_transform: &GlobalTransform) -> Option<Ray3d> {
     let cursor = window.cursor_position()?;
     camera.viewport_to_world(cam_transform, cursor).ok()
+}
+
+/// Nearest existing point to `uv` within `thresh`, if any.
+fn nearest_point(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, p) in sketch.points.iter().enumerate() {
+        let d = Vec2::new(p.x as f32, p.y as f32).distance(uv);
+        if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Reuse a nearby point (implicit coincidence) or create a new one.
+fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
+    nearest_point(sketch, uv, SNAP).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
 // ---------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------
 
-/// View-mode plane picking + sketch-mode drawing, all via the cursor ray.
 fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -221,68 +258,132 @@ fn sketch_interaction(
     let Ok((camera, cam_gt, mut cam_tf, orbit)) = cam_q.single_mut() else { return };
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
 
-    // Track where the cursor sits on the active plane (for rubber-band preview).
     let active_uv = session.plane.as_ref().and_then(|ap| ray_plane(ap, &ray).map(|(_, uv)| uv));
     if session.plane.is_some() {
         session.cursor_uv = active_uv;
     }
 
-    if !buttons.just_pressed(MouseButton::Left) {
-        return;
-    }
+    let just_pressed = buttons.just_pressed(MouseButton::Left);
+    let pressed = buttons.pressed(MouseButton::Left);
+    let just_released = buttons.just_released(MouseButton::Left);
 
+    // ---- View mode: pick a plane to sketch on. ----
     if session.plane.is_none() {
-        // --- View mode: pick the closest reference plane under the cursor. ---
-        let mut best: Option<(f32, ActivePlane)> = None;
-        for (_id, p) in doc.0.planes() {
-            let ap = ActivePlane::from_doc(p);
-            if let Some((t, uv)) = ray_plane(&ap, &ray) {
-                let half = PLANE_SIZE * 0.5;
-                if uv.x.abs() <= half && uv.y.abs() <= half {
-                    if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
-                        best = Some((t, ap));
+        if just_pressed {
+            let mut best: Option<(f32, ActivePlane)> = None;
+            for (_id, p) in doc.0.planes() {
+                let ap = ActivePlane::from_doc(p);
+                if let Some((t, uv)) = ray_plane(&ap, &ray) {
+                    let half = PLANE_SIZE * 0.5;
+                    if uv.x.abs() <= half && uv.y.abs() <= half {
+                        if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                            best = Some((t, ap));
+                        }
                     }
                 }
             }
+            if let Some((_, ap)) = best {
+                let dist = orbit.radius.max(6.0);
+                let eye = ap.origin + ap.n * dist;
+                *cam_tf = Transform::from_translation(eye).looking_at(ap.origin, ap.v);
+                session.sketch.clear();
+                session.pending = None;
+                session.cursor_uv = None;
+                session.drag = None;
+                info!("Entered sketch mode on the {} plane.", ap.name);
+                session.plane = Some(ap);
+            }
         }
-        if let Some((_, ap)) = best {
-            // Snap the camera face-on: look down the plane normal, up = plane v.
-            let dist = orbit.radius.max(6.0);
-            let eye = ap.origin + ap.n * dist;
-            *cam_tf = Transform::from_translation(eye).looking_at(ap.origin, ap.v);
+        return;
+    }
 
-            session.sketch.clear();
-            session.pending = None;
-            session.cursor_uv = None;
-            info!("Entered sketch mode on the {} plane.", ap.name);
-            session.plane = Some(ap);
-        }
-    } else if let Some(uv) = active_uv {
-        // --- Sketch mode: place points for the active tool. ---
-        match session.tool {
-            Tool::Line => {
-                if let Some(start) = session.pending.take() {
-                    let a = session.sketch.add_point(start.x as f64, start.y as f64);
-                    let b = session.sketch.add_point(uv.x as f64, uv.y as f64);
-                    session.sketch.add_line(a, b, false);
-                } else {
-                    session.pending = Some(uv);
-                }
+    // ---- Sketch mode. ----
+    match session.tool {
+        Tool::Select => {
+            if just_pressed {
+                let hit = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP));
+                session.drag = hit;
             }
-            Tool::Circle => {
-                if let Some(center) = session.pending.take() {
-                    let radius = center.distance(uv);
-                    let c = session.sketch.add_point(center.x as f64, center.y as f64);
-                    session.sketch.add_circle(c, radius as f64);
-                } else {
-                    session.pending = Some(uv);
+            if let Some(i) = session.drag {
+                if pressed {
+                    if let Some(uv) = active_uv {
+                        if let Some(p) = session.sketch.points.get_mut(i) {
+                            p.x = uv.x as f64;
+                            p.y = uv.y as f64;
+                        }
+                        session.sketch.solve_with_fixed(&[i]);
+                    }
+                }
+                if just_released {
+                    session.drag = None;
                 }
             }
         }
+        Tool::Line | Tool::Circle | Tool::Rectangle if just_pressed => {
+            if let Some(uv) = active_uv {
+                place_point(&mut session, uv);
+            }
+        }
+        _ => {}
+    }
+
+    // Re-solve after a structural change (never while actively dragging).
+    if session.drag.is_none() && session.dirty {
+        session.sketch.solve();
+        session.dirty = false;
     }
 }
 
-/// Tool selection and exit, active only while sketching.
+/// Handle a click for the active drawing tool.
+fn place_point(session: &mut SketchSession, uv: Vec2) {
+    match session.tool {
+        Tool::Line => {
+            if let Some(start) = session.pending.take() {
+                let a = get_or_add_point(&mut session.sketch, start);
+                let b = get_or_add_point(&mut session.sketch, uv);
+                session.sketch.add_line(a, b, session.construction);
+                session.dirty = true;
+            } else {
+                session.pending = Some(uv);
+            }
+        }
+        Tool::Circle => {
+            if let Some(center) = session.pending.take() {
+                let radius = center.distance(uv);
+                let c = get_or_add_point(&mut session.sketch, center);
+                session.sketch.add_circle(c, radius as f64);
+                session.dirty = true;
+            } else {
+                session.pending = Some(uv);
+            }
+        }
+        Tool::Rectangle => {
+            if let Some(c0) = session.pending.take() {
+                let c1 = uv;
+                let s = &mut session.sketch;
+                // Corners: p0 = c0, p1 = (c1.x, c0.y), p2 = c1, p3 = (c0.x, c1.y).
+                let p0 = s.add_point(c0.x as f64, c0.y as f64);
+                let p1 = s.add_point(c1.x as f64, c0.y as f64);
+                let p2 = s.add_point(c1.x as f64, c1.y as f64);
+                let p3 = s.add_point(c0.x as f64, c1.y as f64);
+                s.add_line(p0, p1, false);
+                s.add_line(p1, p2, false);
+                s.add_line(p2, p3, false);
+                s.add_line(p3, p0, false);
+                // Make it a parametric rectangle: bottom/top horizontal, sides vertical.
+                s.constraints.push(Constraint::Horizontal(p0, p1));
+                s.constraints.push(Constraint::Horizontal(p3, p2));
+                s.constraints.push(Constraint::Vertical(p1, p2));
+                s.constraints.push(Constraint::Vertical(p0, p3));
+                session.dirty = true;
+            } else {
+                session.pending = Some(uv);
+            }
+        }
+        Tool::Select => {}
+    }
+}
+
 fn handle_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut session: ResMut<SketchSession>,
@@ -290,6 +391,10 @@ fn handle_keys(
 ) {
     if session.plane.is_none() {
         return;
+    }
+    if keys.just_pressed(KeyCode::KeyS) {
+        session.tool = Tool::Select;
+        session.pending = None;
     }
     if keys.just_pressed(KeyCode::KeyL) {
         session.tool = Tool::Line;
@@ -299,13 +404,20 @@ fn handle_keys(
         session.tool = Tool::Circle;
         session.pending = None;
     }
+    if keys.just_pressed(KeyCode::KeyR) {
+        session.tool = Tool::Rectangle;
+        session.pending = None;
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        session.construction = !session.construction;
+    }
     if keys.just_pressed(KeyCode::Escape) {
         if session.pending.is_some() {
-            session.pending = None; // cancel the in-progress entity first
+            session.pending = None;
         } else {
-            // Leave sketch mode and restore the prior orbit view.
             session.plane = None;
             session.cursor_uv = None;
+            session.drag = None;
             if let Ok((mut tf, orbit)) = cam_q.single_mut() {
                 *tf = camera_transform(orbit);
             }
@@ -314,7 +426,6 @@ fn handle_keys(
     }
 }
 
-/// Right-drag orbit + scroll zoom. Disabled while sketching (camera is locked face-on).
 fn orbit_camera(
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
@@ -346,6 +457,23 @@ fn orbit_camera(
     }
 }
 
+fn update_hud(session: Res<SketchSession>, mut q: Query<&mut Text, With<HudText>>) {
+    let Ok(mut text) = q.single_mut() else { return };
+    let s = match &session.plane {
+        None => "View — right-drag orbit · scroll zoom · left-click a reference plane to sketch".to_string(),
+        Some(ap) => {
+            let con = if session.construction { " · CONSTRUCTION on" } else { "" };
+            format!(
+                "Sketch on {} — tool: {}{}\nS select · L line · C circle · R rect · X construction · Esc cancel/exit",
+                ap.name,
+                session.tool.label(),
+                con,
+            )
+        }
+    };
+    *text = Text::new(s);
+}
+
 // ---------------------------------------------------------------------------
 // Rendering (gizmos)
 // ---------------------------------------------------------------------------
@@ -357,11 +485,9 @@ fn draw_world_axes(mut gizmos: Gizmos) {
     gizmos.line(Vec3::ZERO, Vec3::Z * L, Color::srgb(0.3, 0.5, 1.0));
 }
 
-/// Draw the active sketch: a reference grid, committed entities, and a live preview.
 fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     let Some(ap) = &session.plane else { return };
 
-    // Grid + plane outline for drawing reference.
     let grid = Color::srgba(0.55, 0.55, 0.62, 0.18);
     let half = (PLANE_SIZE * 0.5) as i32;
     for i in -half..=half {
@@ -370,7 +496,8 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         gizmos.line(ap.to_world(Vec2::new(-PLANE_SIZE * 0.5, f)), ap.to_world(Vec2::new(PLANE_SIZE * 0.5, f)), grid);
     }
 
-    let line_col = Color::srgb(0.95, 0.95, 0.25);
+    let solid = Color::srgb(0.95, 0.95, 0.25);
+    let construction = Color::srgb(0.9, 0.45, 0.95);
     let circle_col = Color::srgb(0.25, 0.9, 0.95);
     let point_col = Color::srgb(1.0, 0.55, 0.15);
     let preview_col = Color::srgba(1.0, 1.0, 1.0, 0.6);
@@ -381,11 +508,11 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         Vec2::new(p.x as f32, p.y as f32)
     };
 
-    // Committed entities.
     for e in &session.sketch.entities {
         match e {
-            SketchEntity::Line { a, b, .. } => {
-                gizmos.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), line_col);
+            SketchEntity::Line { a, b, construction: is_con } => {
+                let col = if *is_con { construction } else { solid };
+                gizmos.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), col);
             }
             SketchEntity::Circle { center, radius } => {
                 let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
@@ -395,7 +522,6 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         }
     }
 
-    // Vertex markers.
     for p in &session.sketch.points {
         draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), point_col);
     }
@@ -403,19 +529,24 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     // Live preview of the in-progress entity.
     if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
         match session.tool {
-            Tool::Line => {
-                gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col);
-            }
+            Tool::Line => gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col),
             Tool::Circle => {
                 let iso = Isometry3d::new(ap.to_world(start), plane_rot);
                 gizmos.circle(iso, start.distance(cur), preview_col);
             }
+            Tool::Rectangle => {
+                let a = Vec2::new(cur.x, start.y);
+                let b = Vec2::new(start.x, cur.y);
+                for (p, q) in [(start, a), (a, cur), (cur, b), (b, start)] {
+                    gizmos.line(ap.to_world(p), ap.to_world(q), preview_col);
+                }
+            }
+            Tool::Select => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col);
     }
 }
 
-/// A small in-plane cross marking a sketch point.
 fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color) {
     const S: f32 = 0.08;
     gizmos.line(ap.to_world(uv + Vec2::new(-S, 0.0)), ap.to_world(uv + Vec2::new(S, 0.0)), color);

@@ -6,4 +6,4 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-# nalgebra (constraint solver) arrives at milestone M2.
+nalgebra = "0.33"
