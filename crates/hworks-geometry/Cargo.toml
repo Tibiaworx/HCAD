@@ -6,4 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-# truck (B-rep kernel) arrives at milestone M3, behind the GeometryKernel trait.
+truck-modeling = "0.6"
+truck-meshalgo = "0.4"
+truck-polymesh = "0.6"

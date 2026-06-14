@@ -69,6 +69,45 @@ impl Sketch {
         self.entities.clear();
         self.constraints.clear();
     }
+
+    /// If the non-construction lines form a single closed loop, return the point
+    /// indices in order around it. Otherwise `None`. This is the profile the
+    /// kernel extrudes (M3). Requires every involved point to have degree 2 and
+    /// the whole thing to be one cycle.
+    pub fn closed_loop(&self) -> Option<Vec<usize>> {
+        use std::collections::HashMap;
+        let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut edges = 0usize;
+        for e in &self.entities {
+            if let SketchEntity::Line { a, b, construction: false } = e {
+                adj.entry(*a).or_default().push(*b);
+                adj.entry(*b).or_default().push(*a);
+                edges += 1;
+            }
+        }
+        if edges < 3 || adj.values().any(|nbrs| nbrs.len() != 2) {
+            return None;
+        }
+        let start = *adj.keys().min()?;
+        let mut order = vec![start];
+        let mut prev = start;
+        let mut cur = adj[&start][0];
+        while cur != start {
+            order.push(cur);
+            let nbrs = &adj[&cur];
+            let next = if nbrs[0] == prev { nbrs[1] } else { nbrs[0] };
+            prev = cur;
+            cur = next;
+            if order.len() > adj.len() {
+                return None; // ran away — not a clean single cycle
+            }
+        }
+        if order.len() == adj.len() {
+            Some(order)
+        } else {
+            None // a cycle, but it didn't cover every involved point
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +303,33 @@ mod tests {
         s.constraints.push(Constraint::Horizontal(a, b));
         s.solve();
         assert!((s.points[a].y - s.points[b].y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn closed_loop_found_for_a_rectangle_and_not_for_an_open_path() {
+        let mut s = Sketch::default();
+        let p0 = s.add_point(0.0, 0.0);
+        let p1 = s.add_point(2.0, 0.0);
+        let p2 = s.add_point(2.0, 1.0);
+        let p3 = s.add_point(0.0, 1.0);
+        s.add_line(p0, p1, false);
+        s.add_line(p1, p2, false);
+        s.add_line(p2, p3, false);
+        // Open path so far: three of four edges — no loop yet.
+        assert!(s.closed_loop().is_none());
+        // Close it.
+        s.add_line(p3, p0, false);
+        let loop_idx = s.closed_loop().expect("rectangle should be a closed loop");
+        assert_eq!(loop_idx.len(), 4);
+        // A construction line must not create a loop on its own.
+        let mut c = Sketch::default();
+        let a = c.add_point(0.0, 0.0);
+        let b = c.add_point(1.0, 0.0);
+        let d = c.add_point(1.0, 1.0);
+        c.add_line(a, b, true);
+        c.add_line(b, d, true);
+        c.add_line(d, a, true);
+        assert!(c.closed_loop().is_none(), "construction-only loop must be ignored");
     }
 
     #[test]

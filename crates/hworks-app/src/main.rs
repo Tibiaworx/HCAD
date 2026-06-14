@@ -14,9 +14,15 @@
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::prelude::*;
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::window::PrimaryWindow;
 use hworks_document::{Document, Plane};
+use hworks_geometry::{extrude, PlaneBasis, TriMesh};
 use hworks_sketch::{Constraint, Sketch, SketchEntity};
+
+/// How far an extrude pushes the profile along the plane normal (M3 fixed default).
+const EXTRUDE_DISTANCE: f64 = 2.0;
 
 /// Edge length of the square reference-plane quads (world units).
 const PLANE_SIZE: f32 = 8.0;
@@ -27,7 +33,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "HCAD — M2: Constraints".into(),
+                title: "HCAD — M3: Extrude".into(),
                 ..default()
             }),
             ..default()
@@ -41,6 +47,7 @@ fn main() {
             (
                 sketch_interaction,
                 handle_keys,
+                do_extrude,
                 orbit_camera,
                 update_hud,
                 draw_world_axes,
@@ -110,9 +117,15 @@ struct SketchSession {
     drag: Option<usize>,
     /// Re-solve requested after a structural change.
     dirty: bool,
+    /// An extrude was requested (E key); consumed by `do_extrude`.
+    extrude_request: bool,
     cursor_uv: Option<Vec2>,
     sketch: Sketch,
 }
+
+/// Marks entities that make up generated 3D solids (so they can be cleared later).
+#[derive(Component)]
+struct SolidPart;
 
 #[derive(Component)]
 struct OrbitCamera {
@@ -193,7 +206,7 @@ fn setup(
         HudText,
     ));
 
-    println!("HCAD M2 ready. Left-click a plane, then S/L/C/R to pick a tool, X for construction.");
+    println!("HCAD M3 ready. Left-click a plane, draw a closed profile (e.g. R for rectangle), then E to extrude.");
 }
 
 fn camera_transform(cam: &OrbitCamera) -> Transform {
@@ -411,6 +424,9 @@ fn handle_keys(
     if keys.just_pressed(KeyCode::KeyX) {
         session.construction = !session.construction;
     }
+    if keys.just_pressed(KeyCode::KeyE) {
+        session.extrude_request = true;
+    }
     if keys.just_pressed(KeyCode::Escape) {
         if session.pending.is_some() {
             session.pending = None;
@@ -424,6 +440,99 @@ fn handle_keys(
             info!("Left sketch mode.");
         }
     }
+}
+
+/// Consume an extrude request: turn the sketch's closed loop into a truck solid,
+/// spawn it shaded with edges, and drop back to the 3D view to see it.
+fn do_extrude(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut session: ResMut<SketchSession>,
+    mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
+) {
+    if !session.extrude_request {
+        return;
+    }
+    session.extrude_request = false;
+
+    let Some(ap) = session.plane.clone() else { return };
+    let Some(loop_idx) = session.sketch.closed_loop() else {
+        warn!("Extrude: the sketch has no single closed profile (need a closed loop of lines).");
+        return;
+    };
+
+    let profile: Vec<[f64; 2]> = loop_idx
+        .iter()
+        .map(|&i| {
+            let p = &session.sketch.points[i];
+            [p.x, p.y]
+        })
+        .collect();
+    let basis = PlaneBasis {
+        origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
+        u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
+        v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
+        normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
+    };
+
+    let Some(result) = extrude(&profile, &basis, EXTRUDE_DISTANCE) else {
+        warn!("Extrude: the kernel could not build a solid from this profile.");
+        return;
+    };
+
+    // Shaded solid.
+    let mesh = meshes.add(trimesh_to_bevy(result.mesh));
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.62, 0.66, 0.74),
+        metallic: 0.1,
+        perceptual_roughness: 0.55,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    commands.spawn((Mesh3d(mesh), MeshMaterial3d(material), SolidPart, Name::new("Extrude")));
+
+    // Black wireframe over the faces.
+    let edge_mesh = meshes.add(edges_to_bevy(&result.edges));
+    let edge_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.05, 0.05, 0.07),
+        unlit: true,
+        ..default()
+    });
+    commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("ExtrudeEdges")));
+
+    info!("Extruded a {}-sided profile by {} units.", profile.len(), EXTRUDE_DISTANCE);
+
+    // Drop back to the orbit view to inspect the solid.
+    session.plane = None;
+    session.pending = None;
+    session.drag = None;
+    session.cursor_uv = None;
+    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
+        *tf = camera_transform(orbit);
+    }
+}
+
+/// Convert our kernel [`TriMesh`] into a Bevy render mesh.
+fn trimesh_to_bevy(t: TriMesh) -> Mesh {
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, t.positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, t.normals);
+    mesh.insert_indices(Indices::U32(t.indices));
+    mesh
+}
+
+/// Build a `LineList` mesh from wireframe edge segments.
+fn edges_to_bevy(edges: &[[[f32; 3]; 2]]) -> Mesh {
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(edges.len() * 2);
+    for e in edges {
+        positions.push(e[0]);
+        positions.push(e[1]);
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh
 }
 
 fn orbit_camera(
@@ -464,7 +573,7 @@ fn update_hud(session: Res<SketchSession>, mut q: Query<&mut Text, With<HudText>
         Some(ap) => {
             let con = if session.construction { " · CONSTRUCTION on" } else { "" };
             format!(
-                "Sketch on {} — tool: {}{}\nS select · L line · C circle · R rect · X construction · Esc cancel/exit",
+                "Sketch on {} — tool: {}{}\nS select · L line · C circle · R rect · X construction · E extrude · Esc cancel/exit",
                 ap.name,
                 session.tool.label(),
                 con,
