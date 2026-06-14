@@ -1,48 +1,49 @@
-//! HCAD — Layer 4: the Bevy viewport.
+//! HCAD — Layer 4: the Bevy viewport + a SolidWorks-style egui shell.
 //!
-//! Milestone **M2**: constraints. The sketch is no longer raw points — it's a
-//! constraint system the solver keeps satisfied. New in M2:
-//!  - **Rectangle tool** built from 4 lines + horizontal/vertical constraints.
-//!  - **Construction lines** (toggle), and endpoint **snapping** (shared points
-//!    = implicit coincidence) so geometry connects.
-//!  - **Select/drag**: grab a point and the rest of the sketch re-solves live.
+//! UI pass (post-M4): the app is now mouse-driven.
+//!  - **Top toolbar** (CommandManager): sketch tools + feature operations.
+//!  - **Left panel** (FeatureManager / PropertyManager): the feature tree, and
+//!    when a boss/cut is being configured, an editable depth field + OK/Cancel.
+//!  - **Bottom status bar**: mode, tool, cursor coordinates, feature count, units.
+//!  - Standard-view + zoom-fit buttons.
 //!
-//! Controls:
-//!   View mode:   right-drag = orbit · scroll = zoom · left-click a plane = sketch
-//!   Sketch mode: S = select/drag · L = line · C = circle · R = rectangle
-//!                X = toggle construction · left-click = place · Esc = cancel / exit
+//! Keyboard shortcuts remain as accelerators (S/L/C/R/X · E boss · D cut · Esc).
+//! Drawing happens in the 3D viewport; egui panels capture the pointer so clicks
+//! on the UI never leak into the sketch.
 
-use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
-use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane};
 use hworks_geometry::{cut, extrude_solid, tessellate, union, KSolid, PlaneBasis, Tessellation, TriMesh};
 use hworks_sketch::{Constraint, Sketch, SketchEntity};
 
-/// How far a boss/cut pushes the profile along the plane normal (fixed default).
+/// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
 const EXTRUDE_DISTANCE: f64 = 2.0;
-
-/// Edge length of the square reference-plane quads (world units).
 const PLANE_SIZE: f32 = 8.0;
-/// How close (world units) a click must be to an existing point to snap/grab it.
 const SNAP: f32 = 0.18;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "HCAD — M4: Cut + Feature Tree".into(),
+                title: "HCAD".into(),
                 ..default()
             }),
             ..default()
         }))
+        .add_plugins(EguiPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
         .insert_resource(DocRes(Document::with_default_planes()))
         .init_resource::<SketchSession>()
         .init_resource::<Part>()
+        .init_resource::<UiState>()
+        .init_resource::<UiBlocking>()
         .add_systems(Startup, setup)
+        .add_systems(EguiPrimaryContextPass, ui_system)
         .add_systems(
             Update,
             (
@@ -50,8 +51,6 @@ fn main() {
                 handle_keys,
                 do_solid_op,
                 orbit_camera,
-                update_hud,
-                update_tree,
                 draw_world_axes,
                 draw_sketch,
             ),
@@ -78,7 +77,7 @@ enum Tool {
 impl Tool {
     fn label(self) -> &'static str {
         match self {
-            Tool::Select => "Select/drag",
+            Tool::Select => "Select",
             Tool::Line => "Line",
             Tool::Circle => "Circle",
             Tool::Rectangle => "Rectangle",
@@ -86,7 +85,40 @@ impl Tool {
     }
 }
 
-/// A reference plane resolved into world-space vectors, ready for ray math.
+/// A requested boolean solid operation, carrying its depth.
+#[derive(Clone, Copy)]
+enum SolidOp {
+    Boss(f64),
+    Cut(f64),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum OpKind {
+    Boss,
+    Cut,
+}
+
+/// PropertyManager state for a boss/cut being configured in the UI.
+#[derive(Clone)]
+struct PendingOp {
+    kind: OpKind,
+    depth: f32,
+}
+
+#[derive(Resource, Default)]
+struct UiState {
+    pending: Option<PendingOp>,
+}
+
+/// True while egui wants the pointer — suppresses viewport drawing/orbit.
+#[derive(Resource, Default)]
+struct UiBlocking(bool);
+
+#[derive(Resource, Default)]
+struct Part {
+    solid: Option<KSolid>,
+}
+
 #[derive(Clone)]
 struct ActivePlane {
     name: String,
@@ -102,7 +134,6 @@ impl ActivePlane {
         let v = Vec3::from_array(p.v);
         Self { name: p.name.clone(), origin: Vec3::from_array(p.origin), u, v, n: u.cross(v) }
     }
-
     fn to_world(&self, uv: Vec2) -> Vec3 {
         self.origin + self.u * uv.x + self.v * uv.y
     }
@@ -113,38 +144,13 @@ struct SketchSession {
     plane: Option<ActivePlane>,
     tool: Tool,
     construction: bool,
-    /// First placed point of the in-progress entity (plane-local uv).
     pending: Option<Vec2>,
-    /// Point index currently being dragged (Select tool).
     drag: Option<usize>,
-    /// Re-solve requested after a structural change.
     dirty: bool,
-    /// A solid operation was requested (E boss / D cut); consumed by `do_solid_op`.
     op_request: Option<SolidOp>,
     cursor_uv: Option<Vec2>,
     sketch: Sketch,
 }
-
-/// A requested boolean solid operation from the active sketch.
-#[derive(Clone, Copy)]
-enum SolidOp {
-    Boss,
-    Cut,
-}
-
-/// The current accumulated 3D body (a truck B-rep behind the kernel seam).
-#[derive(Resource, Default)]
-struct Part {
-    solid: Option<KSolid>,
-}
-
-/// Marks entities that make up generated 3D solids (so they can be cleared later).
-#[derive(Component)]
-struct SolidPart;
-
-/// Marks the feature-tree panel text.
-#[derive(Component)]
-struct TreeText;
 
 #[derive(Component)]
 struct OrbitCamera {
@@ -161,7 +167,7 @@ impl Default for OrbitCamera {
 }
 
 #[derive(Component)]
-struct HudText;
+struct SolidPart;
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -175,11 +181,10 @@ fn setup(
 ) {
     let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
     let colors = [
-        Color::srgba(0.85, 0.25, 0.25, 0.18),
-        Color::srgba(0.25, 0.75, 0.30, 0.18),
-        Color::srgba(0.25, 0.45, 0.90, 0.18),
+        Color::srgba(0.85, 0.25, 0.25, 0.16),
+        Color::srgba(0.25, 0.75, 0.30, 0.16),
+        Color::srgba(0.25, 0.45, 0.90, 0.16),
     ];
-
     for (i, (_id, plane)) in doc.0.planes().enumerate() {
         let ap = ActivePlane::from_doc(plane);
         let rotation = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
@@ -211,50 +216,166 @@ fn setup(
         AmbientLight { color: Color::WHITE, brightness: 250.0, ..default() },
     ));
 
-    // On-screen heads-up text.
-    commands.spawn((
-        Text::new(""),
-        TextFont { font_size: 15.0, ..default() },
-        TextColor(Color::srgb(0.88, 0.90, 0.96)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(10.0),
-            ..default()
-        },
-        HudText,
-    ));
-
-    // Feature-tree panel (left side).
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(58.0),
-                left: Val::Px(8.0),
-                width: Val::Px(250.0),
-                padding: UiRect::all(Val::Px(8.0)),
-                flex_direction: FlexDirection::Column,
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
-        ))
-        .with_children(|panel| {
-            panel.spawn((
-                Text::new("Feature tree"),
-                TextFont { font_size: 13.0, ..default() },
-                TextColor(Color::srgb(0.85, 0.88, 0.95)),
-                TreeText,
-            ));
-        });
-
-    println!("HCAD M4 ready. Draw a closed profile on a plane, then E to boss-extrude or D to cut.");
+    println!("HCAD ready — mouse-driven UI. Click a reference plane to start sketching.");
 }
 
 fn camera_transform(cam: &OrbitCamera) -> Transform {
     let rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
     let translation = cam.focus + rotation * Vec3::new(0.0, 0.0, cam.radius);
     Transform { translation, rotation, ..default() }
+}
+
+// ---------------------------------------------------------------------------
+// egui shell
+// ---------------------------------------------------------------------------
+
+fn ui_system(
+    mut contexts: EguiContexts,
+    mut session: ResMut<SketchSession>,
+    mut ui_state: ResMut<UiState>,
+    mut blocking: ResMut<UiBlocking>,
+    doc: Res<DocRes>,
+    mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
+) -> Result {
+    let ctx = contexts.ctx_mut()?;
+    let in_sketch = session.plane.is_some();
+    let has_profile = session.sketch.closed_loop().is_some();
+
+    // ---- Top toolbar (CommandManager) ----
+    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("HCAD").strong().size(16.0));
+            ui.separator();
+
+            if in_sketch {
+                for (tool, name) in [
+                    (Tool::Select, "Select"),
+                    (Tool::Line, "Line"),
+                    (Tool::Circle, "Circle"),
+                    (Tool::Rectangle, "Rectangle"),
+                ] {
+                    if ui.selectable_label(session.tool == tool, name).clicked() {
+                        session.tool = tool;
+                        session.pending = None;
+                    }
+                }
+                let con = session.construction;
+                if ui.selectable_label(con, "Construction").clicked() {
+                    session.construction = !con;
+                }
+                ui.separator();
+                ui.add_enabled_ui(has_profile, |ui| {
+                    if ui.button("Extrude Boss").clicked() {
+                        ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32 });
+                    }
+                    if ui.button("Extrude Cut").clicked() {
+                        ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32 });
+                    }
+                });
+                ui.separator();
+                if ui.button("Exit Sketch").clicked() {
+                    session.plane = None;
+                    session.pending = None;
+                    session.drag = None;
+                    session.cursor_uv = None;
+                    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
+                        *tf = camera_transform(&orbit);
+                    }
+                }
+            } else {
+                ui.label("Click a reference plane in the viewport to start a sketch.");
+            }
+
+            // Right-aligned view controls.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for (name, yaw, pitch) in [
+                    ("Iso", 0.8_f32, -0.55_f32),
+                    ("Right", 1.5708, 0.0),
+                    ("Top", 0.0, -1.553),
+                    ("Front", 0.0, 0.0),
+                ] {
+                    if ui.button(name).clicked() {
+                        if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                            orbit.yaw = yaw;
+                            orbit.pitch = pitch;
+                            *tf = camera_transform(&orbit);
+                        }
+                    }
+                }
+                if ui.button("Fit").clicked() {
+                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                        orbit.focus = Vec3::ZERO;
+                        orbit.radius = 14.0;
+                        *tf = camera_transform(&orbit);
+                    }
+                }
+            });
+        });
+    });
+
+    // ---- Left panel: PropertyManager (if configuring) else FeatureManager ----
+    egui::SidePanel::left("left_panel").default_width(240.0).show(ctx, |ui| {
+        if let Some(mut op) = ui_state.pending.clone() {
+            ui.heading(match op.kind {
+                OpKind::Boss => "Boss-Extrude",
+                OpKind::Cut => "Cut-Extrude",
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Depth (mm):");
+                ui.add(egui::DragValue::new(&mut op.depth).speed(0.1).range(0.1..=200.0));
+            });
+            ui.add_space(8.0);
+            let mut keep = true;
+            ui.horizontal(|ui| {
+                if ui.button("  OK  ").clicked() {
+                    session.op_request = Some(match op.kind {
+                        OpKind::Boss => SolidOp::Boss(op.depth as f64),
+                        OpKind::Cut => SolidOp::Cut(op.depth as f64),
+                    });
+                    keep = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    keep = false;
+                }
+            });
+            ui_state.pending = if keep { Some(op) } else { None };
+        } else {
+            ui.heading("HCAD Part");
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for line in doc.0.tree_labels() {
+                    ui.label(egui::RichText::new(line).monospace());
+                }
+            });
+        }
+    });
+
+    // ---- Bottom status bar ----
+    egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            let mode = match &session.plane {
+                Some(ap) => format!("Sketch: {}", ap.name),
+                None => "View".to_string(),
+            };
+            ui.label(mode);
+            ui.separator();
+            ui.label(format!("Tool: {}", session.tool.label()));
+            ui.separator();
+            match session.cursor_uv {
+                Some(uv) => ui.label(format!("x {:.2}  y {:.2}", uv.x, uv.y)),
+                None => ui.label("x —  y —"),
+            };
+            ui.separator();
+            ui.label(format!("{} features", doc.0.features.len()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label("mm");
+            });
+        });
+    });
+
+    blocking.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +402,6 @@ fn cursor_ray(window: &Window, camera: &Camera, cam_transform: &GlobalTransform)
     camera.viewport_to_world(cam_transform, cursor).ok()
 }
 
-/// Nearest existing point to `uv` within `thresh`, if any.
 fn nearest_point(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (i, p) in sketch.points.iter().enumerate() {
@@ -293,7 +413,6 @@ fn nearest_point(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-/// Reuse a nearby point (implicit coincidence) or create a new one.
 fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
     nearest_point(sketch, uv, SNAP).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
@@ -304,11 +423,15 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
 
 fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
+    blocking: Res<UiBlocking>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &OrbitCamera)>,
     doc: Res<DocRes>,
     mut session: ResMut<SketchSession>,
 ) {
+    if blocking.0 {
+        return;
+    }
     let Ok(window) = windows.single() else { return };
     let Ok((camera, cam_gt, mut cam_tf, orbit)) = cam_q.single_mut() else { return };
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
@@ -322,7 +445,6 @@ fn sketch_interaction(
     let pressed = buttons.pressed(MouseButton::Left);
     let just_released = buttons.just_released(MouseButton::Left);
 
-    // ---- View mode: pick a plane to sketch on. ----
     if session.plane.is_none() {
         if just_pressed {
             let mut best: Option<(f32, ActivePlane)> = None;
@@ -345,14 +467,13 @@ fn sketch_interaction(
                 session.pending = None;
                 session.cursor_uv = None;
                 session.drag = None;
-                info!("Entered sketch mode on the {} plane.", ap.name);
+                info!("Sketching on the {} plane.", ap.name);
                 session.plane = Some(ap);
             }
         }
         return;
     }
 
-    // ---- Sketch mode. ----
     match session.tool {
         Tool::Select => {
             if just_pressed {
@@ -382,14 +503,12 @@ fn sketch_interaction(
         _ => {}
     }
 
-    // Re-solve after a structural change (never while actively dragging).
     if session.drag.is_none() && session.dirty {
         session.sketch.solve();
         session.dirty = false;
     }
 }
 
-/// Handle a click for the active drawing tool.
 fn place_point(session: &mut SketchSession, uv: Vec2) {
     match session.tool {
         Tool::Line => {
@@ -416,7 +535,6 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             if let Some(c0) = session.pending.take() {
                 let c1 = uv;
                 let s = &mut session.sketch;
-                // Corners: p0 = c0, p1 = (c1.x, c0.y), p2 = c1, p3 = (c0.x, c1.y).
                 let p0 = s.add_point(c0.x as f64, c0.y as f64);
                 let p1 = s.add_point(c1.x as f64, c0.y as f64);
                 let p2 = s.add_point(c1.x as f64, c1.y as f64);
@@ -425,7 +543,6 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 s.add_line(p1, p2, false);
                 s.add_line(p2, p3, false);
                 s.add_line(p3, p0, false);
-                // Make it a parametric rectangle: bottom/top horizontal, sides vertical.
                 s.constraints.push(Constraint::Horizontal(p0, p1));
                 s.constraints.push(Constraint::Horizontal(p3, p2));
                 s.constraints.push(Constraint::Vertical(p1, p2));
@@ -467,10 +584,10 @@ fn handle_keys(
         session.construction = !session.construction;
     }
     if keys.just_pressed(KeyCode::KeyE) {
-        session.op_request = Some(SolidOp::Boss);
+        session.op_request = Some(SolidOp::Boss(EXTRUDE_DISTANCE));
     }
     if keys.just_pressed(KeyCode::KeyD) {
-        session.op_request = Some(SolidOp::Cut);
+        session.op_request = Some(SolidOp::Cut(EXTRUDE_DISTANCE));
     }
     if keys.just_pressed(KeyCode::Escape) {
         if session.pending.is_some() {
@@ -482,14 +599,10 @@ fn handle_keys(
             if let Ok((mut tf, orbit)) = cam_q.single_mut() {
                 *tf = camera_transform(orbit);
             }
-            info!("Left sketch mode.");
         }
     }
 }
 
-/// Consume a solid-op request (boss/cut): turn the sketch's closed loop into a
-/// truck solid, union/subtract it against the current body, record the feature,
-/// re-tessellate, and drop back to the 3D view.
 #[allow(clippy::too_many_arguments)]
 fn do_solid_op(
     mut commands: Commands,
@@ -521,19 +634,17 @@ fn do_solid_op(
         v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
         normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
     };
-    let dist = EXTRUDE_DISTANCE;
 
-    // Compute the new body.
     let new_body: Option<KSolid> = match op {
-        SolidOp::Boss => match extrude_solid(&profile, &basis, dist) {
+        SolidOp::Boss(d) => match extrude_solid(&profile, &basis, d) {
             Some(solid) => match &part.solid {
                 Some(existing) => union(existing, &solid),
                 None => Some(solid),
             },
             None => None,
         },
-        SolidOp::Cut => match &part.solid {
-            Some(existing) => cut(existing, &profile, &basis, dist),
+        SolidOp::Cut(d) => match &part.solid {
+            Some(existing) => cut(existing, &profile, &basis, d),
             None => {
                 warn!("Cut: there is no body yet — extrude a boss first.");
                 return;
@@ -542,21 +653,16 @@ fn do_solid_op(
     };
 
     let Some(body) = new_body else {
-        warn!("The kernel could not complete that {} operation.", match op {
-            SolidOp::Boss => "boss",
-            SolidOp::Cut => "cut",
-        });
+        warn!("The kernel could not complete that operation.");
         return;
     };
 
-    // Record the feature(s) in the timeline.
     doc.0.add_feature(FeatureKind::Sketch(session.sketch.clone()));
     doc.0.add_feature(match op {
-        SolidOp::Boss => FeatureKind::Extrude { distance: dist },
-        SolidOp::Cut => FeatureKind::Cut { distance: dist },
+        SolidOp::Boss(d) => FeatureKind::Extrude { distance: d },
+        SolidOp::Cut(d) => FeatureKind::Cut { distance: d },
     });
 
-    // Replace the rendered solid.
     part.solid = Some(body);
     for e in &existing {
         commands.entity(e).despawn();
@@ -564,12 +670,6 @@ fn do_solid_op(
     let tess = tessellate(part.solid.as_ref().unwrap(), 0.03);
     spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
 
-    info!("Applied {} operation; {} features in tree.", match op {
-        SolidOp::Boss => "boss",
-        SolidOp::Cut => "cut",
-    }, doc.0.features.len());
-
-    // Drop back to the orbit view to inspect the body.
     session.plane = None;
     session.pending = None;
     session.drag = None;
@@ -579,7 +679,6 @@ fn do_solid_op(
     }
 }
 
-/// Spawn the shaded solid mesh + a black wireframe overlay for a tessellation.
 fn spawn_solid(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -606,7 +705,6 @@ fn spawn_solid(
     commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("BodyEdges")));
 }
 
-/// Convert our kernel [`TriMesh`] into a Bevy render mesh.
 fn trimesh_to_bevy(t: TriMesh) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, t.positions);
@@ -615,7 +713,6 @@ fn trimesh_to_bevy(t: TriMesh) -> Mesh {
     mesh
 }
 
-/// Build a `LineList` mesh from wireframe edge segments.
 fn edges_to_bevy(edges: &[[[f32; 3]; 2]]) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(edges.len() * 2);
     for e in edges {
@@ -629,12 +726,13 @@ fn edges_to_bevy(edges: &[[[f32; 3]; 2]]) -> Mesh {
 
 fn orbit_camera(
     buttons: Res<ButtonInput<MouseButton>>,
+    blocking: Res<UiBlocking>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     session: Res<SketchSession>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
-    if session.plane.is_some() {
+    if session.plane.is_some() || blocking.0 {
         return;
     }
     const ORBIT_SENS: f32 = 0.005;
@@ -658,36 +756,8 @@ fn orbit_camera(
     }
 }
 
-fn update_hud(session: Res<SketchSession>, mut q: Query<&mut Text, With<HudText>>) {
-    let Ok(mut text) = q.single_mut() else { return };
-    let s = match &session.plane {
-        None => "View — right-drag orbit · scroll zoom · left-click a reference plane to sketch".to_string(),
-        Some(ap) => {
-            let con = if session.construction { " · CONSTRUCTION on" } else { "" };
-            format!(
-                "Sketch on {} — tool: {}{}\nS select · L line · C circle · R rect · X constr · E boss · D cut · Esc cancel/exit",
-                ap.name,
-                session.tool.label(),
-                con,
-            )
-        }
-    };
-    *text = Text::new(s);
-}
-
-/// Rebuild the feature-tree panel text from the document timeline.
-fn update_tree(doc: Res<DocRes>, mut q: Query<&mut Text, With<TreeText>>) {
-    let Ok(mut text) = q.single_mut() else { return };
-    let mut s = String::from("Feature tree\n");
-    for line in doc.0.tree_labels() {
-        s.push('\n');
-        s.push_str(&line);
-    }
-    *text = Text::new(s);
-}
-
 // ---------------------------------------------------------------------------
-// Rendering (gizmos)
+// Viewport gizmos
 // ---------------------------------------------------------------------------
 
 fn draw_world_axes(mut gizmos: Gizmos) {
@@ -738,7 +808,6 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), point_col);
     }
 
-    // Live preview of the in-progress entity.
     if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
         match session.tool {
             Tool::Line => gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col),
