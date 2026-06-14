@@ -50,6 +50,7 @@ fn main() {
                 sketch_interaction,
                 handle_keys,
                 do_solid_op,
+                handle_new_part,
                 orbit_camera,
                 draw_world_axes,
                 draw_sketch,
@@ -108,6 +109,10 @@ struct PendingOp {
 #[derive(Resource, Default)]
 struct UiState {
     pending: Option<PendingOp>,
+    /// egui style applied once.
+    themed: bool,
+    /// "New Part" was clicked; consumed by `handle_new_part`.
+    new_part: bool,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -238,42 +243,72 @@ fn ui_system(
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+
+    // Apply a CAD-ish dark style once.
+    if !ui_state.themed {
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(6.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.visuals.selection.bg_fill = egui::Color32::from_rgb(59, 110, 165);
+        style.visuals.panel_fill = egui::Color32::from_rgb(34, 36, 41);
+        ctx.set_style(style);
+        ui_state.themed = true;
+    }
+
     let in_sketch = session.plane.is_some();
-    let has_profile = session.sketch.closed_loop().is_some();
+    let has_profile = session.sketch.outer_profile().is_some();
 
     // ---- Top toolbar (CommandManager) ----
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("HCAD").strong().size(16.0));
+            if ui.button("New Part").on_hover_text("Clear the model and start over").clicked() {
+                ui_state.new_part = true;
+            }
             ui.separator();
 
             if in_sketch {
-                for (tool, name) in [
-                    (Tool::Select, "Select"),
-                    (Tool::Line, "Line"),
-                    (Tool::Circle, "Circle"),
-                    (Tool::Rectangle, "Rectangle"),
+                ui.label(egui::RichText::new("Sketch").weak().small());
+                for (tool, name, tip) in [
+                    (Tool::Select, "Select", "Select & drag points — geometry re-solves (S)"),
+                    (Tool::Line, "Line", "Draw line segments; endpoints snap to close loops (L)"),
+                    (Tool::Circle, "Circle", "Click centre, then radius (C)"),
+                    (Tool::Rectangle, "Rectangle", "Click two opposite corners (R)"),
                 ] {
-                    if ui.selectable_label(session.tool == tool, name).clicked() {
+                    if ui.selectable_label(session.tool == tool, name).on_hover_text(tip).clicked() {
                         session.tool = tool;
                         session.pending = None;
                     }
                 }
                 let con = session.construction;
-                if ui.selectable_label(con, "Construction").clicked() {
+                if ui
+                    .selectable_label(con, "Construction")
+                    .on_hover_text("Toggle construction geometry (X)")
+                    .clicked()
+                {
                     session.construction = !con;
                 }
                 ui.separator();
+                ui.label(egui::RichText::new("Features").weak().small());
                 ui.add_enabled_ui(has_profile, |ui| {
-                    if ui.button("Extrude Boss").clicked() {
+                    if ui
+                        .button("Extrude Boss")
+                        .on_hover_text("Add material by extruding the closed profile (E)")
+                        .clicked()
+                    {
                         ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32 });
                     }
-                    if ui.button("Extrude Cut").clicked() {
+                    if ui
+                        .button("Extrude Cut")
+                        .on_hover_text("Remove material by extruding the closed profile (D)")
+                        .clicked()
+                    {
                         ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32 });
                     }
                 });
                 ui.separator();
-                if ui.button("Exit Sketch").clicked() {
+                if ui.button("Exit Sketch").on_hover_text("Leave sketch mode (Esc)").clicked() {
                     session.plane = None;
                     session.pending = None;
                     session.drag = None;
@@ -283,18 +318,29 @@ fn ui_system(
                     }
                 }
             } else {
-                ui.label("Click a reference plane in the viewport to start a sketch.");
+                ui.label(
+                    egui::RichText::new("Click a reference plane in the viewport to start a sketch.")
+                        .italics()
+                        .weak(),
+                );
             }
 
             // Right-aligned view controls.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Fit").on_hover_text("Zoom to fit").clicked() {
+                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                        orbit.focus = Vec3::ZERO;
+                        orbit.radius = 14.0;
+                        *tf = camera_transform(&orbit);
+                    }
+                }
                 for (name, yaw, pitch) in [
                     ("Iso", 0.8_f32, -0.55_f32),
                     ("Right", 1.5708, 0.0),
                     ("Top", 0.0, -1.553),
                     ("Front", 0.0, 0.0),
                 ] {
-                    if ui.button(name).clicked() {
+                    if ui.button(name).on_hover_text(format!("{name} view")).clicked() {
                         if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
                             orbit.yaw = yaw;
                             orbit.pitch = pitch;
@@ -302,15 +348,10 @@ fn ui_system(
                         }
                     }
                 }
-                if ui.button("Fit").clicked() {
-                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-                        orbit.focus = Vec3::ZERO;
-                        orbit.radius = 14.0;
-                        *tf = camera_transform(&orbit);
-                    }
-                }
+                ui.label(egui::RichText::new("View").weak().small());
             });
         });
+        ui.add_space(2.0);
     });
 
     // ---- Left panel: PropertyManager (if configuring) else FeatureManager ----
@@ -367,6 +408,14 @@ fn ui_system(
                 None => ui.label("x —  y —"),
             };
             ui.separator();
+            if in_sketch {
+                if has_profile {
+                    ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "● profile ready");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "○ profile open");
+                }
+                ui.separator();
+            }
             ui.label(format!("{} features", doc.0.features.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label("mm");
@@ -617,17 +666,10 @@ fn do_solid_op(
     let Some(op) = session.op_request.take() else { return };
     let Some(ap) = session.plane.clone() else { return };
 
-    let Some(loop_idx) = session.sketch.closed_loop() else {
-        warn!("Need a single closed profile (a closed loop of lines) for this operation.");
+    let Some(profile) = session.sketch.outer_profile() else {
+        warn!("Need a closed profile (a closed loop of lines, or a circle) for this operation.");
         return;
     };
-    let profile: Vec<[f64; 2]> = loop_idx
-        .iter()
-        .map(|&i| {
-            let p = &session.sketch.points[i];
-            [p.x, p.y]
-        })
-        .collect();
     let basis = PlaneBasis {
         origin: [ap.origin.x as f64, ap.origin.y as f64, ap.origin.z as f64],
         u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
@@ -677,6 +719,37 @@ fn do_solid_op(
     if let Ok((mut tf, orbit)) = cam_q.single_mut() {
         *tf = camera_transform(orbit);
     }
+}
+
+/// Reset the model to an empty part with the three default planes.
+fn handle_new_part(
+    mut commands: Commands,
+    mut ui_state: ResMut<UiState>,
+    mut part: ResMut<Part>,
+    mut doc: ResMut<DocRes>,
+    mut session: ResMut<SketchSession>,
+    existing: Query<Entity, With<SolidPart>>,
+    mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
+) {
+    if !ui_state.new_part {
+        return;
+    }
+    ui_state.new_part = false;
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    part.solid = None;
+    doc.0 = Document::with_default_planes();
+    session.plane = None;
+    session.pending = None;
+    session.drag = None;
+    session.cursor_uv = None;
+    session.sketch.clear();
+    ui_state.pending = None;
+    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
+        *tf = camera_transform(orbit);
+    }
+    info!("New part — model cleared.");
 }
 
 fn spawn_solid(
@@ -806,6 +879,15 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
 
     for p in &session.sketch.points {
         draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), point_col);
+    }
+
+    // Snap indicator: ring the point the cursor would attach to.
+    if let Some(cur) = session.cursor_uv {
+        if let Some(i) = nearest_point(&session.sketch, cur, SNAP) {
+            let p = &session.sketch.points[i];
+            let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
+            gizmos.circle(iso, 0.16, Color::srgb(0.2, 1.0, 0.45));
+        }
     }
 
     if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {

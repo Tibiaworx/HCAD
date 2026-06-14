@@ -108,6 +108,40 @@ impl Sketch {
             None // a cycle, but it didn't cover every involved point
         }
     }
+
+    /// The closed outer profile as ordered 2D points, ready for the kernel to
+    /// extrude — whichever way the sketch closes:
+    ///   - a single closed loop of (non-construction) lines, or
+    ///   - a single circle (tessellated into a polygon).
+    /// Returns `None` if the sketch has no closed region.
+    pub fn outer_profile(&self) -> Option<Vec<[f64; 2]>> {
+        // Prefer a closed loop of lines (rectangles, polygons).
+        if let Some(idx) = self.closed_loop() {
+            return Some(idx.iter().map(|&i| [self.points[i].x, self.points[i].y]).collect());
+        }
+        // Otherwise, a lone circle becomes a polygonal profile.
+        let mut found = None;
+        let mut circles = 0;
+        for e in &self.entities {
+            if let SketchEntity::Circle { center, radius } = e {
+                found = Some((*center, *radius));
+                circles += 1;
+            }
+        }
+        if circles == 1 {
+            let (c, r) = found?;
+            let center = self.points.get(c)?;
+            const SEGMENTS: usize = 64;
+            let pts = (0..SEGMENTS)
+                .map(|k| {
+                    let a = std::f64::consts::TAU * (k as f64) / (SEGMENTS as f64);
+                    [center.x + r * a.cos(), center.y + r * a.sin()]
+                })
+                .collect();
+            return Some(pts);
+        }
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +364,38 @@ mod tests {
         c.add_line(b, d, true);
         c.add_line(d, a, true);
         assert!(c.closed_loop().is_none(), "construction-only loop must be ignored");
+    }
+
+    #[test]
+    fn rectangle_tool_geometry_yields_a_closed_profile() {
+        // Mirror exactly how the app's Rectangle tool builds geometry.
+        let mut s = Sketch::default();
+        let p0 = s.add_point(0.0, 0.0);
+        let p1 = s.add_point(3.0, 0.0);
+        let p2 = s.add_point(3.0, 2.0);
+        let p3 = s.add_point(0.0, 2.0);
+        s.add_line(p0, p1, false);
+        s.add_line(p1, p2, false);
+        s.add_line(p2, p3, false);
+        s.add_line(p3, p0, false);
+        let prof = s.outer_profile().expect("rectangle is a closed profile");
+        assert_eq!(prof.len(), 4);
+    }
+
+    #[test]
+    fn a_lone_circle_yields_a_closed_profile() {
+        let mut s = Sketch::default();
+        let c = s.add_point(1.0, 1.0);
+        s.add_circle(c, 2.0);
+        // closed_loop sees no lines, but outer_profile tessellates the circle.
+        assert!(s.closed_loop().is_none());
+        let prof = s.outer_profile().expect("circle is a closed profile");
+        assert_eq!(prof.len(), 64);
+        // Every profile point sits ~2.0 from the centre.
+        for p in &prof {
+            let d = ((p[0] - 1.0).powi(2) + (p[1] - 1.0).powi(2)).sqrt();
+            assert!((d - 2.0).abs() < 1e-9, "radius was {d}");
+        }
     }
 
     #[test]
