@@ -63,6 +63,7 @@ fn main() {
                 do_regenerate,
                 handle_new_part,
                 highlight_face,
+                update_plane_visibility,
                 orbit_camera,
                 draw_world_axes,
                 draw_sketch,
@@ -230,6 +231,11 @@ impl Default for OrbitCamera {
 #[derive(Component)]
 struct SolidPart;
 
+/// A reference plane's quad — shown only while starting a part (no body, not yet
+/// sketching), so it can't be accidentally selected once you're modeling.
+#[derive(Component)]
+struct RefPlane;
+
 /// The translucent overlay that highlights the hovered / active face.
 #[derive(Component)]
 struct FaceHighlight;
@@ -262,6 +268,9 @@ fn setup(
             alpha_mode: AlphaMode::Blend,
             cull_mode: None,
             double_sided: true,
+            // Distinct bias per plane so the three transparent quads sort
+            // deterministically instead of flickering as the camera moves.
+            depth_bias: i as f32,
             ..default()
         });
         commands.spawn((
@@ -269,6 +278,7 @@ fn setup(
             MeshMaterial3d(material),
             Transform { translation: ap.origin, rotation, ..default() },
             Name::new(plane.name.clone()),
+            RefPlane,
         ));
     }
 
@@ -528,16 +538,49 @@ fn ui_system(
             }
             ui.separator();
 
-            // Clickable feature rows.
-            let labels = doc.0.tree_labels();
+            // Hierarchical feature tree: planes grouped, each Extrude/Cut a
+            // collapsible node with its sketch nested underneath (SolidWorks-style).
             let rollback = doc.0.rollback;
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                for (i, line) in labels.iter().enumerate() {
-                    let mut text = egui::RichText::new(line).monospace();
-                    if i >= rollback {
-                        text = text.weak().strikethrough(); // rolled-back / suppressed
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                // Reference planes, tucked into one collapsible group.
+                egui::CollapsingHeader::new("Reference Planes").default_open(false).show(ui, |ui| {
+                    for (_id, p) in doc.0.planes() {
+                        ui.label(egui::RichText::new(&p.name).weak());
                     }
-                    if ui.selectable_label(ui_state.selected == Some(i), text).clicked() {
+                });
+
+                // Operation features.
+                let (mut ex, mut ct, mut seq) = (0u32, 0u32, 0u32);
+                for (i, f) in doc.0.features.iter().enumerate() {
+                    let title = match &f.kind {
+                        FeatureKind::Plane(_) => continue,
+                        FeatureKind::Extrude { distance, .. } => {
+                            ex += 1;
+                            seq += 1;
+                            format!("Extrude{ex}  (h={distance:.1})")
+                        }
+                        FeatureKind::Cut { distance, .. } => {
+                            ct += 1;
+                            seq += 1;
+                            format!("Cut{ct}  (h={distance:.1})")
+                        }
+                    };
+                    let suppressed = i >= rollback;
+                    let selected = ui_state.selected == Some(i);
+                    let mut rt = egui::RichText::new(title);
+                    if selected {
+                        rt = rt.color(egui::Color32::from_rgb(120, 180, 255)).strong();
+                    }
+                    if suppressed {
+                        rt = rt.weak().strikethrough();
+                    }
+                    let resp = egui::CollapsingHeader::new(rt)
+                        .id_salt(i)
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(format!("Sketch{seq}")).weak());
+                        });
+                    if resp.header_response.clicked() {
                         ui_state.selected = Some(i);
                     }
                 }
@@ -998,14 +1041,17 @@ fn sketch_interaction(
     if session.plane.is_none() {
         if just_pressed {
             let mut best: Option<(f32, ActivePlane)> = None;
-            // Reference planes.
-            for (_id, p) in doc.0.planes() {
-                let ap = ActivePlane::from_doc(p);
-                if let Some((t, uv)) = ray_plane(&ap, &ray) {
-                    let half = PLANE_SIZE * 0.5;
-                    if uv.x.abs() <= half && uv.y.abs() <= half {
-                        if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
-                            best = Some((t, ap));
+            // Reference planes — only while starting the part (they're hidden once
+            // a body exists, so you sketch on faces from then on).
+            if part.solid.is_none() {
+                for (_id, p) in doc.0.planes() {
+                    let ap = ActivePlane::from_doc(p);
+                    if let Some((t, uv)) = ray_plane(&ap, &ray) {
+                        let half = PLANE_SIZE * 0.5;
+                        if uv.x.abs() <= half && uv.y.abs() <= half {
+                            if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                                best = Some((t, ap));
+                            }
                         }
                     }
                 }
@@ -1519,6 +1565,23 @@ fn orbit_camera(
 // ---------------------------------------------------------------------------
 // Viewport gizmos
 // ---------------------------------------------------------------------------
+
+/// Reference planes are visible only when starting a fresh part — no body yet and
+/// not currently sketching. Once you're modeling they hide (and become unpickable),
+/// removing both the clutter/flicker and the risk of selecting them by accident.
+fn update_plane_visibility(
+    part: Res<Part>,
+    session: Res<SketchSession>,
+    mut planes: Query<&mut Visibility, With<RefPlane>>,
+) {
+    let show = part.solid.is_none() && session.plane.is_none();
+    let want = if show { Visibility::Visible } else { Visibility::Hidden };
+    for mut vis in &mut planes {
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
 
 fn draw_world_axes(mut gizmos: Gizmos) {
     const L: f32 = 5.0;
