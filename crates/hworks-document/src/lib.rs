@@ -8,7 +8,7 @@
 //! and a fresh document starts with the three standard reference planes. The
 //! Bevy app renders *from* this document — it never owns the model itself.
 
-use hworks_sketch::{Region, Sketch};
+use hworks_sketch::Sketch;
 use serde::{Deserialize, Serialize};
 
 /// A stable identifier for a feature. Never reused, so downstream references
@@ -47,11 +47,14 @@ pub struct PlaneRef {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum FeatureKind {
     Plane(Plane),
-    /// Boss extrude: add material by sweeping the selected region of a sketch.
-    /// `region` is the resolved profile (outer + holes) chosen at creation.
-    Extrude { sketch: Sketch, region: Region, plane: PlaneRef, distance: f64 },
+    /// A standalone sketch on a plane/face that hasn't been extruded yet. Kept in
+    /// the timeline so you can return to it. `region` is re-resolved from the
+    /// sketch at regenerate time, so editing the sketch updates downstream.
+    Sketch { sketch: Sketch, plane: PlaneRef },
+    /// Boss extrude: add material by sweeping region `region` of `sketch`.
+    Extrude { sketch: Sketch, region: usize, plane: PlaneRef, distance: f64 },
     /// Cut: subtract a swept region from the body.
-    Cut { sketch: Sketch, region: Region, plane: PlaneRef, distance: f64 },
+    Cut { sketch: Sketch, region: usize, plane: PlaneRef, distance: f64 },
     // Revolve / Fillet / … arrive at M8+.
 }
 
@@ -113,18 +116,22 @@ impl Document {
     /// One display label per feature, in timeline order (for the feature-tree
     /// panel). Extrudes/cuts are numbered in the order they appear.
     pub fn tree_labels(&self) -> Vec<String> {
-        let (mut ex, mut ct) = (0, 0);
+        let (mut sk, mut ex, mut ct) = (0, 0, 0);
         self.features
             .iter()
             .map(|f| match &f.kind {
-                FeatureKind::Plane(p) => format!("[plane] {}", p.name),
+                FeatureKind::Plane(p) => format!("[plane]  {}", p.name),
+                FeatureKind::Sketch { .. } => {
+                    sk += 1;
+                    format!("[sketch] Sketch{sk}")
+                }
                 FeatureKind::Extrude { distance, .. } => {
                     ex += 1;
-                    format!("[boss]  Extrude{ex}  h={distance:.1}")
+                    format!("[boss]   Extrude{ex}  h={distance:.1}")
                 }
                 FeatureKind::Cut { distance, .. } => {
                     ct += 1;
-                    format!("[cut]   Cut{ct}  h={distance:.1}")
+                    format!("[cut]    Cut{ct}  h={distance:.1}")
                 }
             })
             .collect()

@@ -59,6 +59,8 @@ fn main() {
                 history_keys,
                 apply_history,
                 handle_file_io,
+                handle_edit_sketch,
+                handle_exit_sketch,
                 do_solid_op,
                 do_regenerate,
                 handle_new_part,
@@ -112,6 +114,17 @@ enum OpKind {
     Cut,
 }
 
+/// An action chosen from a feature-tree right-click menu (applied after the
+/// tree's immutable borrow ends).
+#[derive(Clone, Copy)]
+enum TreeAction {
+    Select(usize),
+    Edit(usize),
+    ExtrudeBoss(usize),
+    ExtrudeCut(usize),
+    Delete(usize),
+}
+
 /// A camera action chosen from the right-click context menu.
 #[derive(Clone, Copy)]
 enum ViewAction {
@@ -148,6 +161,8 @@ struct UiState {
     /// Save / open requested (from buttons or Ctrl+S / Ctrl+O).
     save_request: bool,
     open_request: bool,
+    /// Request to (re)open a feature's sketch for editing.
+    edit_sketch_request: Option<usize>,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -193,6 +208,10 @@ struct SketchSession {
     cursor_uv: Option<Vec2>,
     /// Which region of the current sketch is selected for extrude/cut.
     selected_region: Option<usize>,
+    /// If editing an existing feature's sketch, its feature index (else a new sketch).
+    editing: Option<usize>,
+    /// Request to leave sketch mode and commit the sketch to the timeline.
+    exit_request: bool,
     sketch: Sketch,
 }
 
@@ -449,13 +468,7 @@ fn ui_system(
                 });
                 ui.separator();
                 if ui.button("Exit Sketch").on_hover_text("Leave sketch mode (Esc)").clicked() {
-                    session.plane = None;
-                    session.pending = None;
-                    session.drag = None;
-                    session.cursor_uv = None;
-                    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
-                        *tf = camera_transform(&orbit);
-                    }
+                    session.exit_request = true;
                 }
             } else {
                 ui.label(
@@ -538,9 +551,9 @@ fn ui_system(
             }
             ui.separator();
 
-            // Hierarchical feature tree: planes grouped, each Extrude/Cut a
-            // collapsible node with its sketch nested underneath (SolidWorks-style).
+            // Hierarchical feature tree. Right-click a node for edit/extrude/delete.
             let rollback = doc.0.rollback;
+            let mut action: Option<TreeAction> = None;
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 // Reference planes, tucked into one collapsible group.
                 egui::CollapsingHeader::new("Reference Planes").default_open(false).show(ui, |ui| {
@@ -549,80 +562,140 @@ fn ui_system(
                     }
                 });
 
-                // Operation features.
-                let (mut ex, mut ct, mut seq) = (0u32, 0u32, 0u32);
+                let (mut sk, mut ex, mut ct) = (0u32, 0u32, 0u32);
                 for (i, f) in doc.0.features.iter().enumerate() {
-                    let title = match &f.kind {
-                        FeatureKind::Plane(_) => continue,
-                        FeatureKind::Extrude { distance, .. } => {
-                            ex += 1;
-                            seq += 1;
-                            format!("Extrude{ex}  (h={distance:.1})")
-                        }
-                        FeatureKind::Cut { distance, .. } => {
-                            ct += 1;
-                            seq += 1;
-                            format!("Cut{ct}  (h={distance:.1})")
-                        }
-                    };
                     let suppressed = i >= rollback;
                     let selected = ui_state.selected == Some(i);
-                    let mut rt = egui::RichText::new(title);
-                    if selected {
-                        rt = rt.color(egui::Color32::from_rgb(120, 180, 255)).strong();
-                    }
-                    if suppressed {
-                        rt = rt.weak().strikethrough();
-                    }
-                    let resp = egui::CollapsingHeader::new(rt)
-                        .id_salt(i)
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new(format!("Sketch{seq}")).weak());
-                        });
-                    if resp.header_response.clicked() {
-                        ui_state.selected = Some(i);
+                    let styled = |s: String| {
+                        let mut rt = egui::RichText::new(s);
+                        if selected {
+                            rt = rt.color(egui::Color32::from_rgb(120, 180, 255)).strong();
+                        }
+                        if suppressed {
+                            rt = rt.weak().strikethrough();
+                        }
+                        rt
+                    };
+
+                    match &f.kind {
+                        FeatureKind::Plane(_) => continue,
+                        FeatureKind::Sketch { .. } => {
+                            sk += 1;
+                            let resp = ui.selectable_label(selected, styled(format!("Sketch{sk}")));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit sketch").clicked() {
+                                    action = Some(TreeAction::Edit(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Extrude boss").clicked() {
+                                    action = Some(TreeAction::ExtrudeBoss(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Extrude cut").clicked() {
+                                    action = Some(TreeAction::ExtrudeCut(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Delete").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                        FeatureKind::Extrude { distance, .. } | FeatureKind::Cut { distance, .. } => {
+                            let (label, child) = match &f.kind {
+                                FeatureKind::Extrude { .. } => {
+                                    ex += 1;
+                                    (format!("Extrude{ex}  (h={distance:.1})"), format!("Sketch of Extrude{ex}"))
+                                }
+                                _ => {
+                                    ct += 1;
+                                    (format!("Cut{ct}  (h={distance:.1})"), format!("Sketch of Cut{ct}"))
+                                }
+                            };
+                            let resp = egui::CollapsingHeader::new(styled(label))
+                                .id_salt(i)
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(child).weak());
+                                });
+                            if resp.header_response.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.header_response.context_menu(|ui| {
+                                if ui.button("Edit feature (depth)").clicked() {
+                                    action = Some(TreeAction::Select(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Edit sketch").clicked() {
+                                    action = Some(TreeAction::Edit(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Delete").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close_menu();
+                                }
+                            });
+                        }
                     }
                 }
             });
 
-            // Edit the selected Extrude/Cut feature.
+            // Apply the tree context-menu action (after the borrow above ends).
+            if let Some(act) = action {
+                match act {
+                    TreeAction::Select(i) => ui_state.selected = Some(i),
+                    TreeAction::Edit(i) => ui_state.edit_sketch_request = Some(i),
+                    TreeAction::ExtrudeBoss(i) => {
+                        ui_state.edit_sketch_request = Some(i);
+                        ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32 });
+                    }
+                    TreeAction::ExtrudeCut(i) => {
+                        ui_state.edit_sketch_request = Some(i);
+                        ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32 });
+                    }
+                    TreeAction::Delete(i) => {
+                        if i < doc.0.features.len() {
+                            history.snapshot(&doc.0);
+                            doc.0.features.remove(i);
+                            if doc.0.rollback > doc.0.features.len() {
+                                doc.0.rollback = doc.0.features.len();
+                            }
+                            ui_state.selected = None;
+                            ui_state.regen = true;
+                        }
+                    }
+                }
+            }
+
+            // Inline depth editor for the selected Extrude/Cut.
             if let Some(i) = ui_state.selected {
-                let info = doc.0.features.get(i).and_then(|f| match &f.kind {
-                    FeatureKind::Extrude { distance, .. } => Some(("Extrude", *distance)),
-                    FeatureKind::Cut { distance, .. } => Some(("Cut", *distance)),
-                    FeatureKind::Plane(_) => None,
+                let depth = doc.0.features.get(i).and_then(|f| match &f.kind {
+                    FeatureKind::Extrude { distance, .. } | FeatureKind::Cut { distance, .. } => Some(*distance),
+                    _ => None,
                 });
-                if let Some((kind, depth)) = info {
+                if let Some(depth) = depth {
                     ui.separator();
-                    ui.label(egui::RichText::new(format!("Edit {kind}")).strong());
                     let mut d = depth as f32;
                     ui.horizontal(|ui| {
                         ui.label("Depth (mm):");
                         let resp = ui.add(egui::DragValue::new(&mut d).speed(0.1).range(0.1..=200.0));
                         if resp.drag_started() {
-                            history.snapshot(&doc.0); // one undo step per drag
+                            history.snapshot(&doc.0);
                         }
                         if resp.changed() {
                             if let Some(f) = doc.0.features.get_mut(i) {
                                 match &mut f.kind {
                                     FeatureKind::Extrude { distance, .. }
                                     | FeatureKind::Cut { distance, .. } => *distance = d as f64,
-                                    FeatureKind::Plane(_) => {}
+                                    _ => {}
                                 }
                             }
                             ui_state.regen = true;
                         }
                     });
-                    if ui.button("Delete feature").clicked() {
-                        history.snapshot(&doc.0);
-                        doc.0.features.remove(i);
-                        if doc.0.rollback > doc.0.features.len() {
-                            doc.0.rollback = doc.0.features.len();
-                        }
-                        ui_state.selected = None;
-                        ui_state.regen = true;
-                    }
                 }
             }
         }
@@ -750,10 +823,7 @@ fn ui_system(
                     }
                 }
                 ViewAction::ExitSketch => {
-                    session.plane = None;
-                    session.pending = None;
-                    session.drag = None;
-                    session.cursor_uv = None;
+                    session.exit_request = true;
                 }
             }
         }
@@ -901,6 +971,12 @@ fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
     let v = n.cross(u).normalize();
 
     Some((best_t, ActivePlane { name: "Face".into(), origin, u, v, n }))
+}
+
+/// An `ActivePlane` (app-side) from a stored `PlaneRef` (document-side).
+fn active_plane_from_ref(p: &PlaneRef, name: &str) -> ActivePlane {
+    let f = |a: [f64; 3]| Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
+    ActivePlane { name: name.into(), origin: f(p.origin), u: f(p.u), v: f(p.v), n: f(p.normal) }
 }
 
 /// `PlaneRef` (document-side) from an active plane (app-side).
@@ -1171,11 +1247,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
     }
 }
 
-fn handle_keys(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut session: ResMut<SketchSession>,
-    mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
-) {
+fn handle_keys(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<SketchSession>) {
     if session.plane.is_none() {
         return;
     }
@@ -1206,14 +1278,10 @@ fn handle_keys(
     }
     if keys.just_pressed(KeyCode::Escape) {
         if session.pending.is_some() {
-            session.pending = None;
+            session.pending = None; // cancel the in-progress entity first
         } else {
-            session.plane = None;
-            session.cursor_uv = None;
-            session.drag = None;
-            if let Ok((mut tf, orbit)) = cam_q.single_mut() {
-                *tf = camera_transform(orbit);
-            }
+            // Commit the sketch to the timeline and leave (handled by handle_exit_sketch).
+            session.exit_request = true;
         }
     }
 }
@@ -1278,6 +1346,7 @@ fn handle_file_io(
                         history.undo.clear();
                         history.redo.clear();
                         session.plane = None;
+                        session.editing = None;
                         session.selected_region = None;
                         session.sketch.clear();
                         ui_state.selected = None;
@@ -1335,7 +1404,6 @@ fn do_solid_op(
     }
     // Use the selected region, or the only one.
     let idx = session.selected_region.filter(|&i| i < regions.len()).unwrap_or(0);
-    let region = regions[idx].clone();
 
     if matches!(op, SolidOp::Cut(_)) && part.solid.is_none() {
         warn!("Cut: there is no body yet — extrude a boss first.");
@@ -1345,20 +1413,117 @@ fn do_solid_op(
     history.snapshot(&doc.0);
     let sketch = session.sketch.clone();
     let plane = plane_ref(&ap);
-    doc.0.add_feature(match op {
-        SolidOp::Boss(d) => FeatureKind::Extrude { sketch, region, plane, distance: d },
-        SolidOp::Cut(d) => FeatureKind::Cut { sketch, region, plane, distance: d },
-    });
+    let kind = match op {
+        SolidOp::Boss(d) => FeatureKind::Extrude { sketch, region: idx, plane, distance: d },
+        SolidOp::Cut(d) => FeatureKind::Cut { sketch, region: idx, plane, distance: d },
+    };
+    // Editing an existing feature replaces it in place; otherwise append.
+    let target = match session.editing {
+        Some(i) if i < doc.0.features.len() => {
+            doc.0.features[i].kind = kind;
+            i
+        }
+        _ => {
+            doc.0.add_feature(kind);
+            doc.0.features.len() - 1
+        }
+    };
     ui_state.regen = true;
-    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.selected = Some(target);
 
     session.plane = None;
+    session.editing = None;
     session.pending = None;
     session.drag = None;
     session.cursor_uv = None;
+    session.selected_region = None;
     if let Ok((mut tf, orbit)) = cam_q.single_mut() {
         *tf = camera_transform(orbit);
     }
+}
+
+/// (Re)open a feature's sketch for editing — loads it into the session and aligns
+/// the camera to its plane.
+fn handle_edit_sketch(
+    mut ui_state: ResMut<UiState>,
+    mut session: ResMut<SketchSession>,
+    doc: Res<DocRes>,
+    mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
+) {
+    let Some(i) = ui_state.edit_sketch_request.take() else { return };
+    let Some(f) = doc.0.features.get(i) else { return };
+    let (sketch, plane, region) = match &f.kind {
+        FeatureKind::Sketch { sketch, plane } => (sketch.clone(), plane.clone(), None),
+        FeatureKind::Extrude { sketch, plane, region, .. }
+        | FeatureKind::Cut { sketch, plane, region, .. } => {
+            (sketch.clone(), plane.clone(), Some(*region))
+        }
+        FeatureKind::Plane(_) => return,
+    };
+    let ap = active_plane_from_ref(&plane, "Face");
+    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+        orbit.radius = orbit.radius.max(6.0);
+        look_along(&mut orbit, ap.origin, ap.n);
+        *tf = camera_transform(&orbit);
+    }
+    session.sketch = sketch;
+    session.plane = Some(ap);
+    session.editing = Some(i);
+    session.selected_region = region;
+    session.pending = None;
+    session.drag = None;
+    session.cursor_uv = None;
+    info!("Editing sketch of feature {i}.");
+}
+
+/// Leave sketch mode, committing the sketch to the timeline: update the feature
+/// being edited, or add a standalone Sketch feature so it can be returned to.
+fn handle_exit_sketch(
+    mut session: ResMut<SketchSession>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+    mut ui_state: ResMut<UiState>,
+) {
+    if !session.exit_request {
+        return;
+    }
+    session.exit_request = false;
+    let Some(ap) = session.plane.clone() else { return };
+
+    match session.editing {
+        Some(i) if i < doc.0.features.len() => {
+            history.snapshot(&doc.0);
+            let new_sketch = session.sketch.clone();
+            let region = session.selected_region.unwrap_or(0);
+            match &mut doc.0.features[i].kind {
+                FeatureKind::Sketch { sketch, .. } => *sketch = new_sketch,
+                FeatureKind::Extrude { sketch, region: r, .. }
+                | FeatureKind::Cut { sketch, region: r, .. } => {
+                    *sketch = new_sketch;
+                    *r = region;
+                    ui_state.regen = true;
+                }
+                FeatureKind::Plane(_) => {}
+            }
+            ui_state.selected = Some(i);
+        }
+        _ => {
+            // A brand-new sketch with geometry becomes a standalone Sketch feature.
+            if !session.sketch.entities.is_empty() {
+                history.snapshot(&doc.0);
+                let sketch = session.sketch.clone();
+                doc.0.add_feature(FeatureKind::Sketch { sketch, plane: plane_ref(&ap) });
+                ui_state.selected = Some(doc.0.features.len() - 1);
+            }
+        }
+    }
+
+    session.plane = None;
+    session.editing = None;
+    session.pending = None;
+    session.drag = None;
+    session.cursor_uv = None;
+    session.selected_region = None;
 }
 
 /// Replay the feature timeline (up to the rollback bar) into a solid. This is the
@@ -1370,17 +1535,17 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
     for feature in &doc.features[..end] {
         match &feature.kind {
             FeatureKind::Plane(_) => {}
-            FeatureKind::Extrude { region, plane, distance, .. } => {
-                if region.outer.len() < 3 {
-                    continue;
-                }
+            FeatureKind::Sketch { .. } => {} // 2D only — no solid contribution
+            FeatureKind::Extrude { sketch, region, plane, distance } => {
+                let regions = sketch.regions();
+                let Some(r) = regions.get(*region).or_else(|| regions.first()) else { continue };
                 let basis = basis_from_ref(plane);
                 let next = match &body {
                     Some(b) => {
-                        extrude_solid_with_overlap(&region.outer, &region.holes, &basis, *distance, BOSS_OVERLAP)
+                        extrude_solid_with_overlap(&r.outer, &r.holes, &basis, *distance, BOSS_OVERLAP)
                             .and_then(|boss| union(b, &boss))
                     }
-                    None => extrude_solid(&region.outer, &region.holes, &basis, *distance),
+                    None => extrude_solid(&r.outer, &r.holes, &basis, *distance),
                 };
                 if let Some(s) = next {
                     body = Some(s);
@@ -1388,11 +1553,10 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                     warn!("Regen: an extrude could not be built.");
                 }
             }
-            FeatureKind::Cut { region, plane, distance, .. } => {
+            FeatureKind::Cut { sketch, region, plane, distance } => {
                 let Some(b) = &body else { continue };
-                if region.outer.len() < 3 {
-                    continue;
-                }
+                let regions = sketch.regions();
+                let Some(r) = regions.get(*region).or_else(|| regions.first()) else { continue };
                 let basis = basis_from_ref(plane);
                 // Pick the cut direction from the *current* body, so it stays
                 // correct even after upstream edits move things around.
@@ -1400,7 +1564,7 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                 let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
                 let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
                 let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
-                if let Some(s) = cut(b, &region.outer, &region.holes, &basis, signed) {
+                if let Some(s) = cut(b, &r.outer, &r.holes, &basis, signed) {
                     body = Some(s);
                 } else {
                     warn!("Regen: a cut could not be built.");
@@ -1471,6 +1635,7 @@ fn handle_new_part(
     part.solid = None;
     part.mesh = None;
     session.selected_region = None;
+    session.editing = None;
     doc.0 = Document::with_default_planes();
     session.plane = None;
     session.pending = None;
@@ -1694,7 +1859,7 @@ fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color) {
 mod tests {
     use super::*;
     use hworks_document::{Document, FeatureKind, PlaneRef};
-    use hworks_sketch::{Region, Sketch};
+    use hworks_sketch::Sketch;
 
     fn rect_sketch(w: f64, h: f64) -> Sketch {
         let mut s = Sketch::default();
@@ -1707,10 +1872,6 @@ mod tests {
         s.add_line(p2, p3, false);
         s.add_line(p3, p0, false);
         s
-    }
-
-    fn rect_region(w: f64, h: f64) -> Region {
-        rect_sketch(w, h).regions().into_iter().next().unwrap()
     }
 
     fn xy() -> PlaneRef {
@@ -1730,7 +1891,7 @@ mod tests {
     #[test]
     fn regenerate_replays_an_extrude_into_a_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), region: rect_region(2.0, 2.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), region: 0, plane: xy(), distance: 2.0 });
         let solid = regenerate(&doc).expect("regen should produce a body");
         assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
     }
@@ -1738,7 +1899,7 @@ mod tests {
     #[test]
     fn editing_a_distance_rebuilds_taller() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), region: rect_region(2.0, 2.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), region: 0, plane: xy(), distance: 2.0 });
         let h2 = height(&regenerate(&doc).unwrap());
         if let FeatureKind::Extrude { distance, .. } = &mut doc.features.last_mut().unwrap().kind {
             *distance = 6.0;
@@ -1751,7 +1912,7 @@ mod tests {
     #[test]
     fn rollback_suppresses_downstream_features() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), region: rect_region(4.0, 4.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), region: 0, plane: xy(), distance: 2.0 });
         assert!(regenerate(&doc).is_some());
         // Roll the bar back before the extrude → no body.
         doc.rollback = doc.features.len() - 1;
@@ -1763,7 +1924,7 @@ mod tests {
         let mut doc = Document::with_default_planes();
         doc.add_feature(FeatureKind::Extrude {
             sketch: rect_sketch(2.0, 2.0),
-            region: rect_region(2.0, 2.0),
+            region: 0,
             plane: xy(),
             distance: 2.0,
         });
@@ -1777,7 +1938,7 @@ mod tests {
     #[test]
     fn regenerate_replays_a_cut_through_the_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), region: rect_region(4.0, 4.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), region: 0, plane: xy(), distance: 2.0 });
         // Cut a centred 2x2 pocket from the same plane (body is on the +normal side).
         let mut pocket = Sketch::default();
         let a = pocket.add_point(1.0, 1.0);
@@ -1788,8 +1949,7 @@ mod tests {
         pocket.add_line(b, c, false);
         pocket.add_line(c, d, false);
         pocket.add_line(d, a, false);
-        let region = pocket.regions().into_iter().next().unwrap();
-        doc.add_feature(FeatureKind::Cut { sketch: pocket, region, plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, region: 0, plane: xy(), distance: 2.0 });
         let solid = regenerate(&doc).expect("regen with a cut should produce a body");
         assert!(tessellate(&solid, 0.05).edges.len() > 12, "cut should add edges");
     }
