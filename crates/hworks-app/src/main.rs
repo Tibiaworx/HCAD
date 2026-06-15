@@ -58,6 +58,7 @@ fn main() {
                 do_solid_op,
                 do_regenerate,
                 handle_new_part,
+                highlight_face,
                 orbit_camera,
                 draw_world_axes,
                 draw_sketch,
@@ -106,6 +107,16 @@ enum OpKind {
     Cut,
 }
 
+/// A camera action chosen from the right-click context menu.
+#[derive(Clone, Copy)]
+enum ViewAction {
+    NormalToSketch,
+    Normal(Vec3),
+    Iso,
+    Fit,
+    ExitSketch,
+}
+
 /// PropertyManager state for a boss/cut being configured in the UI.
 #[derive(Clone)]
 struct PendingOp {
@@ -124,6 +135,8 @@ struct UiState {
     regen: bool,
     /// Selected feature index in the tree (for editing).
     selected: Option<usize>,
+    /// If set, a viewport right-click context menu is open at this screen position.
+    context_pos: Option<egui::Pos2>,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -187,6 +200,14 @@ impl Default for OrbitCamera {
 #[derive(Component)]
 struct SolidPart;
 
+/// The translucent overlay that highlights the hovered / active face.
+#[derive(Component)]
+struct FaceHighlight;
+
+/// Handle to the highlight mesh so it can be rebuilt in place each frame.
+#[derive(Resource)]
+struct HighlightMesh(Handle<Mesh>);
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -234,6 +255,28 @@ fn setup(
         AmbientLight { color: Color::WHITE, brightness: 250.0, ..default() },
     ));
 
+    // Reusable translucent overlay for face highlighting (hidden until needed).
+    let mut empty = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    empty.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
+    empty.insert_attribute(Mesh::ATTRIBUTE_NORMAL, Vec::<[f32; 3]>::new());
+    let hl_mesh = meshes.add(empty);
+    let hl_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.25, 0.6, 1.0, 0.35),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(hl_mesh.clone()),
+        MeshMaterial3d(hl_material),
+        Visibility::Hidden,
+        FaceHighlight,
+        Name::new("FaceHighlight"),
+    ));
+    commands.insert_resource(HighlightMesh(hl_mesh));
+
     println!("HCAD ready — mouse-driven UI. Click a reference plane to start sketching.");
 }
 
@@ -241,6 +284,18 @@ fn camera_transform(cam: &OrbitCamera) -> Transform {
     let rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
     let translation = cam.focus + rotation * Vec3::new(0.0, 0.0, cam.radius);
     Transform { translation, rotation, ..default() }
+}
+
+/// Aim the orbit camera straight down a plane/face normal (a "Normal To" view),
+/// keeping the current radius. Setting yaw/pitch (not the transform directly)
+/// means the user can keep orbiting smoothly afterwards.
+fn look_along(cam: &mut OrbitCamera, focus: Vec3, normal: Vec3) {
+    let n = normal.normalize_or_zero();
+    if n != Vec3::ZERO {
+        cam.yaw = n.x.atan2(n.z);
+        cam.pitch = (-n.y).asin().clamp(-1.54, 1.54);
+    }
+    cam.focus = focus;
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +549,95 @@ fn ui_system(
         });
     });
 
+    // ---- Right-click viewport context menu (view alignment) ----
+    if ctx.input(|i| i.pointer.secondary_clicked()) {
+        ui_state.context_pos = ctx.input(|i| i.pointer.interact_pos());
+    }
+    if let Some(pos) = ui_state.context_pos {
+        let mut close = false;
+        let mut action: Option<ViewAction> = None;
+        egui::Area::new(egui::Id::new("viewport_ctx"))
+            .fixed_pos(pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(160.0);
+                    if in_sketch {
+                        if ui.button("Normal to sketch").clicked() {
+                            action = Some(ViewAction::NormalToSketch);
+                            close = true;
+                        }
+                        ui.separator();
+                    }
+                    for (label, act) in [
+                        ("Front", ViewAction::Normal(Vec3::Z)),
+                        ("Top", ViewAction::Normal(Vec3::Y)),
+                        ("Right", ViewAction::Normal(Vec3::X)),
+                        ("Isometric", ViewAction::Iso),
+                        ("Zoom to fit", ViewAction::Fit),
+                    ] {
+                        if ui.button(label).clicked() {
+                            action = Some(act);
+                            close = true;
+                        }
+                    }
+                    if in_sketch {
+                        ui.separator();
+                        if ui.button("Exit sketch").clicked() {
+                            action = Some(ViewAction::ExitSketch);
+                            close = true;
+                        }
+                    }
+                });
+            });
+
+        // Apply the chosen action after the menu closure (avoids double borrows).
+        if let Some(act) = action {
+            match act {
+                ViewAction::NormalToSketch => {
+                    if let (Some(ap), Ok((mut tf, mut orbit))) =
+                        (session.plane.clone(), cam_q.single_mut())
+                    {
+                        look_along(&mut orbit, ap.origin, ap.n);
+                        *tf = camera_transform(&orbit);
+                    }
+                }
+                ViewAction::Normal(n) => {
+                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                        look_along(&mut orbit, Vec3::ZERO, n);
+                        *tf = camera_transform(&orbit);
+                    }
+                }
+                ViewAction::Iso => {
+                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                        orbit.focus = Vec3::ZERO;
+                        orbit.yaw = 0.8;
+                        orbit.pitch = -0.55;
+                        *tf = camera_transform(&orbit);
+                    }
+                }
+                ViewAction::Fit => {
+                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                        orbit.focus = Vec3::ZERO;
+                        orbit.radius = 14.0;
+                        *tf = camera_transform(&orbit);
+                    }
+                }
+                ViewAction::ExitSketch => {
+                    session.plane = None;
+                    session.pending = None;
+                    session.drag = None;
+                    session.cursor_uv = None;
+                }
+            }
+        }
+
+        // Close on any button, a left click elsewhere, or Escape.
+        if close || ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
+            ui_state.context_pos = None;
+        }
+    }
+
     blocking.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
     Ok(())
 }
@@ -643,6 +787,92 @@ fn mesh_centroid(mesh: &TriMesh) -> Vec3 {
     sum / mesh.positions.len() as f32
 }
 
+/// All triangles of `mesh` lying on the plane through `point` with `normal`
+/// (either winding) — i.e. one flat face of the body.
+fn gather_face(mesh: &TriMesh, point: Vec3, normal: Vec3) -> Vec<[Vec3; 3]> {
+    let d = normal.dot(point);
+    let pos = &mesh.positions;
+    let mut out = Vec::new();
+    for tri in mesh.indices.chunks(3) {
+        let a = Vec3::from_array(pos[tri[0] as usize]);
+        let b = Vec3::from_array(pos[tri[1] as usize]);
+        let c = Vec3::from_array(pos[tri[2] as usize]);
+        let tn = (b - a).cross(c - a).normalize_or_zero();
+        if tn.dot(normal).abs() > 0.99 && (normal.dot((a + b + c) / 3.0) - d).abs() < 0.02 {
+            out.push([a, b, c]);
+        }
+    }
+    out
+}
+
+/// Build the highlight overlay mesh from a face's triangles, lifted slightly
+/// toward the camera (along `n`) to avoid z-fighting with the body.
+fn build_face_mesh(tris: &[[Vec3; 3]], n: Vec3) -> Mesh {
+    let off = n * 0.012;
+    let normal = [n.x, n.y, n.z];
+    let mut positions = Vec::with_capacity(tris.len() * 3);
+    let mut normals = Vec::with_capacity(tris.len() * 3);
+    for t in tris {
+        for vtx in t {
+            let p = *vtx + off;
+            positions.push([p.x, p.y, p.z]);
+            normals.push(normal);
+        }
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh
+}
+
+/// Highlight the face under the cursor (view mode) or the active sketch face.
+fn highlight_face(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    part: Res<Part>,
+    session: Res<SketchSession>,
+    blocking: Res<UiBlocking>,
+    hl: Res<HighlightMesh>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut vis_q: Query<&mut Visibility, With<FaceHighlight>>,
+) {
+    let Ok(mut vis) = vis_q.single_mut() else { return };
+    let Some(mesh) = part.mesh.as_ref() else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+
+    // Which face to highlight: the active sketch face, or the hovered one.
+    let target: Option<(Vec3, Vec3)> = if let Some(ap) = &session.plane {
+        (ap.name == "Face").then_some((ap.origin, ap.n))
+    } else if !blocking.0 {
+        windows
+            .single()
+            .ok()
+            .zip(cam_q.single().ok())
+            .and_then(|(w, (cam, gt))| cursor_ray(w, cam, gt))
+            .and_then(|ray| pick_face(mesh, &ray))
+            .map(|(_, ap)| (ap.origin, ap.n))
+    } else {
+        None
+    };
+
+    match target {
+        Some((origin, n)) => {
+            let tris = gather_face(mesh, origin, n);
+            if tris.is_empty() {
+                *vis = Visibility::Hidden;
+            } else {
+                if let Some(slot) = meshes.get_mut(&hl.0) {
+                    *slot = build_face_mesh(&tris, n);
+                }
+                *vis = Visibility::Visible;
+            }
+        }
+        None => *vis = Visibility::Hidden,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------
@@ -651,7 +881,7 @@ fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
     blocking: Res<UiBlocking>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &OrbitCamera)>,
+    mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
     doc: Res<DocRes>,
     part: Res<Part>,
     mut session: ResMut<SketchSession>,
@@ -660,7 +890,7 @@ fn sketch_interaction(
         return;
     }
     let Ok(window) = windows.single() else { return };
-    let Ok((camera, cam_gt, mut cam_tf, orbit)) = cam_q.single_mut() else { return };
+    let Ok((camera, cam_gt, mut cam_tf, mut orbit)) = cam_q.single_mut() else { return };
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
 
     let active_uv = session.plane.as_ref().and_then(|ap| ray_plane(ap, &ray).map(|(_, uv)| uv));
@@ -696,9 +926,10 @@ fn sketch_interaction(
                 }
             }
             if let Some((_, ap)) = best {
-                let dist = orbit.radius.max(6.0);
-                let eye = ap.origin + ap.n * dist;
-                *cam_tf = Transform::from_translation(eye).looking_at(ap.origin, ap.v);
+                // Snap face-on, but via the orbit state so the user can keep orbiting.
+                orbit.radius = orbit.radius.max(6.0);
+                look_along(&mut orbit, ap.origin, ap.n);
+                *cam_tf = camera_transform(&orbit);
                 session.sketch.clear();
                 session.pending = None;
                 session.cursor_uv = None;
@@ -1044,10 +1275,10 @@ fn orbit_camera(
     blocking: Res<UiBlocking>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
-    session: Res<SketchSession>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
-    if session.plane.is_some() || blocking.0 {
+    // Orbit/zoom work even while sketching now — only the UI blocks them.
+    if blocking.0 {
         return;
     }
     const ORBIT_SENS: f32 = 0.005;
