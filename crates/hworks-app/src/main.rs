@@ -12,7 +12,6 @@
 //! on the UI never leak into the sketch.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::gizmos::config::{DefaultGizmoConfigGroup, GizmoConfigStore};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -293,14 +292,8 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut gizmo_store: ResMut<GizmoConfigStore>,
     doc: Res<DocRes>,
 ) {
-    // Bias gizmos slightly toward the camera so the body wireframe sits on top of
-    // the faces instead of z-fighting (the main flicker source).
-    let (cfg, _) = gizmo_store.config_mut::<DefaultGizmoConfigGroup>();
-    cfg.depth_bias = -0.2;
-
     let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
     let colors = [
         Color::srgba(0.85, 0.25, 0.25, 0.16),
@@ -1744,12 +1737,23 @@ fn trimesh_to_bevy(t: TriMesh) -> Mesh {
     mesh
 }
 
-/// Draw the body's feature edges as a gizmo overlay. Gizmos are biased toward the
-/// camera (see `setup`), so the edges sit on top of the faces without z-fighting.
-fn draw_body_edges(mut gizmos: Gizmos, part: Res<Part>) {
+/// Draw the body's feature edges. Each endpoint is nudged a fraction of the way
+/// toward the camera, so a *visible* edge sits just in front of its face (no
+/// z-fighting/flicker) while *hidden* edges stay behind their occluding faces
+/// (normal depth testing → they're correctly hidden, not see-through).
+fn draw_body_edges(
+    mut gizmos: Gizmos,
+    part: Res<Part>,
+    cam_q: Query<&GlobalTransform, With<Camera3d>>,
+) {
+    let Ok(cam) = cam_q.single() else { return };
+    let cam_pos = cam.translation();
     let col = Color::srgb(0.05, 0.05, 0.07);
+    const TOWARD_CAM: f32 = 0.0025; // 0.25% of the way to the camera
     for e in &part.edges {
-        gizmos.line(Vec3::from_array(e[0]), Vec3::from_array(e[1]), col);
+        let a = Vec3::from_array(e[0]);
+        let b = Vec3::from_array(e[1]);
+        gizmos.line(a + (cam_pos - a) * TOWARD_CAM, b + (cam_pos - b) * TOWARD_CAM, col);
     }
 }
 
