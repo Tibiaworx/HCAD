@@ -112,6 +112,7 @@ enum Tool {
     Line,
     Circle,
     Rectangle,
+    Dimension,
 }
 
 impl Tool {
@@ -121,6 +122,7 @@ impl Tool {
             Tool::Line => "Line",
             Tool::Circle => "Circle",
             Tool::Rectangle => "Rectangle",
+            Tool::Dimension => "Dimension",
         }
     }
 }
@@ -244,6 +246,8 @@ struct SketchSession {
     tool: Tool,
     construction: bool,
     pending: Option<Vec2>,
+    /// First point picked by the Dimension tool (point index).
+    dim_first: Option<usize>,
     drag: Option<usize>,
     dirty: bool,
     op_request: Option<SolidOp>,
@@ -413,6 +417,7 @@ fn ui_system(
     mut doc: ResMut<DocRes>,
     mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
+    cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
 
@@ -508,6 +513,7 @@ fn ui_system(
                             (Tool::Line, "Line", "Draw line segments; endpoints snap to close loops (L)"),
                             (Tool::Circle, "Circle", "Click centre, then radius (C)"),
                             (Tool::Rectangle, "Rectangle", "Click two opposite corners (R)"),
+                            (Tool::Dimension, "Dimension", "Click two points to set an exact distance (M)"),
                         ] {
                             if ui.selectable_label(session.tool == tool, name).on_hover_text(tip).clicked() {
                                 session.tool = tool;
@@ -587,6 +593,46 @@ fn ui_system(
                 }
             });
             ui_state.pending = if keep { Some(op) } else { None };
+        } else if in_sketch {
+            // Sketch panel: edit dimension values (drives the geometry via the solver).
+            ui.heading("Sketch");
+            let dims: Vec<usize> = session
+                .sketch
+                .constraints
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| matches!(c, Constraint::Distance { .. }).then_some(i))
+                .collect();
+            if dims.is_empty() {
+                ui.label(
+                    egui::RichText::new("Dimension tool: click two points to set an exact distance.")
+                        .italics()
+                        .weak(),
+                );
+            } else {
+                ui.label(egui::RichText::new("Dimensions").strong());
+                let mut changed = false;
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (k, i) in dims.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("D{}", k + 1));
+                            if let Some(Constraint::Distance { value, .. }) =
+                                session.sketch.constraints.get_mut(*i)
+                            {
+                                if ui
+                                    .add(egui::DragValue::new(value).speed(0.05).range(0.01..=10_000.0).suffix(" mm"))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                });
+                if changed {
+                    session.dirty = true;
+                }
+            }
         } else {
             ui.heading("HCAD Part");
 
@@ -903,6 +949,35 @@ fn ui_system(
         }
     }
 
+    // Dimension value labels floating at each dimension's midpoint in the viewport.
+    if let (Some(ap), Ok((camera, cam_gt))) = (session.plane.as_ref(), cam_read.single()) {
+        let ppp = ctx.pixels_per_point();
+        for (k, c) in session.sketch.constraints.iter().enumerate() {
+            if let Constraint::Distance { a, b, value } = c {
+                if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
+                    let a2 = Vec2::new(pa.x as f32, pa.y as f32);
+                    let b2 = Vec2::new(pb.x as f32, pb.y as f32);
+                    let dir = (b2 - a2).normalize_or_zero();
+                    let perp = Vec2::new(-dir.y, dir.x) * 0.5;
+                    let world = ap.to_world((a2 + b2) * 0.5 + perp);
+                    if let Ok(screen) = camera.world_to_viewport(cam_gt, world) {
+                        let pos = egui::pos2(screen.x / ppp, screen.y / ppp);
+                        egui::Area::new(egui::Id::new(("dimlabel", k)))
+                            .fixed_pos(pos)
+                            .order(egui::Order::Foreground)
+                            .show(ctx, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{value:.1}"))
+                                        .color(egui::Color32::from_rgb(150, 215, 255))
+                                        .strong(),
+                                );
+                            });
+                    }
+                }
+            }
+        }
+    }
+
     blocking.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
     Ok(())
 }
@@ -1216,6 +1291,7 @@ fn sketch_interaction(
                 *cam_tf = camera_transform(&orbit);
                 session.sketch.clear();
                 session.pending = None;
+                session.dim_first = None;
                 session.cursor_uv = None;
                 session.drag = None;
                 session.selected_region = None;
@@ -1224,6 +1300,11 @@ fn sketch_interaction(
             }
         }
         return;
+    }
+
+    // Switching away from the Dimension tool drops any in-progress pick.
+    if session.tool != Tool::Dimension {
+        session.dim_first = None;
     }
 
     match session.tool {
@@ -1258,6 +1339,21 @@ fn sketch_interaction(
         Tool::Line | Tool::Circle | Tool::Rectangle if just_pressed => {
             if let Some(uv) = active_uv {
                 place_point(&mut session, uv);
+            }
+        }
+        Tool::Dimension if just_pressed => {
+            // Click two existing points to lock their distance as a dimension.
+            if let Some(p) = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP * 1.5)) {
+                match session.dim_first.take() {
+                    Some(first) if first != p => {
+                        let a = session.sketch.points[first];
+                        let b = session.sketch.points[p];
+                        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+                        session.sketch.constraints.push(Constraint::Distance { a: first, b: p, value: d });
+                        session.dirty = true;
+                    }
+                    _ => session.dim_first = Some(p),
+                }
             }
         }
         _ => {}
@@ -1312,7 +1408,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 session.pending = Some(uv);
             }
         }
-        Tool::Select => {}
+        Tool::Select | Tool::Dimension => {}
     }
 }
 
@@ -1334,6 +1430,10 @@ fn handle_keys(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<SketchSessio
     }
     if keys.just_pressed(KeyCode::KeyR) {
         session.tool = Tool::Rectangle;
+        session.pending = None;
+    }
+    if keys.just_pressed(KeyCode::KeyM) {
+        session.tool = Tool::Dimension;
         session.pending = None;
     }
     if keys.just_pressed(KeyCode::KeyX) {
@@ -1540,6 +1640,7 @@ fn handle_edit_sketch(
     session.editing = Some(i);
     session.selected_region = region;
     session.pending = None;
+    session.dim_first = None;
     session.drag = None;
     session.cursor_uv = None;
     info!("Editing sketch of feature {i}.");
@@ -1909,6 +2010,30 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         }
     }
 
+    // Dimensions (Distance constraints): an offset dimension line + extension lines.
+    let dim_col = Color::srgb(0.55, 0.85, 1.0);
+    for c in &session.sketch.constraints {
+        if let hworks_sketch::Constraint::Distance { a, b, .. } = c {
+            if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
+                let a2 = Vec2::new(pa.x as f32, pa.y as f32);
+                let b2 = Vec2::new(pb.x as f32, pb.y as f32);
+                let dir = (b2 - a2).normalize_or_zero();
+                let perp = Vec2::new(-dir.y, dir.x) * 0.5; // offset the dim line
+                gizmos.line(ap.to_world(a2 + perp), ap.to_world(b2 + perp), dim_col);
+                gizmos.line(ap.to_world(a2), ap.to_world(a2 + perp), dim_col);
+                gizmos.line(ap.to_world(b2), ap.to_world(b2 + perp), dim_col);
+            }
+        }
+    }
+
+    // Highlight the Dimension tool's first-picked point.
+    if let Some(i) = session.dim_first {
+        if let Some(p) = session.sketch.points.get(i) {
+            let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
+            gizmos.circle(iso, 0.18, dim_col);
+        }
+    }
+
     // Snap indicator: ring the point the cursor would attach to.
     if let Some(cur) = session.cursor_uv {
         if let Some(i) = nearest_point(&session.sketch, cur, SNAP) {
@@ -1932,7 +2057,7 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
                     gizmos.line(ap.to_world(p), ap.to_world(q), preview_col);
                 }
             }
-            Tool::Select => {}
+            Tool::Select | Tool::Dimension => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col);
     }
