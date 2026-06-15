@@ -163,6 +163,18 @@ struct UiState {
     open_request: bool,
     /// Request to (re)open a feature's sketch for editing.
     edit_sketch_request: Option<usize>,
+    /// Active CommandManager tab.
+    active_tab: Tab,
+    /// Tracks sketch-mode transitions so the tab can auto-switch.
+    was_sketching: bool,
+}
+
+/// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    #[default]
+    Features,
+    Sketch,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -325,6 +337,7 @@ fn setup(
         unlit: true,
         cull_mode: None,
         double_sided: true,
+        depth_bias: 6.0, // sit firmly in front of the face it highlights
         ..default()
     });
     commands.spawn((
@@ -395,27 +408,31 @@ fn ui_system(
 
     let in_sketch = session.plane.is_some();
     let has_profile = !session.sketch.regions().is_empty();
+    // A standalone Sketch feature is selected → it can be extruded from the Features tab.
+    let selected_sketch = ui_state.selected.filter(|&i| {
+        matches!(doc.0.features.get(i).map(|f| &f.kind), Some(FeatureKind::Sketch { .. }))
+    });
+    let can_extrude = (in_sketch && has_profile) || selected_sketch.is_some();
+
+    // Auto-switch tab on entering/leaving a sketch.
+    if in_sketch != ui_state.was_sketching {
+        ui_state.active_tab = if in_sketch { Tab::Sketch } else { Tab::Features };
+        ui_state.was_sketching = in_sketch;
+    }
 
     // ---- Top toolbar (CommandManager) ----
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        // Row 1: global actions + view controls.
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("HCAD").strong().size(16.0));
             if ui.button("New Part").on_hover_text("Clear the model and start over").clicked() {
                 ui_state.new_part = true;
             }
-            if ui
-                .add_enabled(!history.undo.is_empty(), egui::Button::new("Undo"))
-                .on_hover_text("Undo (Ctrl+Z)")
-                .clicked()
-            {
+            if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
                 ui_state.undo_request = true;
             }
-            if ui
-                .add_enabled(!history.redo.is_empty(), egui::Button::new("Redo"))
-                .on_hover_text("Redo (Ctrl+Y)")
-                .clicked()
-            {
+            if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Redo (Ctrl+Y)").clicked() {
                 ui_state.redo_request = true;
             }
             ui.separator();
@@ -425,60 +442,6 @@ fn ui_system(
             if ui.button("Save").on_hover_text("Save the part (Ctrl+S)").clicked() {
                 ui_state.save_request = true;
             }
-            ui.separator();
-
-            if in_sketch {
-                ui.label(egui::RichText::new("Sketch").weak().small());
-                for (tool, name, tip) in [
-                    (Tool::Select, "Select", "Select & drag points — geometry re-solves (S)"),
-                    (Tool::Line, "Line", "Draw line segments; endpoints snap to close loops (L)"),
-                    (Tool::Circle, "Circle", "Click centre, then radius (C)"),
-                    (Tool::Rectangle, "Rectangle", "Click two opposite corners (R)"),
-                ] {
-                    if ui.selectable_label(session.tool == tool, name).on_hover_text(tip).clicked() {
-                        session.tool = tool;
-                        session.pending = None;
-                    }
-                }
-                let con = session.construction;
-                if ui
-                    .selectable_label(con, "Construction")
-                    .on_hover_text("Toggle construction geometry (X)")
-                    .clicked()
-                {
-                    session.construction = !con;
-                }
-                ui.separator();
-                ui.label(egui::RichText::new("Features").weak().small());
-                ui.add_enabled_ui(has_profile, |ui| {
-                    if ui
-                        .button("Extrude Boss")
-                        .on_hover_text("Add material by extruding the closed profile (E)")
-                        .clicked()
-                    {
-                        ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32 });
-                    }
-                    if ui
-                        .button("Extrude Cut")
-                        .on_hover_text("Remove material by extruding the closed profile (D)")
-                        .clicked()
-                    {
-                        ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32 });
-                    }
-                });
-                ui.separator();
-                if ui.button("Exit Sketch").on_hover_text("Leave sketch mode (Esc)").clicked() {
-                    session.exit_request = true;
-                }
-            } else {
-                ui.label(
-                    egui::RichText::new("Click a reference plane in the viewport to start a sketch.")
-                        .italics()
-                        .weak(),
-                );
-            }
-
-            // Right-aligned view controls.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Fit").on_hover_text("Zoom to fit").clicked() {
                     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -503,6 +466,67 @@ fn ui_system(
                 }
                 ui.label(egui::RichText::new("View").weak().small());
             });
+        });
+        ui.separator();
+
+        // Row 2: CommandManager tabs + the active tab's tools.
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(ui_state.active_tab == Tab::Features, "Features").clicked() {
+                ui_state.active_tab = Tab::Features;
+            }
+            if ui.selectable_label(ui_state.active_tab == Tab::Sketch, "Sketch").clicked() {
+                ui_state.active_tab = Tab::Sketch;
+            }
+            ui.separator();
+
+            match ui_state.active_tab {
+                Tab::Sketch => {
+                    ui.add_enabled_ui(in_sketch, |ui| {
+                        for (tool, name, tip) in [
+                            (Tool::Select, "Select", "Select & drag points — geometry re-solves (S)"),
+                            (Tool::Line, "Line", "Draw line segments; endpoints snap to close loops (L)"),
+                            (Tool::Circle, "Circle", "Click centre, then radius (C)"),
+                            (Tool::Rectangle, "Rectangle", "Click two opposite corners (R)"),
+                        ] {
+                            if ui.selectable_label(session.tool == tool, name).on_hover_text(tip).clicked() {
+                                session.tool = tool;
+                                session.pending = None;
+                            }
+                        }
+                        let con = session.construction;
+                        if ui.selectable_label(con, "Construction").on_hover_text("Toggle construction geometry (X)").clicked() {
+                            session.construction = !con;
+                        }
+                    });
+                    if in_sketch {
+                        ui.separator();
+                        if ui.button("Exit Sketch").on_hover_text("Leave & keep the sketch (Esc)").clicked() {
+                            session.exit_request = true;
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("Click a plane or face to start a sketch.").italics().weak());
+                    }
+                }
+                Tab::Features => {
+                    ui.add_enabled_ui(can_extrude, |ui| {
+                        if ui.button("Extrude Boss").on_hover_text("Add material from the sketch (E)").clicked() {
+                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
+                                ui_state.edit_sketch_request = Some(i);
+                            }
+                            ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32 });
+                        }
+                        if ui.button("Extrude Cut").on_hover_text("Remove material from the sketch (D)").clicked() {
+                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
+                                ui_state.edit_sketch_request = Some(i);
+                            }
+                            ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32 });
+                        }
+                    });
+                    if !can_extrude {
+                        ui.label(egui::RichText::new("Select a sketch or draw a closed profile.").italics().weak());
+                    }
+                }
+            }
         });
         ui.add_space(2.0);
     });
@@ -619,21 +643,26 @@ fn ui_system(
                                 .id_salt(i)
                                 .default_open(false)
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new(child).weak());
+                                    // The nested sketch has its OWN right-click menu.
+                                    let child_resp =
+                                        ui.selectable_label(false, egui::RichText::new(child).weak());
+                                    child_resp.context_menu(|ui| {
+                                        if ui.button("Edit sketch").clicked() {
+                                            action = Some(TreeAction::Edit(i));
+                                            ui.close_menu();
+                                        }
+                                    });
                                 });
                             if resp.header_response.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            // Feature (header) menu — distinct from the sketch menu above.
                             resp.header_response.context_menu(|ui| {
                                 if ui.button("Edit feature (depth)").clicked() {
                                     action = Some(TreeAction::Select(i));
                                     ui.close_menu();
                                 }
-                                if ui.button("Edit sketch").clicked() {
-                                    action = Some(TreeAction::Edit(i));
-                                    ui.close_menu();
-                                }
-                                if ui.button("Delete").clicked() {
+                                if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close_menu();
                                 }
@@ -749,7 +778,9 @@ fn ui_system(
     });
 
     // ---- Right-click viewport context menu (view alignment) ----
-    if ctx.input(|i| i.pointer.secondary_clicked()) {
+    // Only over the 3D viewport — not when right-clicking inside an egui panel
+    // (the feature tree has its own context menus there).
+    if ctx.input(|i| i.pointer.secondary_clicked()) && !ctx.is_pointer_over_area() {
         ui_state.context_pos = ctx.input(|i| i.pointer.interact_pos());
     }
     if let Some(pos) = ui_state.context_pos {
@@ -1671,6 +1702,9 @@ fn spawn_solid(
     let edge_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.04, 0.04, 0.06),
         unlit: true,
+        // Bias the wireframe toward the camera so the black edges sit cleanly on
+        // top of the faces instead of z-fighting with them (a flicker source).
+        depth_bias: 4.0,
         ..default()
     });
     commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("BodyEdges")));
@@ -1748,7 +1782,11 @@ fn update_plane_visibility(
     }
 }
 
-fn draw_world_axes(mut gizmos: Gizmos) {
+fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
+    // Only while there's no body — otherwise the axis lines run through the model.
+    if part.solid.is_some() {
+        return;
+    }
     const L: f32 = 5.0;
     gizmos.line(Vec3::ZERO, Vec3::X * L, Color::srgb(1.0, 0.2, 0.2));
     gizmos.line(Vec3::ZERO, Vec3::Y * L, Color::srgb(0.2, 1.0, 0.2));
