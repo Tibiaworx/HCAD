@@ -248,6 +248,9 @@ struct SketchSession {
     pending: Option<Vec2>,
     /// First point picked by the Dimension tool (point index).
     dim_first: Option<usize>,
+    /// Time and position of the last left-click, for double-click detection.
+    last_click_time: f32,
+    last_click_uv: Option<Vec2>,
     drag: Option<usize>,
     dirty: bool,
     op_request: Option<SolidOp>,
@@ -262,6 +265,8 @@ struct SketchSession {
     exit_request: bool,
     /// Request to leave sketch mode and discard the changes (no commit).
     cancel_request: bool,
+    /// Edited dimensions / added relations are staged until Apply re-solves.
+    needs_apply: bool,
     sketch: Sketch,
 }
 
@@ -596,8 +601,25 @@ fn ui_system(
             });
             ui_state.pending = if keep { Some(op) } else { None };
         } else if in_sketch {
-            // Sketch panel: edit dimension values (drives the geometry via the solver).
+            // Sketch panel: edit dimensions / relations, then Apply to re-solve.
             ui.heading("Sketch");
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(session.needs_apply, egui::Button::new("Apply").fill(egui::Color32::from_rgb(40, 110, 70)))
+                    .on_hover_text("Re-solve the sketch with your edited dimensions / relations")
+                    .clicked()
+                {
+                    session.dirty = true;
+                    session.needs_apply = false;
+                }
+                if session.needs_apply {
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "unapplied changes");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "up to date");
+                }
+            });
+            ui.separator();
+
             let dims: Vec<usize> = session
                 .sketch
                 .constraints
@@ -607,14 +629,14 @@ fn ui_system(
                 .collect();
             if dims.is_empty() {
                 ui.label(
-                    egui::RichText::new("Dimension tool: click two points to set an exact distance.")
+                    egui::RichText::new("Dimension tool: click two points (or double-click a line).")
                         .italics()
                         .weak(),
                 );
             } else {
                 ui.label(egui::RichText::new("Dimensions").strong());
                 let mut changed = false;
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                     for (k, i) in dims.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(format!("D{}", k + 1));
@@ -632,7 +654,7 @@ fn ui_system(
                     }
                 });
                 if changed {
-                    session.dirty = true;
+                    session.needs_apply = true;
                 }
             }
 
@@ -677,7 +699,7 @@ fn ui_system(
             if let Some(c) = applied {
                 session.sketch.constraints.push(c);
                 session.selected_entities.clear();
-                session.dirty = true;
+                session.needs_apply = true;
             }
         } else {
             ui.heading("HCAD Part");
@@ -997,7 +1019,6 @@ fn ui_system(
 
     // Dimension value labels floating at each dimension's midpoint in the viewport.
     if let (Some(ap), Ok((camera, cam_gt))) = (session.plane.as_ref(), cam_read.single()) {
-        let ppp = ctx.pixels_per_point();
         for (k, c) in session.sketch.constraints.iter().enumerate() {
             if let Constraint::Distance { a, b, value } = c {
                 if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
@@ -1006,8 +1027,9 @@ fn ui_system(
                     let dir = (b2 - a2).normalize_or_zero();
                     let perp = Vec2::new(-dir.y, dir.x) * 0.5;
                     let world = ap.to_world((a2 + b2) * 0.5 + perp);
+                    // world_to_viewport returns logical pixels = egui points (no /ppp).
                     if let Ok(screen) = camera.world_to_viewport(cam_gt, world) {
-                        let pos = egui::pos2(screen.x / ppp, screen.y / ppp);
+                        let pos = egui::pos2(screen.x, screen.y);
                         egui::Area::new(egui::Id::new(("dimlabel", k)))
                             .fixed_pos(pos)
                             .order(egui::Order::Foreground)
@@ -1326,6 +1348,7 @@ fn highlight_face(
 fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
     blocking: Res<UiBlocking>,
+    time: Res<Time>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
     doc: Res<DocRes>,
@@ -1347,6 +1370,21 @@ fn sketch_interaction(
     let just_pressed = buttons.just_pressed(MouseButton::Left);
     let pressed = buttons.pressed(MouseButton::Left);
     let just_released = buttons.just_released(MouseButton::Left);
+
+    // Double-click detection (within 0.4s and close to the previous click).
+    let mut double_click = false;
+    if just_pressed {
+        let now = time.elapsed_secs();
+        if now - session.last_click_time < 0.4 {
+            if let (Some(prev), Some(cur)) = (session.last_click_uv, active_uv) {
+                if prev.distance(cur) < SNAP * 2.0 {
+                    double_click = true;
+                }
+            }
+        }
+        session.last_click_time = now;
+        session.last_click_uv = active_uv;
+    }
 
     if session.plane.is_none() {
         if just_pressed {
@@ -1386,6 +1424,7 @@ fn sketch_interaction(
                 session.drag = None;
                 session.selected_region = None;
                 session.selected_entities.clear();
+                session.needs_apply = false;
                 info!("Sketching on the {} plane.", ap.name);
                 session.plane = Some(ap);
             }
@@ -1449,16 +1488,19 @@ fn sketch_interaction(
             }
         }
         Tool::Dimension if just_pressed => {
-            // Click two existing points to lock their distance as a dimension.
-            if let Some(p) = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP * 1.5)) {
+            // Double-click a line segment → dimension its length directly.
+            if double_click {
+                if let Some((a, b)) = active_uv
+                    .and_then(|uv| nearest_entity(&session.sketch, uv, SNAP * 2.0))
+                    .and_then(|e| entity_line(&session.sketch, e))
+                {
+                    add_distance_dim(&mut session.sketch, a, b);
+                    session.dim_first = None;
+                }
+            } else if let Some(p) = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP * 1.5)) {
+                // Otherwise click two existing points.
                 match session.dim_first.take() {
-                    Some(first) if first != p => {
-                        let a = session.sketch.points[first];
-                        let b = session.sketch.points[p];
-                        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
-                        session.sketch.constraints.push(Constraint::Distance { a: first, b: p, value: d });
-                        session.dirty = true;
-                    }
+                    Some(first) if first != p => add_distance_dim(&mut session.sketch, first, p),
                     _ => session.dim_first = Some(p),
                 }
             }
@@ -1470,6 +1512,17 @@ fn sketch_interaction(
         session.sketch.solve();
         session.dirty = false;
     }
+}
+
+/// Add a distance dimension between two points at their current distance (no
+/// solve needed yet — the value matches reality until the user edits it).
+fn add_distance_dim(sketch: &mut Sketch, a: usize, b: usize) {
+    if a == b {
+        return;
+    }
+    let (pa, pb) = (sketch.points[a], sketch.points[b]);
+    let d = ((pa.x - pb.x).powi(2) + (pa.y - pb.y).powi(2)).sqrt();
+    sketch.constraints.push(Constraint::Distance { a, b, value: d });
 }
 
 fn place_point(session: &mut SketchSession, uv: Vec2) {
@@ -1751,6 +1804,7 @@ fn handle_edit_sketch(
     session.dim_first = None;
     session.drag = None;
     session.cursor_uv = None;
+    session.needs_apply = false;
     info!("Editing sketch of feature {i}.");
 }
 
@@ -1778,6 +1832,12 @@ fn handle_exit_sketch(
     }
     session.exit_request = false;
     let Some(ap) = session.plane.clone() else { return };
+
+    // Apply any staged dimension/relation edits before committing the sketch.
+    if session.needs_apply {
+        session.sketch.solve();
+        session.needs_apply = false;
+    }
 
     match session.editing {
         Some(i) if i < doc.0.features.len() => {
@@ -1994,30 +2054,60 @@ fn orbit_camera(
     blocking: Res<UiBlocking>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
-    mut query: Query<(&mut Transform, &mut OrbitCamera)>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut query: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
 ) {
-    // Orbit/zoom work even while sketching now — only the UI blocks them.
+    // Orbit/pan/zoom work even while sketching now — only the UI blocks them.
     if blocking.0 {
         return;
     }
     const ORBIT_SENS: f32 = 0.005;
     const ZOOM_SENS: f32 = 0.15;
 
-    for (mut transform, mut cam) in &mut query {
-        let mut changed = false;
-        if buttons.pressed(MouseButton::Right) && motion.delta != Vec2::ZERO {
-            cam.yaw -= motion.delta.x * ORBIT_SENS;
-            cam.pitch -= motion.delta.y * ORBIT_SENS;
-            cam.pitch = cam.pitch.clamp(-1.54, 1.54);
-            changed = true;
+    let Ok((camera, cam_gt, mut transform, mut cam)) = query.single_mut() else { return };
+    let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
+    let right = rot * Vec3::X;
+    let up = rot * Vec3::Y;
+    let forward = rot * Vec3::NEG_Z; // camera looks down its local -Z (toward focus)
+    let mut changed = false;
+
+    // Right-drag: orbit.
+    if buttons.pressed(MouseButton::Right) && motion.delta != Vec2::ZERO {
+        cam.yaw -= motion.delta.x * ORBIT_SENS;
+        cam.pitch = (cam.pitch - motion.delta.y * ORBIT_SENS).clamp(-1.54, 1.54);
+        changed = true;
+    }
+
+    // Middle-drag: pan (move the focus in the camera's screen plane).
+    if buttons.pressed(MouseButton::Middle) && motion.delta != Vec2::ZERO {
+        let k = cam.radius * 0.0016;
+        cam.focus += (-right * motion.delta.x + up * motion.delta.y) * k;
+        changed = true;
+    }
+
+    // Scroll: zoom toward the point under the cursor.
+    if scroll.delta.y != 0.0 {
+        let new_radius = (cam.radius * (1.0 - scroll.delta.y * ZOOM_SENS)).clamp(2.0, 100.0);
+        if let Some(ray) = windows.single().ok().and_then(|w| cursor_ray(w, camera, cam_gt)) {
+            let dir = ray.direction.as_vec3();
+            let denom = forward.dot(dir);
+            if denom.abs() > 1e-5 {
+                // Point under the cursor, in the focal plane through `focus`.
+                let t = forward.dot(cam.focus - ray.origin) / denom;
+                if t > 0.0 {
+                    let hit = ray.origin + dir * t;
+                    let blend = 1.0 - new_radius / cam.radius; // >0 zooming in
+                    let f = cam.focus;
+                    cam.focus = f + (hit - f) * blend;
+                }
+            }
         }
-        if scroll.delta.y != 0.0 {
-            cam.radius = (cam.radius * (1.0 - scroll.delta.y * ZOOM_SENS)).clamp(2.0, 100.0);
-            changed = true;
-        }
-        if changed {
-            *transform = camera_transform(&cam);
-        }
+        cam.radius = new_radius;
+        changed = true;
+    }
+
+    if changed {
+        *transform = camera_transform(&cam);
     }
 }
 
