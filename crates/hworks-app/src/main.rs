@@ -173,8 +173,6 @@ struct UiState {
     edit_depth: f32,
     /// Which feature `edit_depth` currently mirrors.
     edit_depth_for: Option<usize>,
-    /// User UI scale (egui zoom factor) — lets you enlarge/sharpen the interface.
-    ui_scale: f32,
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -402,12 +400,6 @@ fn ui_system(
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
 
-    // User UI scale (defaults to 1.0). egui renders crisper at larger sizes.
-    if ui_state.ui_scale < 0.5 {
-        ui_state.ui_scale = 1.0;
-    }
-    ctx.set_zoom_factor(ui_state.ui_scale);
-
     // Apply a CAD-ish dark style once.
     if !ui_state.themed {
         let mut style = (*ctx.style()).clone();
@@ -455,15 +447,6 @@ fn ui_system(
             if ui.button("Save").on_hover_text("Save the part (Ctrl+S)").clicked() {
                 ui_state.save_request = true;
             }
-            ui.separator();
-            ui.add(
-                egui::DragValue::new(&mut ui_state.ui_scale)
-                    .speed(0.02)
-                    .range(0.7..=2.5)
-                    .prefix("UI ")
-                    .fixed_decimals(2),
-            )
-            .on_hover_text("UI scale — raise for larger, crisper text");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Fit").on_hover_text("Zoom to fit").clicked() {
                     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
