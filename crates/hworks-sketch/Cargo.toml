@@ -7,3 +7,4 @@ authors.workspace = true
 
 [dependencies]
 nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }

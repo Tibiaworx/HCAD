@@ -58,6 +58,7 @@ fn main() {
                 handle_keys,
                 history_keys,
                 apply_history,
+                handle_file_io,
                 do_solid_op,
                 do_regenerate,
                 handle_new_part,
@@ -143,6 +144,9 @@ struct UiState {
     /// Undo/redo requested (from buttons or Ctrl+Z / Ctrl+Y).
     undo_request: bool,
     redo_request: bool,
+    /// Save / open requested (from buttons or Ctrl+S / Ctrl+O).
+    save_request: bool,
+    open_request: bool,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -335,9 +339,19 @@ fn ui_system(
     mut blocking: ResMut<UiBlocking>,
     mut doc: ResMut<DocRes>,
     mut history: ResMut<History>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+
+    // Render egui at the display's true pixel density so text stays crisp on
+    // scaled (high-DPI) Windows displays instead of being upscaled and blurry.
+    if let Ok(win) = windows.single() {
+        let ppp = win.scale_factor().max(1.0);
+        if (ctx.pixels_per_point() - ppp).abs() > 0.01 {
+            ctx.set_pixels_per_point(ppp);
+        }
+    }
 
     // Apply a CAD-ish dark style once.
     if !ui_state.themed {
@@ -374,6 +388,13 @@ fn ui_system(
                 .clicked()
             {
                 ui_state.redo_request = true;
+            }
+            ui.separator();
+            if ui.button("Open").on_hover_text("Open a part (Ctrl+O)").clicked() {
+                ui_state.open_request = true;
+            }
+            if ui.button("Save").on_hover_text("Save the part (Ctrl+S)").clicked() {
+                ui_state.save_request = true;
             }
             ui.separator();
 
@@ -1168,6 +1189,61 @@ fn history_keys(keys: Res<ButtonInput<KeyCode>>, mut ui_state: ResMut<UiState>) 
     if keys.just_pressed(KeyCode::KeyY) {
         ui_state.redo_request = true;
     }
+    if keys.just_pressed(KeyCode::KeyS) {
+        ui_state.save_request = true;
+    }
+    if keys.just_pressed(KeyCode::KeyO) {
+        ui_state.open_request = true;
+    }
+}
+
+/// Save the document to a `.hcad` (RON) file, or open one — via a native dialog.
+/// The solid isn't stored; opening triggers a regenerate to rebuild it.
+fn handle_file_io(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+    mut session: ResMut<SketchSession>,
+) {
+    if ui_state.save_request {
+        ui_state.save_request = false;
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("HCAD part", &["hcad", "ron"])
+            .set_file_name("part.hcad")
+            .save_file()
+        {
+            match ron::ser::to_string_pretty(&doc.0, ron::ser::PrettyConfig::default()) {
+                Ok(text) => match std::fs::write(&path, text) {
+                    Ok(()) => info!("Saved {}", path.display()),
+                    Err(e) => warn!("Save failed: {e}"),
+                },
+                Err(e) => warn!("Serialize failed: {e}"),
+            }
+        }
+    }
+
+    if ui_state.open_request {
+        ui_state.open_request = false;
+        if let Some(path) = rfd::FileDialog::new().add_filter("HCAD part", &["hcad", "ron"]).pick_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => match ron::from_str::<Document>(&text) {
+                    Ok(loaded) => {
+                        doc.0 = loaded;
+                        history.undo.clear();
+                        history.redo.clear();
+                        session.plane = None;
+                        session.selected_region = None;
+                        session.sketch.clear();
+                        ui_state.selected = None;
+                        ui_state.regen = true;
+                        info!("Opened {}", path.display());
+                    }
+                    Err(e) => warn!("Could not parse {}: {e}", path.display()),
+                },
+                Err(e) => warn!("Could not read {}: {e}", path.display()),
+            }
+        }
+    }
 }
 
 /// Apply a requested undo/redo by swapping the whole document snapshot.
@@ -1617,6 +1693,22 @@ mod tests {
         // Roll the bar back before the extrude → no body.
         doc.rollback = doc.features.len() - 1;
         assert!(regenerate(&doc).is_none(), "rolled-back model should have no body");
+    }
+
+    #[test]
+    fn document_round_trips_through_ron_and_regenerates() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude {
+            sketch: rect_sketch(2.0, 2.0),
+            region: rect_region(2.0, 2.0),
+            plane: xy(),
+            distance: 2.0,
+        });
+        let text = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).unwrap();
+        let reloaded: Document = ron::from_str(&text).expect("RON parses back");
+        assert_eq!(reloaded.features.len(), doc.features.len());
+        let solid = regenerate(&reloaded).expect("reloaded document regenerates");
+        assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
     }
 
     #[test]

@@ -9,16 +9,17 @@
 //! Bevy app renders *from* this document — it never owns the model itself.
 
 use hworks_sketch::{Region, Sketch};
+use serde::{Deserialize, Serialize};
 
 /// A stable identifier for a feature. Never reused, so downstream references
 /// stay valid across regeneration. (Topological naming, `DESIGN.md` §4.3, builds
 /// on this idea at the entity level from M5.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FeatureId(pub u64);
 
 /// A datum plane: an origin and two orthonormal in-plane axes (u, v). The plane
 /// normal is `u × v`. Sketches are drawn in (u, v) coordinates.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Plane {
     pub name: String,
     pub origin: [f32; 3],
@@ -30,7 +31,7 @@ pub struct Plane {
 /// or a planar face of the body. Recording it (rather than a face index) is the
 /// start of surviving regeneration: after a rebuild, the face is re-matched by
 /// geometry (normal + a point on it). See `DESIGN.md` §4.3. (M5 groundwork.)
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PlaneRef {
     pub origin: [f64; 3],
     pub u: [f64; 3],
@@ -43,7 +44,7 @@ pub struct PlaneRef {
 /// Operation features are *self-contained* — they carry the sketch and the plane
 /// they were drawn on — so the whole timeline can be replayed from scratch to
 /// regenerate the solid (M6). That replay is what makes editing parametric.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum FeatureKind {
     Plane(Plane),
     /// Boss extrude: add material by sweeping the selected region of a sketch.
@@ -55,14 +56,14 @@ pub enum FeatureKind {
 }
 
 /// One node in the feature timeline.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Feature {
     pub id: FeatureId,
     pub kind: FeatureKind,
 }
 
 /// The whole part: an ordered timeline plus a rollback position.
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Document {
     pub features: Vec<Feature>,
     /// Features at indices `>= rollback` are "rolled back" (suppressed).

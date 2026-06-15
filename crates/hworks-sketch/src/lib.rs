@@ -9,10 +9,11 @@
 //! arrives at **M1**, the Newton/least-squares solver at **M2**.
 
 use nalgebra::{DMatrix, DVector};
+use serde::{Deserialize, Serialize};
 
 /// A 2D point in plane-local coordinates — every entity endpoint is one of these,
 /// and each is an unknown the constraint solver positions.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct Point2 {
     pub x: f64,
     pub y: f64,
@@ -21,7 +22,7 @@ pub struct Point2 {
 /// A drawable sketch entity. A rectangle/square is four `Line`s plus constraints;
 /// a "construction line with midpoint" is a construction `Line` plus a midpoint
 /// `Point` tied to it by a `Midpoint` constraint.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SketchEntity {
     Line { a: usize, b: usize, construction: bool },
     Circle { center: usize, radius: f64 },
@@ -29,7 +30,7 @@ pub enum SketchEntity {
 }
 
 /// Geometric and dimensional relations the solver drives the geometry to satisfy.
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Constraint {
     Coincident(usize, usize),
     Horizontal(usize, usize),
@@ -40,7 +41,7 @@ pub enum Constraint {
 
 /// A closed area of a sketch, ready to extrude: one outer boundary loop plus any
 /// inner loops that are *holes* in it (e.g. a rectangle with a circular hole).
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Region {
     pub outer: Vec<[f64; 2]>,
     pub holes: Vec<Vec<[f64; 2]>>,
@@ -55,7 +56,7 @@ impl Region {
 }
 
 /// A 2D sketch bound to a plane (or, from M5, a planar face of a solid).
-#[derive(Debug, Default, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Sketch {
     pub points: Vec<Point2>,
     pub entities: Vec<SketchEntity>,

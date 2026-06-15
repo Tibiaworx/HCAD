@@ -7,4 +7,4 @@ authors.workspace = true
 
 [dependencies]
 hworks-sketch = { path = "../hworks-sketch" }
-# serde + ron (save/load) arrive at milestone M7.
+serde = { version = "1", features = ["derive"] }
