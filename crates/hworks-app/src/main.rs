@@ -12,6 +12,7 @@
 //! on the UI never leak into the sketch.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::gizmos::config::{DefaultGizmoConfigGroup, GizmoConfigStore};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -68,6 +69,7 @@ fn main() {
                 update_plane_visibility,
                 orbit_camera,
                 draw_world_axes,
+                draw_body_edges,
                 draw_sketch,
             ),
         )
@@ -171,6 +173,8 @@ struct UiState {
     edit_depth: f32,
     /// Which feature `edit_depth` currently mirrors.
     edit_depth_for: Option<usize>,
+    /// User UI scale (egui zoom factor) — lets you enlarge/sharpen the interface.
+    ui_scale: f32,
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -190,6 +194,8 @@ struct Part {
     solid: Option<KSolid>,
     /// Last tessellation, kept in world space so faces can be ray-picked.
     mesh: Option<TriMesh>,
+    /// Body feature edges, drawn as an overlay (gizmos) so they can't z-fight.
+    edges: Vec<[[f32; 3]; 2]>,
 }
 
 #[derive(Clone)]
@@ -289,8 +295,14 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gizmo_store: ResMut<GizmoConfigStore>,
     doc: Res<DocRes>,
 ) {
+    // Bias gizmos slightly toward the camera so the body wireframe sits on top of
+    // the faces instead of z-fighting (the main flicker source).
+    let (cfg, _) = gizmo_store.config_mut::<DefaultGizmoConfigGroup>();
+    cfg.depth_bias = -0.2;
+
     let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
     let colors = [
         Color::srgba(0.85, 0.25, 0.25, 0.16),
@@ -390,6 +402,12 @@ fn ui_system(
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
 
+    // User UI scale (defaults to 1.0). egui renders crisper at larger sizes.
+    if ui_state.ui_scale < 0.5 {
+        ui_state.ui_scale = 1.0;
+    }
+    ctx.set_zoom_factor(ui_state.ui_scale);
+
     // Apply a CAD-ish dark style once.
     if !ui_state.themed {
         let mut style = (*ctx.style()).clone();
@@ -437,6 +455,15 @@ fn ui_system(
             if ui.button("Save").on_hover_text("Save the part (Ctrl+S)").clicked() {
                 ui_state.save_request = true;
             }
+            ui.separator();
+            ui.add(
+                egui::DragValue::new(&mut ui_state.ui_scale)
+                    .speed(0.02)
+                    .range(0.7..=2.5)
+                    .prefix("UI ")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("UI scale — raise for larger, crisper text");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Fit").on_hover_text("Zoom to fit").clicked() {
                     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -1652,12 +1679,14 @@ fn do_regenerate(
         Some(solid) => {
             let tess = tessellate(&solid, 0.03);
             part.mesh = Some(tess.mesh.clone());
+            part.edges = tess.edges.clone();
             spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
             part.solid = Some(solid);
         }
         None => {
             part.solid = None;
             part.mesh = None;
+            part.edges.clear();
         }
     }
 }
@@ -1688,6 +1717,7 @@ fn handle_new_part(
     }
     part.solid = None;
     part.mesh = None;
+    part.edges.clear();
     session.selected_region = None;
     session.editing = None;
     doc.0 = Document::with_default_planes();
@@ -1710,8 +1740,6 @@ fn spawn_solid(
     materials: &mut Assets<StandardMaterial>,
     tess: Tessellation,
 ) {
-    // Centroid first (before the mesh is moved) — used to float the wireframe.
-    let centroid = mesh_centroid(&tess.mesh);
     let mesh = meshes.add(trimesh_to_bevy(tess.mesh));
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.62, 0.66, 0.74),
@@ -1722,17 +1750,7 @@ fn spawn_solid(
         ..default()
     });
     commands.spawn((Mesh3d(mesh), MeshMaterial3d(material), SolidPart, Name::new("Body")));
-
-    // Float the wireframe slightly off the surface (outward from the body centre)
-    // so the black edges never sit coplanar with the faces — this kills the edge
-    // z-fighting/flicker without any depth tricks.
-    let edge_mesh = meshes.add(edges_to_bevy(&tess.edges, centroid, 0.02));
-    let edge_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.04, 0.04, 0.06),
-        unlit: true,
-        ..default()
-    });
-    commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("BodyEdges")));
+    // Edges are drawn by `draw_body_edges` as a gizmo overlay (no z-fighting).
 }
 
 fn trimesh_to_bevy(t: TriMesh) -> Mesh {
@@ -1743,20 +1761,13 @@ fn trimesh_to_bevy(t: TriMesh) -> Mesh {
     mesh
 }
 
-fn edges_to_bevy(edges: &[[[f32; 3]; 2]], centroid: Vec3, off: f32) -> Mesh {
-    let nudge = |p: [f32; 3]| -> [f32; 3] {
-        let v = Vec3::from_array(p);
-        let o = v + (v - centroid).normalize_or_zero() * off;
-        [o.x, o.y, o.z]
-    };
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(edges.len() * 2);
-    for e in edges {
-        positions.push(nudge(e[0]));
-        positions.push(nudge(e[1]));
+/// Draw the body's feature edges as a gizmo overlay. Gizmos are biased toward the
+/// camera (see `setup`), so the edges sit on top of the faces without z-fighting.
+fn draw_body_edges(mut gizmos: Gizmos, part: Res<Part>) {
+    let col = Color::srgb(0.05, 0.05, 0.07);
+    for e in &part.edges {
+        gizmos.line(Vec3::from_array(e[0]), Vec3::from_array(e[1]), col);
     }
-    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh
 }
 
 fn orbit_camera(
