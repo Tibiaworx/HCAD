@@ -167,6 +167,10 @@ struct UiState {
     active_tab: Tab,
     /// Tracks sketch-mode transitions so the tab can auto-switch.
     was_sketching: bool,
+    /// Pending depth value for the selected feature's editor (applied on Apply).
+    edit_depth: f32,
+    /// Which feature `edit_depth` currently mirrors.
+    edit_depth_for: Option<usize>,
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -224,6 +228,8 @@ struct SketchSession {
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
     exit_request: bool,
+    /// Request to leave sketch mode and discard the changes (no commit).
+    cancel_request: bool,
     sketch: Sketch,
 }
 
@@ -337,7 +343,6 @@ fn setup(
         unlit: true,
         cull_mode: None,
         double_sided: true,
-        depth_bias: 6.0, // sit firmly in front of the face it highlights
         ..default()
     });
     commands.spawn((
@@ -381,19 +386,9 @@ fn ui_system(
     mut blocking: ResMut<UiBlocking>,
     mut doc: ResMut<DocRes>,
     mut history: ResMut<History>,
-    windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
-
-    // Render egui at the display's true pixel density so text stays crisp on
-    // scaled (high-DPI) Windows displays instead of being upscaled and blurry.
-    if let Ok(win) = windows.single() {
-        let ppp = win.scale_factor().max(1.0);
-        if (ctx.pixels_per_point() - ppp).abs() > 0.01 {
-            ctx.set_pixels_per_point(ppp);
-        }
-    }
 
     // Apply a CAD-ish dark style once.
     if !ui_state.themed {
@@ -500,8 +495,16 @@ fn ui_system(
                     });
                     if in_sketch {
                         ui.separator();
-                        if ui.button("Exit Sketch").on_hover_text("Leave & keep the sketch (Esc)").clicked() {
+                        let confirm = if session.editing.is_some() { "Confirm edit" } else { "Finish sketch" };
+                        if ui
+                            .add(egui::Button::new(confirm).fill(egui::Color32::from_rgb(40, 110, 70)))
+                            .on_hover_text("Apply changes and keep the sketch (Esc)")
+                            .clicked()
+                        {
                             session.exit_request = true;
+                        }
+                        if ui.button("Cancel").on_hover_text("Discard changes since opening this sketch").clicked() {
+                            session.cancel_request = true;
                         }
                     } else {
                         ui.label(egui::RichText::new("Click a plane or face to start a sketch.").italics().weak());
@@ -612,19 +615,19 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit sketch").clicked() {
                                     action = Some(TreeAction::Edit(i));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("Extrude boss").clicked() {
                                     action = Some(TreeAction::ExtrudeBoss(i));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("Extrude cut").clicked() {
                                     action = Some(TreeAction::ExtrudeCut(i));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("Delete").clicked() {
                                     action = Some(TreeAction::Delete(i));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
@@ -649,7 +652,7 @@ fn ui_system(
                                     child_resp.context_menu(|ui| {
                                         if ui.button("Edit sketch").clicked() {
                                             action = Some(TreeAction::Edit(i));
-                                            ui.close_menu();
+                                            ui.close();
                                         }
                                     });
                                 });
@@ -660,11 +663,11 @@ fn ui_system(
                             resp.header_response.context_menu(|ui| {
                                 if ui.button("Edit feature (depth)").clicked() {
                                     action = Some(TreeAction::Select(i));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             });
                         }
@@ -699,30 +702,39 @@ fn ui_system(
                 }
             }
 
-            // Inline depth editor for the selected Extrude/Cut.
+            // Inline depth editor for the selected Extrude/Cut — Apply to confirm.
             if let Some(i) = ui_state.selected {
                 let depth = doc.0.features.get(i).and_then(|f| match &f.kind {
                     FeatureKind::Extrude { distance, .. } | FeatureKind::Cut { distance, .. } => Some(*distance),
                     _ => None,
                 });
                 if let Some(depth) = depth {
+                    // Sync the editor's value when the selection changes.
+                    if ui_state.edit_depth_for != Some(i) {
+                        ui_state.edit_depth = depth as f32;
+                        ui_state.edit_depth_for = Some(i);
+                    }
                     ui.separator();
-                    let mut d = depth as f32;
+                    ui.label(egui::RichText::new("Edit feature").strong());
                     ui.horizontal(|ui| {
                         ui.label("Depth (mm):");
-                        let resp = ui.add(egui::DragValue::new(&mut d).speed(0.1).range(0.1..=200.0));
-                        if resp.drag_started() {
+                        ui.add(egui::DragValue::new(&mut ui_state.edit_depth).speed(0.1).range(0.1..=200.0));
+                    });
+                    let changed = (ui_state.edit_depth as f64 - depth).abs() > 1e-6;
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(changed, egui::Button::new("Apply").fill(egui::Color32::from_rgb(40, 110, 70))).clicked() {
                             history.snapshot(&doc.0);
-                        }
-                        if resp.changed() {
                             if let Some(f) = doc.0.features.get_mut(i) {
                                 match &mut f.kind {
                                     FeatureKind::Extrude { distance, .. }
-                                    | FeatureKind::Cut { distance, .. } => *distance = d as f64,
+                                    | FeatureKind::Cut { distance, .. } => *distance = ui_state.edit_depth as f64,
                                     _ => {}
                                 }
                             }
                             ui_state.regen = true;
+                        }
+                        if ui.add_enabled(changed, egui::Button::new("Revert")).clicked() {
+                            ui_state.edit_depth = depth as f32;
                         }
                     });
                 }
@@ -1051,7 +1063,7 @@ fn gather_face(mesh: &TriMesh, point: Vec3, normal: Vec3) -> Vec<[Vec3; 3]> {
 /// Build the highlight overlay mesh from a face's triangles, lifted slightly
 /// toward the camera (along `n`) to avoid z-fighting with the body.
 fn build_face_mesh(tris: &[[Vec3; 3]], n: Vec3) -> Mesh {
-    let off = n * 0.012;
+    let off = n * 0.025;
     let normal = [n.x, n.y, n.z];
     let mut positions = Vec::with_capacity(tris.len() * 3);
     let mut normals = Vec::with_capacity(tris.len() * 3);
@@ -1515,6 +1527,17 @@ fn handle_exit_sketch(
     mut history: ResMut<History>,
     mut ui_state: ResMut<UiState>,
 ) {
+    // Cancel: leave without committing any changes.
+    if session.cancel_request {
+        session.cancel_request = false;
+        session.plane = None;
+        session.editing = None;
+        session.pending = None;
+        session.drag = None;
+        session.cursor_uv = None;
+        session.selected_region = None;
+        return;
+    }
     if !session.exit_request {
         return;
     }
@@ -1687,6 +1710,8 @@ fn spawn_solid(
     materials: &mut Assets<StandardMaterial>,
     tess: Tessellation,
 ) {
+    // Centroid first (before the mesh is moved) — used to float the wireframe.
+    let centroid = mesh_centroid(&tess.mesh);
     let mesh = meshes.add(trimesh_to_bevy(tess.mesh));
     let material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.62, 0.66, 0.74),
@@ -1698,13 +1723,13 @@ fn spawn_solid(
     });
     commands.spawn((Mesh3d(mesh), MeshMaterial3d(material), SolidPart, Name::new("Body")));
 
-    let edge_mesh = meshes.add(edges_to_bevy(&tess.edges));
+    // Float the wireframe slightly off the surface (outward from the body centre)
+    // so the black edges never sit coplanar with the faces — this kills the edge
+    // z-fighting/flicker without any depth tricks.
+    let edge_mesh = meshes.add(edges_to_bevy(&tess.edges, centroid, 0.02));
     let edge_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.04, 0.04, 0.06),
         unlit: true,
-        // Bias the wireframe toward the camera so the black edges sit cleanly on
-        // top of the faces instead of z-fighting with them (a flicker source).
-        depth_bias: 4.0,
         ..default()
     });
     commands.spawn((Mesh3d(edge_mesh), MeshMaterial3d(edge_material), SolidPart, Name::new("BodyEdges")));
@@ -1718,11 +1743,16 @@ fn trimesh_to_bevy(t: TriMesh) -> Mesh {
     mesh
 }
 
-fn edges_to_bevy(edges: &[[[f32; 3]; 2]]) -> Mesh {
+fn edges_to_bevy(edges: &[[[f32; 3]; 2]], centroid: Vec3, off: f32) -> Mesh {
+    let nudge = |p: [f32; 3]| -> [f32; 3] {
+        let v = Vec3::from_array(p);
+        let o = v + (v - centroid).normalize_or_zero() * off;
+        [o.x, o.y, o.z]
+    };
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(edges.len() * 2);
     for e in edges {
-        positions.push(e[0]);
-        positions.push(e[1]);
+        positions.push(nudge(e[0]));
+        positions.push(nudge(e[1]));
     }
     let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
