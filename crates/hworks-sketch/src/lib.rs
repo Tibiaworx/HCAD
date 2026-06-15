@@ -37,6 +37,14 @@ pub enum Constraint {
     Vertical(usize, usize),
     Midpoint { mid: usize, a: usize, b: usize },
     Distance { a: usize, b: usize, value: f64 },
+    /// Line (a,b) parallel to line (c,d).
+    Parallel(usize, usize, usize, usize),
+    /// Line (a,b) perpendicular to line (c,d).
+    Perpendicular(usize, usize, usize, usize),
+    /// Line (a,b) has the same length as line (c,d).
+    Equal(usize, usize, usize, usize),
+    /// Line (a,b) tangent to a circle centred at `center` with the given radius.
+    Tangent { a: usize, b: usize, center: usize, radius: f64 },
 }
 
 /// A closed area of a sketch, ready to extrude: one outer boundary loop plus any
@@ -418,10 +426,14 @@ impl Sketch {
             .iter()
             .map(|c| match c {
                 Constraint::Coincident(..) => 2,
-                Constraint::Horizontal(..) => 1,
-                Constraint::Vertical(..) => 1,
-                Constraint::Distance { .. } => 1,
                 Constraint::Midpoint { .. } => 2,
+                Constraint::Horizontal(..)
+                | Constraint::Vertical(..)
+                | Constraint::Distance { .. }
+                | Constraint::Parallel(..)
+                | Constraint::Perpendicular(..)
+                | Constraint::Equal(..)
+                | Constraint::Tangent { .. } => 1,
             })
             .sum()
     }
@@ -458,6 +470,34 @@ impl Sketch {
                     r[k] = x[2 * mid] - 0.5 * (x[2 * a] + x[2 * b]);
                     r[k + 1] = x[2 * mid + 1] - 0.5 * (x[2 * a + 1] + x[2 * b + 1]);
                     k += 2;
+                }
+                Constraint::Parallel(a, b, c, d) => {
+                    let (d1x, d1y) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
+                    let (d2x, d2y) = (x[2 * *d] - x[2 * *c], x[2 * *d + 1] - x[2 * *c + 1]);
+                    r[k] = d1x * d2y - d1y * d2x; // cross product → 0 when parallel
+                    k += 1;
+                }
+                Constraint::Perpendicular(a, b, c, d) => {
+                    let (d1x, d1y) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
+                    let (d2x, d2y) = (x[2 * *d] - x[2 * *c], x[2 * *d + 1] - x[2 * *c + 1]);
+                    r[k] = d1x * d2x + d1y * d2y; // dot product → 0 when perpendicular
+                    k += 1;
+                }
+                Constraint::Equal(a, b, c, d) => {
+                    let l1 = ((x[2 * *b] - x[2 * *a]).powi(2) + (x[2 * *b + 1] - x[2 * *a + 1]).powi(2)).sqrt();
+                    let l2 = ((x[2 * *d] - x[2 * *c]).powi(2) + (x[2 * *d + 1] - x[2 * *c + 1]).powi(2)).sqrt();
+                    r[k] = l1 - l2;
+                    k += 1;
+                }
+                Constraint::Tangent { a, b, center, radius } => {
+                    let (a, b, c) = (*a, *b, *center);
+                    let (dx, dy) = (x[2 * b] - x[2 * a], x[2 * b + 1] - x[2 * a + 1]);
+                    let len = (dx * dx + dy * dy).sqrt();
+                    // Perpendicular distance from the circle centre to the line.
+                    let cross = dx * (x[2 * c + 1] - x[2 * a + 1]) - dy * (x[2 * c] - x[2 * a]);
+                    let dist = if len > 1e-9 { cross.abs() / len } else { 0.0 };
+                    r[k] = dist - *radius;
+                    k += 1;
                 }
             }
         }
@@ -580,6 +620,50 @@ mod tests {
         s.add_line(p1, p2, false);
         s.add_line(p2, p3, false);
         s.add_line(p3, p0, false);
+    }
+
+    #[test]
+    fn perpendicular_makes_two_lines_meet_at_a_right_angle() {
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(2.0, 0.0); // line 1 along +x
+        let c = s.add_point(0.0, 0.0);
+        let d = s.add_point(1.0, 0.5); // line 2 at a shallow angle
+        s.constraints.push(Constraint::Perpendicular(a, b, c, d));
+        s.solve();
+        let (d1x, d1y) = (s.points[b].x - s.points[a].x, s.points[b].y - s.points[a].y);
+        let (d2x, d2y) = (s.points[d].x - s.points[c].x, s.points[d].y - s.points[c].y);
+        assert!((d1x * d2x + d1y * d2y).abs() < 1e-6, "dot should be ~0");
+    }
+
+    #[test]
+    fn equal_makes_two_lines_the_same_length() {
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(4.0, 0.0); // length 4
+        let c = s.add_point(0.0, 2.0);
+        let d = s.add_point(1.0, 2.0); // length 1
+        s.constraints.push(Constraint::Equal(a, b, c, d));
+        s.solve();
+        let l1 = ((s.points[b].x - s.points[a].x).powi(2) + (s.points[b].y - s.points[a].y).powi(2)).sqrt();
+        let l2 = ((s.points[d].x - s.points[c].x).powi(2) + (s.points[d].y - s.points[c].y).powi(2)).sqrt();
+        assert!((l1 - l2).abs() < 1e-6, "lengths {l1} vs {l2}");
+    }
+
+    #[test]
+    fn tangent_pulls_a_line_to_touch_a_circle() {
+        let mut s = Sketch::default();
+        let center = s.add_point(0.0, 0.0);
+        // A horizontal line at y = 3, should drop to y = 2 to be tangent to r=2.
+        let a = s.add_point(-5.0, 3.0);
+        let b = s.add_point(5.0, 3.0);
+        s.constraints.push(Constraint::Horizontal(a, b));
+        s.constraints.push(Constraint::Tangent { a, b, center, radius: 2.0 });
+        s.solve();
+        let (dx, dy) = (s.points[b].x - s.points[a].x, s.points[b].y - s.points[a].y);
+        let len = (dx * dx + dy * dy).sqrt();
+        let cross = dx * (s.points[center].y - s.points[a].y) - dy * (s.points[center].x - s.points[a].x);
+        assert!((cross.abs() / len - 2.0).abs() < 1e-5, "distance to centre should be the radius");
     }
 
     #[test]

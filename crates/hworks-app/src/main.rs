@@ -254,6 +254,8 @@ struct SketchSession {
     cursor_uv: Option<Vec2>,
     /// Which region of the current sketch is selected for extrude/cut.
     selected_region: Option<usize>,
+    /// Sketch entities selected (with the Select tool) for applying a constraint.
+    selected_entities: Vec<usize>,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -632,6 +634,50 @@ fn ui_system(
                 if changed {
                     session.dirty = true;
                 }
+            }
+
+            // Geometric constraints on the selected entities (Select tool).
+            ui.separator();
+            let sel = session.selected_entities.clone();
+            let lines: Vec<(usize, usize)> = sel.iter().filter_map(|&i| entity_line(&session.sketch, i)).collect();
+            let circles: Vec<(usize, f64)> = sel.iter().filter_map(|&i| entity_circle(&session.sketch, i)).collect();
+            let two_lines = lines.len() == 2;
+            let line_circle = lines.len() == 1 && circles.len() == 1;
+            ui.label(egui::RichText::new(format!("Relations — {} selected", sel.len())).strong());
+            if sel.is_empty() {
+                ui.label(
+                    egui::RichText::new("Select tool: click 2 lines (or a line + circle).")
+                        .italics()
+                        .weak(),
+                );
+            }
+            let mut applied: Option<Constraint> = None;
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(two_lines, egui::Button::new("Parallel")).clicked() {
+                    applied = Some(Constraint::Parallel(lines[0].0, lines[0].1, lines[1].0, lines[1].1));
+                }
+                if ui.add_enabled(two_lines, egui::Button::new("Perpendicular")).clicked() {
+                    applied = Some(Constraint::Perpendicular(lines[0].0, lines[0].1, lines[1].0, lines[1].1));
+                }
+                if ui.add_enabled(two_lines, egui::Button::new("Equal")).clicked() {
+                    applied = Some(Constraint::Equal(lines[0].0, lines[0].1, lines[1].0, lines[1].1));
+                }
+                if ui.add_enabled(line_circle, egui::Button::new("Tangent")).clicked() {
+                    applied = Some(Constraint::Tangent {
+                        a: lines[0].0,
+                        b: lines[0].1,
+                        center: circles[0].0,
+                        radius: circles[0].1,
+                    });
+                }
+            });
+            if !sel.is_empty() && ui.button("Clear selection").clicked() {
+                session.selected_entities.clear();
+            }
+            if let Some(c) = applied {
+                session.sketch.constraints.push(c);
+                session.selected_entities.clear();
+                session.dirty = true;
             }
         } else {
             ui.heading("HCAD Part");
@@ -1021,6 +1067,50 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
     nearest_point(sketch, uv, SNAP).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
+/// Index of the line/circle entity nearest to `uv`, within `thresh`.
+fn nearest_entity(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
+    let p = |i: usize| Vec2::new(sketch.points[i].x as f32, sketch.points[i].y as f32);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, e) in sketch.entities.iter().enumerate() {
+        let d = match e {
+            SketchEntity::Line { a, b, .. } => {
+                let (a, b) = (p(*a), p(*b));
+                let ab = b - a;
+                let t = if ab.length_squared() > 1e-9 {
+                    ((uv - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (uv - (a + ab * t)).length()
+            }
+            SketchEntity::Circle { center, radius } => {
+                ((uv - p(*center)).length() - *radius as f32).abs()
+            }
+            SketchEntity::Point { .. } => continue,
+        };
+        if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// The endpoint indices of a line entity, if `i` is a line.
+fn entity_line(sketch: &Sketch, i: usize) -> Option<(usize, usize)> {
+    match sketch.entities.get(i) {
+        Some(SketchEntity::Line { a, b, .. }) => Some((*a, *b)),
+        _ => None,
+    }
+}
+
+/// The (centre index, radius) of a circle entity, if `i` is a circle.
+fn entity_circle(sketch: &Sketch, i: usize) -> Option<(usize, f64)> {
+    match sketch.entities.get(i) {
+        Some(SketchEntity::Circle { center, radius }) => Some((*center, *radius)),
+        _ => None,
+    }
+}
+
 /// Index of the sketch region whose interior (inside the outer loop, outside any
 /// hole) contains `uv`.
 fn region_at(sketch: &Sketch, uv: Vec2) -> Option<usize> {
@@ -1295,6 +1385,7 @@ fn sketch_interaction(
                 session.cursor_uv = None;
                 session.drag = None;
                 session.selected_region = None;
+                session.selected_entities.clear();
                 info!("Sketching on the {} plane.", ap.name);
                 session.plane = Some(ap);
             }
@@ -1302,9 +1393,12 @@ fn sketch_interaction(
         return;
     }
 
-    // Switching away from the Dimension tool drops any in-progress pick.
+    // Switching tools drops any in-progress dimension pick / entity selection.
     if session.tool != Tool::Dimension {
         session.dim_first = None;
+    }
+    if session.tool != Tool::Select {
+        session.selected_entities.clear();
     }
 
     match session.tool {
@@ -1312,11 +1406,24 @@ fn sketch_interaction(
             if just_pressed {
                 let hit = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP));
                 session.drag = hit;
-                // Clicking empty space inside a region selects that region.
                 if hit.is_none() {
                     if let Some(uv) = active_uv {
-                        if let Some(r) = region_at(&session.sketch, uv) {
-                            session.selected_region = Some(r);
+                        if let Some(e) = nearest_entity(&session.sketch, uv, SNAP * 1.5) {
+                            // Click a line/circle to (de)select it for a constraint (keep ≤2).
+                            if let Some(pos) = session.selected_entities.iter().position(|&x| x == e) {
+                                session.selected_entities.remove(pos);
+                            } else {
+                                session.selected_entities.push(e);
+                                while session.selected_entities.len() > 2 {
+                                    session.selected_entities.remove(0);
+                                }
+                            }
+                        } else {
+                            // Empty space: clear the entity selection, pick a region.
+                            session.selected_entities.clear();
+                            if let Some(r) = region_at(&session.sketch, uv) {
+                                session.selected_region = Some(r);
+                            }
                         }
                     }
                 }
@@ -1639,6 +1746,7 @@ fn handle_edit_sketch(
     session.plane = Some(ap);
     session.editing = Some(i);
     session.selected_region = region;
+    session.selected_entities.clear();
     session.pending = None;
     session.dim_first = None;
     session.drag = None;
@@ -2007,6 +2115,21 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
             for hole in &regions[i].holes {
                 draw_loop(&mut gizmos, hole);
             }
+        }
+    }
+
+    // Highlight entities selected for a relation (Select tool).
+    let sel_col = Color::srgb(1.0, 0.7, 0.1);
+    for &i in &session.selected_entities {
+        match session.sketch.entities.get(i) {
+            Some(SketchEntity::Line { a, b, .. }) => {
+                gizmos.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), sel_col);
+            }
+            Some(SketchEntity::Circle { center, radius }) => {
+                let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
+                gizmos.circle(iso, *radius as f32, sel_col);
+            }
+            _ => {}
         }
     }
 
