@@ -35,24 +35,30 @@ const PLANE_SIZE: f32 = 8.0;
 const SNAP: f32 = 0.18;
 
 fn main() {
+    // GPU selection: the integrated Radeon's 2020-era driver crashes (device
+    // lost) under DX12, so we let Bevy use the default (discrete) GPU, which is
+    // stable. On hybrid laptops that can flicker (cross-GPU present); the proper
+    // fix is to run on the integrated GPU after updating its driver — see README.
+    let power_preference = match std::env::var("HCAD_GPU").as_deref() {
+        Ok("integrated") | Ok("low") => PowerPreference::LowPower,
+        Ok("discrete") | Ok("high") => PowerPreference::HighPerformance,
+        _ => PowerPreference::HighPerformance,
+    };
+
     App::new()
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "HCAD".into(),
-                        // Standard vsync — most compatible present mode on hybrid GPUs.
                         present_mode: bevy::window::PresentMode::Fifo,
                         ..default()
                     }),
                     ..default()
                 })
                 .set(RenderPlugin {
-                    // Render on the integrated GPU, which is wired to the laptop
-                    // display. Rendering on the discrete GPU forces a cross-GPU
-                    // copy each frame, which flickers on hybrid-graphics laptops.
                     render_creation: RenderCreation::Automatic(WgpuSettings {
-                        power_preference: PowerPreference::LowPower,
+                        power_preference,
                         ..default()
                     }),
                     ..default()
@@ -350,9 +356,6 @@ fn setup(
         camera_transform(&cam),
         cam,
         AmbientLight { color: Color::WHITE, brightness: 250.0, ..default() },
-        // Disable MSAA: a sample-count mismatch between the 3D pass and the egui
-        // overlay pass makes the UI text flicker constantly. Off keeps them in sync.
-        Msaa::Off,
     ));
 
     // Reusable translucent overlay for face highlighting (hidden until needed).

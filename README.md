@@ -81,15 +81,30 @@ Each milestone is independently runnable.
 
 ## Building & running
 
-Not buildable yet — the workspace is scaffolded starting at milestone **M0**. Once it is:
-
 ```sh
-# (future)
-cargo run -p hworks-app
+cargo run -p hworks-app          # or: cargo build --release
 ```
 
-Prebuilt binaries will be published to this repository's **Releases** page once there is
-a runnable milestone.
+Prebuilt Windows binaries are on the **Releases** page.
+
+### Flickering on a laptop with hybrid graphics
+
+Many laptops have two GPUs — an integrated one (Intel/AMD) wired to the display, and a
+discrete one (NVIDIA/AMD) for performance. By default HCAD renders on the **discrete**
+GPU, which is stable. On some hybrid laptops this causes flickering, because each frame
+is copied from the discrete GPU to the integrated one for display.
+
+The flicker-free fix is to render on the **integrated** GPU (it's connected straight to
+the screen). Set the `HCAD_GPU` environment variable:
+
+```sh
+HCAD_GPU=integrated   # render on the integrated GPU (no cross-GPU flicker)
+HCAD_GPU=discrete     # render on the discrete GPU (default)
+```
+
+> ⚠️ If the integrated GPU crashes with a *"device lost / suspended"* error, its driver
+> is likely out of date — update the integrated GPU's driver (AMD Adrenalin / Intel
+> Graphics) and try again. A CAD viewport runs fine on integrated graphics.
 
 ---
 
