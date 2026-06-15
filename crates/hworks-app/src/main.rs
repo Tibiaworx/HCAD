@@ -333,6 +333,9 @@ fn setup(
         camera_transform(&cam),
         cam,
         AmbientLight { color: Color::WHITE, brightness: 250.0, ..default() },
+        // Disable MSAA: a sample-count mismatch between the 3D pass and the egui
+        // overlay pass makes the UI text flicker constantly. Off keeps them in sync.
+        Msaa::Off,
     ));
 
     // Reusable translucent overlay for face highlighting (hidden until needed).
