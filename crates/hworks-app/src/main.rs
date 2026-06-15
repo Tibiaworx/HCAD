@@ -15,6 +15,8 @@ use bevy::asset::RenderAssetUsages;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
+use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
@@ -34,13 +36,28 @@ const SNAP: f32 = 0.18;
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "HCAD".into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "HCAD".into(),
+                        // Standard vsync — most compatible present mode on hybrid GPUs.
+                        present_mode: bevy::window::PresentMode::Fifo,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    // Render on the integrated GPU, which is wired to the laptop
+                    // display. Rendering on the discrete GPU forces a cross-GPU
+                    // copy each frame, which flickers on hybrid-graphics laptops.
+                    render_creation: RenderCreation::Automatic(WgpuSettings {
+                        power_preference: PowerPreference::LowPower,
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .add_plugins(EguiPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
         .insert_resource(DocRes(Document::with_default_planes()))
