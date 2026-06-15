@@ -47,22 +47,28 @@ const TOL: f64 = 0.05;
 // Public kernel operations
 // ---------------------------------------------------------------------------
 
-/// Extrude a closed profile (ordered loop, plane-local uv) along the plane normal
-/// by `distance` into a solid (boss / add material). `None` if degenerate.
-pub fn extrude_solid(profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
-    build_solid(profile_uv, basis, 0.0, distance).map(KSolid)
+/// Extrude a closed region (an outer loop plus optional hole loops, in plane-local
+/// uv) along the plane normal by `distance` into a solid. `None` if degenerate.
+pub fn extrude_solid(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    distance: f64,
+) -> Option<KSolid> {
+    build_solid(outer, holes, basis, 0.0, distance).map(KSolid)
 }
 
 /// Like [`extrude_solid`] but the prism starts `back` units *behind* the plane,
 /// so a boss built on a face overlaps the body it sits on — avoiding a coplanar
 /// shared face that would make the following union fail.
 pub fn extrude_solid_with_overlap(
-    profile_uv: &[[f64; 2]],
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
     basis: &PlaneBasis,
     distance: f64,
     back: f64,
 ) -> Option<KSolid> {
-    build_solid(profile_uv, basis, -back, distance + back).map(KSolid)
+    build_solid(outer, holes, basis, -back, distance + back).map(KSolid)
 }
 
 /// Boolean union of two solids (boss added to an existing body).
@@ -70,14 +76,20 @@ pub fn union(a: &KSolid, b: &KSolid) -> Option<KSolid> {
     truck_shapeops::or(&a.0, &b.0, TOL).map(KSolid)
 }
 
-/// Boolean cut: subtract a swept profile from `base`.
+/// Boolean cut: subtract a swept region from `base`.
 ///
 /// `distance` is *signed*: positive sweeps the tool along the plane normal,
 /// negative sweeps against it. The caller picks the sign so the tool extends
 /// *into* the material. Either way the tool overshoots both caps so they are
 /// never coplanar with the body's faces (the classic B-rep boolean failure), and
 /// the tool is inverted so `base ∩ ¬tool == base − tool`.
-pub fn cut(base: &KSolid, profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
+pub fn cut(
+    base: &KSolid,
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    distance: f64,
+) -> Option<KSolid> {
     let depth = distance.abs();
     if depth < 1e-9 {
         return None;
@@ -88,9 +100,30 @@ pub fn cut(base: &KSolid, profile_uv: &[[f64; 2]], basis: &PlaneBasis, distance:
     } else {
         (-(depth + eps), depth + 2.0 * eps)
     };
-    let mut tool = build_solid(profile_uv, basis, start_offset, length)?;
+    let mut tool = build_solid(outer, holes, basis, start_offset, length)?;
     tool.not(); // invert all faces → complement region
     truck_shapeops::and(&base.0, &tool, TOL).map(KSolid)
+}
+
+/// Signed area of a 2D polygon (positive ⇒ counter-clockwise).
+fn signed_area(pts: &[[f64; 2]]) -> f64 {
+    let n = pts.len();
+    let mut a = 0.0;
+    for i in 0..n {
+        let p = pts[i];
+        let q = pts[(i + 1) % n];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    a * 0.5
+}
+
+/// Return the loop wound to the requested orientation (ccw = true ⇒ CCW).
+fn wound(pts: &[[f64; 2]], ccw: bool) -> Vec<[f64; 2]> {
+    let mut v = pts.to_vec();
+    if (signed_area(pts) > 0.0) != ccw {
+        v.reverse();
+    }
+    v
 }
 
 /// Tessellate a solid into a flat-shaded mesh plus its feature/boundary edges.
@@ -106,16 +139,17 @@ pub fn tessellate(solid: &KSolid, tol: f64) -> Tessellation {
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Build a prism solid: place the profile at `origin + normal*start_offset`, then
-/// translational-sweep it by `normal*length`. The canonical truck vertex → wire →
-/// face → solid workflow.
+/// Build a prism solid from a region (outer loop + holes): place it at
+/// `origin + normal*start_offset`, attach a planar face (outer CCW, holes CW),
+/// and translational-sweep it by `normal*length`.
 fn build_solid(
-    profile_uv: &[[f64; 2]],
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
     basis: &PlaneBasis,
     start_offset: f64,
     length: f64,
 ) -> Option<truck_modeling::Solid> {
-    if profile_uv.len() < 3 || length.abs() < 1e-9 {
+    if outer.len() < 3 || length.abs() < 1e-9 {
         return None;
     }
     let origin = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
@@ -128,13 +162,24 @@ fn build_solid(
         let p = base + u * uv[0] + v * uv[1];
         Point3::new(p.x, p.y, p.z)
     };
-    let verts: Vec<_> = profile_uv.iter().map(|uv| builder::vertex(to_p3(uv))).collect();
-    let np = verts.len();
-    let mut wire = truck_modeling::Wire::new();
-    for i in 0..np {
-        wire.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
+    let make_wire = |loop_pts: &[[f64; 2]]| {
+        let verts: Vec<_> = loop_pts.iter().map(|uv| builder::vertex(to_p3(uv))).collect();
+        let np = verts.len();
+        let mut w = truck_modeling::Wire::new();
+        for i in 0..np {
+            w.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
+        }
+        w
+    };
+
+    // Outer boundary CCW, holes CW (truck's convention for a face with holes).
+    let mut wires = vec![make_wire(&wound(outer, true))];
+    for h in holes {
+        if h.len() >= 3 {
+            wires.push(make_wire(&wound(h, false)));
+        }
     }
-    let face = builder::try_attach_plane(&vec![wire]).ok()?;
+    let face = builder::try_attach_plane(&wires).ok()?;
     Some(builder::tsweep(&face, n * length))
 }
 
@@ -248,7 +293,7 @@ mod tests {
     #[test]
     fn extrude_square_makes_a_box() {
         let square = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
-        let solid = extrude_solid(&square, &xy_plane(), 2.0).expect("extrude");
+        let solid = extrude_solid(&square, &[], &xy_plane(), 2.0).expect("extrude");
         let t = tessellate(&solid, 0.05);
         assert!(t.mesh.indices.len() >= 36, "got {} indices", t.mesh.indices.len());
         assert_eq!(t.mesh.indices.len() % 3, 0);
@@ -259,7 +304,7 @@ mod tests {
     #[test]
     fn boss_on_a_top_face_unions_into_a_stepped_solid() {
         // 4×4×2 base on the XY plane.
-        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &xy_plane(), 2.0)
+        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &[], &xy_plane(), 2.0)
             .expect("base");
         // A 2×2 boss on the top face (z = 2), overlapping back into the base.
         let top = PlaneBasis {
@@ -268,7 +313,7 @@ mod tests {
             v: [0.0, 1.0, 0.0],
             normal: [0.0, 0.0, 1.0],
         };
-        let boss = extrude_solid_with_overlap(&[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]], &top, 2.0, 0.1)
+        let boss = extrude_solid_with_overlap(&[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]], &[], &top, 2.0, 0.1)
             .expect("boss");
         let combined = union(&base, &boss).expect("union should succeed");
         let t = tessellate(&combined, 0.05);
@@ -279,7 +324,7 @@ mod tests {
     #[test]
     fn cut_into_a_top_face_with_negative_distance() {
         // 4×4×2 base; cut downward from the top face (body is on the −normal side).
-        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &xy_plane(), 2.0)
+        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &[], &xy_plane(), 2.0)
             .expect("base");
         let top = PlaneBasis {
             origin: [0.0, 0.0, 2.0],
@@ -288,20 +333,31 @@ mod tests {
             normal: [0.0, 0.0, 1.0],
         };
         // Negative distance ⇒ tool sweeps against the normal, i.e. down into the body.
-        let result = cut(&base, &[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]], &top, -2.0)
+        let result = cut(&base, &[[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]], &[], &top, -2.0)
             .expect("downward cut should succeed");
         let t = tessellate(&result, 0.05);
         assert!(t.edges.len() > 12, "pocketed solid should have extra edges, got {}", t.edges.len());
     }
 
     #[test]
+    fn extrude_a_square_with_a_hole_makes_a_frame() {
+        let outer = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        let hole = vec![[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
+        let solid = extrude_solid(&outer, std::slice::from_ref(&hole), &xy_plane(), 2.0)
+            .expect("frame should extrude");
+        let t = tessellate(&solid, 0.05);
+        assert!(t.edges.len() > 12, "frame should have inner+outer edges, got {}", t.edges.len());
+        assert!(t.mesh.indices.len() % 3 == 0 && !t.mesh.positions.is_empty());
+    }
+
+    #[test]
     fn cutting_a_pocket_reduces_volume_and_adds_edges() {
         // Base: 4×4 box, 2 tall.
-        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &xy_plane(), 2.0)
+        let base = extrude_solid(&[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]], &[], &xy_plane(), 2.0)
             .expect("base");
         // Cut a centered 2×2 pocket straight through.
         let pocket = [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]];
-        let result = cut(&base, &pocket, &xy_plane(), 2.0).expect("cut should succeed");
+        let result = cut(&base, &pocket, &[], &xy_plane(), 2.0).expect("cut should succeed");
         let t = tessellate(&result, 0.05);
         // A box with a rectangular through-hole has more than the 12 edges of a plain box.
         assert!(t.edges.len() > 12, "cut result should have extra edges, got {}", t.edges.len());

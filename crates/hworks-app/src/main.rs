@@ -25,7 +25,7 @@ use hworks_geometry::{
 
 /// How far a boss reaches back into the body it's built on, so the union is robust.
 const BOSS_OVERLAP: f64 = 0.1;
-use hworks_sketch::{Constraint, Sketch, SketchEntity};
+use hworks_sketch::{point_in_poly, Constraint, Sketch, SketchEntity};
 
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
 const EXTRUDE_DISTANCE: f64 = 2.0;
@@ -48,6 +48,7 @@ fn main() {
         .init_resource::<Part>()
         .init_resource::<UiState>()
         .init_resource::<UiBlocking>()
+        .init_resource::<History>()
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, ui_system)
         .add_systems(
@@ -55,6 +56,8 @@ fn main() {
             (
                 sketch_interaction,
                 handle_keys,
+                history_keys,
+                apply_history,
                 do_solid_op,
                 do_regenerate,
                 handle_new_part,
@@ -137,6 +140,9 @@ struct UiState {
     selected: Option<usize>,
     /// If set, a viewport right-click context menu is open at this screen position.
     context_pos: Option<egui::Pos2>,
+    /// Undo/redo requested (from buttons or Ctrl+Z / Ctrl+Y).
+    undo_request: bool,
+    redo_request: bool,
 }
 
 /// True while egui wants the pointer — suppresses viewport drawing/orbit.
@@ -180,7 +186,27 @@ struct SketchSession {
     dirty: bool,
     op_request: Option<SolidOp>,
     cursor_uv: Option<Vec2>,
+    /// Which region of the current sketch is selected for extrude/cut.
+    selected_region: Option<usize>,
     sketch: Sketch,
+}
+
+/// Undo/redo stacks of whole-document snapshots.
+#[derive(Resource, Default)]
+struct History {
+    undo: Vec<Document>,
+    redo: Vec<Document>,
+}
+
+impl History {
+    /// Snapshot the document before a mutation (caps the stack; clears redo).
+    fn snapshot(&mut self, doc: &Document) {
+        self.undo.push(doc.clone());
+        if self.undo.len() > 64 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
 }
 
 #[derive(Component)]
@@ -308,6 +334,7 @@ fn ui_system(
     mut ui_state: ResMut<UiState>,
     mut blocking: ResMut<UiBlocking>,
     mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -324,7 +351,7 @@ fn ui_system(
     }
 
     let in_sketch = session.plane.is_some();
-    let has_profile = session.sketch.outer_profile().is_some();
+    let has_profile = !session.sketch.regions().is_empty();
 
     // ---- Top toolbar (CommandManager) ----
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -333,6 +360,20 @@ fn ui_system(
             ui.label(egui::RichText::new("HCAD").strong().size(16.0));
             if ui.button("New Part").on_hover_text("Clear the model and start over").clicked() {
                 ui_state.new_part = true;
+            }
+            if ui
+                .add_enabled(!history.undo.is_empty(), egui::Button::new("Undo"))
+                .on_hover_text("Undo (Ctrl+Z)")
+                .clicked()
+            {
+                ui_state.undo_request = true;
+            }
+            if ui
+                .add_enabled(!history.redo.is_empty(), egui::Button::new("Redo"))
+                .on_hover_text("Redo (Ctrl+Y)")
+                .clicked()
+            {
+                ui_state.redo_request = true;
             }
             ui.separator();
 
@@ -494,7 +535,11 @@ fn ui_system(
                     let mut d = depth as f32;
                     ui.horizontal(|ui| {
                         ui.label("Depth (mm):");
-                        if ui.add(egui::DragValue::new(&mut d).speed(0.1).range(0.1..=200.0)).changed() {
+                        let resp = ui.add(egui::DragValue::new(&mut d).speed(0.1).range(0.1..=200.0));
+                        if resp.drag_started() {
+                            history.snapshot(&doc.0); // one undo step per drag
+                        }
+                        if resp.changed() {
                             if let Some(f) = doc.0.features.get_mut(i) {
                                 match &mut f.kind {
                                     FeatureKind::Extrude { distance, .. }
@@ -506,6 +551,7 @@ fn ui_system(
                         }
                     });
                     if ui.button("Delete feature").clicked() {
+                        history.snapshot(&doc.0);
                         doc.0.features.remove(i);
                         if doc.0.rollback > doc.0.features.len() {
                             doc.0.rollback = doc.0.features.len();
@@ -541,6 +587,22 @@ fn ui_system(
                     ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "○ profile open");
                 }
                 ui.separator();
+                let nreg = session.sketch.regions().len();
+                if nreg > 0 {
+                    let sel = session
+                        .selected_region
+                        .map(|i| (i + 1).to_string())
+                        .unwrap_or_else(|| if nreg == 1 { "1".into() } else { "—".into() });
+                    ui.label(format!("region {sel}/{nreg}"));
+                    if nreg > 1 {
+                        ui.label(
+                            egui::RichText::new("(Select tool: click a region)")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    ui.separator();
+                }
             }
             ui.label(format!("{} features", doc.0.features.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -679,6 +741,16 @@ fn nearest_point(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
 
 fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
     nearest_point(sketch, uv, SNAP).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
+}
+
+/// Index of the sketch region whose interior (inside the outer loop, outside any
+/// hole) contains `uv`.
+fn region_at(sketch: &Sketch, uv: Vec2) -> Option<usize> {
+    let p = [uv.x as f64, uv.y as f64];
+    sketch
+        .regions()
+        .iter()
+        .position(|r| point_in_poly(p, &r.outer) && !r.holes.iter().any(|h| point_in_poly(p, h)))
 }
 
 /// Möller–Trumbore ray/triangle intersection. Returns the ray parameter `t` of a
@@ -934,6 +1006,7 @@ fn sketch_interaction(
                 session.pending = None;
                 session.cursor_uv = None;
                 session.drag = None;
+                session.selected_region = None;
                 info!("Sketching on the {} plane.", ap.name);
                 session.plane = Some(ap);
             }
@@ -946,6 +1019,14 @@ fn sketch_interaction(
             if just_pressed {
                 let hit = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP));
                 session.drag = hit;
+                // Clicking empty space inside a region selects that region.
+                if hit.is_none() {
+                    if let Some(uv) = active_uv {
+                        if let Some(r) = region_at(&session.sketch, uv) {
+                            session.selected_region = Some(r);
+                        }
+                    }
+                }
             }
             if let Some(i) = session.drag {
                 if pressed {
@@ -1070,6 +1151,47 @@ fn handle_keys(
     }
 }
 
+/// Ctrl+Z = undo, Ctrl+Shift+Z / Ctrl+Y = redo.
+fn history_keys(keys: Res<ButtonInput<KeyCode>>, mut ui_state: ResMut<UiState>) {
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if !ctrl {
+        return;
+    }
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if keys.just_pressed(KeyCode::KeyZ) {
+        if shift {
+            ui_state.redo_request = true;
+        } else {
+            ui_state.undo_request = true;
+        }
+    }
+    if keys.just_pressed(KeyCode::KeyY) {
+        ui_state.redo_request = true;
+    }
+}
+
+/// Apply a requested undo/redo by swapping the whole document snapshot.
+fn apply_history(mut history: ResMut<History>, mut doc: ResMut<DocRes>, mut ui_state: ResMut<UiState>) {
+    if ui_state.undo_request {
+        ui_state.undo_request = false;
+        if let Some(prev) = history.undo.pop() {
+            history.redo.push(doc.0.clone());
+            doc.0 = prev;
+            ui_state.regen = true;
+            ui_state.selected = None;
+        }
+    }
+    if ui_state.redo_request {
+        ui_state.redo_request = false;
+        if let Some(next) = history.redo.pop() {
+            history.undo.push(doc.0.clone());
+            doc.0 = next;
+            ui_state.regen = true;
+            ui_state.selected = None;
+        }
+    }
+}
+
 /// Turn the active sketch into a timeline feature, then request a regenerate.
 /// The kernel work happens in `do_regenerate` by replaying the whole timeline —
 /// so the document, not this op, is the source of truth.
@@ -1078,25 +1200,32 @@ fn do_solid_op(
     part: Res<Part>,
     mut doc: ResMut<DocRes>,
     mut ui_state: ResMut<UiState>,
+    mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
 ) {
     let Some(op) = session.op_request.take() else { return };
     let Some(ap) = session.plane.clone() else { return };
 
-    if session.sketch.outer_profile().is_none() {
-        warn!("Need a closed profile (a closed loop of lines, or a circle) for this operation.");
+    let regions = session.sketch.regions();
+    if regions.is_empty() {
+        warn!("Need a closed profile (a loop of lines, or a circle) to extrude.");
         return;
     }
+    // Use the selected region, or the only one.
+    let idx = session.selected_region.filter(|&i| i < regions.len()).unwrap_or(0);
+    let region = regions[idx].clone();
+
     if matches!(op, SolidOp::Cut(_)) && part.solid.is_none() {
         warn!("Cut: there is no body yet — extrude a boss first.");
         return;
     }
 
+    history.snapshot(&doc.0);
     let sketch = session.sketch.clone();
     let plane = plane_ref(&ap);
     doc.0.add_feature(match op {
-        SolidOp::Boss(d) => FeatureKind::Extrude { sketch, plane, distance: d },
-        SolidOp::Cut(d) => FeatureKind::Cut { sketch, plane, distance: d },
+        SolidOp::Boss(d) => FeatureKind::Extrude { sketch, region, plane, distance: d },
+        SolidOp::Cut(d) => FeatureKind::Cut { sketch, region, plane, distance: d },
     });
     ui_state.regen = true;
     ui_state.selected = Some(doc.0.features.len() - 1);
@@ -1119,13 +1248,17 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
     for feature in &doc.features[..end] {
         match &feature.kind {
             FeatureKind::Plane(_) => {}
-            FeatureKind::Extrude { sketch, plane, distance } => {
-                let Some(profile) = sketch.outer_profile() else { continue };
+            FeatureKind::Extrude { region, plane, distance, .. } => {
+                if region.outer.len() < 3 {
+                    continue;
+                }
                 let basis = basis_from_ref(plane);
                 let next = match &body {
-                    Some(b) => extrude_solid_with_overlap(&profile, &basis, *distance, BOSS_OVERLAP)
-                        .and_then(|boss| union(b, &boss)),
-                    None => extrude_solid(&profile, &basis, *distance),
+                    Some(b) => {
+                        extrude_solid_with_overlap(&region.outer, &region.holes, &basis, *distance, BOSS_OVERLAP)
+                            .and_then(|boss| union(b, &boss))
+                    }
+                    None => extrude_solid(&region.outer, &region.holes, &basis, *distance),
                 };
                 if let Some(s) = next {
                     body = Some(s);
@@ -1133,9 +1266,11 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                     warn!("Regen: an extrude could not be built.");
                 }
             }
-            FeatureKind::Cut { sketch, plane, distance } => {
+            FeatureKind::Cut { region, plane, distance, .. } => {
                 let Some(b) = &body else { continue };
-                let Some(profile) = sketch.outer_profile() else { continue };
+                if region.outer.len() < 3 {
+                    continue;
+                }
                 let basis = basis_from_ref(plane);
                 // Pick the cut direction from the *current* body, so it stays
                 // correct even after upstream edits move things around.
@@ -1143,7 +1278,7 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                 let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
                 let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
                 let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
-                if let Some(s) = cut(b, &profile, &basis, signed) {
+                if let Some(s) = cut(b, &region.outer, &region.holes, &basis, signed) {
                     body = Some(s);
                 } else {
                     warn!("Regen: a cut could not be built.");
@@ -1199,6 +1334,7 @@ fn handle_new_part(
     mut part: ResMut<Part>,
     mut doc: ResMut<DocRes>,
     mut session: ResMut<SketchSession>,
+    mut history: ResMut<History>,
     existing: Query<Entity, With<SolidPart>>,
     mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
 ) {
@@ -1206,11 +1342,13 @@ fn handle_new_part(
         return;
     }
     ui_state.new_part = false;
+    history.snapshot(&doc.0);
     for e in &existing {
         commands.entity(e).despawn();
     }
     part.solid = None;
     part.mesh = None;
+    session.selected_region = None;
     doc.0 = Document::with_default_planes();
     session.plane = None;
     session.pending = None;
@@ -1354,6 +1492,30 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), point_col);
     }
 
+    // Highlight the selected region (or the only one) — outer + holes in green.
+    let regions = session.sketch.regions();
+    if !regions.is_empty() {
+        let idx = session
+            .selected_region
+            .filter(|&i| i < regions.len())
+            .or((regions.len() == 1).then_some(0));
+        if let Some(i) = idx {
+            let region_col = Color::srgb(0.2, 1.0, 0.45);
+            let draw_loop = |gizmos: &mut Gizmos, loop_pts: &[[f64; 2]]| {
+                let m = loop_pts.len();
+                for k in 0..m {
+                    let a = Vec2::new(loop_pts[k][0] as f32, loop_pts[k][1] as f32);
+                    let b = Vec2::new(loop_pts[(k + 1) % m][0] as f32, loop_pts[(k + 1) % m][1] as f32);
+                    gizmos.line(ap.to_world(a), ap.to_world(b), region_col);
+                }
+            };
+            draw_loop(&mut gizmos, &regions[i].outer);
+            for hole in &regions[i].holes {
+                draw_loop(&mut gizmos, hole);
+            }
+        }
+    }
+
     // Snap indicator: ring the point the cursor would attach to.
     if let Some(cur) = session.cursor_uv {
         if let Some(i) = nearest_point(&session.sketch, cur, SNAP) {
@@ -1393,7 +1555,7 @@ fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color) {
 mod tests {
     use super::*;
     use hworks_document::{Document, FeatureKind, PlaneRef};
-    use hworks_sketch::Sketch;
+    use hworks_sketch::{Region, Sketch};
 
     fn rect_sketch(w: f64, h: f64) -> Sketch {
         let mut s = Sketch::default();
@@ -1406,6 +1568,10 @@ mod tests {
         s.add_line(p2, p3, false);
         s.add_line(p3, p0, false);
         s
+    }
+
+    fn rect_region(w: f64, h: f64) -> Region {
+        rect_sketch(w, h).regions().into_iter().next().unwrap()
     }
 
     fn xy() -> PlaneRef {
@@ -1425,7 +1591,7 @@ mod tests {
     #[test]
     fn regenerate_replays_an_extrude_into_a_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), region: rect_region(2.0, 2.0), plane: xy(), distance: 2.0 });
         let solid = regenerate(&doc).expect("regen should produce a body");
         assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
     }
@@ -1433,7 +1599,7 @@ mod tests {
     #[test]
     fn editing_a_distance_rebuilds_taller() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), region: rect_region(2.0, 2.0), plane: xy(), distance: 2.0 });
         let h2 = height(&regenerate(&doc).unwrap());
         if let FeatureKind::Extrude { distance, .. } = &mut doc.features.last_mut().unwrap().kind {
             *distance = 6.0;
@@ -1446,7 +1612,7 @@ mod tests {
     #[test]
     fn rollback_suppresses_downstream_features() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), region: rect_region(4.0, 4.0), plane: xy(), distance: 2.0 });
         assert!(regenerate(&doc).is_some());
         // Roll the bar back before the extrude → no body.
         doc.rollback = doc.features.len() - 1;
@@ -1456,7 +1622,7 @@ mod tests {
     #[test]
     fn regenerate_replays_a_cut_through_the_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), region: rect_region(4.0, 4.0), plane: xy(), distance: 2.0 });
         // Cut a centred 2x2 pocket from the same plane (body is on the +normal side).
         let mut pocket = Sketch::default();
         let a = pocket.add_point(1.0, 1.0);
@@ -1467,7 +1633,8 @@ mod tests {
         pocket.add_line(b, c, false);
         pocket.add_line(c, d, false);
         pocket.add_line(d, a, false);
-        doc.add_feature(FeatureKind::Cut { sketch: pocket, plane: xy(), distance: 2.0 });
+        let region = pocket.regions().into_iter().next().unwrap();
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, region, plane: xy(), distance: 2.0 });
         let solid = regenerate(&doc).expect("regen with a cut should produce a body");
         assert!(tessellate(&solid, 0.05).edges.len() > 12, "cut should add edges");
     }

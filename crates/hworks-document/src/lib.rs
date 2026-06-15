@@ -8,7 +8,7 @@
 //! and a fresh document starts with the three standard reference planes. The
 //! Bevy app renders *from* this document — it never owns the model itself.
 
-use hworks_sketch::Sketch;
+use hworks_sketch::{Region, Sketch};
 
 /// A stable identifier for a feature. Never reused, so downstream references
 /// stay valid across regeneration. (Topological naming, `DESIGN.md` §4.3, builds
@@ -46,10 +46,11 @@ pub struct PlaneRef {
 #[derive(Debug, Clone)]
 pub enum FeatureKind {
     Plane(Plane),
-    /// Boss extrude: add material by sweeping a sketch on a plane/face.
-    Extrude { sketch: Sketch, plane: PlaneRef, distance: f64 },
-    /// Cut: subtract a swept profile from the body.
-    Cut { sketch: Sketch, plane: PlaneRef, distance: f64 },
+    /// Boss extrude: add material by sweeping the selected region of a sketch.
+    /// `region` is the resolved profile (outer + holes) chosen at creation.
+    Extrude { sketch: Sketch, region: Region, plane: PlaneRef, distance: f64 },
+    /// Cut: subtract a swept region from the body.
+    Cut { sketch: Sketch, region: Region, plane: PlaneRef, distance: f64 },
     // Revolve / Fillet / … arrive at M8+.
 }
 

@@ -38,6 +38,22 @@ pub enum Constraint {
     Distance { a: usize, b: usize, value: f64 },
 }
 
+/// A closed area of a sketch, ready to extrude: one outer boundary loop plus any
+/// inner loops that are *holes* in it (e.g. a rectangle with a circular hole).
+#[derive(Debug, Default, Clone)]
+pub struct Region {
+    pub outer: Vec<[f64; 2]>,
+    pub holes: Vec<Vec<[f64; 2]>>,
+}
+
+impl Region {
+    /// A representative interior point (used for hit-testing which region the
+    /// user clicked). The outer centroid, nudged off any hole it lands in.
+    pub fn interior_point(&self) -> [f64; 2] {
+        centroid(&self.outer)
+    }
+}
+
 /// A 2D sketch bound to a plane (or, from M5, a planar face of a solid).
 #[derive(Debug, Default, Clone)]
 pub struct Sketch {
@@ -142,6 +158,162 @@ impl Sketch {
         }
         None
     }
+
+    /// Every closed contour in the sketch as an ordered point loop: each closed
+    /// loop of non-construction lines, plus each circle (tessellated).
+    pub fn contours(&self) -> Vec<Vec<[f64; 2]>> {
+        use std::collections::{HashMap, HashSet};
+        let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+        for e in &self.entities {
+            if let SketchEntity::Line { a, b, construction: false } = e {
+                adj.entry(*a).or_default().push(*b);
+                adj.entry(*b).or_default().push(*a);
+            }
+        }
+
+        let mut contours = Vec::new();
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut starts: Vec<usize> = adj.keys().copied().collect();
+        starts.sort_unstable();
+        for start in starts {
+            if visited.contains(&start) {
+                continue;
+            }
+            // Gather this connected component.
+            let mut comp = Vec::new();
+            let mut stack = vec![start];
+            let mut seen = HashSet::new();
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v) {
+                    continue;
+                }
+                comp.push(v);
+                for &w in &adj[&v] {
+                    if !seen.contains(&w) {
+                        stack.push(w);
+                    }
+                }
+            }
+            for &v in &comp {
+                visited.insert(v);
+            }
+            // A simple cycle needs every vertex to have degree 2.
+            if !comp.iter().all(|v| adj[v].len() == 2) {
+                continue;
+            }
+            let mut order = vec![start];
+            let (mut prev, mut cur) = (start, adj[&start][0]);
+            let mut ok = true;
+            while cur != start {
+                order.push(cur);
+                let nbrs = &adj[&cur];
+                let next = if nbrs[0] == prev { nbrs[1] } else { nbrs[0] };
+                prev = cur;
+                cur = next;
+                if order.len() > comp.len() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && order.len() == comp.len() {
+                contours.push(order.iter().map(|&i| [self.points[i].x, self.points[i].y]).collect());
+            }
+        }
+
+        for e in &self.entities {
+            if let SketchEntity::Circle { center, radius } = e {
+                if let Some(c) = self.points.get(*center) {
+                    const SEG: usize = 48;
+                    contours.push(
+                        (0..SEG)
+                            .map(|k| {
+                                let a = std::f64::consts::TAU * (k as f64) / (SEG as f64);
+                                [c.x + radius * a.cos(), c.y + radius * a.sin()]
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        contours
+    }
+
+    /// Group the contours into closed regions, nesting inner loops as holes
+    /// (one level deep). A rectangle with a circle inside it becomes one region
+    /// whose outer is the rectangle and whose hole is the circle.
+    pub fn regions(&self) -> Vec<Region> {
+        let contours = self.contours();
+        let n = contours.len();
+        let areas: Vec<f64> = contours.iter().map(|c| area(c)).collect();
+        // `j` contains `i` if it's bigger and `i`'s centroid falls inside it.
+        // (The area test matters: an outer loop's centroid can land inside its
+        // own hole, which would fool a centroid-only test.)
+        let contains = |j: usize, i: usize| {
+            j != i && areas[j] > areas[i] && point_in_poly(centroid(&contours[i]), &contours[j])
+        };
+        let depth: Vec<usize> =
+            (0..n).map(|i| (0..n).filter(|&j| contains(j, i)).count()).collect();
+
+        let mut regions = Vec::new();
+        for i in 0..n {
+            if depth[i] != 0 {
+                continue; // not an outer boundary
+            }
+            let holes = (0..n)
+                .filter(|&k| depth[k] == 1 && contains(i, k))
+                .map(|k| contours[k].clone())
+                .collect();
+            regions.push(Region { outer: contours[i].clone(), holes });
+        }
+        regions
+    }
+}
+
+/// Absolute area of a 2D polygon.
+fn area(poly: &[[f64; 2]]) -> f64 {
+    let n = poly.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0;
+    for i in 0..n {
+        let p = poly[i];
+        let q = poly[(i + 1) % n];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    (a * 0.5).abs()
+}
+
+/// Average of a loop's points.
+fn centroid(poly: &[[f64; 2]]) -> [f64; 2] {
+    if poly.is_empty() {
+        return [0.0, 0.0];
+    }
+    let (mut x, mut y) = (0.0, 0.0);
+    for p in poly {
+        x += p[0];
+        y += p[1];
+    }
+    [x / poly.len() as f64, y / poly.len() as f64]
+}
+
+/// Even-odd ray-cast point-in-polygon test.
+pub fn point_in_poly(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (poly[i][0], poly[i][1]);
+        let (xj, yj) = (poly[j][0], poly[j][1]);
+        if ((yi > p[1]) != (yj > p[1])) && (p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +568,37 @@ mod tests {
             let d = ((p[0] - 1.0).powi(2) + (p[1] - 1.0).powi(2)).sqrt();
             assert!((d - 2.0).abs() < 1e-9, "radius was {d}");
         }
+    }
+
+    fn add_rect(s: &mut Sketch, x0: f64, y0: f64, x1: f64, y1: f64) {
+        let p0 = s.add_point(x0, y0);
+        let p1 = s.add_point(x1, y0);
+        let p2 = s.add_point(x1, y1);
+        let p3 = s.add_point(x0, y1);
+        s.add_line(p0, p1, false);
+        s.add_line(p1, p2, false);
+        s.add_line(p2, p3, false);
+        s.add_line(p3, p0, false);
+    }
+
+    #[test]
+    fn nested_loops_become_a_region_with_a_hole() {
+        let mut s = Sketch::default();
+        add_rect(&mut s, 0.0, 0.0, 10.0, 10.0); // outer
+        add_rect(&mut s, 3.0, 3.0, 7.0, 7.0); // inner → hole
+        let regions = s.regions();
+        assert_eq!(regions.len(), 1, "one region");
+        assert_eq!(regions[0].holes.len(), 1, "with one hole");
+    }
+
+    #[test]
+    fn two_separate_rectangles_are_two_regions() {
+        let mut s = Sketch::default();
+        add_rect(&mut s, 0.0, 0.0, 2.0, 2.0);
+        add_rect(&mut s, 5.0, 0.0, 7.0, 2.0);
+        let regions = s.regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions.iter().all(|r| r.holes.is_empty()));
     }
 
     #[test]
