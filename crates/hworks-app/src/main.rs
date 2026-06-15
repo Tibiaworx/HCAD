@@ -248,9 +248,10 @@ struct SketchSession {
     pending: Option<Vec2>,
     /// First point picked by the Dimension tool (point index).
     dim_first: Option<usize>,
-    /// Time and position of the last left-click, for double-click detection.
-    last_click_time: f32,
-    last_click_uv: Option<Vec2>,
+    /// Live dimension input while drawing (length for a line, radius for a circle).
+    live_buf: f32,
+    /// Request keyboard focus on the live-input field (set when a draw starts).
+    request_live_focus: bool,
     drag: Option<usize>,
     dirty: bool,
     op_request: Option<SolidOp>,
@@ -603,6 +604,69 @@ fn ui_system(
         } else if in_sketch {
             // Sketch panel: edit dimensions / relations, then Apply to re-solve.
             ui.heading("Sketch");
+
+            // Live dimension entry while drawing a line/circle.
+            if let Some(start) = session.pending {
+                let live = session.cursor_uv.map(|c| (c - start).length()).unwrap_or(0.0);
+                let mut focus_now = session.request_live_focus;
+                match session.tool {
+                    Tool::Line => {
+                        ui.label(egui::RichText::new("Line length").strong());
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::DragValue::new(&mut session.live_buf).speed(0.05).range(0.0..=10_000.0).suffix(" mm"),
+                            );
+                            if focus_now {
+                                resp.request_focus();
+                                focus_now = false;
+                            }
+                            if !resp.has_focus() {
+                                session.live_buf = live;
+                            }
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let len = session.live_buf;
+                                commit_line_length(&mut session, len);
+                            }
+                        });
+                        ui.label(egui::RichText::new("type a length + Enter, or click the end point").italics().weak());
+                        ui.separator();
+                    }
+                    Tool::Circle => {
+                        ui.label(egui::RichText::new("Circle radius").strong());
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::DragValue::new(&mut session.live_buf).speed(0.05).range(0.01..=10_000.0).suffix(" mm"),
+                            );
+                            if focus_now {
+                                resp.request_focus();
+                                focus_now = false;
+                            }
+                            if !resp.has_focus() {
+                                session.live_buf = live;
+                            }
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let r = session.live_buf;
+                                commit_circle_radius(&mut session, r);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(format!("circumference {:.1} mm", std::f32::consts::TAU * session.live_buf))
+                                .weak(),
+                        );
+                        ui.separator();
+                    }
+                    Tool::Rectangle => {
+                        if let Some(cur) = session.cursor_uv {
+                            let (w, h) = ((cur.x - start.x).abs(), (cur.y - start.y).abs());
+                            ui.label(egui::RichText::new(format!("Rectangle {w:.1} × {h:.1} mm")).strong());
+                            ui.separator();
+                        }
+                    }
+                    _ => {}
+                }
+                session.request_live_focus = focus_now;
+            }
+
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(session.needs_apply, egui::Button::new("Apply").fill(egui::Color32::from_rgb(40, 110, 70)))
@@ -629,7 +693,7 @@ fn ui_system(
                 .collect();
             if dims.is_empty() {
                 ui.label(
-                    egui::RichText::new("Dimension tool: click two points (or double-click a line).")
+                    egui::RichText::new("Dimension tool: click a line, or two points.")
                         .italics()
                         .weak(),
                 );
@@ -653,6 +717,35 @@ fn ui_system(
                         });
                     }
                 });
+                if changed {
+                    session.needs_apply = true;
+                }
+            }
+
+            // Circle radii (editable — a circle's radius is its dimension).
+            let circles: Vec<usize> = session
+                .sketch
+                .entities
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| matches!(e, SketchEntity::Circle { .. }).then_some(i))
+                .collect();
+            if !circles.is_empty() {
+                ui.label(egui::RichText::new("Circles").strong());
+                let mut changed = false;
+                for (k, i) in circles.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("C{}", k + 1));
+                        if let Some(SketchEntity::Circle { radius, .. }) = session.sketch.entities.get_mut(*i) {
+                            if ui
+                                .add(egui::DragValue::new(radius).speed(0.05).range(0.01..=10_000.0).prefix("R ").suffix(" mm"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+                }
                 if changed {
                     session.needs_apply = true;
                 }
@@ -1348,7 +1441,6 @@ fn highlight_face(
 fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
     blocking: Res<UiBlocking>,
-    time: Res<Time>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
     doc: Res<DocRes>,
@@ -1370,21 +1462,6 @@ fn sketch_interaction(
     let just_pressed = buttons.just_pressed(MouseButton::Left);
     let pressed = buttons.pressed(MouseButton::Left);
     let just_released = buttons.just_released(MouseButton::Left);
-
-    // Double-click detection (within 0.4s and close to the previous click).
-    let mut double_click = false;
-    if just_pressed {
-        let now = time.elapsed_secs();
-        if now - session.last_click_time < 0.4 {
-            if let (Some(prev), Some(cur)) = (session.last_click_uv, active_uv) {
-                if prev.distance(cur) < SNAP * 2.0 {
-                    double_click = true;
-                }
-            }
-        }
-        session.last_click_time = now;
-        session.last_click_uv = active_uv;
-    }
 
     if session.plane.is_none() {
         if just_pressed {
@@ -1488,20 +1565,20 @@ fn sketch_interaction(
             }
         }
         Tool::Dimension if just_pressed => {
-            // Double-click a line segment → dimension its length directly.
-            if double_click {
-                if let Some((a, b)) = active_uv
-                    .and_then(|uv| nearest_entity(&session.sketch, uv, SNAP * 2.0))
-                    .and_then(|e| entity_line(&session.sketch, e))
+            if let Some(uv) = active_uv {
+                // Smart pick: a point starts/continues a point-to-point distance;
+                // clicking a line dimensions its length; a circle's radius is edited
+                // in the panel (all circles are listed there).
+                if let Some(p) = nearest_point(&session.sketch, uv, SNAP * 1.5) {
+                    match session.dim_first.take() {
+                        Some(first) if first != p => add_distance_dim(&mut session.sketch, first, p),
+                        _ => session.dim_first = Some(p),
+                    }
+                } else if let Some((a, b)) =
+                    nearest_entity(&session.sketch, uv, SNAP * 2.0).and_then(|e| entity_line(&session.sketch, e))
                 {
                     add_distance_dim(&mut session.sketch, a, b);
                     session.dim_first = None;
-                }
-            } else if let Some(p) = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP * 1.5)) {
-                // Otherwise click two existing points.
-                match session.dim_first.take() {
-                    Some(first) if first != p => add_distance_dim(&mut session.sketch, first, p),
-                    _ => session.dim_first = Some(p),
                 }
             }
         }
@@ -1512,6 +1589,32 @@ fn sketch_interaction(
         session.sketch.solve();
         session.dirty = false;
     }
+}
+
+/// Commit the in-progress line at an exact `length` (toward the current cursor),
+/// adding a locking distance dimension. Used by the live dimension input.
+fn commit_line_length(session: &mut SketchSession, length: f32) {
+    let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) else { return };
+    let mut dir = (cur - start).normalize_or_zero();
+    if dir == Vec2::ZERO {
+        dir = Vec2::X;
+    }
+    let end = start + dir * length;
+    let a = get_or_add_point(&mut session.sketch, start);
+    let b = get_or_add_point(&mut session.sketch, end);
+    session.sketch.add_line(a, b, session.construction);
+    session.sketch.constraints.push(Constraint::Distance { a, b, value: length as f64 });
+    session.pending = None;
+    session.dirty = true;
+}
+
+/// Commit the in-progress circle at an exact `radius`.
+fn commit_circle_radius(session: &mut SketchSession, radius: f32) {
+    let Some(center) = session.pending else { return };
+    let c = get_or_add_point(&mut session.sketch, center);
+    session.sketch.add_circle(c, radius.max(0.01) as f64);
+    session.pending = None;
+    session.dirty = true;
 }
 
 /// Add a distance dimension between two points at their current distance (no
@@ -1535,6 +1638,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 session.dirty = true;
             } else {
                 session.pending = Some(uv);
+                session.request_live_focus = true;
             }
         }
         Tool::Circle => {
@@ -1545,6 +1649,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 session.dirty = true;
             } else {
                 session.pending = Some(uv);
+                session.request_live_focus = true;
             }
         }
         Tool::Rectangle => {
