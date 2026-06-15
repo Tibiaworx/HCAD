@@ -260,6 +260,11 @@ struct SketchSession {
     selected_region: Option<usize>,
     /// Sketch entities selected (with the Select tool) for applying a constraint.
     selected_entities: Vec<usize>,
+    /// Snap/inference points for the entity currently under the cursor (line
+    /// midpoint, circle centre + quadrants). Recomputed each frame on hover.
+    inference_points: Vec<Vec2>,
+    /// User toggle to disable the snap/inference points.
+    hide_inference: bool,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -531,6 +536,14 @@ fn ui_system(
                         let con = session.construction;
                         if ui.selectable_label(con, "Construction").on_hover_text("Toggle construction geometry (X)").clicked() {
                             session.construction = !con;
+                        }
+                        let mut snap = !session.hide_inference;
+                        if ui
+                            .checkbox(&mut snap, "Snap pts")
+                            .on_hover_text("Show midpoint / circle centre + quadrant snap points on hover")
+                            .changed()
+                        {
+                            session.hide_inference = !snap;
                         }
                     });
                     if in_sketch {
@@ -1210,6 +1223,37 @@ fn nearest_entity(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
+/// Snap/inference points for an entity: a line's midpoint, or a circle's centre
+/// and four quadrant points. These let the user snap new geometry to centres.
+fn inference_points(sketch: &Sketch, i: usize) -> Vec<Vec2> {
+    let p = |j: usize| Vec2::new(sketch.points[j].x as f32, sketch.points[j].y as f32);
+    match sketch.entities.get(i) {
+        Some(SketchEntity::Line { a, b, .. }) => vec![(p(*a) + p(*b)) * 0.5],
+        Some(SketchEntity::Circle { center, radius }) => {
+            let c = p(*center);
+            let r = *radius as f32;
+            vec![
+                c,
+                c + Vec2::new(0.0, r),
+                c - Vec2::new(0.0, r),
+                c + Vec2::new(r, 0.0),
+                c - Vec2::new(r, 0.0),
+            ]
+        }
+        _ => vec![],
+    }
+}
+
+/// Snap `uv` to the nearest inference point within `thresh`, else return it.
+fn snap_to_inference(uv: Vec2, points: &[Vec2], thresh: f32) -> Vec2 {
+    points
+        .iter()
+        .copied()
+        .filter(|p| p.distance(uv) <= thresh)
+        .min_by(|a, b| a.distance(uv).total_cmp(&b.distance(uv)))
+        .unwrap_or(uv)
+}
+
 /// The endpoint indices of a line entity, if `i` is a line.
 fn entity_line(sketch: &Sketch, i: usize) -> Option<(usize, usize)> {
     match sketch.entities.get(i) {
@@ -1455,8 +1499,17 @@ fn sketch_interaction(
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
 
     let active_uv = session.plane.as_ref().and_then(|ap| ray_plane(ap, &ray).map(|(_, uv)| uv));
+
+    // Inference/snap points for the entity under the cursor (shown on hover).
+    session.inference_points.clear();
+    if session.plane.is_some() && !session.hide_inference {
+        if let Some(e) = active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, SNAP * 2.5)) {
+            session.inference_points = inference_points(&session.sketch, e);
+        }
+    }
+    // The working cursor snaps to an inference point when near one.
     if session.plane.is_some() {
-        session.cursor_uv = active_uv;
+        session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &session.inference_points, SNAP));
     }
 
     let just_pressed = buttons.just_pressed(MouseButton::Left);
@@ -1560,7 +1613,8 @@ fn sketch_interaction(
             }
         }
         Tool::Line | Tool::Circle | Tool::Rectangle if just_pressed => {
-            if let Some(uv) = active_uv {
+            // Use the snapped cursor so endpoints land on midpoints / quadrants / centres.
+            if let Some(uv) = session.cursor_uv {
                 place_point(&mut session, uv);
             }
         }
@@ -1617,10 +1671,17 @@ fn commit_circle_radius(session: &mut SketchSession, radius: f32) {
     session.dirty = true;
 }
 
-/// Add a distance dimension between two points at their current distance (no
-/// solve needed yet — the value matches reality until the user edits it).
+/// True if a distance dimension already exists between points `a` and `b`.
+fn has_distance(sketch: &Sketch, a: usize, b: usize) -> bool {
+    sketch.constraints.iter().any(|c| {
+        matches!(c, Constraint::Distance { a: x, b: y, .. } if (*x == a && *y == b) || (*x == b && *y == a))
+    })
+}
+
+/// Add a distance dimension between two points at their current distance — unless
+/// one already exists for that pair (avoids over-driving the geometry).
 fn add_distance_dim(sketch: &mut Sketch, a: usize, b: usize) {
-    if a == b {
+    if a == b || has_distance(sketch, a, b) {
         return;
     }
     let (pa, pb) = (sketch.points[a], sketch.points[b]);
@@ -2350,6 +2411,14 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
             let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
             gizmos.circle(iso, 0.18, dim_col);
         }
+    }
+
+    // Inference/snap points (line midpoint, circle centre + quadrants) on hover.
+    let inf_col = Color::srgb(1.0, 0.9, 0.25);
+    for p in &session.inference_points {
+        let iso = Isometry3d::new(ap.to_world(*p), plane_rot);
+        gizmos.circle(iso, 0.1, inf_col);
+        draw_marker(&mut gizmos, ap, *p, inf_col);
     }
 
     // Snap indicator: ring the point the cursor would attach to.
