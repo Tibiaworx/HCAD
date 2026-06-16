@@ -968,32 +968,32 @@ fn ui_system(
                 session.needs_apply = true;
             }
         } else {
-            ui.heading("HCAD Part");
+            // ---- FeatureManager design tree (SolidWorks-style) ----
+            let nplanes = doc.0.features.iter().filter(|f| matches!(f.kind, FeatureKind::Plane(_))).count();
+            let rollback = doc.0.rollback;
 
-            // Rollback bar: replay only features[..rollback].
-            let n = doc.0.features.len();
-            if n > 0 {
-                let mut rb = doc.0.rollback.min(n);
-                ui.horizontal(|ui| {
-                    ui.label("Rollback");
-                    if ui.add(egui::Slider::new(&mut rb, 0..=n)).changed() {
-                        doc.0.rollback = rb;
-                        ui_state.regen = true;
-                    }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("⬡ Part").strong().size(15.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let shown = rollback.saturating_sub(nplanes);
+                    let total = doc.0.features.len().saturating_sub(nplanes);
+                    ui.label(egui::RichText::new(format!("{shown} / {total}")).weak().small())
+                        .on_hover_text("Active features (drag the blue rollback bar to change)");
                 });
-            }
+            });
             ui.separator();
 
-            // Hierarchical feature tree. Right-click a node for edit/extrude/delete.
-            let rollback = doc.0.rollback;
             let mut action: Option<TreeAction> = None;
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                // Reference planes, tucked into one collapsible group.
-                egui::CollapsingHeader::new("Reference Planes").default_open(false).show(ui, |ui| {
-                    for (_id, p) in doc.0.planes() {
-                        ui.label(egui::RichText::new(&p.name).weak());
-                    }
-                });
+            // Rows of solid features, with their on-screen rects, for the rollback bar.
+            let mut feat_rows: Vec<(usize, egui::Rect)> = Vec::new();
+
+            egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                // Datum planes + origin, shown flat at the top like SolidWorks.
+                for (_id, p) in doc.0.planes() {
+                    ui.label(egui::RichText::new(format!("▱  {} Plane", p.name)).weak());
+                }
+                ui.label(egui::RichText::new("⊕  Origin").weak());
+                ui.add_space(3.0);
 
                 let (mut sk, mut ex, mut ct) = (0u32, 0u32, 0u32);
                 for (i, f) in doc.0.features.iter().enumerate() {
@@ -1010,11 +1010,11 @@ fn ui_system(
                         rt
                     };
 
-                    match &f.kind {
+                    let row = match &f.kind {
                         FeatureKind::Plane(_) => continue,
                         FeatureKind::Sketch { .. } => {
                             sk += 1;
-                            let resp = ui.selectable_label(selected, styled(format!("Sketch{sk}")));
+                            let resp = ui.selectable_label(selected, styled(format!("✎ Sketch{sk}")));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -1036,23 +1036,23 @@ fn ui_system(
                                     ui.close();
                                 }
                             });
+                            resp.rect
                         }
                         FeatureKind::Extrude { distance, .. } | FeatureKind::Cut { distance, .. } => {
-                            let (label, child) = match &f.kind {
+                            let (label, child, icon) = match &f.kind {
                                 FeatureKind::Extrude { .. } => {
                                     ex += 1;
-                                    (format!("Extrude{ex}  (h={distance:.1})"), format!("Sketch of Extrude{ex}"))
+                                    (format!("Boss-Extrude{ex}  (h {distance:.1})"), format!("✎ Sketch of Extrude{ex}"), "⬢")
                                 }
                                 _ => {
                                     ct += 1;
-                                    (format!("Cut{ct}  (h={distance:.1})"), format!("Sketch of Cut{ct}"))
+                                    (format!("Cut-Extrude{ct}  (h {distance:.1})"), format!("✎ Sketch of Cut{ct}"), "⬣")
                                 }
                             };
-                            let resp = egui::CollapsingHeader::new(styled(label))
+                            let resp = egui::CollapsingHeader::new(styled(format!("{icon} {label}")))
                                 .id_salt(i)
                                 .default_open(false)
                                 .show(ui, |ui| {
-                                    // The nested sketch has its OWN right-click menu.
                                     let child_resp =
                                         ui.selectable_label(false, egui::RichText::new(child).weak());
                                     child_resp.context_menu(|ui| {
@@ -1065,7 +1065,6 @@ fn ui_system(
                             if resp.header_response.clicked() {
                                 ui_state.selected = Some(i);
                             }
-                            // Feature (header) menu — distinct from the sketch menu above.
                             resp.header_response.context_menu(|ui| {
                                 if ui.button("Edit feature (depth)").clicked() {
                                     action = Some(TreeAction::Select(i));
@@ -1076,6 +1075,39 @@ fn ui_system(
                                     ui.close();
                                 }
                             });
+                            resp.header_response.rect
+                        }
+                    };
+                    feat_rows.push((i, row));
+                }
+
+                // ---- Draggable rollback bar, in the tree (SolidWorks-style) ----
+                if !feat_rows.is_empty() {
+                    let bar_y = match feat_rows.iter().filter(|(d, _)| *d < rollback).last() {
+                        Some((_, last)) => last.bottom() + 2.0,
+                        None => feat_rows[0].1.top() - 2.0,
+                    };
+                    let x = ui.max_rect().x_range();
+                    let bar_rect = egui::Rect::from_x_y_ranges(x.clone(), (bar_y - 3.0)..=(bar_y + 3.0));
+                    let resp = ui.interact(bar_rect, ui.id().with("rollback_bar"), egui::Sense::drag());
+                    let col = egui::Color32::from_rgb(70, 140, 220);
+                    ui.painter().hline(x, bar_y, egui::Stroke::new(2.0, col));
+                    ui.painter().circle_filled(egui::pos2(bar_rect.left() + 7.0, bar_y), 4.0, col);
+                    if resp.hovered() || resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if resp.dragged() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let mut new_rb = nplanes; // keep datum planes; suppress all solids
+                            for (d, rect) in &feat_rows {
+                                if rect.center().y < pos.y {
+                                    new_rb = d + 1;
+                                }
+                            }
+                            if new_rb != doc.0.rollback {
+                                doc.0.rollback = new_rb;
+                                ui_state.regen = true;
+                            }
                         }
                     }
                 }
@@ -2337,7 +2369,11 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
             FeatureKind::Sketch { .. } => {} // 2D only — no solid contribution
             FeatureKind::Extrude { sketch, regions, plane, distance } => {
                 let all = sketch.regions();
-                let basis = basis_from_ref(plane);
+                // A feature built on a face rides on that face: re-resolve its plane
+                // to the current body so stacked features build on each other and
+                // shift when an upstream feature is edited.
+                let resolved = match &body { Some(b) => reproject_plane(plane, b), None => plane.clone() };
+                let basis = basis_from_ref(&resolved);
                 // Boss each selected contour (empty ⇒ all), unioning into the body.
                 for r in chosen_regions(&all, regions) {
                     let next = match &body {
@@ -2352,19 +2388,18 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                 }
             }
             FeatureKind::Cut { sketch, regions, plane, distance } => {
-                if body.is_none() {
-                    continue;
-                }
+                let Some(b0) = &body else { continue };
                 let all = sketch.regions();
-                let basis = basis_from_ref(plane);
+                let resolved = reproject_plane(plane, b0);
+                let basis = basis_from_ref(&resolved);
+                let origin = Vec3::new(resolved.origin[0] as f32, resolved.origin[1] as f32, resolved.origin[2] as f32);
+                let n = Vec3::new(resolved.normal[0] as f32, resolved.normal[1] as f32, resolved.normal[2] as f32);
                 // Cut each selected contour (empty ⇒ all) from the current body.
                 for r in chosen_regions(&all, regions) {
                     let Some(b) = &body else { break };
                     // Pick the cut direction from the *current* body, so it stays
                     // correct even after upstream edits move things around.
                     let centroid = mesh_centroid(&tessellate(b, 0.06).mesh);
-                    let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
-                    let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
                     let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
                     if let Some(s) = cut_op(b, r, &basis, signed) {
                         body = Some(s);
@@ -2421,6 +2456,31 @@ fn do_regenerate(
 /// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
 fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
     PlaneBasis { origin: p.origin, u: p.u, v: p.v, normal: p.normal }
+}
+
+/// Re-resolve a face-built feature's plane against the current body: keep its
+/// in-plane location and axes, but slide the origin along the normal onto the body's
+/// extreme face in that direction (the "top" the sketch sits on). This is what lets
+/// stacked features build on each other — when an upstream feature's height changes,
+/// downstream features ride up/down with the face instead of being left behind.
+///
+/// Limitation: it targets the *outermost* coplanar face along the normal, so a
+/// feature sketched on a recessed/stepped face of the same orientation can resolve
+/// to the wrong one. Robust topological naming (DESIGN.md §4.3) is the eventual fix.
+fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
+    let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+    let mesh = tessellate(body, 0.2).mesh;
+    if mesh.positions.is_empty() {
+        return plane.clone();
+    }
+    let max_proj = mesh
+        .positions
+        .iter()
+        .map(|p| Vec3::from_array(*p).dot(n))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let shifted = o + n * (max_proj - o.dot(n));
+    PlaneRef { origin: [shifted.x as f64, shifted.y as f64, shifted.z as f64], ..plane.clone() }
 }
 
 /// Resolve the selected-contour indices against a sketch's regions. An empty
@@ -3245,6 +3305,25 @@ mod tests {
         let h6 = height(&regenerate(&doc).unwrap());
         assert!((h2 - 2.0).abs() < 0.1, "h2 was {h2}");
         assert!((h6 - 6.0).abs() < 0.1, "h6 was {h6}");
+    }
+
+    #[test]
+    fn editing_an_upstream_height_shifts_stacked_features() {
+        let mut doc = Document::with_default_planes();
+        // Base box 4×4×2 on XY.
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0 });
+        // Boss 2×2 sketched on the top face (z=2), 2 tall → stacked total height 4.
+        let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: top, distance: 2.0 });
+        let before = height(&regenerate(&doc).unwrap());
+        assert!((before - 4.0).abs() < 0.2, "stacked height should be 4, was {before}");
+        // Grow the base to 5 tall — the boss must ride up to z=5..7 (total 7), not
+        // stay at z=2..4 (which would leave the base poking through it).
+        if let FeatureKind::Extrude { distance, .. } = &mut doc.features[3].kind {
+            *distance = 5.0;
+        }
+        let after = height(&regenerate(&doc).unwrap());
+        assert!((after - 7.0).abs() < 0.3, "boss should ride up to total 7, was {after}");
     }
 
     #[test]
