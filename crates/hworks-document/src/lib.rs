@@ -48,13 +48,14 @@ pub struct PlaneRef {
 pub enum FeatureKind {
     Plane(Plane),
     /// A standalone sketch on a plane/face that hasn't been extruded yet. Kept in
-    /// the timeline so you can return to it. `region` is re-resolved from the
+    /// the timeline so you can return to it. Its regions are re-resolved from the
     /// sketch at regenerate time, so editing the sketch updates downstream.
     Sketch { sketch: Sketch, plane: PlaneRef },
-    /// Boss extrude: add material by sweeping region `region` of `sketch`.
-    Extrude { sketch: Sketch, region: usize, plane: PlaneRef, distance: f64 },
-    /// Cut: subtract a swept region from the body.
-    Cut { sketch: Sketch, region: usize, plane: PlaneRef, distance: f64 },
+    /// Boss extrude: add material by sweeping the chosen `regions` (the "Selected
+    /// Contours") of `sketch`. An empty list means "all closed regions".
+    Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
+    /// Cut: subtract the chosen swept `regions` from the body (empty = all).
+    Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
     // Revolve / Fillet / … arrive at M8+.
 }
 

@@ -73,7 +73,60 @@ pub fn extrude_solid_with_overlap(
 
 /// Boolean union of two solids (boss added to an existing body).
 pub fn union(a: &KSolid, b: &KSolid) -> Option<KSolid> {
-    truck_shapeops::or(&a.0, &b.0, TOL).map(KSolid)
+    union_tol(a, b, TOL)
+}
+
+/// Boolean union at a caller-chosen tolerance. A smaller tolerance makes the kernel
+/// treat near-coincident faces as distinct, so a *sub-micron* boss inflation is
+/// enough to dodge the coincident-face boolean failure — keeping the result exact
+/// to well within tessellation/manufacturing precision.
+pub fn union_tol(a: &KSolid, b: &KSolid, tol: f64) -> Option<KSolid> {
+    guard(|| truck_shapeops::or(&a.0, &b.0, tol)).map(KSolid)
+}
+
+/// Run a kernel operation that may *panic* (truck asserts internally — e.g. "this
+/// wire is not simple" on degenerate input) and turn that panic into `None` so a
+/// single bad contour can't bring the whole app down.
+fn guard<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(None)
+}
+
+/// Sanitize a polygon loop so truck accepts it as a *simple* wire: drop
+/// (near-)duplicate consecutive vertices and antenna spikes (a vertex whose
+/// neighbours coincide — a zero-area backtrack). Both produce zero-length or
+/// self-touching wire edges, which make the kernel panic.
+fn clean_loop(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    const TOL: f64 = 1e-4;
+    let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < TOL && (a[1] - b[1]).abs() < TOL;
+
+    // Pass 1: remove consecutive duplicates (and the wrap-around duplicate).
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(pts.len());
+    for &p in pts {
+        if out.last().map_or(true, |&q| !close(p, q)) {
+            out.push(p);
+        }
+    }
+    while out.len() >= 2 && close(out[0], *out.last().unwrap()) {
+        out.pop();
+    }
+
+    // Pass 2: remove antenna spikes (prev ≈ next), restarting after each removal.
+    let mut changed = true;
+    while changed && out.len() >= 3 {
+        changed = false;
+        let m = out.len();
+        for i in 0..m {
+            if close(out[(i + m - 1) % m], out[(i + 1) % m]) {
+                let mut idx = [i, (i + 1) % m];
+                idx.sort_unstable();
+                out.remove(idx[1]);
+                out.remove(idx[0]);
+                changed = true;
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Boolean cut: subtract a swept region from `base`.
@@ -90,6 +143,20 @@ pub fn cut(
     basis: &PlaneBasis,
     distance: f64,
 ) -> Option<KSolid> {
+    cut_tol(base, outer, holes, basis, distance, TOL)
+}
+
+/// Boolean cut at a caller-chosen tolerance — the cut equivalent of [`union_tol`],
+/// so a cut whose wall coincides with an existing face can be completed with a
+/// sub-micron tool nudge instead of failing.
+pub fn cut_tol(
+    base: &KSolid,
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    distance: f64,
+    tol: f64,
+) -> Option<KSolid> {
     let depth = distance.abs();
     if depth < 1e-9 {
         return None;
@@ -101,8 +168,11 @@ pub fn cut(
         (-(depth + eps), depth + 2.0 * eps)
     };
     let mut tool = build_solid(outer, holes, basis, start_offset, length)?;
-    tool.not(); // invert all faces → complement region
-    truck_shapeops::and(&base.0, &tool, TOL).map(KSolid)
+    guard(move || {
+        tool.not(); // invert all faces → complement region
+        truck_shapeops::and(&base.0, &tool, tol)
+    })
+    .map(KSolid)
 }
 
 /// Signed area of a 2D polygon (positive ⇒ counter-clockwise).
@@ -149,38 +219,45 @@ fn build_solid(
     start_offset: f64,
     length: f64,
 ) -> Option<truck_modeling::Solid> {
+    // Sanitize the loops first so degenerate contours can't panic the kernel.
+    let outer = clean_loop(outer);
     if outer.len() < 3 || length.abs() < 1e-9 {
         return None;
     }
+    let holes: Vec<Vec<[f64; 2]>> =
+        holes.iter().map(|h| clean_loop(h)).filter(|h| h.len() >= 3).collect();
+
     let origin = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
     let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
     let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
     let n = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
     let base = origin + n * start_offset;
 
-    let to_p3 = |uv: &[f64; 2]| {
-        let p = base + u * uv[0] + v * uv[1];
-        Point3::new(p.x, p.y, p.z)
-    };
-    let make_wire = |loop_pts: &[[f64; 2]]| {
-        let verts: Vec<_> = loop_pts.iter().map(|uv| builder::vertex(to_p3(uv))).collect();
-        let np = verts.len();
-        let mut w = truck_modeling::Wire::new();
-        for i in 0..np {
-            w.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
-        }
-        w
-    };
+    // Wire/face/sweep construction can still panic on geometry truck dislikes, so
+    // run it under the guard and surface failures as `None`.
+    guard(move || {
+        let to_p3 = |uv: &[f64; 2]| {
+            let p = base + u * uv[0] + v * uv[1];
+            Point3::new(p.x, p.y, p.z)
+        };
+        let make_wire = |loop_pts: &[[f64; 2]]| {
+            let verts: Vec<_> = loop_pts.iter().map(|uv| builder::vertex(to_p3(uv))).collect();
+            let np = verts.len();
+            let mut w = truck_modeling::Wire::new();
+            for i in 0..np {
+                w.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
+            }
+            w
+        };
 
-    // Outer boundary CCW, holes CW (truck's convention for a face with holes).
-    let mut wires = vec![make_wire(&wound(outer, true))];
-    for h in holes {
-        if h.len() >= 3 {
+        // Outer boundary CCW, holes CW (truck's convention for a face with holes).
+        let mut wires = vec![make_wire(&wound(&outer, true))];
+        for h in &holes {
             wires.push(make_wire(&wound(h, false)));
         }
-    }
-    let face = builder::try_attach_plane(&wires).ok()?;
-    Some(builder::tsweep(&face, n * length))
+        let face = builder::try_attach_plane(&wires).ok()?;
+        Some(builder::tsweep(&face, n * length))
+    })
 }
 
 /// Convert a truck `PolygonMesh` into a flat-shaded [`TriMesh`] (per-triangle
@@ -288,6 +365,30 @@ mod tests {
             v: [0.0, 1.0, 0.0],
             normal: [0.0, 0.0, 1.0],
         }
+    }
+
+    #[test]
+    fn degenerate_contour_is_cleaned_not_crashed() {
+        // A loop with a duplicate vertex and an antenna spike — truck would panic
+        // ("wire is not simple") on this raw, but clean_loop fixes it to a square.
+        let pts = [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 0.0], // duplicate
+            [2.0, 2.0],
+            [1.0, 3.0], // spike tip
+            [2.0, 2.0], // back — spike
+            [0.0, 2.0],
+        ];
+        let solid = extrude_solid(&pts, &[], &xy_plane(), 1.0).expect("cleaned square extrudes");
+        // Cleaned to a 4-edge square prism → 12 feature edges.
+        assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
+    }
+
+    #[test]
+    fn clean_loop_removes_spikes_and_duplicates() {
+        let pts = [[0.0, 0.0], [2.0, 0.0], [2.0, 0.0], [2.0, 2.0], [1.0, 3.0], [2.0, 2.0], [0.0, 2.0]];
+        assert_eq!(clean_loop(&pts).len(), 4, "should reduce to a clean quad");
     }
 
     #[test]

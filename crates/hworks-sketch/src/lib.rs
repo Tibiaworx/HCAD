@@ -247,16 +247,19 @@ impl Sketch {
         contours
     }
 
-    /// Group the contours into closed regions, nesting inner loops as holes
-    /// (one level deep). A rectangle with a circle inside it becomes one region
-    /// whose outer is the rectangle and whose hole is the circle.
+    /// The selectable closed regions of the sketch — its "contours".
+    ///
+    /// Built from the **planar arrangement** of all non-construction geometry: every
+    /// curve is tessellated to straight segments, split at every intersection, and
+    /// the bounded minimal faces are traced. So a circle cut by two lines yields the
+    /// pie slice *and* the remainder as separate, individually-selectable regions.
+    /// Disconnected inner loops are then nested as holes by even/odd containment
+    /// (a rectangle with a separate circle inside becomes one region with a hole).
     pub fn regions(&self) -> Vec<Region> {
-        let contours = self.contours();
+        let contours = self.arrangement_faces();
         let n = contours.len();
         let areas: Vec<f64> = contours.iter().map(|c| area(c)).collect();
         // `j` contains `i` if it's bigger and `i`'s centroid falls inside it.
-        // (The area test matters: an outer loop's centroid can land inside its
-        // own hole, which would fool a centroid-only test.)
         let contains = |j: usize, i: usize| {
             j != i && areas[j] > areas[i] && point_in_poly(centroid(&contours[i]), &contours[j])
         };
@@ -265,16 +268,49 @@ impl Sketch {
 
         let mut regions = Vec::new();
         for i in 0..n {
-            if depth[i] != 0 {
-                continue; // not an outer boundary
+            if depth[i] % 2 != 0 {
+                continue; // odd nesting depth ⇒ this face is a hole, not a solid
             }
             let holes = (0..n)
-                .filter(|&k| depth[k] == 1 && contains(i, k))
+                .filter(|&k| depth[k] == depth[i] + 1 && contains(i, k))
                 .map(|k| contours[k].clone())
                 .collect();
             regions.push(Region { outer: contours[i].clone(), holes });
         }
         regions
+    }
+
+    /// Tessellate all non-construction geometry to straight segments, split them at
+    /// every intersection, and trace the bounded minimal faces of the resulting
+    /// planar arrangement. Each face is a simple polygon wound counter-clockwise.
+    fn arrangement_faces(&self) -> Vec<Vec<[f64; 2]>> {
+        let mut segs: Vec<([f64; 2], [f64; 2])> = Vec::new();
+        for e in &self.entities {
+            match e {
+                SketchEntity::Line { a, b, construction: false } => {
+                    if let (Some(pa), Some(pb)) = (self.points.get(*a), self.points.get(*b)) {
+                        segs.push(([pa.x, pa.y], [pb.x, pb.y]));
+                    }
+                }
+                SketchEntity::Circle { center, radius } => {
+                    if let Some(c) = self.points.get(*center) {
+                        const SEG: usize = 64;
+                        let mut prev = [c.x + radius, c.y];
+                        for k in 1..=SEG {
+                            let ang = std::f64::consts::TAU * k as f64 / SEG as f64;
+                            let p = [c.x + radius * ang.cos(), c.y + radius * ang.sin()];
+                            segs.push((prev, p));
+                            prev = p;
+                        }
+                    }
+                }
+                SketchEntity::Line { .. } | SketchEntity::Point { .. } => {}
+            }
+        }
+        if segs.len() < 3 {
+            return Vec::new();
+        }
+        trace_minimal_faces(&split_at_intersections(&segs))
     }
 }
 
@@ -304,6 +340,156 @@ fn centroid(poly: &[[f64; 2]]) -> [f64; 2] {
         y += p[1];
     }
     [x / poly.len() as f64, y / poly.len() as f64]
+}
+
+/// Signed area of a 2D polygon (positive ⇒ counter-clockwise winding).
+fn signed_area(poly: &[[f64; 2]]) -> f64 {
+    let n = poly.len();
+    let mut a = 0.0;
+    for i in 0..n {
+        let p = poly[i];
+        let q = poly[(i + 1) % n];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    a * 0.5
+}
+
+/// Linear interpolation between two 2D points.
+fn lerp2(a: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+}
+
+/// Distance between two 2D points.
+fn dist2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+/// If segment p1→p2 meets segment p3→p4 at a single point, return the parameter
+/// t ∈ [0,1] of that point along p1→p2. Parallel/collinear segments give `None`.
+fn intersect_param(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> Option<f64> {
+    let (rx, ry) = (p2[0] - p1[0], p2[1] - p1[1]);
+    let (sx, sy) = (p4[0] - p3[0], p4[1] - p3[1]);
+    let denom = rx * sy - ry * sx;
+    if denom.abs() < 1e-12 {
+        return None; // parallel or collinear
+    }
+    let (qx, qy) = (p3[0] - p1[0], p3[1] - p1[1]);
+    let t = (qx * sy - qy * sx) / denom;
+    let u = (qx * ry - qy * rx) / denom;
+    let eps = 1e-9;
+    ((-eps..=1.0 + eps).contains(&t) && (-eps..=1.0 + eps).contains(&u)).then(|| t.clamp(0.0, 1.0))
+}
+
+/// Split every segment at all its intersections with the others, so the result is
+/// a planar set of segments that only meet at shared endpoints.
+fn split_at_intersections(segs: &[([f64; 2], [f64; 2])]) -> Vec<([f64; 2], [f64; 2])> {
+    let mut out = Vec::new();
+    for (i, (a, b)) in segs.iter().enumerate() {
+        let mut ts = vec![0.0, 1.0];
+        for (j, (c, d)) in segs.iter().enumerate() {
+            if i != j {
+                if let Some(t) = intersect_param(*a, *b, *c, *d) {
+                    ts.push(t);
+                }
+            }
+        }
+        ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let mut prev = ts[0];
+        for &t in &ts[1..] {
+            if t - prev > 1e-7 {
+                let (p, q) = (lerp2(*a, *b, prev), lerp2(*a, *b, t));
+                if dist2(p, q) > 1e-7 {
+                    out.push((p, q));
+                }
+                prev = t;
+            }
+        }
+    }
+    out
+}
+
+/// Trace the bounded minimal faces of a planar arrangement of (already split)
+/// segments. Each face is returned as a simple CCW polygon; the unbounded face is
+/// discarded. This is what lets the user pick the individual closed areas formed
+/// by intersecting sketch geometry.
+fn trace_minimal_faces(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
+    use std::collections::{HashMap, HashSet};
+    let key = |p: [f64; 2]| ((p[0] * 1.0e6).round() as i64, (p[1] * 1.0e6).round() as i64);
+    let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut pos: Vec<[f64; 2]> = Vec::new();
+
+    // Build directed half-edges (both directions of each undirected edge).
+    let (mut he_from, mut he_to): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for (a, b) in segs {
+        let va = *ids.entry(key(*a)).or_insert_with(|| {
+            pos.push(*a);
+            pos.len() - 1
+        });
+        let vb = *ids.entry(key(*b)).or_insert_with(|| {
+            pos.push(*b);
+            pos.len() - 1
+        });
+        if va == vb {
+            continue;
+        }
+        for (u, v) in [(va, vb), (vb, va)] {
+            if seen.insert((u, v)) {
+                he_from.push(u);
+                he_to.push(v);
+            }
+        }
+    }
+    let nhe = he_from.len();
+    if nhe == 0 {
+        return Vec::new();
+    }
+
+    let angle = |h: usize| {
+        let (f, t) = (pos[he_from[h]], pos[he_to[h]]);
+        (t[1] - f[1]).atan2(t[0] - f[0])
+    };
+    // Outgoing half-edges per vertex, sorted by angle; plus a twin lookup.
+    let mut out_he: Vec<Vec<usize>> = vec![Vec::new(); pos.len()];
+    let mut twin: HashMap<(usize, usize), usize> = HashMap::new();
+    for h in 0..nhe {
+        out_he[he_from[h]].push(h);
+        twin.insert((he_from[h], he_to[h]), h);
+    }
+    for v in 0..pos.len() {
+        out_he[v].sort_by(|&x, &y| angle(x).partial_cmp(&angle(y)).unwrap());
+    }
+    // next(h): arriving at h's target, take the outgoing edge immediately clockwise
+    // of the twin — which traces each bounded face counter-clockwise.
+    let next_of = |h: usize| -> usize {
+        let v = he_to[h];
+        let tw = twin[&(v, he_from[h])];
+        let ring = &out_he[v];
+        let idx = ring.iter().position(|&x| x == tw).unwrap();
+        ring[(idx + ring.len() - 1) % ring.len()]
+    };
+
+    let mut visited = vec![false; nhe];
+    let mut faces = Vec::new();
+    for start in 0..nhe {
+        if visited[start] {
+            continue;
+        }
+        let mut cycle = Vec::new();
+        let mut h = start;
+        loop {
+            visited[h] = true;
+            cycle.push(pos[he_from[h]]);
+            h = next_of(h);
+            if h == start || cycle.len() > nhe + 1 {
+                break;
+            }
+        }
+        if cycle.len() >= 3 && signed_area(&cycle) > 1e-9 {
+            faces.push(cycle); // bounded (CCW) face; the outer face is CW → dropped
+        }
+    }
+    faces
 }
 
 /// Even-odd ray-cast point-in-polygon test.
@@ -684,6 +870,51 @@ mod tests {
         let regions = s.regions();
         assert_eq!(regions.len(), 2);
         assert!(regions.iter().all(|r| r.holes.is_empty()));
+    }
+
+    #[test]
+    fn a_diagonal_splits_a_rectangle_into_two_triangles() {
+        let mut s = Sketch::default();
+        add_rect(&mut s, 0.0, 0.0, 4.0, 4.0);
+        let a = s.add_point(0.0, 0.0); // coincides with a corner → same arrangement vertex
+        let b = s.add_point(4.0, 4.0);
+        s.add_line(a, b, false);
+        let regions = s.regions();
+        assert_eq!(regions.len(), 2, "a diagonal cuts the square into two regions");
+        assert!(regions.iter().all(|r| r.holes.is_empty()));
+        // Each triangle is half the 16-unit square.
+        for r in &regions {
+            assert!((area(&r.outer) - 8.0).abs() < 1e-6, "triangle area {}", area(&r.outer));
+        }
+    }
+
+    #[test]
+    fn a_chord_splits_a_circle_into_two_regions() {
+        let mut s = Sketch::default();
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 2.0);
+        let a = s.add_point(-3.0, 0.5); // horizontal chord crossing the disk
+        let b = s.add_point(3.0, 0.5);
+        s.add_line(a, b, false);
+        assert_eq!(s.regions().len(), 2, "a chord cuts the disk into two areas");
+    }
+
+    #[test]
+    fn two_radii_carve_a_quarter_pie_from_a_circle() {
+        let mut s = Sketch::default();
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 2.0);
+        // Two radii from the centre out past the rim → a quarter pie + the rest.
+        let center = s.add_point(0.0, 0.0);
+        let rx = s.add_point(3.0, 0.0);
+        let ry = s.add_point(0.0, 3.0);
+        s.add_line(center, rx, false);
+        s.add_line(center, ry, false);
+        let regions = s.regions();
+        assert_eq!(regions.len(), 2, "two radii split the disk into a pie slice and the rest");
+        let smallest = regions.iter().map(|r| area(&r.outer)).fold(f64::INFINITY, f64::min);
+        let quarter = std::f64::consts::PI * 2.0 * 2.0 / 4.0; // πr²/4 with r=2
+        assert!((smallest - quarter).abs() < 0.3, "pie area {smallest}, expected ~{quarter}");
     }
 
     #[test]

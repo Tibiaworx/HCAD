@@ -4,6 +4,10 @@
 *.pdb
 Cargo.lock
 
+# Runtime logs
+run.log
+*.log
+
 # Editor / OS
 .vscode/
 .idea/
