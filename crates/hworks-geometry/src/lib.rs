@@ -34,10 +34,13 @@ pub struct PlaneBasis {
 #[derive(Clone)]
 pub struct KSolid(truck_modeling::Solid);
 
-/// A render-ready tessellation: triangle mesh + feature/boundary edges.
+/// A render-ready tessellation: triangle mesh + feature/boundary edges, split into
+/// **sharp** edges (real corners — always drawn) and **tangent** edges (smooth
+/// curvature lines between near-coplanar faces — hidden by default, SolidWorks-style).
 pub struct Tessellation {
     pub mesh: TriMesh,
     pub edges: Vec<[[f32; 3]; 2]>,
+    pub tangent_edges: Vec<[[f32; 3]; 2]>,
 }
 
 /// Tolerance for boolean operations and tessellation.
@@ -196,13 +199,16 @@ fn wound(pts: &[[f64; 2]], ccw: bool) -> Vec<[f64; 2]> {
     v
 }
 
-/// Tessellate a solid into a flat-shaded mesh plus its feature/boundary edges.
+/// Tessellate a solid into a flat-shaded mesh plus its classified edges. Edges
+/// sharper than `SHARP_DEG` (real corners) are "sharp"; gentler ones (the facet
+/// lines of a curved surface, or a tangent blend) are "tangent".
 pub fn tessellate(solid: &KSolid, tol: f64) -> Tessellation {
+    const SHARP_DEG: f64 = 35.0;
     let mut poly = solid.0.triangulation(tol).to_polygon();
     poly.triangulate();
     let mesh = polymesh_to_trimesh(&poly);
-    let edges = feature_edges(&mesh, 18.0);
-    Tessellation { mesh, edges }
+    let (edges, tangent_edges) = feature_edges(&mesh, SHARP_DEG);
+    Tessellation { mesh, edges, tangent_edges }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,10 +297,13 @@ fn polymesh_to_trimesh(poly: &truck_polymesh::PolygonMesh) -> TriMesh {
     out
 }
 
-/// Extract the wireframe: every edge that is either a boundary (used by one
-/// triangle) or a feature edge (its two triangles meet at more than `min_angle`
-/// degrees). Coplanar interior edges are skipped, giving a clean outline.
-fn feature_edges(mesh: &TriMesh, min_angle_deg: f64) -> Vec<[[f32; 3]; 2]> {
+/// Extract the wireframe, classified. Returns `(sharp, tangent)`:
+/// - **sharp**: boundary edges, or edges whose faces meet at more than
+///   `sharp_deg` — the real corners of the model.
+/// - **tangent**: edges whose faces meet at a gentle angle (above a tiny flat
+///   threshold) — the curvature/facet lines of smooth surfaces and tangent blends.
+/// Exactly-coplanar interior edges are dropped from both.
+fn feature_edges(mesh: &TriMesh, sharp_deg: f64) -> (Vec<[[f32; 3]; 2]>, Vec<[[f32; 3]; 2]>) {
     use std::collections::HashMap;
     // Merge duplicated (flat-shaded) vertices by quantized position.
     let quant = |p: [f32; 3]| {
@@ -327,31 +336,34 @@ fn feature_edges(mesh: &TriMesh, min_angle_deg: f64) -> Vec<[[f32; 3]; 2]> {
         }
     }
 
-    let cos_thresh = min_angle_deg.to_radians().cos();
-    let mut out = Vec::new();
+    let cos_sharp = sharp_deg.to_radians().cos();
+    let cos_flat = 1.0_f64.to_radians().cos(); // below this angle ⇒ coplanar, drop
+    let mut sharp = Vec::new();
+    let mut tangent = Vec::new();
     for ((i, j), normals) in emap {
-        let keep = if normals.len() == 1 {
-            true // boundary edge
-        } else {
-            // sharp if any incident pair of faces differ by more than the angle
-            let mut sharp = false;
-            for a in 0..normals.len() {
-                for b in (a + 1)..normals.len() {
-                    let d = normals[a][0] * normals[b][0]
-                        + normals[a][1] * normals[b][1]
-                        + normals[a][2] * normals[b][2];
-                    if (d as f64) < cos_thresh {
-                        sharp = true;
-                    }
-                }
-            }
-            sharp
-        };
-        if keep {
-            out.push([canon_pos[i], canon_pos[j]]);
+        let edge = [canon_pos[i], canon_pos[j]];
+        if normals.len() == 1 {
+            sharp.push(edge); // boundary edge
+            continue;
         }
+        // The widest angle between any incident pair of faces = the smallest dot.
+        let mut min_dot = 1.0_f32;
+        for a in 0..normals.len() {
+            for b in (a + 1)..normals.len() {
+                let d = normals[a][0] * normals[b][0]
+                    + normals[a][1] * normals[b][1]
+                    + normals[a][2] * normals[b][2];
+                min_dot = min_dot.min(d);
+            }
+        }
+        let md = min_dot as f64;
+        if md < cos_sharp {
+            sharp.push(edge); // a real corner
+        } else if md < cos_flat {
+            tangent.push(edge); // smooth/curvature edge
+        } // else coplanar interior → drop
     }
-    out
+    (sharp, tangent)
 }
 
 #[cfg(test)]

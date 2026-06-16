@@ -21,12 +21,14 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    cut, cut_tol, extrude_solid, extrude_solid_with_overlap, tessellate, union, union_tol, KSolid,
+    cut, cut_tol, extrude_solid, extrude_solid_with_overlap, tessellate, union_tol, KSolid,
     PlaneBasis, Tessellation, TriMesh,
 };
 
-/// How far a boss reaches back into the body it's built on, so the union is robust.
-const BOSS_OVERLAP: f64 = 0.1;
+/// How far a boss reaches back into the body it's built on, so the union is robust
+/// without leaving a visible lip where the boss overhangs. Small (paired with the
+/// tight boolean tolerance) so it stays well under the tessellation tolerance.
+const BOSS_OVERLAP: f64 = 2.0e-3;
 use hworks_sketch::{point_in_poly, Constraint, Sketch, SketchEntity};
 
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
@@ -202,6 +204,8 @@ struct UiState {
     open_request: bool,
     /// Request to (re)open a feature's sketch for editing.
     edit_sketch_request: Option<usize>,
+    /// Show smooth/tangent edges in the viewport (off = SolidWorks-style removed).
+    show_tangent_edges: bool,
     /// Active CommandManager tab.
     active_tab: Tab,
     /// Tracks sketch-mode transitions so the tab can auto-switch.
@@ -231,6 +235,8 @@ struct Part {
     mesh: Option<TriMesh>,
     /// Body feature edges, drawn as an overlay (gizmos) so they can't z-fight.
     edges: Vec<[[f32; 3]; 2]>,
+    /// Smooth/tangent edges (curvature lines) — hidden unless the user shows them.
+    tangent_edges: Vec<[[f32; 3]; 2]>,
 }
 
 /// A picked model edge (or edge loop) in view mode: the ordered world-space
@@ -532,6 +538,9 @@ fn ui_system(
                 ui_state.save_request = true;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut ui_state.show_tangent_edges, "Tangent edges")
+                    .on_hover_text("Show smooth curvature edges (off = SolidWorks-style tangent edges removed)");
+                ui.separator();
                 if ui.button("Fit").on_hover_text("Zoom to fit").clicked() {
                     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
                         orbit.focus = Vec3::ZERO;
@@ -2340,6 +2349,7 @@ fn do_regenerate(
             let tess = tessellate(&solid, 0.03);
             part.mesh = Some(tess.mesh.clone());
             part.edges = tess.edges.clone();
+            part.tangent_edges = tess.tangent_edges.clone();
             spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
             part.solid = Some(solid);
         }
@@ -2347,6 +2357,7 @@ fn do_regenerate(
             part.solid = None;
             part.mesh = None;
             part.edges.clear();
+            part.tangent_edges.clear();
         }
     }
 }
@@ -2379,8 +2390,9 @@ const COINCIDENT_TOL: f64 = 1.0e-4;
 /// Add a boss (region `r`) to an existing body. The exact union is tried first; if
 /// it fails on coincident faces, retry with the imperceptible nudge above.
 fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
+    // Tight tolerance so the small flush overlap is still distinct from the face.
     if let Some(s) = extrude_solid_with_overlap(&r.outer, &r.holes, basis, distance, BOSS_OVERLAP)
-        .and_then(|boss| union(body, &boss))
+        .and_then(|boss| union_tol(body, &boss, COINCIDENT_TOL))
     {
         return Some(s);
     }
@@ -2501,16 +2513,25 @@ fn trimesh_to_bevy(t: TriMesh) -> Mesh {
 fn draw_body_edges(
     mut gizmos: Gizmos,
     part: Res<Part>,
+    ui_state: Res<UiState>,
     cam_q: Query<&GlobalTransform, With<Camera3d>>,
 ) {
     let Ok(cam) = cam_q.single() else { return };
     let cam_pos = cam.translation();
-    let col = Color::srgb(0.05, 0.05, 0.07);
     const TOWARD_CAM: f32 = 0.0025; // 0.25% of the way to the camera
+    let nudge = |p: Vec3| p + (cam_pos - p) * TOWARD_CAM;
+
+    // Sharp edges (real corners) always draw.
+    let col = Color::srgb(0.05, 0.05, 0.07);
     for e in &part.edges {
-        let a = Vec3::from_array(e[0]);
-        let b = Vec3::from_array(e[1]);
-        gizmos.line(a + (cam_pos - a) * TOWARD_CAM, b + (cam_pos - b) * TOWARD_CAM, col);
+        gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), col);
+    }
+    // Tangent/curvature edges only when the user asks (drawn lighter to read as soft).
+    if ui_state.show_tangent_edges {
+        let tcol = Color::srgb(0.45, 0.47, 0.52);
+        for e in &part.tangent_edges {
+            gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), tcol);
+        }
     }
 }
 
