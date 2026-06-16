@@ -379,6 +379,27 @@ mod tests {
         }
     }
 
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f64; 2]> {
+        vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+    fn plane_at(z: f64) -> PlaneBasis {
+        PlaneBasis { origin: [0.0, 0.0, z], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
+    }
+
+    #[test]
+    fn stacked_bosses_regenerate_with_small_overlap() {
+        // base box 4×4×2, then two more bosses stacked on top faces — the
+        // "after two extrusions" case. Each union uses the app's small overlap.
+        let ov = 2.0e-3;
+        let tol = 1.0e-4;
+        let base = extrude_solid(&rect(0.0, 0.0, 4.0, 4.0), &[], &plane_at(0.0), 2.0).unwrap();
+        let boss1 = extrude_solid_with_overlap(&rect(1.0, 1.0, 3.0, 3.0), &[], &plane_at(2.0), 2.0, ov).unwrap();
+        let s1 = union_tol(&base, &boss1, tol).expect("first boss unions");
+        let boss2 = extrude_solid_with_overlap(&rect(1.5, 1.5, 2.5, 2.5), &[], &plane_at(4.0), 2.0, ov).unwrap();
+        let s2 = union_tol(&s1, &boss2, tol).expect("second boss unions");
+        assert!(tessellate(&s2, 0.05).edges.len() > 12);
+    }
+
     #[test]
     fn degenerate_contour_is_cleaned_not_crashed() {
         // A loop with a duplicate vertex and an antenna spike — truck would panic

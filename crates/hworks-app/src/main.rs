@@ -21,14 +21,14 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    cut, cut_tol, extrude_solid, extrude_solid_with_overlap, tessellate, union_tol, KSolid,
-    PlaneBasis, Tessellation, TriMesh,
+    cut_tol, extrude_solid, extrude_solid_with_overlap, tessellate, union_tol, KSolid, PlaneBasis,
+    Tessellation, TriMesh,
 };
 
-/// How far a boss reaches back into the body it's built on, so the union is robust
-/// without leaving a visible lip where the boss overhangs. Small (paired with the
-/// tight boolean tolerance) so it stays well under the tessellation tolerance.
-const BOSS_OVERLAP: f64 = 2.0e-3;
+/// How far a boss reaches back into the body it's built on (flush path). Kept below
+/// the 0.03 tessellation tolerance so any overhang lip is sub-facet (invisible),
+/// while big enough to keep the union robust paired with the tight tolerance.
+const BOSS_OVERLAP: f64 = 0.01;
 use hworks_sketch::{point_in_poly, Constraint, Sketch, SketchEntity};
 
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
@@ -321,6 +321,9 @@ struct SketchSession {
     /// Circular edges on the sketch face: (centre uv, radius). Lets the Circle tool
     /// snap its radius so a new circle matches existing round geometry exactly.
     reference_circles: Vec<(Vec2, f32)>,
+    /// Snap tolerance in world units, scaled to the zoom so snapping feels the same
+    /// at any scale (a fixed tolerance is unusable on a large part). Set each frame.
+    snap_dist: f32,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -426,6 +429,8 @@ fn setup(
     let cam = OrbitCamera::default();
     commands.spawn((
         Camera3d::default(),
+        // Wide depth range so large parts (and a far-backed-out camera) don't clip.
+        Projection::from(PerspectiveProjection { near: 0.02, far: 100_000.0, ..default() }),
         camera_transform(&cam),
         cam,
         AmbientLight { color: Color::WHITE, brightness: 250.0, ..default() },
@@ -462,6 +467,25 @@ fn camera_transform(cam: &OrbitCamera) -> Transform {
     Transform { translation, rotation, ..default() }
 }
 
+/// Focus point + camera radius that frame the current body — or the reference
+/// planes when there's no body yet. Used by Zoom-to-Fit so it works at any scale.
+fn fit_view(part: &Part) -> (Vec3, f32) {
+    if let Some(mesh) = &part.mesh {
+        if !mesh.positions.is_empty() {
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for p in &mesh.positions {
+                let v = Vec3::from_array(*p);
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            let center = (lo + hi) * 0.5;
+            let radius = ((hi - lo).length() * 0.9).max(4.0);
+            return (center, radius);
+        }
+    }
+    (Vec3::ZERO, 14.0)
+}
+
 /// Aim the orbit camera straight down a plane/face normal (a "Normal To" view),
 /// keeping the current radius. Setting yaw/pitch (not the transform directly)
 /// means the user can keep orbiting smoothly afterwards.
@@ -487,6 +511,7 @@ fn ui_system(
     mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
     cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    part: Res<Part>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
 
@@ -541,10 +566,11 @@ fn ui_system(
                 ui.checkbox(&mut ui_state.show_tangent_edges, "Tangent edges")
                     .on_hover_text("Show smooth curvature edges (off = SolidWorks-style tangent edges removed)");
                 ui.separator();
-                if ui.button("Fit").on_hover_text("Zoom to fit").clicked() {
+                if ui.button("Fit").on_hover_text("Zoom to fit the part").clicked() {
                     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-                        orbit.focus = Vec3::ZERO;
-                        orbit.radius = 14.0;
+                        let (focus, radius) = fit_view(&part);
+                        orbit.focus = focus;
+                        orbit.radius = radius;
                         *tf = camera_transform(&orbit);
                     }
                 }
@@ -778,7 +804,7 @@ fn ui_system(
                     }
                     Tool::Circle => {
                         // Snap the live radius to a matching existing circular edge.
-                        let snapped_live = snap_radius(live, &session.reference_circles, SNAP);
+                        let snapped_live = snap_radius(live, &session.reference_circles, session.snap_dist.max(SNAP));
                         ui.label(egui::RichText::new("Circle radius").strong());
                         ui.horizontal(|ui| {
                             let resp = ui.add(
@@ -1239,8 +1265,9 @@ fn ui_system(
                 }
                 ViewAction::Fit => {
                     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-                        orbit.focus = Vec3::ZERO;
-                        orbit.radius = 14.0;
+                        let (focus, radius) = fit_view(&part);
+                        orbit.focus = focus;
+                        orbit.radius = radius;
                         *tf = camera_transform(&orbit);
                     }
                 }
@@ -1324,8 +1351,8 @@ fn nearest_point(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-fn get_or_add_point(sketch: &mut Sketch, uv: Vec2) -> usize {
-    nearest_point(sketch, uv, SNAP).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
+fn get_or_add_point(sketch: &mut Sketch, uv: Vec2, snap: f32) -> usize {
+    nearest_point(sketch, uv, snap).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
 /// Index of the line/circle entity nearest to `uv`, within `thresh`.
@@ -1645,10 +1672,14 @@ fn sketch_interaction(
 
     let active_uv = session.plane.as_ref().and_then(|ap| ray_plane(ap, &ray).map(|(_, uv)| uv));
 
+    // Snap tolerance scaled to the zoom, so snapping feels consistent at any scale.
+    let snap = (orbit.radius * (SNAP / 12.0)).clamp(0.03, 200.0);
+    session.snap_dist = snap;
+
     // Inference/snap points for the entity under the cursor (shown on hover).
     session.inference_points.clear();
     if session.plane.is_some() && !session.hide_inference {
-        if let Some(e) = active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, SNAP * 2.5)) {
+        if let Some(e) = active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, snap * 2.5)) {
             session.inference_points = inference_points(&session.sketch, e);
         }
     }
@@ -1704,12 +1735,12 @@ fn sketch_interaction(
     if session.plane.is_some() {
         let mut snaps = session.inference_points.clone();
         snaps.extend_from_slice(&session.reference_points);
-        session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &snaps, SNAP));
+        session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &snaps, snap));
     }
 
     // Entity under the cursor (Select tool) for hover highlighting.
     session.hover_entity = if session.plane.is_some() && session.tool == Tool::Select {
-        active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, SNAP * 1.5))
+        active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, snap * 1.5))
     } else {
         None
     };
@@ -1794,11 +1825,11 @@ fn sketch_interaction(
     match session.tool {
         Tool::Select => {
             if just_pressed {
-                let hit = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, SNAP));
+                let hit = active_uv.and_then(|uv| nearest_point(&session.sketch, uv, snap));
                 session.drag = hit;
                 if hit.is_none() {
                     if let Some(uv) = active_uv {
-                        if let Some(e) = nearest_entity(&session.sketch, uv, SNAP * 1.5) {
+                        if let Some(e) = nearest_entity(&session.sketch, uv, snap * 1.5) {
                             // Click a line/circle to (de)select it for a constraint (keep ≤2).
                             if let Some(pos) = session.selected_entities.iter().position(|&x| x == e) {
                                 session.selected_entities.remove(pos);
@@ -1850,13 +1881,13 @@ fn sketch_interaction(
                 // Smart pick: a point starts/continues a point-to-point distance;
                 // clicking a line dimensions its length; a circle's radius is edited
                 // in the panel (all circles are listed there).
-                if let Some(p) = nearest_point(&session.sketch, uv, SNAP * 1.5) {
+                if let Some(p) = nearest_point(&session.sketch, uv, snap * 1.5) {
                     match session.dim_first.take() {
                         Some(first) if first != p => add_distance_dim(&mut session.sketch, first, p),
                         _ => session.dim_first = Some(p),
                     }
                 } else if let Some((a, b)) =
-                    nearest_entity(&session.sketch, uv, SNAP * 2.0).and_then(|e| entity_line(&session.sketch, e))
+                    nearest_entity(&session.sketch, uv, snap * 2.0).and_then(|e| entity_line(&session.sketch, e))
                 {
                     add_distance_dim(&mut session.sketch, a, b);
                     session.dim_first = None;
@@ -1881,8 +1912,9 @@ fn commit_line_length(session: &mut SketchSession, length: f32) {
         dir = Vec2::X;
     }
     let end = start + dir * length;
-    let a = get_or_add_point(&mut session.sketch, start);
-    let b = get_or_add_point(&mut session.sketch, end);
+    let snap = session.snap_dist;
+    let a = get_or_add_point(&mut session.sketch, start, snap);
+    let b = get_or_add_point(&mut session.sketch, end, snap);
     session.sketch.add_line(a, b, session.construction);
     session.sketch.constraints.push(Constraint::Distance { a, b, value: length as f64 });
     session.pending = None;
@@ -1892,7 +1924,7 @@ fn commit_line_length(session: &mut SketchSession, length: f32) {
 /// Commit the in-progress circle at an exact `radius`.
 fn commit_circle_radius(session: &mut SketchSession, radius: f32) {
     let Some(center) = session.pending else { return };
-    let c = get_or_add_point(&mut session.sketch, center);
+    let c = get_or_add_point(&mut session.sketch, center, session.snap_dist);
     session.sketch.add_circle(c, radius.max(0.01) as f64);
     session.pending = None;
     session.dirty = true;
@@ -1917,11 +1949,12 @@ fn add_distance_dim(sketch: &mut Sketch, a: usize, b: usize) {
 }
 
 fn place_point(session: &mut SketchSession, uv: Vec2) {
+    let snap = session.snap_dist;
     match session.tool {
         Tool::Line => {
             if let Some(start) = session.pending.take() {
-                let a = get_or_add_point(&mut session.sketch, start);
-                let b = get_or_add_point(&mut session.sketch, uv);
+                let a = get_or_add_point(&mut session.sketch, start, snap);
+                let b = get_or_add_point(&mut session.sketch, uv, snap);
                 session.sketch.add_line(a, b, session.construction);
                 session.dirty = true;
             } else {
@@ -1931,8 +1964,8 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
         }
         Tool::Circle => {
             if let Some(center) = session.pending.take() {
-                let radius = snap_radius(center.distance(uv), &session.reference_circles, SNAP);
-                let c = get_or_add_point(&mut session.sketch, center);
+                let radius = snap_radius(center.distance(uv), &session.reference_circles, snap);
+                let c = get_or_add_point(&mut session.sketch, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
             } else {
@@ -2378,45 +2411,57 @@ fn chosen_regions<'a>(all: &'a [hworks_sketch::Region], selected: &[usize]) -> V
     }
 }
 
-/// A boss whose face exactly coincides with a body face (e.g. a circle drawn to
-/// match an existing arc) defeats truck's boolean union. We nudge the boss outward
-/// by this much — ~1 micron — paired with a tight boolean tolerance, so the faces
-/// register as distinct. It is 30× below the tessellation tolerance and far below
-/// any manufacturing precision, so the part stays exact for all practical purposes
-/// (and the sketch keeps your exact typed dimension regardless).
+/// A boss/cut whose face exactly coincides with a body face (e.g. a circle drawn to
+/// match an existing arc) defeats truck's boolean. We nudge the profile outward by
+/// this much — ~1 micron — so the faces register as distinct. It is far below the
+/// tessellation tolerance and any manufacturing precision, so the part stays exact
+/// for all practical purposes (and the sketch keeps your exact typed dimension).
 const COINCIDENT_NUDGE: f64 = 1.0e-3;
 const COINCIDENT_TOL: f64 = 1.0e-4;
+/// A robust fallback tolerance/overlap for when the tight, flush settings fail —
+/// truck is more forgiving here at the cost of a (still tiny) visible lip.
+const ROBUST_TOL: f64 = 0.05;
+const ROBUST_OVERLAP: f64 = 0.1;
 
-/// Add a boss (region `r`) to an existing body. The exact union is tried first; if
-/// it fails on coincident faces, retry with the imperceptible nudge above.
+/// Add a boss (region `r`) to an existing body, trying progressively more robust
+/// strategies so a boolean never simply fails: flush+exact, flush+nudge (coincident
+/// faces), then the robust overlap/tolerance with and without the nudge. The first
+/// (cleanest) one that works wins.
 fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
-    // Tight tolerance so the small flush overlap is still distinct from the face.
-    if let Some(s) = extrude_solid_with_overlap(&r.outer, &r.holes, basis, distance, BOSS_OVERLAP)
-        .and_then(|boss| union_tol(body, &boss, COINCIDENT_TOL))
-    {
-        return Some(s);
+    // (radial nudge, overlap, tolerance)
+    let strategies = [
+        (0.0, BOSS_OVERLAP, COINCIDENT_TOL),
+        (COINCIDENT_NUDGE, BOSS_OVERLAP, COINCIDENT_TOL),
+        (0.0, ROBUST_OVERLAP, ROBUST_TOL),
+        (COINCIDENT_NUDGE, ROBUST_OVERLAP, ROBUST_TOL),
+    ];
+    for (k, &(nudge, overlap, tol)) in strategies.iter().enumerate() {
+        let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
+        if let Some(s) = extrude_solid_with_overlap(&outer, &r.holes, basis, distance, overlap)
+            .and_then(|boss| union_tol(body, &boss, tol))
+        {
+            if k > 0 {
+                info!("Boss union: used fallback strategy {k} (coincident/awkward faces).");
+            }
+            return Some(s);
+        }
     }
-    let inflated = inflate_loop(&r.outer, COINCIDENT_NUDGE);
-    let s = extrude_solid_with_overlap(&inflated, &r.holes, basis, distance, BOSS_OVERLAP)
-        .and_then(|boss| union_tol(body, &boss, COINCIDENT_TOL));
-    if s.is_some() {
-        info!("Boss shared a face with the body — nudged it ~1µm to complete the union.");
-    }
-    s
+    None
 }
 
-/// Cut region `r` from the body. Like [`boss_union`], if the exact cut fails on a
-/// wall coincident with an existing face, retry with the imperceptible nudge.
+/// Cut region `r` from the body — same escalating fallback idea as [`boss_union`].
 fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
-    if let Some(s) = cut(body, &r.outer, &r.holes, basis, distance) {
-        return Some(s);
+    let strategies = [(0.0, COINCIDENT_TOL), (COINCIDENT_NUDGE, COINCIDENT_TOL), (0.0, ROBUST_TOL), (COINCIDENT_NUDGE, ROBUST_TOL)];
+    for (k, &(nudge, tol)) in strategies.iter().enumerate() {
+        let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
+        if let Some(s) = cut_tol(body, &outer, &r.holes, basis, distance, tol) {
+            if k > 0 {
+                info!("Cut: used fallback strategy {k} (coincident/awkward faces).");
+            }
+            return Some(s);
+        }
     }
-    let inflated = inflate_loop(&r.outer, COINCIDENT_NUDGE);
-    let s = cut_tol(body, &inflated, &r.holes, basis, distance, COINCIDENT_TOL);
-    if s.is_some() {
-        info!("Cut shared a face with the body — nudged it ~1µm to complete.");
-    }
-    s
+    None
 }
 
 /// Scale a loop outward about its centroid so every vertex moves out by at least
@@ -2573,7 +2618,7 @@ fn orbit_camera(
 
     // Scroll: zoom toward the point under the cursor.
     if scroll.delta.y != 0.0 {
-        let new_radius = (cam.radius * (1.0 - scroll.delta.y * ZOOM_SENS)).clamp(2.0, 100.0);
+        let new_radius = (cam.radius * (1.0 - scroll.delta.y * ZOOM_SENS)).clamp(0.5, 20_000.0);
         if let Some(ray) = windows.single().ok().and_then(|w| cursor_ray(w, camera, cam_gt)) {
             let dir = ray.direction.as_vec3();
             let denom = forward.dot(dir);
@@ -2646,6 +2691,8 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     let point_col = Color::srgb(1.0, 0.55, 0.15);
     let preview_col = Color::srgba(1.0, 1.0, 1.0, 0.6);
     let plane_rot = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
+    // Marker/snap-glyph scale tied to the zoom, so points stay visible at any scale.
+    let ms = if session.snap_dist > 1e-6 { (session.snap_dist / SNAP).clamp(0.5, 40.0) } else { 1.0 };
 
     let uv_of = |i: usize| -> Vec2 {
         let p = &session.sketch.points[i];
@@ -2672,7 +2719,7 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     }
 
     for p in &session.sketch.points {
-        draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), point_col);
+        draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), point_col, ms);
     }
 
     // Highlight the Selected Contours — outer + holes. Explicitly-picked contours
@@ -2733,8 +2780,8 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
                 gizmos.line(wa, wb, sel_col);
                 gizmos.line(wa + off, wb + off, sel_col);
                 gizmos.line(wa - off, wb - off, sel_col);
-                draw_marker(&mut gizmos, ap, uv_of(*a), sel_col);
-                draw_marker(&mut gizmos, ap, uv_of(*b), sel_col);
+                draw_marker(&mut gizmos, ap, uv_of(*a), sel_col, ms);
+                draw_marker(&mut gizmos, ap, uv_of(*b), sel_col, ms);
             }
             Some(SketchEntity::Circle { center, radius }) => {
                 let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
@@ -2765,7 +2812,7 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     if let Some(i) = session.dim_first {
         if let Some(p) = session.sketch.points.get(i) {
             let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
-            gizmos.circle(iso, 0.18, dim_col);
+            gizmos.circle(iso, 0.18 * ms, dim_col);
         }
     }
 
@@ -2774,24 +2821,24 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     let ref_col = Color::srgb(0.35, 0.85, 1.0);
     for p in &session.reference_points {
         let iso = Isometry3d::new(ap.to_world(*p), plane_rot);
-        gizmos.circle(iso, 0.07, ref_col);
-        draw_marker(&mut gizmos, ap, *p, ref_col);
+        gizmos.circle(iso, 0.07 * ms, ref_col);
+        draw_marker(&mut gizmos, ap, *p, ref_col, ms);
     }
 
     // Inference/snap points (line midpoint, circle centre + quadrants) on hover.
     let inf_col = Color::srgb(1.0, 0.9, 0.25);
     for p in &session.inference_points {
         let iso = Isometry3d::new(ap.to_world(*p), plane_rot);
-        gizmos.circle(iso, 0.1, inf_col);
-        draw_marker(&mut gizmos, ap, *p, inf_col);
+        gizmos.circle(iso, 0.1 * ms, inf_col);
+        draw_marker(&mut gizmos, ap, *p, inf_col, ms);
     }
 
     // Snap indicator: ring the point the cursor would attach to.
     if let Some(cur) = session.cursor_uv {
-        if let Some(i) = nearest_point(&session.sketch, cur, SNAP) {
+        if let Some(i) = nearest_point(&session.sketch, cur, session.snap_dist.max(0.01)) {
             let p = &session.sketch.points[i];
             let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
-            gizmos.circle(iso, 0.16, Color::srgb(0.2, 1.0, 0.45));
+            gizmos.circle(iso, 0.16 * ms, Color::srgb(0.2, 1.0, 0.45));
         }
     }
 
@@ -2799,7 +2846,7 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
         match session.tool {
             Tool::Line => gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col),
             Tool::Circle => {
-                let r = snap_radius(start.distance(cur), &session.reference_circles, SNAP);
+                let r = snap_radius(start.distance(cur), &session.reference_circles, session.snap_dist.max(SNAP));
                 let iso = Isometry3d::new(ap.to_world(start), plane_rot);
                 gizmos.circle(iso, r, preview_col);
             }
@@ -2812,14 +2859,14 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
             }
             Tool::Select | Tool::Dimension => {}
         }
-        draw_marker(&mut gizmos, ap, start, point_col);
+        draw_marker(&mut gizmos, ap, start, point_col, ms);
     }
 }
 
-fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color) {
-    const S: f32 = 0.08;
-    gizmos.line(ap.to_world(uv + Vec2::new(-S, 0.0)), ap.to_world(uv + Vec2::new(S, 0.0)), color);
-    gizmos.line(ap.to_world(uv + Vec2::new(0.0, -S)), ap.to_world(uv + Vec2::new(0.0, S)), color);
+fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color, scale: f32) {
+    let s = 0.08 * scale;
+    gizmos.line(ap.to_world(uv + Vec2::new(-s, 0.0)), ap.to_world(uv + Vec2::new(s, 0.0)), color);
+    gizmos.line(ap.to_world(uv + Vec2::new(0.0, -s)), ap.to_world(uv + Vec2::new(0.0, s)), color);
 }
 
 /// Draw a dashed segment a→b (used so construction geometry reads as construction).
@@ -3053,12 +3100,15 @@ fn draw_edge_selection(
     if sel.flash > 0.0 {
         let a = (sel.flash / FLASH_SECS).clamp(0.0, 1.0); // fade out
         let fcol = Color::srgba(0.3, 1.0, 0.5, a);
-        const S: f32 = 0.13;
+        // Size the cross-markers by how far the camera is, so they stay visible at
+        // any scale (the larger the part / the further back, the bigger they draw).
+        let dist = cam_pos.distance(sel.chain[0]).max(1.0);
+        let s = (dist * 0.012).clamp(0.08, 50.0);
         for p in &sel.flash_points {
             let c = nudge(*p);
-            gizmos.line(c - Vec3::X * S, c + Vec3::X * S, fcol);
-            gizmos.line(c - Vec3::Y * S, c + Vec3::Y * S, fcol);
-            gizmos.line(c - Vec3::Z * S, c + Vec3::Z * S, fcol);
+            gizmos.line(c - Vec3::X * s, c + Vec3::X * s, fcol);
+            gizmos.line(c - Vec3::Y * s, c + Vec3::Y * s, fcol);
+            gizmos.line(c - Vec3::Z * s, c + Vec3::Z * s, fcol);
         }
     }
 }
