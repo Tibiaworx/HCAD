@@ -7,9 +7,12 @@ modeling** — the same workflow you'd recognize from SolidWorks, Fusion 360, or
 sketch in 2D, turn sketches into 3D solids, and edit any earlier step to have the whole
 model rebuild itself.
 
-> ⚠️ **Status: early / pre-alpha.** This repository currently contains the architecture
-> and design (see [`DESIGN.md`](DESIGN.md)). The application code is being built
-> incrementally against the milestone roadmap below. There is **no runnable build yet.**
+> **Status: alpha — runnable.** The core parametric workflow is implemented and the
+> app builds and runs today: reference planes → 2D sketching → constraints &
+> dimensions → extrude/cut solids → an editable feature tree with rollback,
+> regeneration, undo/redo, and save/load. Milestones **M0–M7 are complete**; work
+> now is on the M8+ advanced features (revolve, fillet, chamfer, pattern). See the
+> roadmap below and [`DESIGN.md`](DESIGN.md) for the architecture.
 
 ---
 
@@ -65,24 +68,43 @@ hworks-app/        # Bevy viewport + egui UI
 
 Each milestone is independently runnable.
 
-| Milestone | Deliverable |
-|-----------|-------------|
-| **M0** | Bevy window, orbit camera, render the three reference planes |
-| **M1** | Pick a plane → flat (unconstrained) sketch mode |
-| **M2** | Constraint solver v1, rectangle tool, construction lines, drag-to-resolve |
-| **M3** | First solid — extrude a sketch profile |
-| **M4** | Extrude-cut (boolean) + feature-tree panel |
-| **M5** | Sketch on a solid face (stable topological IDs introduced) |
-| **M6** | Edit an earlier feature → regenerate downstream; rollback bar |
-| **M7** | Save / load documents |
-| **M8+** | Revolve, Fillet, Chamfer, Pattern, more constraints, dimensions display |
+| Milestone | Deliverable | Status |
+|-----------|-------------|:------:|
+| **M0** | Bevy window, orbit camera, render the three reference planes | ✅ |
+| **M1** | Pick a plane → flat (unconstrained) sketch mode | ✅ |
+| **M2** | Constraint solver v1, rectangle tool, construction lines, drag-to-resolve | ✅ |
+| **M3** | First solid — extrude a sketch profile | ✅ |
+| **M4** | Extrude-cut (boolean) + feature-tree panel | ✅ |
+| **M5** | Sketch on a solid face (stable topological IDs introduced) | ✅ |
+| **M6** | Edit an earlier feature → regenerate downstream; rollback bar | ✅ |
+| **M7** | Save / load documents (RON `.hcad` files) | ✅ |
+| **M8+** | Revolve, Fillet, Chamfer, Pattern, concentric constraint, dimension display polish | 🔲 |
+
+Implemented today:
+
+- **Sketch tools:** Select/drag, Line, Circle, Rectangle, Dimension, construction
+  geometry, and midpoint / circle-centre / quadrant snap (inference) points.
+- **Constraints:** coincident, horizontal, vertical, midpoint, distance (driving
+  dimension), parallel, perpendicular, equal, tangent — solved together so the
+  sketch is parametric. *(Concentric is still on the M8+ list.)*
+- **Features:** extrude boss (union), extrude cut (boolean), an editable feature
+  tree with per-feature depth editing, a rollback bar, downstream regeneration,
+  64-level undo/redo, and save/load.
 
 ---
 
 ## Building & running
 
 ```sh
-cargo run -p hworks-app          # or: cargo build --release
+cargo run -p hworks-app          # runs the `hcad` binary (debug)
+cargo build --release            # optimized build → target/release/hcad
+```
+
+The application crate is `hworks-app`; the binary it produces is named **`hcad`**.
+The kernel, sketcher, and document crates build and test headless:
+
+```sh
+cargo test                       # headless tests (geometry, sketch, document)
 ```
 
 Prebuilt Windows binaries are on the **Releases** page.
