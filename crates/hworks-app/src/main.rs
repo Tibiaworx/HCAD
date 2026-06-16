@@ -1694,33 +1694,56 @@ fn sketch_interaction(
             let d = w - ap.origin;
             Vec2::new(d.dot(ap.u), d.dot(ap.v))
         };
-        let mut consumed: Vec<Vec3> = Vec::new();
+        // Vertices already accounted for by a detected circular edge (full circle or
+        // arc), so its many tessellation segments aren't each emitted as straight points.
+        let mut circle_verts: Vec<Vec3> = Vec::new();
         for (i, e) in part.edges.iter().enumerate() {
             let (a, b) = (Vec3::from_array(e[0]), Vec3::from_array(e[1]));
-            if !in_plane(a) || !in_plane(b) {
+            if !in_plane(a) || !in_plane(b) || a.distance(b) < 1e-6 {
                 continue;
             }
-            if a.distance(b) > 0.4 {
-                // A straight feature edge → endpoints + midpoint as snap points.
-                let (ua, ub) = (to_uv(a), to_uv(b));
-                session.reference_points.push(ua);
-                session.reference_points.push(ub);
-                session.reference_points.push((ua + ub) * 0.5);
-            } else if !consumed.iter().any(|c| c.distance(a) < 1e-3) {
-                // A short segment may be part of a tessellated circular edge — walk
-                // its loop and, if it's circular, expose the centre + radius.
-                let (chain, closed) = edge_chain(&part.edges, i);
-                if closed && chain.len() >= 8 {
-                    let center: Vec3 = chain.iter().copied().sum::<Vec3>() / chain.len() as f32;
-                    let radius = chain.iter().map(|p| p.distance(center)).sum::<f32>() / chain.len() as f32;
-                    let max_dev =
-                        chain.iter().map(|p| (p.distance(center) - radius).abs()).fold(0.0_f32, f32::max);
-                    if radius > 1e-3 && max_dev < radius * 0.05 && in_plane(center) {
-                        let c_uv = to_uv(center);
-                        session.reference_circles.push((c_uv, radius));
-                        session.reference_points.push(c_uv); // concentric centre snap
+            // Skip a segment only if BOTH ends belong to a handled circle/arc — a
+            // radial edge that merely touches an arc endpoint must still be processed.
+            let on_circle = |p: Vec3| circle_verts.iter().any(|c| c.distance(p) < 1e-3);
+            if on_circle(a) && on_circle(b) {
+                continue;
+            }
+            // Classify by the chain this segment belongs to, not its length. Fit a
+            // circle to the chain's points; a good fit over enough segments is a
+            // circular edge (closed) or arc (open) at any size — not a straight edge.
+            let (chain, closed) = edge_chain(&part.edges, i);
+            let uvs: Vec<Vec2> = chain.iter().map(|p| to_uv(*p)).collect();
+            let fit = if chain.len() >= 5 {
+                fit_circle(&uvs).filter(|&(c, r)| {
+                    r > 1e-3 && uvs.iter().map(|p| (p.distance(c) - r).abs()).fold(0.0_f32, f32::max) < r * 0.05
+                })
+            } else {
+                None
+            };
+            match fit {
+                Some((c, r)) => {
+                    session.reference_circles.push((c, r));
+                    session.reference_points.push(c); // centre
+                    if closed {
+                        // Full circle → the four quadrant points (top/bottom/left/right).
+                        session.reference_points.push(c + Vec2::new(r, 0.0));
+                        session.reference_points.push(c + Vec2::new(-r, 0.0));
+                        session.reference_points.push(c + Vec2::new(0.0, r));
+                        session.reference_points.push(c + Vec2::new(0.0, -r));
+                    } else {
+                        // Arc → its two endpoints and its midpoint.
+                        session.reference_points.push(uvs[0]);
+                        session.reference_points.push(uvs[uvs.len() - 1]);
+                        session.reference_points.push(uvs[uvs.len() / 2]);
                     }
-                    consumed.extend(chain);
+                    circle_verts.extend(chain);
+                }
+                None => {
+                    // A straight feature edge → endpoints + midpoint.
+                    let (ua, ub) = (to_uv(a), to_uv(b));
+                    session.reference_points.push(ua);
+                    session.reference_points.push(ub);
+                    session.reference_points.push((ua + ub) * 0.5);
                 }
             }
         }
@@ -2462,6 +2485,63 @@ fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance
         }
     }
     None
+}
+
+/// Algebraic (Kåsa) least-squares circle fit through 2D points. Returns the centre
+/// and radius, or `None` if the points are collinear/degenerate. Works for an open
+/// arc (where the centroid is *not* the centre), so arcs can be detected by fit.
+fn fit_circle(pts: &[Vec2]) -> Option<(Vec2, f32)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    // Solve, in f64, the normal equations of |x²+y² + D·x + E·y + F|² = 0.
+    let (mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    let (mut sxz, mut syz, mut sz) = (0.0, 0.0, 0.0);
+    for p in pts {
+        let (x, y) = (p.x as f64, p.y as f64);
+        let z = x * x + y * y;
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+        sxz += x * z;
+        syz += y * z;
+        sz += z;
+    }
+    let n = pts.len() as f64;
+    let m = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]];
+    let sol = solve3(m, [-sxz, -syz, -sz])?;
+    let (cx, cy) = (-sol[0] / 2.0, -sol[1] / 2.0);
+    let r2 = cx * cx + cy * cy - sol[2];
+    if r2 <= 0.0 {
+        return None;
+    }
+    Some((Vec2::new(cx as f32, cy as f32), r2.sqrt() as f32))
+}
+
+/// Determinant of a 3×3 matrix.
+fn det3(m: [[f64; 3]; 3]) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+/// Solve a 3×3 linear system by Cramer's rule. `None` if (near-)singular.
+fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det = det3(m);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let mut out = [0.0; 3];
+    for i in 0..3 {
+        let mut mi = m;
+        for r in 0..3 {
+            mi[r][i] = b[r];
+        }
+        out[i] = det3(mi) / det;
+    }
+    Some(out)
 }
 
 /// Scale a loop outward about its centroid so every vertex moves out by at least
@@ -3297,6 +3377,27 @@ mod tests {
         // The nudge that makes the union succeed must stay far below the 0.03
         // tessellation tolerance, so the part is exact for all practical purposes.
         assert!(COINCIDENT_NUDGE < 0.03 / 10.0, "nudge {COINCIDENT_NUDGE} too large for CAD accuracy");
+    }
+
+    #[test]
+    fn fit_circle_recovers_centre_and_radius_from_an_arc() {
+        // A quarter arc (open) of radius 5 centred at (2, 3) — the case that floods
+        // a pie slice. Its centroid is NOT the centre, so this needs a real fit.
+        let pts: Vec<Vec2> = (0..=16)
+            .map(|k| {
+                let a = std::f32::consts::FRAC_PI_2 * k as f32 / 16.0;
+                Vec2::new(2.0 + 5.0 * a.cos(), 3.0 + 5.0 * a.sin())
+            })
+            .collect();
+        let (c, r) = fit_circle(&pts).expect("arc fits a circle");
+        assert!((c - Vec2::new(2.0, 3.0)).length() < 1e-2, "centre {c:?}");
+        assert!((r - 5.0).abs() < 1e-2, "radius {r}");
+    }
+
+    #[test]
+    fn fit_circle_rejects_a_straight_line() {
+        let pts: Vec<Vec2> = (0..5).map(|k| Vec2::new(k as f32, 2.0 * k as f32)).collect();
+        assert!(fit_circle(&pts).is_none(), "collinear points have no circle");
     }
 
     #[test]
