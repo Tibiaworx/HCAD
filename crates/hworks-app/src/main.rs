@@ -534,9 +534,13 @@ fn ui_system(
     });
     let can_extrude = (in_sketch && has_profile) || selected_sketch.is_some();
 
-    // Auto-switch tab on entering/leaving a sketch.
+    // Auto-switch tab on entering/leaving a sketch. Leaving a sketch drops back to
+    // the Select tool — no reason to stay on a drawing tool once in Features.
     if in_sketch != ui_state.was_sketching {
         ui_state.active_tab = if in_sketch { Tab::Sketch } else { Tab::Features };
+        if !in_sketch {
+            session.tool = Tool::Select;
+        }
         ui_state.was_sketching = in_sketch;
     }
 
@@ -597,6 +601,7 @@ fn ui_system(
         ui.horizontal_wrapped(|ui| {
             if ui.selectable_label(ui_state.active_tab == Tab::Features, "Features").clicked() {
                 ui_state.active_tab = Tab::Features;
+                session.tool = Tool::Select;
             }
             if ui.selectable_label(ui_state.active_tab == Tab::Sketch, "Sketch").clicked() {
                 ui_state.active_tab = Tab::Sketch;
@@ -930,15 +935,17 @@ fn ui_system(
             let lines: Vec<(usize, usize)> = sel.iter().filter_map(|&i| entity_line(&session.sketch, i)).collect();
             let circles: Vec<(usize, f64)> = sel.iter().filter_map(|&i| entity_circle(&session.sketch, i)).collect();
             let two_lines = lines.len() == 2;
+            let two_circles = circles.len() == 2;
             let line_circle = lines.len() == 1 && circles.len() == 1;
-            ui.label(egui::RichText::new(format!("Relations — {} selected", sel.len())).strong());
+            ui.label(egui::RichText::new(format!("Selected Entities — {}", sel.len())).strong());
             if sel.is_empty() {
                 ui.label(
-                    egui::RichText::new("Select tool: click 2 lines (or a line + circle).")
+                    egui::RichText::new("Select tool: click lines/circles to relate (2 lines, 2 circles, or a line + circle).")
                         .italics()
                         .weak(),
                 );
             }
+            // ---- Add Relations ----
             let mut applied: Option<Constraint> = None;
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(two_lines, egui::Button::new("Parallel")).clicked() {
@@ -947,8 +954,15 @@ fn ui_system(
                 if ui.add_enabled(two_lines, egui::Button::new("Perpendicular")).clicked() {
                     applied = Some(Constraint::Perpendicular(lines[0].0, lines[0].1, lines[1].0, lines[1].1));
                 }
-                if ui.add_enabled(two_lines, egui::Button::new("Equal")).clicked() {
-                    applied = Some(Constraint::Equal(lines[0].0, lines[0].1, lines[1].0, lines[1].1));
+                if ui.add_enabled(two_lines || two_circles, egui::Button::new("Equal"))
+                    .on_hover_text("Equal line lengths, or equal circle radii")
+                    .clicked()
+                {
+                    applied = Some(if two_circles {
+                        Constraint::EqualRadius { a: circles[0].0, b: circles[1].0 }
+                    } else {
+                        Constraint::Equal(lines[0].0, lines[0].1, lines[1].0, lines[1].1)
+                    });
                 }
                 if ui.add_enabled(line_circle, egui::Button::new("Tangent")).clicked() {
                     applied = Some(Constraint::Tangent {
@@ -959,6 +973,41 @@ fn ui_system(
                     });
                 }
             });
+
+            // ---- Existing Relations on the selection (view + delete) ----
+            let sel_points: std::collections::HashSet<usize> =
+                sel.iter().flat_map(|&i| entity_points(&session.sketch, i)).collect();
+            if !sel_points.is_empty() {
+                let related: Vec<usize> = session
+                    .sketch
+                    .constraints
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| constraint_points(c).iter().any(|p| sel_points.contains(p)))
+                    .map(|(i, _)| i)
+                    .collect();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Existing Relations").strong());
+                if related.is_empty() {
+                    ui.label(egui::RichText::new("none").italics().weak());
+                }
+                let mut delete: Option<usize> = None;
+                egui::ScrollArea::vertical().max_height(150.0).id_salt("relations").show(ui, |ui| {
+                    for &ci in &related {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✕").on_hover_text("Delete relation").clicked() {
+                                delete = Some(ci);
+                            }
+                            ui.label(constraint_label(&session.sketch.constraints[ci]));
+                        });
+                    }
+                });
+                if let Some(ci) = delete {
+                    session.sketch.constraints.remove(ci);
+                    session.needs_apply = true;
+                }
+            }
+
             if !sel.is_empty() && ui.button("Clear selection").clicked() {
                 session.selected_entities.clear();
             }
@@ -1317,6 +1366,18 @@ fn ui_system(
 
     // Dimension value labels floating at each dimension's midpoint in the viewport.
     if let (Some(ap), Ok((camera, cam_gt))) = (session.plane.as_ref(), cam_read.single()) {
+        let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String| {
+            if let Ok(screen) = camera.world_to_viewport(cam_gt, world) {
+                egui::Area::new(id).fixed_pos(egui::pos2(screen.x, screen.y)).order(egui::Order::Foreground).show(
+                    ctx,
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(text).color(egui::Color32::from_rgb(150, 215, 255)).strong(),
+                        );
+                    },
+                );
+            }
+        };
         for (k, c) in session.sketch.constraints.iter().enumerate() {
             if let Constraint::Distance { a, b, value } = c {
                 if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
@@ -1324,21 +1385,17 @@ fn ui_system(
                     let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                     let dir = (b2 - a2).normalize_or_zero();
                     let perp = Vec2::new(-dir.y, dir.x) * 0.5;
-                    let world = ap.to_world((a2 + b2) * 0.5 + perp);
-                    // world_to_viewport returns logical pixels = egui points (no /ppp).
-                    if let Ok(screen) = camera.world_to_viewport(cam_gt, world) {
-                        let pos = egui::pos2(screen.x, screen.y);
-                        egui::Area::new(egui::Id::new(("dimlabel", k)))
-                            .fixed_pos(pos)
-                            .order(egui::Order::Foreground)
-                            .show(ctx, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{value:.1}"))
-                                        .color(egui::Color32::from_rgb(150, 215, 255))
-                                        .strong(),
-                                );
-                            });
-                    }
+                    label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world((a2 + b2) * 0.5 + perp), format!("{value:.1}"));
+                }
+            }
+        }
+        // Diameter callout (Ø) for every circle, near its rim.
+        for (k, e) in session.sketch.entities.iter().enumerate() {
+            if let SketchEntity::Circle { center, radius } = e {
+                if let Some(c) = session.sketch.points.get(*center) {
+                    let cu = Vec2::new(c.x as f32, c.y as f32);
+                    let edge = cu + Vec2::new(*radius as f32 * 0.707, *radius as f32 * 0.707);
+                    label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{:.2}", radius * 2.0));
                 }
             }
         }
@@ -1470,6 +1527,49 @@ fn entity_circle(sketch: &Sketch, i: usize) -> Option<(usize, f64)> {
     match sketch.entities.get(i) {
         Some(SketchEntity::Circle { center, radius }) => Some((*center, *radius)),
         _ => None,
+    }
+}
+
+/// The point indices an entity is built on (a line's ends, a circle's centre).
+fn entity_points(sketch: &Sketch, i: usize) -> Vec<usize> {
+    match sketch.entities.get(i) {
+        Some(SketchEntity::Line { a, b, .. }) => vec![*a, *b],
+        Some(SketchEntity::Circle { center, .. }) => vec![*center],
+        Some(SketchEntity::Point { at }) => vec![*at],
+        None => vec![],
+    }
+}
+
+/// The point indices a constraint references — used to find the relations that
+/// touch a selected entity.
+fn constraint_points(c: &Constraint) -> Vec<usize> {
+    match c {
+        Constraint::Coincident(a, b)
+        | Constraint::Horizontal(a, b)
+        | Constraint::Vertical(a, b)
+        | Constraint::Distance { a, b, .. }
+        | Constraint::EqualRadius { a, b } => vec![*a, *b],
+        Constraint::Midpoint { mid, a, b } => vec![*mid, *a, *b],
+        Constraint::Parallel(a, b, c, d)
+        | Constraint::Perpendicular(a, b, c, d)
+        | Constraint::Equal(a, b, c, d) => vec![*a, *b, *c, *d],
+        Constraint::Tangent { a, b, center, .. } => vec![*a, *b, *center],
+    }
+}
+
+/// A short human label for a relation (for the Existing Relations list).
+fn constraint_label(c: &Constraint) -> String {
+    match c {
+        Constraint::Coincident(..) => "Coincident".into(),
+        Constraint::Horizontal(..) => "Horizontal".into(),
+        Constraint::Vertical(..) => "Vertical".into(),
+        Constraint::Midpoint { .. } => "Midpoint".into(),
+        Constraint::Distance { value, .. } => format!("Distance  {value:.2}"),
+        Constraint::Parallel(..) => "Parallel".into(),
+        Constraint::Perpendicular(..) => "Perpendicular".into(),
+        Constraint::Equal(..) => "Equal length".into(),
+        Constraint::Tangent { .. } => "Tangent".into(),
+        Constraint::EqualRadius { .. } => "Equal radius".into(),
     }
 }
 
@@ -1740,42 +1840,49 @@ fn sketch_interaction(
             if on_circle(a) && on_circle(b) {
                 continue;
             }
-            // Classify by the chain this segment belongs to, not its length. Fit a
-            // circle to the chain's points; a good fit over enough segments is a
-            // circular edge (closed) or arc (open) at any size — not a straight edge.
             let (chain, closed) = edge_chain(&part.edges, i);
             let uvs: Vec<Vec2> = chain.iter().map(|p| to_uv(*p)).collect();
-            let fit = if chain.len() >= 5 {
+            // Fast path: a whole closed circle → centre + 4 quadrant points.
+            let whole_circle = if closed && uvs.len() >= 8 {
                 fit_circle(&uvs).filter(|&(c, r)| {
                     r > 1e-3 && uvs.iter().map(|p| (p.distance(c) - r).abs()).fold(0.0_f32, f32::max) < r * 0.05
                 })
             } else {
                 None
             };
-            match fit {
-                Some((c, r)) => {
-                    session.reference_circles.push((c, r));
-                    session.reference_points.push(c); // centre
-                    if closed {
-                        // Full circle → the four quadrant points (top/bottom/left/right).
-                        session.reference_points.push(c + Vec2::new(r, 0.0));
-                        session.reference_points.push(c + Vec2::new(-r, 0.0));
-                        session.reference_points.push(c + Vec2::new(0.0, r));
-                        session.reference_points.push(c + Vec2::new(0.0, -r));
-                    } else {
-                        // Arc → its two endpoints and its midpoint.
-                        session.reference_points.push(uvs[0]);
-                        session.reference_points.push(uvs[uvs.len() - 1]);
-                        session.reference_points.push(uvs[uvs.len() / 2]);
+            if let Some((c, r)) = whole_circle {
+                session.reference_circles.push((c, r));
+                session.reference_points.push(c);
+                session.reference_points.push(c + Vec2::new(r, 0.0));
+                session.reference_points.push(c + Vec2::new(-r, 0.0));
+                session.reference_points.push(c + Vec2::new(0.0, r));
+                session.reference_points.push(c + Vec2::new(0.0, -r));
+                circle_verts.extend(chain);
+            } else {
+                // Segment a mixed/long chain into arcs + straight runs, emitting only a
+                // few key points per part (so a slot's arc isn't a wall of midpoints).
+                let segs = segment_chain(&uvs);
+                let has_curve = segs.iter().any(|(_, _, f)| f.is_some());
+                for (s, e, fit) in &segs {
+                    match fit {
+                        Some((c, r)) => {
+                            session.reference_circles.push((*c, *r));
+                            session.reference_points.push(*c);
+                            session.reference_points.push(uvs[*s]);
+                            session.reference_points.push(uvs[*e]);
+                            session.reference_points.push(uvs[(*s + *e) / 2]);
+                        }
+                        None => {
+                            session.reference_points.push(uvs[*s]);
+                            session.reference_points.push(uvs[*e]);
+                            session.reference_points.push((uvs[*s] + uvs[*e]) * 0.5);
+                        }
                     }
-                    circle_verts.extend(chain);
                 }
-                None => {
-                    // A straight feature edge → endpoints + midpoint.
-                    let (ua, ub) = (to_uv(a), to_uv(b));
-                    session.reference_points.push(ua);
-                    session.reference_points.push(ub);
-                    session.reference_points.push((ua + ub) * 0.5);
+                // Only consume the chain if it contained a curve (so straight box edges
+                // sharing corners are each still processed; duplicates are deduped).
+                if has_curve {
+                    circle_verts.extend(chain);
                 }
             }
         }
@@ -1786,11 +1893,56 @@ fn sketch_interaction(
         session.reference_points.dedup_by(|p, q| p.distance(*q) < 1e-3);
     }
 
-    // The working cursor snaps to an inference point or a reference point near it.
+    // The working cursor snaps to an inference point, a reference point, or onto the
+    // boundary of a sketch circle near it — so lines drawn to a circle actually
+    // connect (land on the rim) instead of stopping a hair short.
     if session.plane.is_some() {
         let mut snaps = session.inference_points.clone();
         snaps.extend_from_slice(&session.reference_points);
+        // Every existing sketch point (line endpoints, circle centres) is a snap
+        // target — so a circle placed on a line's end shares its exact coordinates.
+        for p in &session.sketch.points {
+            snaps.push(Vec2::new(p.x as f32, p.y as f32));
+        }
+        // Each circle's centre + 4 quadrant points (top/bottom/left/right), always —
+        // so connecting lines can be lined up to the rim to enclose a region.
+        for e in &session.sketch.entities {
+            if let SketchEntity::Circle { center, radius } = e {
+                if let Some(c) = session.sketch.points.get(*center) {
+                    let (cc, r) = (Vec2::new(c.x as f32, c.y as f32), *radius as f32);
+                    snaps.push(cc + Vec2::new(r, 0.0));
+                    snaps.push(cc + Vec2::new(-r, 0.0));
+                    snaps.push(cc + Vec2::new(0.0, r));
+                    snaps.push(cc + Vec2::new(0.0, -r));
+                    if let Some(uv) = active_uv {
+                        let to = uv - cc;
+                        if to.length() > 1e-4 {
+                            snaps.push(cc + to.normalize() * r); // nearest point on the rim
+                        }
+                    }
+                }
+            }
+        }
         session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &snaps, snap));
+    }
+
+    // Line tool: when the in-progress segment is near horizontal/vertical (a 90°
+    // step), snap it square — unless the cursor already locked onto an exact point.
+    if session.tool == Tool::Line {
+        if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
+            let on_point = nearest_point(&session.sketch, cur, snap).is_some();
+            let v = cur - start;
+            if !on_point && v.length() > 1e-4 {
+                let step = std::f32::consts::FRAC_PI_2; // 90°
+                let ang = v.y.atan2(v.x);
+                let snapped = (ang / step).round() * step;
+                if (ang - snapped).abs() < 5.0_f32.to_radians() {
+                    // Project the cursor onto the square axis (length follows the cursor).
+                    let dir = Vec2::new(snapped.cos(), snapped.sin());
+                    session.cursor_uv = Some(start + dir * v.dot(dir));
+                }
+            }
+        }
     }
 
     // Entity under the cursor (Select tool) for hover highlighting.
@@ -1884,8 +2036,14 @@ fn sketch_interaction(
                 session.drag = hit;
                 if hit.is_none() {
                     if let Some(uv) = active_uv {
-                        if let Some(e) = nearest_entity(&session.sketch, uv, snap * 1.5) {
-                            // Click a line/circle to (de)select it for a constraint (keep ≤2).
+                        // Priority: clicking *on* a line/circle (tight) selects it for
+                        // a constraint; clicking *inside* a closed area selects that
+                        // contour; a looser grab still catches a nearby line otherwise.
+                        let on_entity = nearest_entity(&session.sketch, uv, snap * 0.6);
+                        let region = region_at(&session.sketch, uv);
+                        let near_entity = nearest_entity(&session.sketch, uv, snap * 1.5);
+                        if let Some(e) = on_entity.or(region.is_none().then_some(()).and(near_entity)) {
+                            // (de)select the entity for a constraint (keep ≤2).
                             if let Some(pos) = session.selected_entities.iter().position(|&x| x == e) {
                                 session.selected_entities.remove(pos);
                             } else {
@@ -1894,18 +2052,16 @@ fn sketch_interaction(
                                     session.selected_entities.remove(0);
                                 }
                             }
-                        } else {
-                            // Empty space inside a closed region: toggle it as a
-                            // Selected Contour (SolidWorks-style). Clicking truly
-                            // empty space just clears the entity selection.
+                        } else if let Some(r) = region {
+                            // Inside a closed region → toggle it as a Selected Contour.
                             session.selected_entities.clear();
-                            if let Some(r) = region_at(&session.sketch, uv) {
-                                if let Some(pos) = session.selected_contours.iter().position(|&x| x == r) {
-                                    session.selected_contours.remove(pos);
-                                } else {
-                                    session.selected_contours.push(r);
-                                }
+                            if let Some(pos) = session.selected_contours.iter().position(|&x| x == r) {
+                                session.selected_contours.remove(pos);
+                            } else {
+                                session.selected_contours.push(r);
                             }
+                        } else {
+                            session.selected_entities.clear();
                         }
                     }
                 }
@@ -2086,11 +2242,31 @@ fn handle_keys(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<SketchSessio
     if keys.just_pressed(KeyCode::KeyD) {
         session.op_request = Some(SolidOp::Cut(EXTRUDE_DISTANCE));
     }
+    // Delete (or Backspace) removes the selected sketch entities.
+    if keys.just_pressed(KeyCode::Delete) || keys.just_pressed(KeyCode::Backspace) {
+        if !session.selected_entities.is_empty() {
+            let mut idx = session.selected_entities.clone();
+            idx.sort_unstable();
+            idx.dedup();
+            for &i in idx.iter().rev() {
+                if i < session.sketch.entities.len() {
+                    session.sketch.entities.remove(i);
+                }
+            }
+            session.selected_entities.clear();
+            session.hover_entity = None;
+            session.selected_contours.clear(); // region indices shift after a delete
+            session.dirty = true;
+        }
+    }
     if keys.just_pressed(KeyCode::Escape) {
         if session.pending.is_some() {
-            session.pending = None; // cancel the in-progress entity first
+            session.pending = None; // 1) cancel the in-progress entity…
+            session.tool = Tool::Select;
+        } else if session.tool != Tool::Select {
+            session.tool = Tool::Select; // 2) …then drop back to the Select tool…
         } else {
-            // Commit the sketch to the timeline and leave (handled by handle_exit_sketch).
+            // 3) already on Select → commit the sketch and leave (handle_exit_sketch).
             session.exit_request = true;
         }
     }
@@ -2374,8 +2550,11 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                 // shift when an upstream feature is edited.
                 let resolved = match &body { Some(b) => reproject_plane(plane, b), None => plane.clone() };
                 let basis = basis_from_ref(&resolved);
-                // Boss each selected contour (empty ⇒ all), unioning into the body.
-                for r in chosen_regions(&all, regions) {
+                // Merge adjacent contours into single profiles first (a dumbbell of
+                // two circles + connecting band becomes one outline), so each piece
+                // extrudes as one solid without a coincident-face boolean.
+                let merged = merge_regions(&chosen_regions(&all, regions));
+                for r in &merged {
                     let next = match &body {
                         Some(b) => boss_union(b, r, &basis, *distance),
                         None => extrude_solid(&r.outer, &r.holes, &basis, *distance),
@@ -2394,8 +2573,10 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
                 let basis = basis_from_ref(&resolved);
                 let origin = Vec3::new(resolved.origin[0] as f32, resolved.origin[1] as f32, resolved.origin[2] as f32);
                 let n = Vec3::new(resolved.normal[0] as f32, resolved.normal[1] as f32, resolved.normal[2] as f32);
-                // Cut each selected contour (empty ⇒ all) from the current body.
-                for r in chosen_regions(&all, regions) {
+                // Merge adjacent contours into single profiles first (same reason as
+                // the boss), then cut each from the current body.
+                let merged = merge_regions(&chosen_regions(&all, regions));
+                for r in &merged {
                     let Some(b) = &body else { break };
                     // Pick the cut direction from the *current* body, so it stays
                     // correct even after upstream edits move things around.
@@ -2506,6 +2687,119 @@ const COINCIDENT_TOL: f64 = 1.0e-4;
 const ROBUST_TOL: f64 = 0.05;
 const ROBUST_OVERLAP: f64 = 0.1;
 
+/// Union a set of sketch regions in 2D into merged outline(s) by cancelling the
+/// edges shared between adjacent regions. Adjacent contours collapse into a single
+/// profile — so the extrude is one solid and never needs the fragile coincident-
+/// face 3D boolean — while disjoint contours stay separate. Falls back to the
+/// inputs if a clean merge can't be traced.
+fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Region> {
+    use std::collections::{HashMap, HashSet};
+    let key = |p: [f64; 2]| ((p[0] * 1.0e6).round() as i64, (p[1] * 1.0e6).round() as i64);
+    let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut pos: Vec<[f64; 2]> = Vec::new();
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for r in regions {
+        for loop_pts in std::iter::once(&r.outer).chain(r.holes.iter()) {
+            let m = loop_pts.len();
+            if m < 3 {
+                continue;
+            }
+            let vids: Vec<usize> = loop_pts
+                .iter()
+                .map(|p| *ids.entry(key(*p)).or_insert_with(|| {
+                    pos.push(*p);
+                    pos.len() - 1
+                }))
+                .collect();
+            for k in 0..m {
+                edges.push((vids[k], vids[(k + 1) % m]));
+            }
+        }
+    }
+    // A directed edge whose reverse also appears is internal (between two selected
+    // faces) → drop it. The survivors are the union boundary.
+    let present: HashSet<(usize, usize)> = edges.iter().copied().collect();
+    let mut next: HashMap<usize, usize> = HashMap::new();
+    for &(a, b) in &edges {
+        if !present.contains(&(b, a)) {
+            next.insert(a, b);
+        }
+    }
+    if next.is_empty() {
+        return regions.iter().map(|r| (*r).clone()).collect();
+    }
+    // Trace the boundary edges into loops (assumes degree-2 boundary vertices).
+    let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut used: HashSet<usize> = HashSet::new();
+    let starts: Vec<usize> = next.keys().copied().collect();
+    for s in starts {
+        if used.contains(&s) {
+            continue;
+        }
+        let mut loop_pts = Vec::new();
+        let mut cur = s;
+        loop {
+            used.insert(cur);
+            loop_pts.push(pos[cur]);
+            match next.get(&cur) {
+                Some(&nx) if nx != s && !used.contains(&nx) => cur = nx,
+                _ => break,
+            }
+            if loop_pts.len() > pos.len() + 1 {
+                break;
+            }
+        }
+        if loop_pts.len() >= 3 {
+            loops.push(loop_pts);
+        }
+    }
+    if loops.is_empty() {
+        return regions.iter().map(|r| (*r).clone()).collect();
+    }
+    nest_loops(loops)
+}
+
+/// Classify a set of closed loops into regions (outer + holes) by even/odd
+/// containment — the same nesting rule the sketcher uses.
+fn nest_loops(loops: Vec<Vec<[f64; 2]>>) -> Vec<hworks_sketch::Region> {
+    let n = loops.len();
+    let area = |poly: &[[f64; 2]]| {
+        let m = poly.len();
+        let mut a = 0.0;
+        for i in 0..m {
+            let (p, q) = (poly[i], poly[(i + 1) % m]);
+            a += p[0] * q[1] - q[0] * p[1];
+        }
+        (a * 0.5).abs()
+    };
+    let centroid = |poly: &[[f64; 2]]| {
+        let m = poly.len() as f64;
+        let (mut x, mut y) = (0.0, 0.0);
+        for p in poly {
+            x += p[0];
+            y += p[1];
+        }
+        [x / m, y / m]
+    };
+    let areas: Vec<f64> = loops.iter().map(|l| area(l)).collect();
+    let contains = |j: usize, i: usize| {
+        j != i && areas[j] > areas[i] && point_in_poly(centroid(&loops[i]), &loops[j])
+    };
+    let depth: Vec<usize> = (0..n).map(|i| (0..n).filter(|&j| contains(j, i)).count()).collect();
+    let mut out = Vec::new();
+    for i in 0..n {
+        if depth[i] % 2 != 0 {
+            continue;
+        }
+        let holes = (0..n)
+            .filter(|&k| depth[k] == depth[i] + 1 && contains(i, k))
+            .map(|k| loops[k].clone())
+            .collect();
+        out.push(hworks_sketch::Region { outer: loops[i].clone(), holes });
+    }
+    out
+}
+
 /// Add a boss (region `r`) to an existing body, trying progressively more robust
 /// strategies so a boolean never simply fails: flush+exact, flush+nudge (coincident
 /// faces), then the robust overlap/tolerance with and without the nudge. The first
@@ -2578,6 +2872,63 @@ fn fit_circle(pts: &[Vec2]) -> Option<(Vec2, f32)> {
         return None;
     }
     Some((Vec2::new(cx as f32, cy as f32), r2.sqrt() as f32))
+}
+
+/// Perpendicular distance from point `p` to the line through `a`–`b`.
+fn point_line_dist(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let len = ab.length();
+    if len < 1e-6 {
+        return p.distance(a);
+    }
+    ((p - a).perp_dot(ab) / len).abs()
+}
+
+/// Split a polyline into maximal circular arcs and straight runs. Each entry is
+/// `(start, end, Some((centre, radius)))` for an arc, or `(start, end, None)` for a
+/// straight run. Used so a slot's chain (two straight sides + two end arcs, joined
+/// tangentially) emits a few key points per part instead of every vertex.
+fn segment_chain(pts: &[Vec2]) -> Vec<(usize, usize, Option<(Vec2, f32)>)> {
+    let n = pts.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < n {
+        // Greedily grow an arc starting at i (needs ≥3 points to fit a circle).
+        let mut arc: Option<(Vec2, f32, usize)> = None;
+        let mut j = i + 2;
+        while j < n {
+            if let Some((c, r)) = fit_circle(&pts[i..=j]) {
+                let dev = pts[i..=j].iter().map(|p| (p.distance(c) - r).abs()).fold(0.0_f32, f32::max);
+                let span = pts[i].distance(pts[j]).max(1e-4);
+                // A real arc: tight fit, and radius not absurd vs the span (a near-
+                // straight run fits a giant circle — reject that as straight).
+                if dev < r * 0.02 && r < span * 50.0 {
+                    arc = Some((c, r, j));
+                    j += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if let Some((c, r, e)) = arc {
+            out.push((i, e, Some((c, r))));
+            i = e;
+        } else {
+            // Straight run: extend while the next point stays on the i→end line.
+            let mut end = i + 1;
+            while end + 1 < n {
+                let span = pts[i].distance(pts[end + 1]).max(1e-4);
+                if point_line_dist(pts[end + 1], pts[i], pts[end]) < span * 0.01 {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push((i, end, None));
+            i = end;
+        }
+    }
+    out
 }
 
 /// Determinant of a 3×3 matrix.
@@ -2814,15 +3165,28 @@ fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
     gizmos.line(Vec3::ZERO, Vec3::Z * L, Color::srgb(0.3, 0.5, 1.0));
 }
 
-fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
+fn draw_sketch(
+    mut gizmos: Gizmos,
+    session: Res<SketchSession>,
+    ui_state: Res<UiState>,
+    cam_q: Query<&OrbitCamera>,
+) {
     let Some(ap) = &session.plane else { return };
+    let radius = cam_q.single().map(|c| c.radius).unwrap_or(12.0);
 
+    // Adaptive grid: spacing snaps to a nice 1/2/5×10^k that's ~1/16 of the view,
+    // with a bounded number of cells, so it stays usable from millimetres to metres.
     let grid = Color::srgba(0.55, 0.55, 0.62, 0.18);
-    let half = (PLANE_SIZE * 0.5) as i32;
-    for i in -half..=half {
-        let f = i as f32;
-        gizmos.line(ap.to_world(Vec2::new(f, -PLANE_SIZE * 0.5)), ap.to_world(Vec2::new(f, PLANE_SIZE * 0.5)), grid);
-        gizmos.line(ap.to_world(Vec2::new(-PLANE_SIZE * 0.5, f)), ap.to_world(Vec2::new(PLANE_SIZE * 0.5, f)), grid);
+    let raw = (radius / 16.0).max(1e-4);
+    let mag = 10f32.powf(raw.log10().floor());
+    let norm = raw / mag;
+    let spacing = mag * if norm < 1.5 { 1.0 } else if norm < 3.5 { 2.0 } else if norm < 7.5 { 5.0 } else { 10.0 };
+    let cells = 24;
+    let ext = spacing * cells as f32;
+    for k in -cells..=cells {
+        let f = k as f32 * spacing;
+        gizmos.line(ap.to_world(Vec2::new(f, -ext)), ap.to_world(Vec2::new(f, ext)), grid);
+        gizmos.line(ap.to_world(Vec2::new(-ext, f)), ap.to_world(Vec2::new(ext, f)), grid);
     }
 
     let solid = Color::srgb(0.95, 0.95, 0.25);
@@ -2851,8 +3215,13 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
                 }
             }
             SketchEntity::Circle { center, radius } => {
-                let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
+                let cu = uv_of(*center);
+                let iso = Isometry3d::new(ap.to_world(cu), plane_rot);
                 gizmos.circle(iso, *radius as f32, circle_col);
+                // Faint diameter leader toward the Ø callout (drawn by the UI).
+                let dcol = Color::srgba(0.55, 0.85, 1.0, 0.5);
+                let d = Vec2::splat(0.707) * (*radius as f32);
+                gizmos.line(ap.to_world(cu - d), ap.to_world(cu + d), dcol);
             }
             SketchEntity::Point { .. } => {}
         }
@@ -2869,10 +3238,12 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
     if !regions.is_empty() {
         let picked: Vec<usize> =
             session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
-        let (indices, region_col): (Vec<usize>, Color) = if picked.is_empty() {
-            ((0..regions.len()).collect(), Color::srgba(0.2, 1.0, 0.45, 0.4))
+        let explicit = !picked.is_empty();
+        // Explicit picks read in blue and shade more strongly; the "all" default is dim green.
+        let (indices, region_col, fill): (Vec<usize>, Color, Color) = if explicit {
+            (picked, Color::srgb(0.45, 0.85, 1.0), Color::srgba(0.45, 0.85, 1.0, 0.22))
         } else {
-            (picked, Color::srgb(0.2, 1.0, 0.45))
+            ((0..regions.len()).collect(), Color::srgba(0.2, 1.0, 0.45, 0.4), Color::srgba(0.2, 1.0, 0.45, 0.10))
         };
         let draw_loop = |gizmos: &mut Gizmos, loop_pts: &[[f64; 2]]| {
             let m = loop_pts.len();
@@ -2882,7 +3253,9 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
                 gizmos.line(ap.to_world(a), ap.to_world(b), region_col);
             }
         };
-        for i in indices {
+        let hatch = (spacing * 0.5).max(1e-3);
+        for &i in &indices {
+            hatch_region(&mut gizmos, ap, &regions[i].outer, &regions[i].holes, fill, hatch);
             draw_loop(&mut gizmos, &regions[i].outer);
             for hole in &regions[i].holes {
                 draw_loop(&mut gizmos, hole);
@@ -3000,6 +3373,86 @@ fn draw_sketch(mut gizmos: Gizmos, session: Res<SketchSession>) {
             Tool::Select | Tool::Dimension => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col, ms);
+    }
+
+    // ---- Boss/Cut preview: direction arrow + ghost extrusion of the contours ----
+    if let Some(op) = &ui_state.pending {
+        let regions = session.sketch.regions();
+        let picked: Vec<usize> =
+            session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
+        let indices: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
+        let dir = if op.reverse { -1.0 } else { 1.0 };
+        let depth = op.depth * dir;
+        let lift = ap.n * depth;
+        let ghost = match op.kind {
+            OpKind::Boss => Color::srgba(0.95, 0.85, 0.25, 0.8),
+            OpKind::Cut => Color::srgba(1.0, 0.4, 0.35, 0.8),
+        };
+
+        // Ghost prism: each contour's loops drawn at the top, with vertical risers.
+        let mut sum = Vec2::ZERO;
+        let mut count = 0.0_f32;
+        for &i in &indices {
+            for loop_pts in std::iter::once(&regions[i].outer).chain(regions[i].holes.iter()) {
+                let m = loop_pts.len();
+                for k in 0..m {
+                    let a = Vec2::new(loop_pts[k][0] as f32, loop_pts[k][1] as f32);
+                    let b = Vec2::new(loop_pts[(k + 1) % m][0] as f32, loop_pts[(k + 1) % m][1] as f32);
+                    gizmos.line(ap.to_world(a) + lift, ap.to_world(b) + lift, ghost); // top loop
+                    gizmos.line(ap.to_world(a), ap.to_world(a) + lift, ghost); // riser
+                    sum += a;
+                    count += 1.0;
+                }
+            }
+        }
+        // Direction arrow from the contours' centroid along the (reversible) normal.
+        if count > 0.0 {
+            let c = ap.to_world(sum / count);
+            gizmos.arrow(c, c + lift, Color::srgb(1.0, 0.85, 0.2));
+        }
+    }
+}
+
+/// Shade a region by scan-line hatching (even-odd, so holes are left empty) — a
+/// gizmo-only "fill" that makes a selected contour read as selected.
+fn hatch_region(
+    gizmos: &mut Gizmos,
+    ap: &ActivePlane,
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    color: Color,
+    spacing: f32,
+) {
+    if outer.len() < 3 || spacing <= 0.0 {
+        return;
+    }
+    let (mut ymin, mut ymax) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in outer {
+        ymin = ymin.min(p[1] as f32);
+        ymax = ymax.max(p[1] as f32);
+    }
+    let mut y = ymin + spacing * 0.5;
+    let mut guard = 0;
+    while y < ymax && guard < 4000 {
+        guard += 1;
+        let mut xs: Vec<f32> = Vec::new();
+        for loop_pts in std::iter::once(outer).chain(holes.iter().map(|h| h.as_slice())) {
+            let m = loop_pts.len();
+            for k in 0..m {
+                let (x1, y1) = (loop_pts[k][0] as f32, loop_pts[k][1] as f32);
+                let (x2, y2) = (loop_pts[(k + 1) % m][0] as f32, loop_pts[(k + 1) % m][1] as f32);
+                if (y1 > y) != (y2 > y) {
+                    xs.push(x1 + (y - y1) / (y2 - y1) * (x2 - x1));
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut k = 0;
+        while k + 1 < xs.len() {
+            gizmos.line(ap.to_world(Vec2::new(xs[k], y)), ap.to_world(Vec2::new(xs[k + 1], y)), color);
+            k += 2;
+        }
+        y += spacing;
     }
 }
 
@@ -3292,6 +3745,62 @@ mod tests {
         doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0 });
         let solid = regenerate(&doc).expect("regen should produce a body");
         assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
+    }
+
+    #[test]
+    fn adjacent_contours_merge_into_one_extrudable_outline() {
+        use hworks_sketch::Sketch;
+        let mut s = Sketch::default();
+        let ca = s.add_point(0.0, 0.0);
+        s.add_circle(ca, 3.0);
+        let cb = s.add_point(10.0, 0.0);
+        s.add_circle(cb, 3.0);
+        let a1 = s.add_point(-1.0, 2.0);
+        let a2 = s.add_point(11.0, 2.0);
+        s.add_line(a1, a2, false);
+        let b1 = s.add_point(-1.0, -2.0);
+        let b2 = s.add_point(11.0, -2.0);
+        s.add_line(b1, b2, false);
+        let regions = s.regions();
+        // The three adjacent strips (circle A · band · circle B) share line edges, so
+        // they merge into ONE outline — the dumbbell — that extrudes as one solid
+        // (no fragile coincident-face union).
+        let refs: Vec<&hworks_sketch::Region> = regions.iter().collect();
+        let merged = merge_regions(&refs);
+        assert_eq!(merged.len(), 1, "adjacent contours should merge into one outline, got {}", merged.len());
+        let solid = extrude_solid(&merged[0].outer, &merged[0].holes, &xy_basis(), 2.0);
+        assert!(solid.is_some(), "the merged dumbbell outline must extrude");
+    }
+
+    #[test]
+    fn a_diameter_line_splits_then_merges_back_to_a_disk() {
+        use hworks_sketch::Sketch;
+        let mut s = Sketch::default();
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 3.0);
+        let a = s.add_point(-4.0, 0.0);
+        let b = s.add_point(4.0, 0.0);
+        s.add_line(a, b, false);
+        assert_eq!(s.regions().len(), 2, "diameter splits the disk in two");
+        let merged = merge_regions(&s.regions().iter().collect::<Vec<_>>());
+        assert_eq!(merged.len(), 1, "the two halves merge back into one disk");
+    }
+
+    #[test]
+    fn disjoint_contours_stay_separate_when_merged() {
+        use hworks_sketch::Region;
+        let a = Region { outer: rect(0.0, 0.0, 2.0, 2.0), holes: vec![] };
+        let b = Region { outer: rect(5.0, 0.0, 7.0, 2.0), holes: vec![] };
+        let merged = merge_regions(&[&a, &b]);
+        assert_eq!(merged.len(), 2, "disjoint contours must stay two outlines");
+    }
+
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f64; 2]> {
+        vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+
+    fn xy_basis() -> hworks_geometry::PlaneBasis {
+        hworks_geometry::PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
     }
 
     #[test]

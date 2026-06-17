@@ -45,6 +45,9 @@ pub enum Constraint {
     Equal(usize, usize, usize, usize),
     /// Line (a,b) tangent to a circle centred at `center` with the given radius.
     Tangent { a: usize, b: usize, center: usize, radius: f64 },
+    /// The circles centred at points `a` and `b` have equal radius (a drives b).
+    /// Radius isn't a solver variable, so this is enforced after each solve.
+    EqualRadius { a: usize, b: usize },
 }
 
 /// A closed area of a sketch, ready to extrude: one outer boundary loop plus any
@@ -534,6 +537,7 @@ impl Sketch {
         let n = self.points.len();
         let m = self.residual_len();
         if n == 0 || m == 0 {
+            self.apply_equal_radius(); // radius relations don't need a point solve
             return;
         }
         let nvars = 2 * n;
@@ -604,6 +608,36 @@ impl Sketch {
             p.x = x[2 * i];
             p.y = x[2 * i + 1];
         }
+
+        self.apply_equal_radius();
+    }
+
+    /// Enforce `EqualRadius` relations: each makes circle `b` adopt circle `a`'s
+    /// radius. Done after the point solve since radius isn't a solver variable.
+    fn apply_equal_radius(&mut self) {
+        let pairs: Vec<(usize, usize)> = self
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::EqualRadius { a, b } => Some((*a, *b)),
+                _ => None,
+            })
+            .collect();
+        for (a, b) in pairs {
+            let ra = self.entities.iter().find_map(|e| match e {
+                SketchEntity::Circle { center, radius } if *center == a => Some(*radius),
+                _ => None,
+            });
+            if let Some(ra) = ra {
+                for e in self.entities.iter_mut() {
+                    if let SketchEntity::Circle { center, radius } = e {
+                        if *center == b {
+                            *radius = ra;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Total number of scalar residual equations across all constraints.
@@ -620,6 +654,8 @@ impl Sketch {
                 | Constraint::Perpendicular(..)
                 | Constraint::Equal(..)
                 | Constraint::Tangent { .. } => 1,
+                // Enforced after the solve (radius isn't a point variable).
+                Constraint::EqualRadius { .. } => 0,
             })
             .sum()
     }
@@ -685,6 +721,8 @@ impl Sketch {
                     r[k] = dist - *radius;
                     k += 1;
                 }
+                // Not a point residual — enforced separately after the solve.
+                Constraint::EqualRadius { .. } => {}
             }
         }
         r
@@ -853,6 +891,26 @@ mod tests {
     }
 
     #[test]
+    fn equal_radius_makes_two_circles_match() {
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        s.add_circle(a, 2.0);
+        let b = s.add_point(10.0, 0.0);
+        s.add_circle(b, 5.0);
+        s.constraints.push(Constraint::EqualRadius { a, b });
+        s.solve();
+        let rb = s
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { center, radius } if *center == b => Some(*radius),
+                _ => None,
+            })
+            .unwrap();
+        assert!((rb - 2.0).abs() < 1e-9, "circle b should match circle a's radius, was {rb}");
+    }
+
+    #[test]
     fn nested_loops_become_a_region_with_a_hole() {
         let mut s = Sketch::default();
         add_rect(&mut s, 0.0, 0.0, 10.0, 10.0); // outer
@@ -897,6 +955,46 @@ mod tests {
         let b = s.add_point(3.0, 0.5);
         s.add_line(a, b, false);
         assert_eq!(s.regions().len(), 2, "a chord cuts the disk into two areas");
+    }
+
+    #[test]
+    fn two_circles_linked_by_lines_expose_the_middle_region() {
+        let mut s = Sketch::default();
+        let ca = s.add_point(0.0, 0.0);
+        s.add_circle(ca, 3.0);
+        let cb = s.add_point(10.0, 0.0);
+        s.add_circle(cb, 3.0);
+        // Two lines crossing both circles (secants) near the top and bottom.
+        let a1 = s.add_point(-1.0, 2.0);
+        let a2 = s.add_point(11.0, 2.0);
+        s.add_line(a1, a2, false);
+        let b1 = s.add_point(-1.0, -2.0);
+        let b2 = s.add_point(11.0, -2.0);
+        s.add_line(b1, b2, false);
+        let regions = s.regions();
+        let inside = |rs: &[Region], p: [f64; 2]| {
+            rs.iter().position(|r| point_in_poly(p, &r.outer) && !r.holes.iter().any(|h| point_in_poly(p, h)))
+        };
+        eprintln!("SECANT: region count = {}", regions.len());
+        eprintln!("  middle (5,0) -> {:?}, left circle (0,0) -> {:?}", inside(&regions, [5.0, 0.0]), inside(&regions, [0.0, 0.0]));
+
+        // Tangent/external connectors: lines just touch the circles (endpoints on
+        // the rim), so the circles stay whole — the case from the screenshot.
+        let mut t = Sketch::default();
+        let ta = t.add_point(0.0, 0.0);
+        t.add_circle(ta, 3.0);
+        let tb = t.add_point(10.0, 0.0);
+        t.add_circle(tb, 3.0);
+        let p1 = t.add_point(0.0, 3.0);
+        let p2 = t.add_point(10.0, 3.0);
+        t.add_line(p1, p2, false);
+        let p3 = t.add_point(0.0, -3.0);
+        let p4 = t.add_point(10.0, -3.0);
+        t.add_line(p3, p4, false);
+        let tr = t.regions();
+        assert!(inside(&regions, [5.0, 0.0]).is_some(), "secant middle band should be a region");
+        assert!(inside(&tr, [5.0, 0.0]).is_some(), "tangent middle band should be a region");
+        assert!(inside(&tr, [0.0, 0.0]).is_some(), "each circle is still a region");
     }
 
     #[test]
