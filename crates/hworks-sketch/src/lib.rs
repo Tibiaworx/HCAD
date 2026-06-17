@@ -98,6 +98,39 @@ impl Sketch {
         self.constraints.clear();
     }
 
+    /// Drop points no entity references (e.g. the stray endpoints left after a line
+    /// is deleted), remapping indices. Constraints that touched a removed point are
+    /// dropped too. Call after deleting entities.
+    pub fn remove_unused_points(&mut self) {
+        let n = self.points.len();
+        let mut used = vec![false; n];
+        for e in &self.entities {
+            for p in entity_point_indices(e) {
+                if p < n {
+                    used[p] = true;
+                }
+            }
+        }
+        // A constraint on a vanished point is meaningless → drop it.
+        self.constraints.retain(|c| constraint_point_indices(c).iter().all(|&p| p < n && used[p]));
+
+        let mut remap = vec![0usize; n];
+        let mut keep = Vec::with_capacity(n);
+        for i in 0..n {
+            if used[i] {
+                remap[i] = keep.len();
+                keep.push(self.points[i]);
+            }
+        }
+        self.points = keep;
+        for e in &mut self.entities {
+            remap_entity(e, &remap);
+        }
+        for c in &mut self.constraints {
+            remap_constraint(c, &remap);
+        }
+    }
+
     /// If the non-construction lines form a single closed loop, return the point
     /// indices in order around it. Otherwise `None`. This is the profile the
     /// kernel extrudes (M3). Requires every involved point to have degree 2 and
@@ -495,6 +528,75 @@ fn trace_minimal_faces(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
     faces
 }
 
+/// Point indices an entity references.
+fn entity_point_indices(e: &SketchEntity) -> Vec<usize> {
+    match e {
+        SketchEntity::Line { a, b, .. } => vec![*a, *b],
+        SketchEntity::Circle { center, .. } => vec![*center],
+        SketchEntity::Point { at } => vec![*at],
+    }
+}
+
+/// Point indices a constraint references.
+fn constraint_point_indices(c: &Constraint) -> Vec<usize> {
+    match c {
+        Constraint::Coincident(a, b)
+        | Constraint::Horizontal(a, b)
+        | Constraint::Vertical(a, b)
+        | Constraint::Distance { a, b, .. }
+        | Constraint::EqualRadius { a, b } => vec![*a, *b],
+        Constraint::Midpoint { mid, a, b } => vec![*mid, *a, *b],
+        Constraint::Parallel(a, b, c, d)
+        | Constraint::Perpendicular(a, b, c, d)
+        | Constraint::Equal(a, b, c, d) => vec![*a, *b, *c, *d],
+        Constraint::Tangent { a, b, center, .. } => vec![*a, *b, *center],
+    }
+}
+
+/// Remap an entity's point indices through `m`.
+fn remap_entity(e: &mut SketchEntity, m: &[usize]) {
+    match e {
+        SketchEntity::Line { a, b, .. } => {
+            *a = m[*a];
+            *b = m[*b];
+        }
+        SketchEntity::Circle { center, .. } => *center = m[*center],
+        SketchEntity::Point { at } => *at = m[*at],
+    }
+}
+
+/// Remap a constraint's point indices through `m`.
+fn remap_constraint(c: &mut Constraint, m: &[usize]) {
+    match c {
+        Constraint::Coincident(a, b)
+        | Constraint::Horizontal(a, b)
+        | Constraint::Vertical(a, b)
+        | Constraint::Distance { a, b, .. }
+        | Constraint::EqualRadius { a, b } => {
+            *a = m[*a];
+            *b = m[*b];
+        }
+        Constraint::Midpoint { mid, a, b } => {
+            *mid = m[*mid];
+            *a = m[*a];
+            *b = m[*b];
+        }
+        Constraint::Parallel(a, b, c, d)
+        | Constraint::Perpendicular(a, b, c, d)
+        | Constraint::Equal(a, b, c, d) => {
+            *a = m[*a];
+            *b = m[*b];
+            *c = m[*c];
+            *d = m[*d];
+        }
+        Constraint::Tangent { a, b, center, .. } => {
+            *a = m[*a];
+            *b = m[*b];
+            *center = m[*center];
+        }
+    }
+}
+
 /// Even-odd ray-cast point-in-polygon test.
 pub fn point_in_poly(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     let n = poly.len();
@@ -604,9 +706,14 @@ impl Sketch {
             }
         }
 
-        for (i, p) in self.points.iter_mut().enumerate() {
-            p.x = x[2 * i];
-            p.y = x[2 * i + 1];
+        // Only accept the result if it's all finite — an over/under-constrained solve
+        // can diverge to NaN/∞, and a NaN coordinate poisons everything downstream
+        // (dimension values, radii) and even crashes egui's number widgets.
+        if x.iter().all(|v| v.is_finite()) {
+            for (i, p) in self.points.iter_mut().enumerate() {
+                p.x = x[2 * i];
+                p.y = x[2 * i + 1];
+            }
         }
 
         self.apply_equal_radius();
@@ -888,6 +995,22 @@ mod tests {
         let len = (dx * dx + dy * dy).sqrt();
         let cross = dx * (s.points[center].y - s.points[a].y) - dy * (s.points[center].x - s.points[a].x);
         assert!((cross.abs() / len - 2.0).abs() < 1e-5, "distance to centre should be the radius");
+    }
+
+    #[test]
+    fn remove_unused_points_drops_orphan_endpoints() {
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(5.0, 0.0);
+        s.add_line(a, b, false);
+        let c = s.add_point(2.0, 2.0); // a circle that shares no points with the line
+        s.add_circle(c, 1.0);
+        // Delete the line (leaving its two endpoints orphaned), then clean up.
+        s.entities.remove(0);
+        s.remove_unused_points();
+        assert_eq!(s.points.len(), 1, "only the circle centre should remain");
+        // The circle still resolves to a valid centre.
+        assert!(matches!(s.entities[0], SketchEntity::Circle { center: 0, .. }));
     }
 
     #[test]

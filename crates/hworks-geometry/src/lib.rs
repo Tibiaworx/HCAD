@@ -204,11 +204,16 @@ fn wound(pts: &[[f64; 2]], ccw: bool) -> Vec<[f64; 2]> {
 /// lines of a curved surface, or a tangent blend) are "tangent".
 pub fn tessellate(solid: &KSolid, tol: f64) -> Tessellation {
     const SHARP_DEG: f64 = 35.0;
-    let mut poly = solid.0.triangulation(tol).to_polygon();
-    poly.triangulate();
-    let mesh = polymesh_to_trimesh(&poly);
-    let (edges, tangent_edges) = feature_edges(&mesh, SHARP_DEG);
-    Tessellation { mesh, edges, tangent_edges }
+    // truck's triangulation can panic on awkward geometry; never let that crash the
+    // app — fall back to an empty tessellation (the booleans are guarded too).
+    guard(|| {
+        let mut poly = solid.0.triangulation(tol).to_polygon();
+        poly.triangulate();
+        let mesh = polymesh_to_trimesh(&poly);
+        let (edges, tangent_edges) = feature_edges(&mesh, SHARP_DEG);
+        Some(Tessellation { mesh, edges, tangent_edges })
+    })
+    .unwrap_or(Tessellation { mesh: TriMesh::default(), edges: Vec::new(), tangent_edges: Vec::new() })
 }
 
 // ---------------------------------------------------------------------------

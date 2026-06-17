@@ -12,6 +12,7 @@
 //! on the UI never leak into the sketch.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::gizmos::config::{GizmoConfigGroup, GizmoConfigStore};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -24,6 +25,11 @@ use hworks_geometry::{
     cut_tol, extrude_solid, extrude_solid_with_overlap, tessellate, union_tol, KSolid, PlaneBasis,
     Tessellation, TriMesh,
 };
+
+/// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
+/// the drag arrow, and the cut-depth indicator — so they show through the model.
+#[derive(Default, Reflect, GizmoConfigGroup)]
+struct OverlayGizmos;
 
 /// How far a boss reaches back into the body it's built on (flush path). Kept below
 /// the 0.03 tessellation tolerance so any overhang lip is sub-facet (invisible),
@@ -75,6 +81,7 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin::default())
+        .init_gizmo_group::<OverlayGizmos>()
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
         .insert_resource(DocRes(Document::with_default_planes()))
         .init_resource::<SketchSession>()
@@ -324,6 +331,8 @@ struct SketchSession {
     /// Snap tolerance in world units, scaled to the zoom so snapping feels the same
     /// at any scale (a fixed tolerance is unusable on a large part). Set each frame.
     snap_dist: f32,
+    /// True while the user is dragging the extrude direction arrow to set the depth.
+    arrow_drag: bool,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -391,8 +400,13 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut gizmo_store: ResMut<GizmoConfigStore>,
     doc: Res<DocRes>,
 ) {
+    // Overlay gizmos draw in front of the solid so the extrude preview/arrow and the
+    // cut-depth indicator are visible through the model.
+    gizmo_store.config_mut::<OverlayGizmos>().0.depth_bias = -1.0;
+
     let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
     let colors = [
         Color::srgba(0.85, 0.25, 0.25, 0.16),
@@ -514,6 +528,31 @@ fn ui_system(
     part: Res<Part>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+
+    // Sanitize every value that feeds an egui number widget — a NaN/∞ crashes egui's
+    // "smart aim" code. (The solver already rejects NaN; this is the last line.)
+    for c in &mut session.sketch.constraints {
+        if let Constraint::Distance { value, .. } = c {
+            if !value.is_finite() {
+                *value = 1.0;
+            }
+        }
+    }
+    for e in &mut session.sketch.entities {
+        if let SketchEntity::Circle { radius, .. } = e {
+            if !radius.is_finite() {
+                *radius = 1.0;
+            }
+        }
+    }
+    if !session.live_buf.is_finite() {
+        session.live_buf = 0.0;
+    }
+    if let Some(op) = ui_state.pending.as_mut() {
+        if !op.depth.is_finite() {
+            op.depth = EXTRUDE_DISTANCE as f32;
+        }
+    }
 
     // Apply a CAD-ish dark style once.
     if !ui_state.themed {
@@ -681,6 +720,11 @@ fn ui_system(
     egui::SidePanel::left("left_panel").default_width(240.0).show(ctx, |ui| {
         if let Some(mut op) = ui_state.pending.clone() {
             // PropertyManager laid out like SolidWorks' Boss-Extrude.
+            // Guard the depth: a non-finite value would crash egui's DragValue.
+            if !op.depth.is_finite() {
+                op.depth = EXTRUDE_DISTANCE as f32;
+            }
+            op.depth = op.depth.clamp(0.1, 10_000.0);
             let mut keep = true;
             let mut commit = false;
             ui.horizontal(|ui| {
@@ -721,7 +765,7 @@ fn ui_system(
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("D1").strong());
                     ui.add(
-                        egui::DragValue::new(&mut op.depth).speed(0.1).range(0.1..=200.0).suffix(" mm"),
+                        egui::DragValue::new(&mut op.depth).speed(0.1).range(0.1..=10_000.0).suffix(" mm"),
                     );
                 });
             });
@@ -1165,7 +1209,22 @@ fn ui_system(
             // Apply the tree context-menu action (after the borrow above ends).
             if let Some(act) = action {
                 match act {
-                    TreeAction::Select(i) => ui_state.selected = Some(i),
+                    TreeAction::Select(i) => {
+                        // "Edit feature" → reopen the sketch and the PropertyManager
+                        // prefilled with the feature's kind/depth (no separate editor).
+                        let op = doc.0.features.get(i).and_then(|f| match &f.kind {
+                            FeatureKind::Extrude { distance, .. } => Some((OpKind::Boss, *distance)),
+                            FeatureKind::Cut { distance, .. } => Some((OpKind::Cut, *distance)),
+                            _ => None,
+                        });
+                        if let Some((kind, dist)) = op {
+                            ui_state.edit_sketch_request = Some(i);
+                            ui_state.pending =
+                                Some(PendingOp { kind, depth: (dist.abs() as f32).max(0.1), reverse: dist < 0.0 });
+                        } else {
+                            ui_state.selected = Some(i);
+                        }
+                    }
                     TreeAction::Edit(i) => ui_state.edit_sketch_request = Some(i),
                     TreeAction::ExtrudeBoss(i) => {
                         ui_state.edit_sketch_request = Some(i);
@@ -1189,43 +1248,15 @@ fn ui_system(
                 }
             }
 
-            // Inline depth editor for the selected Extrude/Cut — Apply to confirm.
-            if let Some(i) = ui_state.selected {
-                let depth = doc.0.features.get(i).and_then(|f| match &f.kind {
-                    FeatureKind::Extrude { distance, .. } | FeatureKind::Cut { distance, .. } => Some(*distance),
-                    _ => None,
-                });
-                if let Some(depth) = depth {
-                    // Sync the editor's value when the selection changes.
-                    if ui_state.edit_depth_for != Some(i) {
-                        ui_state.edit_depth = depth as f32;
-                        ui_state.edit_depth_for = Some(i);
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Edit feature").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("Depth (mm):");
-                        // Allow negatives so a reversed extrude/cut survives editing.
-                        ui.add(egui::DragValue::new(&mut ui_state.edit_depth).speed(0.1).range(-200.0..=200.0));
-                    });
-                    let changed = (ui_state.edit_depth as f64 - depth).abs() > 1e-6;
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(changed, egui::Button::new("Apply").fill(egui::Color32::from_rgb(40, 110, 70))).clicked() {
-                            history.snapshot(&doc.0);
-                            if let Some(f) = doc.0.features.get_mut(i) {
-                                match &mut f.kind {
-                                    FeatureKind::Extrude { distance, .. }
-                                    | FeatureKind::Cut { distance, .. } => *distance = ui_state.edit_depth as f64,
-                                    _ => {}
-                                }
-                            }
-                            ui_state.regen = true;
-                        }
-                        if ui.add_enabled(changed, egui::Button::new("Revert")).clicked() {
-                            ui_state.edit_depth = depth as f32;
-                        }
-                    });
-                }
+            // (Feature depth is edited in the PropertyManager via "Edit feature".)
+            if doc.0.features.iter().any(|f| matches!(f.kind, FeatureKind::Extrude { .. } | FeatureKind::Cut { .. })) {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Right-click a feature → Edit feature / Edit sketch.")
+                        .italics()
+                        .weak()
+                        .small(),
+                );
             }
         }
     });
@@ -1794,6 +1825,7 @@ fn sketch_interaction(
     part: Res<Part>,
     mut session: ResMut<SketchSession>,
     mut edge_sel: ResMut<EdgeSelection>,
+    mut ui_state: ResMut<UiState>,
 ) {
     if blocking.0 {
         return;
@@ -1944,6 +1976,10 @@ fn sketch_interaction(
             }
         }
     }
+    // Never let a non-finite cursor through — it poisons placed points and egui.
+    if session.cursor_uv.is_some_and(|c| !c.is_finite()) {
+        session.cursor_uv = None;
+    }
 
     // Entity under the cursor (Select tool) for hover highlighting.
     session.hover_entity = if session.plane.is_some() && session.tool == Tool::Select {
@@ -1955,6 +1991,14 @@ fn sketch_interaction(
     let just_pressed = buttons.just_pressed(MouseButton::Left);
     let pressed = buttons.pressed(MouseButton::Left);
     let just_released = buttons.just_released(MouseButton::Left);
+
+    // While a boss/cut is being configured, grabbing its direction arrow and dragging
+    // sets the depth live (which shows in the panel and the feature tree on commit).
+    if ui_state.pending.is_some() && session.plane.is_some() {
+        if extrude_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
+            return;
+        }
+    }
 
     if session.plane.is_none() {
         if just_pressed {
@@ -2253,6 +2297,7 @@ fn handle_keys(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<SketchSessio
                     session.sketch.entities.remove(i);
                 }
             }
+            session.sketch.remove_unused_points(); // drop the now-orphan endpoints
             session.selected_entities.clear();
             session.hover_entity = None;
             session.selected_contours.clear(); // region indices shift after a delete
@@ -2417,6 +2462,7 @@ fn do_solid_op(
     };
     ui_state.regen = true;
     ui_state.selected = Some(target);
+    doc.0.rollback = doc.0.features.len(); // roll forward so the result is visible
 
     session.plane = None;
     session.editing = None;
@@ -2434,7 +2480,7 @@ fn do_solid_op(
 fn handle_edit_sketch(
     mut ui_state: ResMut<UiState>,
     mut session: ResMut<SketchSession>,
-    doc: Res<DocRes>,
+    mut doc: ResMut<DocRes>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
     let Some(i) = ui_state.edit_sketch_request.take() else { return };
@@ -2463,6 +2509,10 @@ fn handle_edit_sketch(
     session.drag = None;
     session.cursor_uv = None;
     session.needs_apply = false;
+    // Roll back to just before this feature so you sketch on its input geometry
+    // (the body without this feature); committing rolls forward again.
+    doc.0.rollback = i;
+    ui_state.regen = true;
     info!("Editing sketch of feature {i}.");
 }
 
@@ -2483,6 +2533,9 @@ fn handle_exit_sketch(
         session.drag = None;
         session.cursor_uv = None;
         session.selected_contours.clear();
+        // Restore the rollback bar (edit rolled it back to the feature).
+        doc.0.rollback = doc.0.features.len();
+        ui_state.regen = true;
         return;
     }
     if !session.exit_request {
@@ -2524,6 +2577,9 @@ fn handle_exit_sketch(
             }
         }
     }
+    // Roll the bar forward so the committed result is shown (edit rolled it back).
+    doc.0.rollback = doc.0.features.len();
+    ui_state.regen = true;
 
     session.plane = None;
     session.editing = None;
@@ -2613,10 +2669,18 @@ fn do_regenerate(
     // Vertices move when the model rebuilds, so any edge selection is stale.
     edge_sel.clear();
 
+    // The whole rebuild runs under a panic guard: a kernel panic deep in a boolean
+    // or triangulation leaves the model empty rather than taking the app down.
+    let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate(&doc.0)))
+        .unwrap_or_else(|_| {
+            warn!("Regenerate panicked — the kernel choked on this geometry; model cleared.");
+            None
+        });
+
     for e in &existing {
         commands.entity(e).despawn();
     }
-    match regenerate(&doc.0) {
+    match rebuilt {
         Some(solid) => {
             let tess = tessellate(&solid, 0.03);
             part.mesh = Some(tess.mesh.clone());
@@ -2828,16 +2892,27 @@ fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, dist
 
 /// Cut region `r` from the body — same escalating fallback idea as [`boss_union`].
 fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
-    let strategies = [(0.0, COINCIDENT_TOL), (COINCIDENT_NUDGE, COINCIDENT_TOL), (0.0, ROBUST_TOL), (COINCIDENT_NUDGE, ROBUST_TOL)];
+    // (radial nudge, boolean tolerance) — truck's cut boolean is flaky, so sweep a
+    // range of tolerances/nudges; the first that produces a solid wins.
+    let strategies = [
+        (0.0, COINCIDENT_TOL),
+        (COINCIDENT_NUDGE, COINCIDENT_TOL),
+        (0.0, 1.0e-3),
+        (COINCIDENT_NUDGE, 1.0e-3),
+        (0.0, 1.0e-2),
+        (0.0, ROBUST_TOL),
+        (COINCIDENT_NUDGE, ROBUST_TOL),
+    ];
     for (k, &(nudge, tol)) in strategies.iter().enumerate() {
         let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
         if let Some(s) = cut_tol(body, &outer, &r.holes, basis, distance, tol) {
             if k > 0 {
-                info!("Cut: used fallback strategy {k} (coincident/awkward faces).");
+                info!("Cut: used fallback strategy {k} (truck's boolean is finicky here).");
             }
             return Some(s);
         }
     }
+    warn!("Cut could not be built by any strategy — truck rejected this geometry.");
     None
 }
 
@@ -3167,6 +3242,7 @@ fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
 
 fn draw_sketch(
     mut gizmos: Gizmos,
+    mut overlay: Gizmos<OverlayGizmos>,
     session: Res<SketchSession>,
     ui_state: Res<UiState>,
     cam_q: Query<&OrbitCamera>,
@@ -3381,34 +3457,47 @@ fn draw_sketch(
         let picked: Vec<usize> =
             session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
         let indices: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
-        let dir = if op.reverse { -1.0 } else { 1.0 };
-        let depth = op.depth * dir;
-        let lift = ap.n * depth;
+        // A boss goes out along +normal by default; a cut goes in (−normal, into the
+        // material). Reverse flips either one.
+        let kind_sign = match op.kind {
+            OpKind::Boss => 1.0,
+            OpKind::Cut => -1.0,
+        };
+        let nominal = kind_sign * if op.reverse { -1.0 } else { 1.0 };
+        let lift = ap.n * (op.depth * nominal);
         let ghost = match op.kind {
             OpKind::Boss => Color::srgba(0.95, 0.85, 0.25, 0.8),
             OpKind::Cut => Color::srgba(1.0, 0.4, 0.35, 0.8),
         };
 
-        // Ghost prism: each contour's loops drawn at the top, with vertical risers.
-        let mut sum = Vec2::ZERO;
-        let mut count = 0.0_f32;
+        // Ghost prism, drawn on the overlay group so it shows THROUGH the model — the
+        // far end is the cut-depth indicator (where the cut bottoms out, à la SW).
+        // The far loop is drawn brighter so the depth reads clearly.
+        let far = match op.kind {
+            OpKind::Boss => ghost,
+            OpKind::Cut => Color::srgb(1.0, 0.75, 0.2), // bright depth ring for a cut
+        };
         for &i in &indices {
             for loop_pts in std::iter::once(&regions[i].outer).chain(regions[i].holes.iter()) {
                 let m = loop_pts.len();
                 for k in 0..m {
                     let a = Vec2::new(loop_pts[k][0] as f32, loop_pts[k][1] as f32);
                     let b = Vec2::new(loop_pts[(k + 1) % m][0] as f32, loop_pts[(k + 1) % m][1] as f32);
-                    gizmos.line(ap.to_world(a) + lift, ap.to_world(b) + lift, ghost); // top loop
-                    gizmos.line(ap.to_world(a), ap.to_world(a) + lift, ghost); // riser
-                    sum += a;
-                    count += 1.0;
+                    overlay.line(ap.to_world(a) + lift, ap.to_world(b) + lift, far); // far loop (depth)
+                    overlay.line(ap.to_world(a), ap.to_world(a) + lift, ghost); // riser
                 }
             }
         }
-        // Direction arrow from the contours' centroid along the (reversible) normal.
-        if count > 0.0 {
-            let c = ap.to_world(sum / count);
-            gizmos.arrow(c, c + lift, Color::srgb(1.0, 0.85, 0.2));
+        // Direction arrow from the contours' centroid — on the overlay group so it's
+        // always visible. Grab it (within 16px) to drag the depth.
+        if let Some(base_uv) = contours_centroid(&session) {
+            let c = ap.to_world(base_uv);
+            let acol = if session.arrow_drag { Color::srgb(1.0, 1.0, 0.5) } else { Color::srgb(1.0, 0.85, 0.2) };
+            // The arrow always points OUT along the face normal (away from the body)
+            // so it stays visible and grabbable, even for a cut whose ghost goes in.
+            let handle = c + ap.n * op.depth.max(0.5 * ms.max(1.0));
+            overlay.arrow(c, handle, acol);
+            overlay.sphere(Isometry3d::from_translation(handle), 0.15 * ms.max(1.0), acol);
         }
     }
 }
@@ -3510,6 +3599,96 @@ fn segment_screen_dist(
         0.0
     };
     Some((cursor - (pa + ab * t)).length())
+}
+
+/// Centroid (in plane uv) of the contours a pending extrude would use — the base
+/// of the direction arrow.
+fn contours_centroid(session: &SketchSession) -> Option<Vec2> {
+    let regions = session.sketch.regions();
+    if regions.is_empty() {
+        return None;
+    }
+    let picked: Vec<usize> =
+        session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
+    let idxs: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
+    let (mut sum, mut count) = (Vec2::ZERO, 0.0_f32);
+    for i in idxs {
+        for p in &regions[i].outer {
+            sum += Vec2::new(p[0] as f32, p[1] as f32);
+            count += 1.0;
+        }
+    }
+    (count > 0.0).then(|| sum / count)
+}
+
+/// Signed parameter `t` along the axis (`base` + `n`·t) of the point closest to the
+/// cursor ray — used to read an extrude depth from where the user drags the arrow.
+fn closest_t_on_axis(base: Vec3, n: Vec3, ro: Vec3, rd: Vec3) -> f32 {
+    let n = n.normalize_or_zero();
+    let d = rd.normalize_or_zero();
+    let w0 = base - ro;
+    let b = n.dot(d);
+    let denom = 1.0 - b * b;
+    if denom.abs() < 1e-4 {
+        return 0.0; // axis ~parallel to the view ray
+    }
+    let t = (b * d.dot(w0) - n.dot(w0)) / denom;
+    if t.is_finite() {
+        t
+    } else {
+        0.0
+    }
+}
+
+/// Drag the boss/cut direction arrow to set the depth live. Returns true while it's
+/// actively handling the drag (so the caller skips the normal sketch tools).
+fn extrude_arrow_drag(
+    session: &mut SketchSession,
+    ui_state: &mut UiState,
+    window: &Window,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    ray: &Ray3d,
+    just_pressed: bool,
+    pressed: bool,
+    just_released: bool,
+) -> bool {
+    let (Some(ap), Some(op)) = (session.plane.clone(), ui_state.pending.clone()) else {
+        return false;
+    };
+    let Some(base_uv) = contours_centroid(session) else { return false };
+    let base = ap.to_world(base_uv);
+    let n = ap.n.normalize_or_zero();
+    // The handle points OUT along the face normal (matching the drawn arrow).
+    let tip = base + n * op.depth.max(0.5);
+
+    if just_pressed {
+        if let Some(cursor) = window.cursor_position() {
+            // Grab if the click is near the arrow shaft (screen space).
+            if segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 16.0) {
+                session.arrow_drag = true;
+            }
+        }
+    }
+    if session.arrow_drag && pressed {
+        // `t` is the distance dragged out along +normal. Set the depth from it (clamped
+        // to a sane, finite range); keep the direction on the Reverse checkbox so a
+        // little wobble past the face can't silently flip the cut. A non-finite `t`
+        // (axis nearly edge-on to the view) is ignored — a NaN here crashes egui.
+        let t = closest_t_on_axis(base, n, ray.origin, ray.direction.as_vec3());
+        if t.is_finite() {
+            let depth = t.clamp(0.1, 10_000.0);
+            ui_state.pending = Some(PendingOp { kind: op.kind, depth, reverse: op.reverse });
+        }
+        if just_released {
+            session.arrow_drag = false;
+        }
+        return true;
+    }
+    if just_released {
+        session.arrow_drag = false;
+    }
+    false
 }
 
 /// Index of the body edge segment nearest the cursor in screen space, within
@@ -3801,6 +3980,57 @@ mod tests {
 
     fn xy_basis() -> hworks_geometry::PlaneBasis {
         hworks_geometry::PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
+    }
+
+    #[test]
+    fn cut_pocket_into_one_of_two_cylinders() {
+        use hworks_sketch::Sketch;
+        let mut doc = Document::with_default_planes();
+        let mut a = Sketch::default();
+        let pa = a.add_point(0.0, 0.0);
+        a.add_circle(pa, 3.0);
+        doc.add_feature(FeatureKind::Extrude { sketch: a, regions: vec![], plane: xy(), distance: 5.0 });
+        let mut b = Sketch::default();
+        let pb = b.add_point(10.0, 0.0);
+        b.add_circle(pb, 3.0);
+        doc.add_feature(FeatureKind::Extrude { sketch: b, regions: vec![], plane: xy(), distance: 3.0 });
+        let before = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
+        // Cut a 1mm hole in the top of cylinder A (z=5), 2mm deep.
+        let mut cut = Sketch::default();
+        let pc = cut.add_point(0.0, 0.0);
+        cut.add_circle(pc, 1.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        doc.add_feature(FeatureKind::Cut { sketch: cut, regions: vec![], plane: top, distance: 2.0 });
+        let after_solid = regenerate(&doc).expect("body after cut");
+        let after = tessellate(&after_solid, 0.05).edges.len();
+        eprintln!("edges before cut {before}, after cut {after}");
+        assert!(after > before, "the cut must add pocket edges (before {before}, after {after})");
+    }
+
+    #[test]
+    fn cut_into_a_dumbbell_does_not_panic() {
+        use hworks_sketch::Sketch;
+        let mut boss = Sketch::default();
+        let ca = boss.add_point(0.0, 0.0);
+        boss.add_circle(ca, 3.0);
+        let cb = boss.add_point(10.0, 0.0);
+        boss.add_circle(cb, 3.0);
+        let a1 = boss.add_point(-1.0, 2.0);
+        let a2 = boss.add_point(11.0, 2.0);
+        boss.add_line(a1, a2, false);
+        let b1 = boss.add_point(-1.0, -2.0);
+        let b2 = boss.add_point(11.0, -2.0);
+        boss.add_line(b1, b2, false);
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 2.0 });
+        // Cut a 1mm-radius hole in the middle, from the top face.
+        let mut cutsk = Sketch::default();
+        let cc = cutsk.add_point(5.0, 0.0);
+        cutsk.add_circle(cc, 1.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        doc.add_feature(FeatureKind::Cut { sketch: cutsk, regions: vec![], plane: top, distance: 1.0 });
+        let solid = regenerate(&doc); // must not panic
+        assert!(solid.is_some(), "dumbbell with a cut should still produce a body");
     }
 
     #[test]
