@@ -12,11 +12,15 @@ use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
 /// A 2D point in plane-local coordinates — every entity endpoint is one of these,
-/// and each is an unknown the constraint solver positions.
+/// and each is an unknown the constraint solver positions. A `fixed` point is locked:
+/// the solver never moves it (used for geometry projected from the 3D body — corners,
+/// centres, and edges — so a sketch can be referenced/constrained to the solid).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct Point2 {
     pub x: f64,
     pub y: f64,
+    #[serde(default)]
+    pub fixed: bool,
 }
 
 /// A drawable sketch entity. A rectangle/square is four `Line`s plus constraints;
@@ -24,9 +28,42 @@ pub struct Point2 {
 /// `Point` tied to it by a `Midpoint` constraint.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SketchEntity {
-    Line { a: usize, b: usize, construction: bool },
+    /// A straight edge. `construction` lines guide but don't form profiles;
+    /// `reference` lines are projected from the 3D body (locked, also non-profile).
+    Line {
+        a: usize,
+        b: usize,
+        construction: bool,
+        #[serde(default)]
+        reference: bool,
+    },
     Circle { center: usize, radius: f64 },
     Point { at: usize },
+    /// A smooth spline through (or guided by) its `points`. `control == false` ⇒ the
+    /// curve passes *through* the points (interpolating Catmull-Rom); `control == true`
+    /// ⇒ the points are a B-spline control hull the curve only approaches. `closed`
+    /// wraps it into a loop. `construction` splines guide but don't form profiles.
+    Spline {
+        points: Vec<usize>,
+        #[serde(default)]
+        closed: bool,
+        #[serde(default)]
+        construction: bool,
+        #[serde(default)]
+        control: bool,
+    },
+    /// A slot whose two rounded ends are centred at points `a` and `b`, with half-width
+    /// `radius`. If `mid` is `Some`, the centre line bends through that point into an arc
+    /// (a curved slot); otherwise it's a straight stadium.
+    Slot {
+        a: usize,
+        b: usize,
+        radius: f64,
+        #[serde(default)]
+        construction: bool,
+        #[serde(default)]
+        mid: Option<usize>,
+    },
 }
 
 /// Geometric and dimensional relations the solver drives the geometry to satisfy.
@@ -36,7 +73,11 @@ pub enum Constraint {
     Horizontal(usize, usize),
     Vertical(usize, usize),
     Midpoint { mid: usize, a: usize, b: usize },
-    Distance { a: usize, b: usize, value: f64 },
+    /// Driving distance between points a and b. `offset` is the (display-only)
+    /// perpendicular offset of the dimension line from the geometry, in plane uv.
+    /// `axis` chooses whether `value` measures the true (aligned) distance or only
+    /// the horizontal / vertical gap (SolidWorks-style projected dimensions).
+    Distance { a: usize, b: usize, value: f64, offset: f64, #[serde(default)] axis: DimAxis },
     /// Line (a,b) parallel to line (c,d).
     Parallel(usize, usize, usize, usize),
     /// Line (a,b) perpendicular to line (c,d).
@@ -48,6 +89,37 @@ pub enum Constraint {
     /// The circles centred at points `a` and `b` have equal radius (a drives b).
     /// Radius isn't a solver variable, so this is enforced after each solve.
     EqualRadius { a: usize, b: usize },
+    /// Driving radius dimension: the circle centred at `center` has radius `value`.
+    /// Enforced after the solve (radius isn't a point variable). `diameter` is a
+    /// display choice — when true the dimension reads as Ø (2·value).
+    Radius { center: usize, value: f64, #[serde(default)] diameter: bool },
+    /// Driving angle between directed lines (a→b) and (c→d). `value` is in radians;
+    /// `offset` is the (display-only) radius of the angle arc from the vertex.
+    Angle { a: usize, b: usize, c: usize, d: usize, value: f64, offset: f64 },
+    /// Driving perpendicular distance from point `p` to the line through (a,b). Used to
+    /// dimension a sketch line off a body edge (the edge is a locked reference line).
+    PointLineDistance { p: usize, a: usize, b: usize, value: f64, offset: f64 },
+    /// Point `p` lies on the rim of the circle centred at `center`. The radius is read
+    /// from the circle entity at solve time, so the point follows radius edits.
+    PointOnCircle { p: usize, center: usize },
+    /// Point `p` lies on the (infinite) line through (a,b) — perpendicular distance is
+    /// zero. Used to snap a sketch point/line onto a body edge (a locked reference line);
+    /// two of these on one drawn line make it collinear with the edge.
+    PointOnLine { p: usize, a: usize, b: usize },
+    /// Point `p` lies on a body arc/circle of `radius` centred at (`cx`,`cy`). The centre
+    /// and radius are baked (projected reference geometry), so this snaps a sketch point
+    /// onto a rounded body edge without needing a sketch circle entity.
+    PointOnArc { p: usize, cx: f64, cy: f64, radius: f64 },
+}
+
+/// Which span a [`Constraint::Distance`] measures: the true point-to-point distance
+/// (`Aligned`) or only the horizontal / vertical component (projected dimensions).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DimAxis {
+    #[default]
+    Aligned,
+    Horizontal,
+    Vertical,
 }
 
 /// A closed area of a sketch, ready to extrude: one outer boundary loop plus any
@@ -77,13 +149,26 @@ pub struct Sketch {
 impl Sketch {
     /// Add a free point and return its index (the solver's future unknown).
     pub fn add_point(&mut self, x: f64, y: f64) -> usize {
-        self.points.push(Point2 { x, y });
+        self.points.push(Point2 { x, y, fixed: false });
+        self.points.len() - 1
+    }
+
+    /// Add a locked point (projected from the 3D body) the solver won't move.
+    pub fn add_fixed_point(&mut self, x: f64, y: f64) -> usize {
+        self.points.push(Point2 { x, y, fixed: true });
         self.points.len() - 1
     }
 
     /// Add a line between two existing points.
     pub fn add_line(&mut self, a: usize, b: usize, construction: bool) {
-        self.entities.push(SketchEntity::Line { a, b, construction });
+        self.entities.push(SketchEntity::Line { a, b, construction, reference: false });
+    }
+
+    /// Add a reference line projected from a 3D body edge (locked, non-profile).
+    /// Returns the new entity's index so the caller can select it for a constraint.
+    pub fn add_reference_line(&mut self, a: usize, b: usize) -> usize {
+        self.entities.push(SketchEntity::Line { a, b, construction: false, reference: true });
+        self.entities.len() - 1
     }
 
     /// Add a circle from a center point and radius.
@@ -140,7 +225,7 @@ impl Sketch {
         let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut edges = 0usize;
         for e in &self.entities {
-            if let SketchEntity::Line { a, b, construction: false } = e {
+            if let SketchEntity::Line { a, b, construction: false, reference: false } = e {
                 adj.entry(*a).or_default().push(*b);
                 adj.entry(*b).or_default().push(*a);
                 edges += 1;
@@ -210,7 +295,7 @@ impl Sketch {
         use std::collections::{HashMap, HashSet};
         let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
         for e in &self.entities {
-            if let SketchEntity::Line { a, b, construction: false } = e {
+            if let SketchEntity::Line { a, b, construction: false, reference: false } = e {
                 adj.entry(*a).or_default().push(*b);
                 adj.entry(*b).or_default().push(*a);
             }
@@ -323,7 +408,7 @@ impl Sketch {
         let mut segs: Vec<([f64; 2], [f64; 2])> = Vec::new();
         for e in &self.entities {
             match e {
-                SketchEntity::Line { a, b, construction: false } => {
+                SketchEntity::Line { a, b, construction: false, reference: false } => {
                     if let (Some(pa), Some(pb)) = (self.points.get(*a), self.points.get(*b)) {
                         segs.push(([pa.x, pa.y], [pb.x, pb.y]));
                     }
@@ -340,7 +425,38 @@ impl Sketch {
                         }
                     }
                 }
-                SketchEntity::Line { .. } | SketchEntity::Point { .. } => {}
+                SketchEntity::Spline { points, closed, construction: false, control } => {
+                    let pts: Vec<[f64; 2]> =
+                        points.iter().filter_map(|&i| self.points.get(i)).map(|p| [p.x, p.y]).collect();
+                    if pts.len() >= 2 {
+                        let poly = tessellate_spline(&pts, *closed, *control);
+                        for w in poly.windows(2) {
+                            segs.push((w[0], w[1]));
+                        }
+                        if *closed && poly.len() >= 2 {
+                            segs.push((poly[poly.len() - 1], poly[0]));
+                        }
+                    }
+                }
+                SketchEntity::Slot { a, b, radius, construction: false, mid } => {
+                    let pm = mid.and_then(|m| self.points.get(m)).map(|p| [p.x, p.y]);
+                    if let (Some(pa), Some(pb)) = (self.points.get(*a), self.points.get(*b)) {
+                        let poly = match pm {
+                            Some(pm) => tessellate_arc_slot([pa.x, pa.y], pm, [pb.x, pb.y], *radius),
+                            None => tessellate_slot([pa.x, pa.y], [pb.x, pb.y], *radius),
+                        };
+                        for w in poly.windows(2) {
+                            segs.push((w[0], w[1]));
+                        }
+                        if poly.len() >= 2 {
+                            segs.push((poly[poly.len() - 1], poly[0]));
+                        }
+                    }
+                }
+                SketchEntity::Line { .. }
+                | SketchEntity::Point { .. }
+                | SketchEntity::Spline { .. }
+                | SketchEntity::Slot { .. } => {}
             }
         }
         if segs.len() < 3 {
@@ -348,6 +464,174 @@ impl Sketch {
         }
         trace_minimal_faces(&split_at_intersections(&segs))
     }
+}
+
+/// The closed outline of a slot whose centre line is `cl` (≥2 points), half-width `r`:
+/// the two offset sides joined by semicircular caps at the ends. Wound as one loop.
+/// Works for any centre line, so a straight and an arc slot share this code.
+fn slot_outline(cl: &[[f64; 2]], r: f64) -> Vec<[f64; 2]> {
+    let n = cl.len();
+    if n < 2 || r <= 0.0 {
+        return Vec::new();
+    }
+    let pi = std::f64::consts::PI;
+    let tangent = |i: usize| -> [f64; 2] {
+        let (p, q) = if i == 0 {
+            (cl[0], cl[1])
+        } else if i == n - 1 {
+            (cl[n - 2], cl[n - 1])
+        } else {
+            (cl[i - 1], cl[i + 1])
+        };
+        let d = [q[0] - p[0], q[1] - p[1]];
+        let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if len > 1e-9 { [d[0] / len, d[1] / len] } else { [1.0, 0.0] }
+    };
+    let perp = |t: [f64; 2]| [-t[1], t[0]];
+    const CAP: usize = 16;
+    let mut out = Vec::new();
+    // Outer side (centre + perp·r), forward.
+    for i in 0..n {
+        let pp = perp(tangent(i));
+        out.push([cl[i][0] + pp[0] * r, cl[i][1] + pp[1] * r]);
+    }
+    // Cap at the end (sweeps past cl[n-1] in the tangent direction).
+    let pe = perp(tangent(n - 1));
+    let a0 = pe[1].atan2(pe[0]);
+    for k in 1..CAP {
+        let t = a0 - pi * (k as f64 / CAP as f64);
+        out.push([cl[n - 1][0] + r * t.cos(), cl[n - 1][1] + r * t.sin()]);
+    }
+    // Inner side (centre − perp·r), backward.
+    for i in (0..n).rev() {
+        let pp = perp(tangent(i));
+        out.push([cl[i][0] - pp[0] * r, cl[i][1] - pp[1] * r]);
+    }
+    // Cap at the start.
+    let ps = perp(tangent(0));
+    let a1 = ps[1].atan2(ps[0]) + pi;
+    for k in 1..CAP {
+        let t = a1 - pi * (k as f64 / CAP as f64);
+        out.push([cl[0][0] + r * t.cos(), cl[0][1] + r * t.sin()]);
+    }
+    out
+}
+
+/// Outline of a straight slot (stadium) centred on segment `a`→`b`, half-width `r`.
+pub fn tessellate_slot(a: [f64; 2], b: [f64; 2], r: f64) -> Vec<[f64; 2]> {
+    slot_outline(&[a, b], r)
+}
+
+/// Outline of an arc slot whose centre line is the circular arc through `a`, `p`, `b`
+/// (falling back to a straight slot if those three points are collinear).
+pub fn tessellate_arc_slot(a: [f64; 2], p: [f64; 2], b: [f64; 2], r: f64) -> Vec<[f64; 2]> {
+    slot_outline(&arc_through(a, p, b, 40), r)
+}
+
+/// Tessellate the circular arc through `a`, `p`, `b` (in order) into `steps`+1 points.
+/// Returns `[a, b]` if the three points are (nearly) collinear.
+fn arc_through(a: [f64; 2], p: [f64; 2], b: [f64; 2], steps: usize) -> Vec<[f64; 2]> {
+    let d = 2.0 * (a[0] * (p[1] - b[1]) + p[0] * (b[1] - a[1]) + b[0] * (a[1] - p[1]));
+    if d.abs() < 1e-9 {
+        return vec![a, b];
+    }
+    let (a2, p2, b2) = (a[0] * a[0] + a[1] * a[1], p[0] * p[0] + p[1] * p[1], b[0] * b[0] + b[1] * b[1]);
+    let cx = (a2 * (p[1] - b[1]) + p2 * (b[1] - a[1]) + b2 * (a[1] - p[1])) / d;
+    let cy = (a2 * (b[0] - p[0]) + p2 * (a[0] - b[0]) + b2 * (p[0] - a[0])) / d;
+    let rad = ((a[0] - cx).powi(2) + (a[1] - cy).powi(2)).sqrt();
+    let ang = |q: [f64; 2]| (q[1] - cy).atan2(q[0] - cx);
+    let (ta, tp, tb) = (ang(a), ang(p), ang(b));
+    let tau = std::f64::consts::TAU;
+    let norm = |x: f64| {
+        let mut y = x % tau;
+        if y < 0.0 {
+            y += tau;
+        }
+        y
+    };
+    // Sweep CCW if P lies on the CCW arc from A to B, else CW (the long way round).
+    let sweep = if norm(tp - ta) <= norm(tb - ta) { norm(tb - ta) } else { norm(tb - ta) - tau };
+    (0..=steps)
+        .map(|k| {
+            let t = ta + sweep * (k as f64 / steps as f64);
+            [cx + rad * t.cos(), cy + rad * t.sin()]
+        })
+        .collect()
+}
+
+/// Tessellate a spline into a polyline. `control == false` ⇒ interpolating Catmull-Rom
+/// (passes through the points); `control == true` ⇒ approximating uniform cubic B-spline
+/// (open ends are clamped to the first/last control point). `closed` wraps it into a loop.
+pub fn tessellate_spline(pts: &[[f64; 2]], closed: bool, control: bool) -> Vec<[f64; 2]> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec(); // 0/1/2 points ⇒ point or straight segment
+    }
+    const STEPS: usize = 16;
+    let lerp4 = |w: [f64; 4], q: [[f64; 2]; 4]| {
+        [
+            w[0] * q[0][0] + w[1] * q[1][0] + w[2] * q[2][0] + w[3] * q[3][0],
+            w[0] * q[0][1] + w[1] * q[1][1] + w[2] * q[2][1] + w[3] * q[3][1],
+        ]
+    };
+    let mut out = Vec::new();
+    if control {
+        // Build the control sequence: closed wraps; open clamps the ends (so the curve
+        // actually touches the first and last control points).
+        let cps: Vec<[f64; 2]> = if closed {
+            pts.to_vec()
+        } else {
+            let mut v = vec![pts[0], pts[0]];
+            v.extend_from_slice(pts);
+            v.push(pts[n - 1]);
+            v.push(pts[n - 1]);
+            v
+        };
+        let m = cps.len();
+        let segs = if closed { m } else { m - 3 };
+        for s in 0..segs {
+            let q = [cps[s % m], cps[(s + 1) % m], cps[(s + 2) % m], cps[(s + 3) % m]];
+            for t in 0..STEPS {
+                let u = t as f64 / STEPS as f64;
+                let (u2, u3) = (u * u, u * u * u);
+                let w = [
+                    (1.0 - 3.0 * u + 3.0 * u2 - u3) / 6.0,
+                    (4.0 - 6.0 * u2 + 3.0 * u3) / 6.0,
+                    (1.0 + 3.0 * u + 3.0 * u2 - 3.0 * u3) / 6.0,
+                    u3 / 6.0,
+                ];
+                out.push(lerp4(w, q));
+            }
+        }
+    } else {
+        // Catmull-Rom through the points.
+        let get = |i: isize| -> [f64; 2] {
+            if closed {
+                pts[(((i % n as isize) + n as isize) % n as isize) as usize]
+            } else {
+                pts[i.clamp(0, n as isize - 1) as usize]
+            }
+        };
+        let segs = if closed { n } else { n - 1 };
+        for s in 0..segs {
+            let q = [get(s as isize - 1), get(s as isize), get(s as isize + 1), get(s as isize + 2)];
+            for t in 0..STEPS {
+                let u = t as f64 / STEPS as f64;
+                let (u2, u3) = (u * u, u * u * u);
+                let w = [
+                    0.5 * (-u + 2.0 * u2 - u3),
+                    0.5 * (2.0 - 5.0 * u2 + 3.0 * u3),
+                    0.5 * (u + 4.0 * u2 - 3.0 * u3),
+                    0.5 * (-u2 + u3),
+                ];
+                out.push(lerp4(w, q));
+            }
+        }
+        if !closed {
+            out.push(pts[n - 1]);
+        }
+    }
+    out
 }
 
 /// Absolute area of a 2D polygon.
@@ -534,6 +818,12 @@ fn entity_point_indices(e: &SketchEntity) -> Vec<usize> {
         SketchEntity::Line { a, b, .. } => vec![*a, *b],
         SketchEntity::Circle { center, .. } => vec![*center],
         SketchEntity::Point { at } => vec![*at],
+        SketchEntity::Spline { points, .. } => points.clone(),
+        SketchEntity::Slot { a, b, mid, .. } => {
+            let mut v = vec![*a, *b];
+            v.extend(mid.iter().copied());
+            v
+        }
     }
 }
 
@@ -550,6 +840,12 @@ fn constraint_point_indices(c: &Constraint) -> Vec<usize> {
         | Constraint::Perpendicular(a, b, c, d)
         | Constraint::Equal(a, b, c, d) => vec![*a, *b, *c, *d],
         Constraint::Tangent { a, b, center, .. } => vec![*a, *b, *center],
+        Constraint::Radius { center, .. } => vec![*center],
+        Constraint::Angle { a, b, c, d, .. } => vec![*a, *b, *c, *d],
+        Constraint::PointLineDistance { p, a, b, .. } => vec![*p, *a, *b],
+        Constraint::PointOnCircle { p, center } => vec![*p, *center],
+        Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
+        Constraint::PointOnArc { p, .. } => vec![*p],
     }
 }
 
@@ -562,6 +858,18 @@ fn remap_entity(e: &mut SketchEntity, m: &[usize]) {
         }
         SketchEntity::Circle { center, .. } => *center = m[*center],
         SketchEntity::Point { at } => *at = m[*at],
+        SketchEntity::Spline { points, .. } => {
+            for p in points.iter_mut() {
+                *p = m[*p];
+            }
+        }
+        SketchEntity::Slot { a, b, mid, .. } => {
+            *a = m[*a];
+            *b = m[*b];
+            if let Some(p) = mid {
+                *p = m[*p];
+            }
+        }
     }
 }
 
@@ -594,6 +902,28 @@ fn remap_constraint(c: &mut Constraint, m: &[usize]) {
             *b = m[*b];
             *center = m[*center];
         }
+        Constraint::Radius { center, .. } => *center = m[*center],
+        Constraint::Angle { a, b, c, d, .. } => {
+            *a = m[*a];
+            *b = m[*b];
+            *c = m[*c];
+            *d = m[*d];
+        }
+        Constraint::PointLineDistance { p, a, b, .. } => {
+            *p = m[*p];
+            *a = m[*a];
+            *b = m[*b];
+        }
+        Constraint::PointOnCircle { p, center } => {
+            *p = m[*p];
+            *center = m[*center];
+        }
+        Constraint::PointOnLine { p, a, b } => {
+            *p = m[*p];
+            *a = m[*a];
+            *b = m[*b];
+        }
+        Constraint::PointOnArc { p, .. } => *p = m[*p],
     }
 }
 
@@ -644,8 +974,16 @@ impl Sketch {
         }
         let nvars = 2 * n;
 
-        // Free-variable indices (everything except the pinned points' x/y).
+        // Free-variable indices (everything except the pinned points' x/y). Points
+        // flagged `fixed` (projected from the 3D body) are always pinned, on top of
+        // any caller-supplied pins (e.g. the point being dragged).
         let mut is_fixed = vec![false; nvars];
+        for (i, p) in self.points.iter().enumerate() {
+            if p.fixed {
+                is_fixed[2 * i] = true;
+                is_fixed[2 * i + 1] = true;
+            }
+        }
         for &pi in fixed_points {
             if pi < n {
                 is_fixed[2 * pi] = true;
@@ -719,9 +1057,28 @@ impl Sketch {
         self.apply_equal_radius();
     }
 
-    /// Enforce `EqualRadius` relations: each makes circle `b` adopt circle `a`'s
-    /// radius. Done after the point solve since radius isn't a solver variable.
+    /// Enforce radius relations after the point solve (radius isn't a solver
+    /// variable): `Radius` sets a circle's radius directly; `EqualRadius` makes
+    /// circle `b` adopt circle `a`'s radius.
     fn apply_equal_radius(&mut self) {
+        // Radius dimensions first (they may drive an EqualRadius source).
+        let radii: Vec<(usize, f64)> = self
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::Radius { center, value, .. } => Some((*center, *value)),
+                _ => None,
+            })
+            .collect();
+        for (center_pt, value) in radii {
+            for e in self.entities.iter_mut() {
+                if let SketchEntity::Circle { center, radius } = e {
+                    if *center == center_pt {
+                        *radius = value.max(1e-4);
+                    }
+                }
+            }
+        }
         let pairs: Vec<(usize, usize)> = self
             .constraints
             .iter()
@@ -760,9 +1117,14 @@ impl Sketch {
                 | Constraint::Parallel(..)
                 | Constraint::Perpendicular(..)
                 | Constraint::Equal(..)
-                | Constraint::Tangent { .. } => 1,
+                | Constraint::Tangent { .. }
+                | Constraint::Angle { .. }
+                | Constraint::PointLineDistance { .. }
+                | Constraint::PointOnCircle { .. }
+                | Constraint::PointOnLine { .. }
+                | Constraint::PointOnArc { .. } => 1,
                 // Enforced after the solve (radius isn't a point variable).
-                Constraint::EqualRadius { .. } => 0,
+                Constraint::EqualRadius { .. } | Constraint::Radius { .. } => 0,
             })
             .sum()
     }
@@ -787,11 +1149,16 @@ impl Sketch {
                     r[k] = x[2 * *a] - x[2 * *b];
                     k += 1;
                 }
-                Constraint::Distance { a, b, value } => {
+                Constraint::Distance { a, b, value, axis, .. } => {
                     let (a, b) = (*a, *b);
                     let dx = x[2 * a] - x[2 * b];
                     let dy = x[2 * a + 1] - x[2 * b + 1];
-                    r[k] = (dx * dx + dy * dy).sqrt() - *value;
+                    let measured = match axis {
+                        DimAxis::Aligned => (dx * dx + dy * dy).sqrt(),
+                        DimAxis::Horizontal => dx.abs(),
+                        DimAxis::Vertical => dy.abs(),
+                    };
+                    r[k] = measured - *value;
                     k += 1;
                 }
                 Constraint::Midpoint { mid, a, b } => {
@@ -828,8 +1195,61 @@ impl Sketch {
                     r[k] = dist - *radius;
                     k += 1;
                 }
-                // Not a point residual — enforced separately after the solve.
-                Constraint::EqualRadius { .. } => {}
+                Constraint::Angle { a, b, c, d, value, .. } => {
+                    // Signed angle from line (a→b) to line (c→d) should equal `value`.
+                    let (v1x, v1y) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
+                    let (v2x, v2y) = (x[2 * *d] - x[2 * *c], x[2 * *d + 1] - x[2 * *c + 1]);
+                    let cross = v1x * v2y - v1y * v2x;
+                    let dot = v1x * v2x + v1y * v2y;
+                    let ang = cross.atan2(dot);
+                    let diff = ang - *value;
+                    r[k] = diff.sin().atan2(diff.cos()); // wrap to (-π, π]
+                    k += 1;
+                }
+                Constraint::PointLineDistance { p, a, b, value, .. } => {
+                    // Perpendicular distance from point p to the line (a,b) → value.
+                    let (px, py) = (x[2 * *p], x[2 * *p + 1]);
+                    let (dx, dy) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
+                    let len = (dx * dx + dy * dy).sqrt();
+                    let cross = dx * (py - x[2 * *a + 1]) - dy * (px - x[2 * *a]);
+                    let dist = if len > 1e-9 { cross.abs() / len } else { 0.0 };
+                    r[k] = dist - *value;
+                    k += 1;
+                }
+                Constraint::PointOnLine { p, a, b } => {
+                    // Perpendicular distance from point p to the line (a,b) → zero.
+                    let (px, py) = (x[2 * *p], x[2 * *p + 1]);
+                    let (dx, dy) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
+                    let len = (dx * dx + dy * dy).sqrt();
+                    let cross = dx * (py - x[2 * *a + 1]) - dy * (px - x[2 * *a]);
+                    r[k] = if len > 1e-9 { cross / len } else { 0.0 };
+                    k += 1;
+                }
+                Constraint::PointOnArc { p, cx, cy, radius } => {
+                    // Distance from p to the baked arc centre equals its radius.
+                    let (ddx, ddy) = (x[2 * *p] - *cx, x[2 * *p + 1] - *cy);
+                    r[k] = (ddx * ddx + ddy * ddy).sqrt() - *radius;
+                    k += 1;
+                }
+                Constraint::PointOnCircle { p, center } => {
+                    // Distance from p to the centre equals the circle's current radius.
+                    let dx = x[2 * *p] - x[2 * *center];
+                    let dy = x[2 * *p + 1] - x[2 * *center + 1];
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    // Radius is a parameter (read from the entity), not a point variable.
+                    let radius = self
+                        .entities
+                        .iter()
+                        .find_map(|e| match e {
+                            SketchEntity::Circle { center: cc, radius } if cc == center => Some(*radius),
+                            _ => None,
+                        })
+                        .unwrap_or(dist); // circle gone → no-op residual
+                    r[k] = dist - radius;
+                    k += 1;
+                }
+                // Not point residuals — enforced separately after the solve.
+                Constraint::EqualRadius { .. } | Constraint::Radius { .. } => {}
             }
         }
         r
@@ -865,12 +1285,146 @@ mod tests {
         let mut s = Sketch::default();
         let a = s.add_point(0.0, 0.0);
         let b = s.add_point(1.0, 0.0);
-        s.constraints.push(Constraint::Distance { a, b, value: 5.0 });
+        s.constraints.push(Constraint::Distance { a, b, value: 5.0, offset: 0.5, axis: DimAxis::Aligned });
         s.solve();
         let d = ((s.points[a].x - s.points[b].x).powi(2)
             + (s.points[a].y - s.points[b].y).powi(2))
         .sqrt();
         assert!((d - 5.0).abs() < 1e-6, "distance was {d}");
+    }
+
+    #[test]
+    fn fixed_points_stay_put_through_solve() {
+        // A locked (body-projected) point must not move even under a distance pull.
+        let mut s = Sketch::default();
+        let a = s.add_fixed_point(0.0, 0.0);
+        let b = s.add_point(2.0, 0.0);
+        s.constraints.push(Constraint::Distance { a, b, value: 10.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.solve();
+        assert!((s.points[a].x).abs() < 1e-9 && (s.points[a].y).abs() < 1e-9, "fixed point moved");
+        let d = ((s.points[a].x - s.points[b].x).powi(2) + (s.points[a].y - s.points[b].y).powi(2)).sqrt();
+        assert!((d - 10.0).abs() < 1e-4, "distance not met: {d}");
+    }
+
+    #[test]
+    fn point_on_circle_follows_the_rim() {
+        // A point off the rim is pulled onto it; growing the radius keeps it on.
+        let mut s = Sketch::default();
+        let center = s.add_fixed_point(0.0, 0.0);
+        s.add_circle(center, 5.0);
+        let p = s.add_point(4.0, 0.0); // inside the rim
+        s.constraints.push(Constraint::PointOnCircle { p, center });
+        s.solve();
+        let d = ((s.points[p].x).powi(2) + (s.points[p].y).powi(2)).sqrt();
+        assert!((d - 5.0).abs() < 1e-3, "point not on rim: {d}");
+        // Grow the circle and re-solve — the point should ride out to the new radius.
+        if let Some(SketchEntity::Circle { radius, .. }) = s.entities.get_mut(0) {
+            *radius = 8.0;
+        }
+        s.solve();
+        let d2 = ((s.points[p].x).powi(2) + (s.points[p].y).powi(2)).sqrt();
+        assert!((d2 - 8.0).abs() < 1e-3, "point didn't follow radius: {d2}");
+    }
+
+    #[test]
+    fn slot_outline_is_a_stadium() {
+        // Horizontal slot: centres (0,0)–(10,0), half-width 2. The outline should span
+        // x∈[-2,12], y∈[-2,2], and every point sits exactly 2 from the centre line.
+        let poly = tessellate_slot([0.0, 0.0], [10.0, 0.0], 2.0);
+        assert!(poly.len() > 8, "slot outline too coarse");
+        let (mut xmin, mut xmax, mut ymax) = (f64::MAX, f64::MIN, f64::MIN);
+        for p in &poly {
+            xmin = xmin.min(p[0]);
+            xmax = xmax.max(p[0]);
+            ymax = ymax.max(p[1].abs());
+            // Distance to the segment [0,10]×{0}: clamp x to [0,10], then dist.
+            let cx = p[0].clamp(0.0, 10.0);
+            let d = ((p[0] - cx).powi(2) + p[1].powi(2)).sqrt();
+            assert!((d - 2.0).abs() < 1e-6, "slot point {p:?} not on the r=2 boundary (d={d})");
+        }
+        assert!((xmin + 2.0).abs() < 1e-6 && (xmax - 12.0).abs() < 1e-6, "slot x-extent wrong");
+        assert!((ymax - 2.0).abs() < 1e-6, "slot y-extent wrong");
+    }
+
+    #[test]
+    fn catmull_rom_spline_passes_through_its_points() {
+        let pts = [[0.0, 0.0], [1.0, 2.0], [3.0, 1.0], [4.0, 3.0]];
+        let poly = tessellate_spline(&pts, false, false);
+        // Every input point must appear (closely) on the interpolating curve.
+        for p in &pts {
+            let near = poly.iter().any(|q| (q[0] - p[0]).abs() < 1e-6 && (q[1] - p[1]).abs() < 1e-6);
+            assert!(near, "through-points spline missed {p:?}");
+        }
+    }
+
+    #[test]
+    fn bspline_stays_inside_its_control_hull() {
+        // A control-point spline should NOT pass through the interior control points.
+        let pts = [[0.0, 0.0], [1.0, 5.0], [2.0, 0.0]];
+        let poly = tessellate_spline(&pts, false, true);
+        let peak = poly.iter().map(|q| q[1]).fold(0.0_f64, f64::max);
+        assert!(peak < 5.0, "control-point curve overshot the hull (peak {peak})");
+    }
+
+    #[test]
+    fn point_on_line_snaps_onto_the_edge() {
+        // A fixed reference edge along y=0; a free point off it is pulled onto the line.
+        let mut s = Sketch::default();
+        let a = s.add_fixed_point(0.0, 0.0);
+        let b = s.add_fixed_point(10.0, 0.0);
+        let p = s.add_point(3.0, 4.0); // 4 above the edge
+        s.constraints.push(Constraint::PointOnLine { p, a, b });
+        s.solve();
+        assert!((s.points[p].y).abs() < 1e-4, "point not on edge: y={}", s.points[p].y);
+    }
+
+    #[test]
+    fn point_line_distance_drives_a_gap() {
+        // A horizontal reference edge along y=0; drive a free point to 5 above it.
+        let mut s = Sketch::default();
+        let a = s.add_fixed_point(0.0, 0.0);
+        let b = s.add_fixed_point(4.0, 0.0);
+        let p = s.add_point(2.0, 1.0);
+        s.constraints.push(Constraint::PointLineDistance { p, a, b, value: 5.0, offset: 0.0 });
+        s.solve();
+        let dy = (s.points[p].y).abs();
+        assert!((dy - 5.0).abs() < 1e-3, "point-line gap was {dy}");
+    }
+
+    #[test]
+    fn horizontal_distance_ignores_vertical_gap() {
+        // A projected (horizontal) dimension drives only the x-extent.
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(1.0, 4.0);
+        s.constraints.push(Constraint::Distance { a, b, value: 10.0, offset: 0.5, axis: DimAxis::Horizontal });
+        s.solve();
+        let dx = (s.points[a].x - s.points[b].x).abs();
+        assert!((dx - 10.0).abs() < 1e-4, "horizontal extent was {dx}");
+    }
+
+    #[test]
+    fn angle_constraint_opens_two_lines() {
+        // Two lines sharing a vertex; drive the angle between them to 90°.
+        let mut s = Sketch::default();
+        let o = s.add_point(0.0, 0.0);
+        let b = s.add_point(2.0, 0.0); // line 1: o→b along +x
+        let c = s.add_point(0.0, 0.0); // line 2 starts near the vertex
+        let d = s.add_point(2.0, 0.3); // nearly along +x → solver opens it up
+        s.constraints.push(Constraint::Coincident(o, c));
+        s.constraints.push(Constraint::Angle {
+            a: o,
+            b,
+            c,
+            d,
+            value: std::f64::consts::FRAC_PI_2,
+            offset: 1.0,
+        });
+        s.solve();
+        let v1 = (s.points[b].x - s.points[o].x, s.points[b].y - s.points[o].y);
+        let v2 = (s.points[d].x - s.points[c].x, s.points[d].y - s.points[c].y);
+        let ang = (v1.0 * v2.1 - v1.1 * v2.0).atan2(v1.0 * v2.0 + v1.1 * v2.1);
+        assert!((ang.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-2, "angle was {}", ang.to_degrees());
     }
 
     #[test]
@@ -1151,7 +1705,7 @@ mod tests {
         s.constraints.push(Constraint::Vertical(p1, p2));
         s.constraints.push(Constraint::Vertical(p0, p3));
         // Drag p2 to (4, 3); it stays pinned, the rest must keep right angles.
-        s.points[p2] = Point2 { x: 4.0, y: 3.0 };
+        s.points[p2] = Point2 { x: 4.0, y: 3.0, fixed: false };
         s.solve_with_fixed(&[p2]);
         assert!((s.points[p1].x - s.points[p2].x).abs() < 1e-6, "right edge not vertical");
         assert!((s.points[p3].y - s.points[p2].y).abs() < 1e-6, "top edge not horizontal");

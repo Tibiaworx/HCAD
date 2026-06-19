@@ -11,6 +11,10 @@
 use truck_meshalgo::prelude::*;
 use truck_modeling::{builder, Point3, Vector3};
 
+mod csg;
+mod mesh_bool;
+pub use mesh_bool::{mesh_difference, mesh_union};
+
 /// A tessellated triangle mesh handed up to the renderer.
 #[derive(Debug, Default, Clone)]
 pub struct TriMesh {
@@ -216,6 +220,55 @@ pub fn tessellate(solid: &KSolid, tol: f64) -> Tessellation {
     .unwrap_or(Tessellation { mesh: TriMesh::default(), edges: Vec::new(), tangent_edges: Vec::new() })
 }
 
+/// Build an extruded prism (a region swept by `normal*length`, starting at
+/// `normal*start_offset`) as a **triangle mesh** — the boss/cut "tool" for the
+/// robust mesh-boolean fallback. `None` if the region is degenerate.
+pub fn extrude_tool_mesh(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    start_offset: f64,
+    length: f64,
+) -> Option<TriMesh> {
+    let solid = build_solid(outer, holes, basis, start_offset, length)?;
+    guard(|| {
+        let mut poly = solid.triangulation(TOL).to_polygon();
+        poly.triangulate();
+        Some(polymesh_to_trimesh(&poly))
+    })
+}
+
+/// Build the **cut tool** mesh for a signed cut `distance` (positive sweeps along the
+/// normal, negative against it). The tool overshoots both caps so they never end up
+/// coplanar with the body — matching [`cut_tol`]'s tool exactly, but as a mesh.
+pub fn cut_tool_mesh(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    distance: f64,
+) -> Option<TriMesh> {
+    let depth = distance.abs();
+    if depth < 1e-9 {
+        return None;
+    }
+    let eps = 0.05 + depth * 0.02;
+    let (start, length) =
+        if distance >= 0.0 { (-eps, depth + 2.0 * eps) } else { (-(depth + eps), depth + 2.0 * eps) };
+    extrude_tool_mesh(outer, holes, basis, start, length)
+}
+
+/// Wrap a raw triangle mesh (e.g. a mesh-boolean result) as a renderable
+/// [`Tessellation`] by classifying its feature edges, so the mesh fallback renders
+/// with the same sharp/tangent edge treatment as the exact kernel.
+pub fn mesh_tessellation(mesh: TriMesh) -> Tessellation {
+    // CSG output has T-junctions and near-coincident vertices where two solids' separate
+    // tessellations meet. Weld coarsely (2e-3 grid) and keep only *manifold* edges above
+    // a slightly raised 50° threshold — so boolean seams don't draw as stray dashes,
+    // while real corners (≥~90°) still show.
+    let (edges, tangent_edges) = feature_edges_opts(&mesh, 50.0, 5.0e2, true);
+    Tessellation { mesh, edges, tangent_edges }
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -309,14 +362,26 @@ fn polymesh_to_trimesh(poly: &truck_polymesh::PolygonMesh) -> TriMesh {
 ///   threshold) — the curvature/facet lines of smooth surfaces and tangent blends.
 /// Exactly-coplanar interior edges are dropped from both.
 fn feature_edges(mesh: &TriMesh, sharp_deg: f64) -> (Vec<[[f32; 3]; 2]>, Vec<[[f32; 3]; 2]>) {
+    feature_edges_opts(mesh, sharp_deg, 1.0e4, false)
+}
+
+/// `feature_edges`, parameterised for the two mesh sources:
+/// - `weld` is the quantisation scale used to merge coincident vertices (a larger
+///   number = finer grid; truck meshes are clean so 1e4 is right).
+/// - `manifold_only` keeps **only** edges shared by exactly two faces and drops
+///   boundary/non-manifold edges. Mesh-boolean (CSG) output is riddled with
+///   T-junctions whose "boundary" edges would otherwise draw as a starburst, so the
+///   mesh-fallback path turns this on; the exact (truck) path leaves it off.
+fn feature_edges_opts(
+    mesh: &TriMesh,
+    sharp_deg: f64,
+    weld: f32,
+    manifold_only: bool,
+) -> (Vec<[[f32; 3]; 2]>, Vec<[[f32; 3]; 2]>) {
     use std::collections::HashMap;
     // Merge duplicated (flat-shaded) vertices by quantized position.
     let quant = |p: [f32; 3]| {
-        (
-            (p[0] * 1.0e4).round() as i64,
-            (p[1] * 1.0e4).round() as i64,
-            (p[2] * 1.0e4).round() as i64,
-        )
+        ((p[0] * weld).round() as i64, (p[1] * weld).round() as i64, (p[2] * weld).round() as i64)
     };
     let mut canon: HashMap<(i64, i64, i64), usize> = HashMap::new();
     let mut canon_pos: Vec<[f32; 3]> = Vec::new();
@@ -347,8 +412,12 @@ fn feature_edges(mesh: &TriMesh, sharp_deg: f64) -> (Vec<[[f32; 3]; 2]>, Vec<[[f
     let mut tangent = Vec::new();
     for ((i, j), normals) in emap {
         let edge = [canon_pos[i], canon_pos[j]];
-        if normals.len() == 1 {
-            sharp.push(edge); // boundary edge
+        if normals.len() != 2 {
+            // Boundary (1) or non-manifold (≥3). For CSG output these are T-junction
+            // artifacts → drop. For exact (truck) meshes a lone boundary edge is real.
+            if !manifold_only && normals.len() == 1 {
+                sharp.push(edge);
+            }
             continue;
         }
         // The widest angle between any incident pair of faces = the smallest dot.

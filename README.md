@@ -46,7 +46,7 @@ feature-tree/regeneration model and the topological-naming strategy — is in
 
 | Layer | Responsibility | Built on |
 |-------|----------------|----------|
-| Geometry kernel | B-rep solids, extrude (sweep), boolean cut, tessellation | [`truck`](https://github.com/ricosjp/truck) (pure Rust), behind a swappable `GeometryKernel` trait |
+| Geometry kernel | B-rep solids, extrude (sweep), boolean cut, tessellation | [`truck`](https://github.com/ricosjp/truck) (exact B-rep, pure Rust) + [`Manifold`](https://github.com/elalish/manifold) (robust mesh booleans, C++) as a fallback for coincident-face cases |
 | Sketcher + solver | 2D entities, constraints, Newton/least-squares solve | our code (nalgebra) |
 | Document / feature tree | parametric-history DAG, regeneration — **the source of truth** | our code |
 | Viewport / UI | 3D rendering, camera, face/edge picking, gizmos, panels | [`Bevy`](https://bevyengine.org/) + `bevy_egui` |
@@ -95,6 +95,23 @@ Implemented today:
 
 ## Building & running
 
+### Build prerequisites
+
+HCAD's geometry kernel uses [`Manifold`](https://github.com/elalish/manifold) (a C++
+library) for robust mesh booleans, so building from source needs a **C++ toolchain and
+CMake** in addition to Rust:
+
+- **Rust** (stable, MSVC toolchain on Windows).
+- **CMake** on `PATH` — e.g. `winget install Kitware.CMake`, then ensure
+  `C:\Program Files\CMake\bin` is on `PATH` (a fresh terminal picks it up). If a build
+  fails with *"cmake not found"*, this is why.
+- **A C++ compiler** — on Windows, the MSVC toolchain from Visual Studio (or the
+  standalone *Build Tools for Visual Studio*, "Desktop development with C++" workload).
+  Manifold is compiled once and **statically linked** into the `hcad` binary.
+
+> These are **build-time only**. The shipped `hcad.exe` is self-contained — end users
+> who run an installer need none of this.
+
 ```sh
 cargo run -p hworks-app          # runs the `hcad` binary (debug)
 cargo build --release            # optimized build → target/release/hcad
@@ -108,6 +125,21 @@ cargo test                       # headless tests (geometry, sketch, document)
 ```
 
 Prebuilt Windows binaries are on the **Releases** page.
+
+### Packaging / installer note
+
+Because Manifold is C++, the built `hcad.exe` depends on the **Visual C++
+Redistributable** (`MSVCP140.dll`, `VCRUNTIME140.dll`). An installer must ensure it's
+present, two standard ways:
+
+1. **Bundle the redistributable** — ship Microsoft's `vc_redist.x64.exe` and run it
+   silently during install (idempotent; most machines already have it).
+2. **Statically link the C++ runtime** — build both Rust (`-C target-feature=+crt-static`)
+   and Manifold (`/MT`) against the static CRT, producing a fully self-contained exe with
+   no external runtime DLLs. Preferred when the flags line up cleanly.
+
+The Universal CRT (`api-ms-win-crt-*`) ships with Windows 10/11, so no action is needed
+for it.
 
 ### Flickering on a laptop with hybrid graphics
 
