@@ -338,89 +338,140 @@ fn fit_circle(pts: &[[f64; 3]]) -> Option<(V3, V3, f64)> {
 /// revolved tool plus whether it should be *unioned* (a concave corner — the fillet adds a
 /// fill) or *subtracted* (a convex rim — it shaves the corner). `None` if the edge isn't a
 /// circular flat-cap + round-wall corner, or the radius is too steep.
-fn fillet_circular(tris: &[[V3; 3]], radius: f64, loop_pts: &[[f64; 3]], tol: f64) -> Option<(TriMesh, bool)> {
-    let (center, mut axis, big_r) = fit_circle(loop_pts)?;
+fn fillet_circular(tris: &[[V3; 3]], radius: f64, loop_pts: &[[f64; 3]], _tol: f64) -> Option<(TriMesh, bool)> {
+    let (center, axis0, big_r) = fit_circle(loop_pts)?;
     if big_r <= radius * 1.05 {
         return None; // radius too big for this rim
     }
-    // Adjacent faces from one rim segment: one ≈ axial (the cap), one ≈ radial (the wall).
-    let (n1, n2) = adjacent_normals(tris, loop_pts[0], loop_pts[1], tol.max(1e-3))?;
-    let (cap_n, wall_n) = if dot(n1, axis).abs() > dot(n2, axis).abs() { (n1, n2) } else { (n2, n1) };
-    if dot(cap_n, axis).abs() < 0.9 || dot(wall_n, axis).abs() > 0.3 {
-        return None; // not a flat-cap + round-wall corner
-    }
-    // Orient `axis` so +axis is the cap's outward normal; radial0 outward to the rim.
-    if dot(cap_n, axis) < 0.0 {
-        axis = scale(axis, -1.0);
-    }
-    let radial0 = norm(sub(loop_pts[0], center));
-    let wall_n = if dot(wall_n, radial0) < 0.0 { scale(wall_n, -1.0) } else { wall_n };
-    // Revolve at the rim vertices' own angles so the torus rings line up with the body's
-    // facets (no beat / step at the union seam).
-    let tangent = cross(axis, radial0);
-    let angles: Vec<f64> = loop_pts
-        .iter()
-        .map(|p| {
-            let d = sub(*p, center);
-            dot(d, tangent).atan2(dot(d, radial0))
-        })
-        .collect();
-
-    // Convex vs concave: probe the four (cap, wall) quadrants around the rim and count how
-    // many are solid. A protruding (convex) rim has just one solid quadrant (inside both
-    // faces); a notch (concave) has three (only outside-both is air).
+    // The cap normal is the loop's axis and the wall normal is radial — derive both (and
+    // their orientation) from a winding-based corner probe, NOT from matching mesh vertices
+    // (the committed mesh-kernel rebuild tessellates the rim differently than the preview,
+    // so vertex matching is unreliable; winding is tessellation-independent).
+    let radial0 = {
+        let r = sub(loop_pts[0], center);
+        norm(sub(r, scale(axis0, dot(r, axis0)))) // make it exactly ⟂ to the axis
+    };
     let inside = |p: V3| {
         let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
         (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
     };
     let rim0 = loop_pts[0];
     let e = radius * 0.4;
+    // Probe the four (axis, radial) quadrants; `sc`/`sw` ∈ {−1,+1}.
+    let signs = [-1.0_f64, 1.0];
+    let mut q = [[false; 2]; 2];
     let mut solid = 0;
-    for sc in [-1.0_f64, 1.0] {
-        for sw in [-1.0_f64, 1.0] {
-            let p = add(rim0, add(scale(axis, sc * e), scale(wall_n, sw * e)));
-            if inside(p) {
+    for (i, &sc) in signs.iter().enumerate() {
+        for (j, &sw) in signs.iter().enumerate() {
+            let p = add(rim0, add(scale(axis0, sc * e), scale(radial0, sw * e)));
+            q[i][j] = inside(p);
+            if q[i][j] {
                 solid += 1;
             }
         }
     }
+    // Orient the axis so +axis is the cap's outward normal, and find which radial side the
+    // wall material is on (`sign_w`: +1 boss, −1 hole).
+    let (axis, sign_w, is_concave) = if solid == 1 {
+        // Convex: the lone solid quadrant (sc0, sw0) holds the material; the cap/wall
+        // outward normals point away from it.
+        let (mut sc0, mut sw0) = (1.0, 1.0);
+        for (i, &sc) in signs.iter().enumerate() {
+            for (j, &sw) in signs.iter().enumerate() {
+                if q[i][j] {
+                    sc0 = sc;
+                    sw0 = sw;
+                }
+            }
+        }
+        (scale(axis0, -sc0), -sw0, false)
+    } else if solid == 3 {
+        // Concave: the lone air quadrant (sc_a, sw_a) is the notch the fillet fills.
+        let (mut sca, mut swa) = (1.0, 1.0);
+        for (i, &sc) in signs.iter().enumerate() {
+            for (j, &sw) in signs.iter().enumerate() {
+                if !q[i][j] {
+                    sca = sc;
+                    swa = sw;
+                }
+            }
+        }
+        (scale(axis0, sca), swa, true)
+    } else {
+        return None; // ambiguous (e.g. a flat coplanar ring)
+    };
+
+    // Revolve at the angles of the *actual mesh's* rim vertices (the ring at radius `big_r`
+    // in the cap plane) so the torus rings line up with the body's wall facets — no beat or
+    // step. We read these from the live mesh, not the stored edge polyline, because the
+    // committed mesh-kernel rebuild tessellates the rim differently than the preview did.
+    let tangent = cross(axis, radial0);
+    let mut ring: Vec<(f64, [i64; 3])> = Vec::new();
+    let plane_tol = big_r * 0.03;
+    for t in tris {
+        for &v in t {
+            let d = sub(v, center);
+            let axial = dot(d, axis);
+            let radial = len(sub(d, scale(axis, axial)));
+            if axial.abs() < plane_tol && (radial - big_r).abs() < plane_tol {
+                let ang = dot(d, tangent).atan2(dot(d, radial0));
+                let key = [(v[0] * 1e3) as i64, (v[1] * 1e3) as i64, (v[2] * 1e3) as i64];
+                ring.push((ang, key));
+            }
+        }
+    }
+    ring.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    ring.dedup_by_key(|r| r.1);
+    let angles: Vec<f64> = if ring.len() >= 8 {
+        ring.iter().map(|r| r.0).collect()
+    } else {
+        // Couldn't read a clean rim from the mesh — fall back to the stored edge's angles.
+        loop_pts
+            .iter()
+            .map(|p| {
+                let d = sub(*p, center);
+                dot(d, tangent).atan2(dot(d, radial0))
+            })
+            .collect()
+    };
     let r = radius;
     let pad = r;
     const ARC: usize = 20;
+    // Map a normal-aligned cross-section point (u = offset along the wall normal, v =
+    // offset along the cap normal/axis) to the lathe's (s = radius, z = axial). `sign_w`
+    // flips the radial direction for a hole so the same profiles serve boss and hole.
+    let sz = |u: f64, v: f64| -> (f64, f64) { (big_r + sign_w * u, v) };
 
-    if solid == 1 {
-        // Convex (e.g. a cylinder top rim): subtract the corner sliver. The tool's outer
-        // edges run into open air so the cut is transversal — no curved coincidence.
-        let cc = (big_r - r, -r);
-        let mut profile: Vec<(f64, f64)> = vec![(big_r - r, 0.0)];
+    if !is_concave {
+        // Convex rim (cylinder top / hole lip): subtract the corner sliver. The tool's
+        // outer edges run into open air, so the cut is transversal (no curved coincidence).
+        // Material is the (−wall, −cap) corner; the rolling circle centre is (−r, −r).
+        let mut profile: Vec<(f64, f64)> = vec![sz(-r, 0.0)]; // cap contact
         for k in 1..ARC {
-            let ang = std::f64::consts::FRAC_PI_2 * (1.0 - k as f64 / ARC as f64);
-            profile.push((cc.0 + r * ang.cos(), cc.1 + r * ang.sin()));
+            let a = std::f64::consts::FRAC_PI_2 * (1.0 - k as f64 / ARC as f64);
+            profile.push(sz(-r + r * a.cos(), -r + r * a.sin()));
         }
-        profile.push((big_r, -r));
-        profile.push((big_r + pad, -r));
-        profile.push((big_r + pad, pad));
-        profile.push((big_r - r, pad));
+        profile.push(sz(0.0, -r)); // wall contact
+        profile.push(sz(pad, -r)); // out into air past the wall
+        profile.push(sz(pad, pad)); // air
+        profile.push(sz(-r, pad)); // back over the cap (air)
         let tool = revolve(&profile, center, axis, radial0, &angles);
         Some((tool, false))
-    } else if solid == 3 {
-        // Concave (e.g. a boss base): union a rounded fill. The tool's non-arc edges run
-        // *into* existing material (overlap), so the only exposed new surface is the arc.
-        let cc = (big_r + r, r); // rolling-circle centre, in the notch
-        let mut profile: Vec<(f64, f64)> = vec![(big_r, r)]; // wall contact
+    } else {
+        // Concave rim (a boss base / counterbore floor): union a rounded fill. The notch is
+        // the (+wall, +cap) quadrant; the rolling circle centre is (+r, +r). The tool's
+        // non-arc edges run into existing material, so only the arc is a new surface.
+        let mut profile: Vec<(f64, f64)> = vec![sz(0.0, r)]; // wall contact
         for k in 1..ARC {
-            // Arc from wall contact (180°) to cap contact (270°), bulging to the corner.
-            let ang = std::f64::consts::PI + std::f64::consts::FRAC_PI_2 * (k as f64 / ARC as f64);
-            profile.push((cc.0 + r * ang.cos(), cc.1 + r * ang.sin()));
+            let a = std::f64::consts::PI + std::f64::consts::FRAC_PI_2 * (k as f64 / ARC as f64);
+            profile.push(sz(r + r * a.cos(), r + r * a.sin()));
         }
-        profile.push((big_r + r, 0.0)); // cap contact
-        profile.push((big_r + r, -pad)); // down into material
-        profile.push((big_r - pad, -pad)); // deep material
-        profile.push((big_r - pad, r)); // up into the wall's material, back to wall contact
+        profile.push(sz(r, 0.0)); // cap contact
+        profile.push(sz(r, -pad)); // down into material
+        profile.push(sz(-pad, -pad)); // deep material
+        profile.push(sz(-pad, r)); // up into the wall's material, back to wall contact
         let tool = revolve(&profile, center, axis, radial0, &angles);
         Some((tool, true))
-    } else {
-        None // ambiguous (tangent/coplanar) — leave it sharp
     }
 }
 
@@ -495,34 +546,68 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             if (1.0 + c).abs() < 1e-3 {
                 continue; // faces nearly opposite → no corner to round
             }
-            // Cylinder centre offset from the edge: equidistant `radius` from both faces.
-            let off = scale(add(n1, n2), -radius / (1.0 + c));
-            // Convex test: the centre should sit inside the material. Outward face normals
-            // mean "inside" is the −normal side; for a convex ridge `off` points inward.
-            let inward = norm(scale(add(n1, n2), -1.0));
-            if dot(off, inward) <= 0.0 {
-                continue; // concave (or flat) — skip for now (would need a union)
+            // Convex vs concave: probe the four (n1, n2) quadrants at the edge midpoint and
+            // count solid ones (1 = convex ridge, 3 = concave notch).
+            let inside = |p: V3| {
+                let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+                (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+            };
+            let m = scale(add(a, b), 0.5);
+            let e = radius * 0.4;
+            let mut solid = 0;
+            for s1 in [-1.0_f64, 1.0] {
+                for s2 in [-1.0_f64, 1.0] {
+                    if inside(add(m, add(scale(n1, s1 * e), scale(n2, s2 * e)))) {
+                        solid += 1;
+                    }
+                }
             }
-            // Cross-section at the `a` end: the sharp corner `a`, and the two tangent
-            // contact points on each face. Extrude along the edge (with end margins).
-            let c0 = add(a, off); // cylinder centre at the a-end
-            let t1 = add(c0, scale(n1, radius));
-            let t2 = add(c0, scale(n2, radius));
-            let margin = radius.max(l * 0.0) * 1.5;
+            let margin = radius * 1.5;
             let start_shift = scale(axis, -margin);
             let total_len = l + 2.0 * margin;
-            // Corner prism (triangle a, t1, t2) extruded along the edge.
-            let cross = [add(a, start_shift), add(t1, start_shift), add(t2, start_shift)];
-            let prism = extrude_prism(&cross, axis, total_len);
-            // Tangent cylinder, slightly oversized in length to fully span the prism.
-            let u = norm(sub(t1, c0));
-            let w = norm(cross_perp(axis, u));
-            let cyl = make_cylinder(add(c0, start_shift), axis, u, w, radius, total_len, 48);
-            // tool = corner sliver outside the cylinder; carve it out of the body.
-            let tool = crate::mesh_difference(&prism, &cyl);
-            if tool.indices.len() >= 3 {
-                body = crate::mesh_difference(&body, &tool);
-                any = true;
+            let u = |c0: V3| norm(sub(add(c0, scale(n1, radius)), c0));
+
+            if solid == 1 {
+                // Convex ridge: subtract the corner sliver (corner-prism − tangent cylinder).
+                let c0 = add(a, scale(add(n1, n2), -radius / (1.0 + c))); // centre, in material
+                let t1 = add(c0, scale(n1, radius));
+                let t2 = add(c0, scale(n2, radius));
+                let cross = [add(a, start_shift), add(t1, start_shift), add(t2, start_shift)];
+                let prism = extrude_prism(&cross, axis, total_len);
+                let uu = u(c0);
+                let w = norm(cross_perp(axis, uu));
+                let cyl = make_cylinder(add(c0, start_shift), axis, uu, w, radius, total_len, 48);
+                let tool = crate::mesh_difference(&prism, &cyl);
+                if tool.indices.len() >= 3 {
+                    body = crate::mesh_difference(&body, &tool);
+                    any = true;
+                }
+            } else if solid == 3 {
+                // Concave notch (e.g. an inside L): union a quarter-round fill. The rolling
+                // circle sits in the notch (+n1,+n2 side); the fill region runs into the
+                // material so only the arc is exposed.
+                let c0 = add(a, scale(add(n1, n2), radius / (1.0 + c))); // centre, in the notch
+                let t1 = add(c0, scale(n1, -radius)); // contact on face 1
+                let t2 = add(c0, scale(n2, -radius)); // contact on face 2
+                let pad = radius;
+                // Cross-section: arc t1→t2 (notch surface), then back through the material.
+                let mut cross: Vec<V3> = vec![add(t1, start_shift)];
+                const ARC: usize = 16;
+                for k in 1..ARC {
+                    let f = k as f64 / ARC as f64;
+                    // Slerp-ish: interpolate the contact directions around the circle.
+                    let dir = norm(add(scale(sub(t1, c0), 1.0 - f), scale(sub(t2, c0), f)));
+                    cross.push(add(add(c0, scale(dir, radius)), start_shift));
+                }
+                cross.push(add(t2, start_shift));
+                cross.push(add(add(t2, scale(n2, -pad)), start_shift)); // into material behind face 2
+                cross.push(add(add(a, scale(add(n1, n2), -pad)), start_shift)); // deep material
+                cross.push(add(add(t1, scale(n1, -pad)), start_shift)); // into material behind face 1
+                let fill = extrude_prism(&cross, axis, total_len);
+                if fill.indices.len() >= 3 {
+                    body = crate::mesh_union(&body, &fill);
+                    any = true;
+                }
             }
         }
     }

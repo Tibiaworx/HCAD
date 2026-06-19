@@ -1293,9 +1293,23 @@ fn ui_system(
                 }
             });
             ui.separator();
+            // Cap the radius to under half the body's smallest dimension — a steeper fillet
+            // deforms the geometry and can abort the kernel.
+            let max_r = part
+                .mesh
+                .as_ref()
+                .map(|m| {
+                    let (lo, hi) = mesh_bbox(m);
+                    (((hi - lo).min_element()) * 0.45).max(0.02)
+                })
+                .unwrap_or(1000.0);
+            if r > max_r {
+                r = max_r;
+                ui_state.fillet_shown = None;
+            }
             ui.horizontal(|ui| {
                 ui.label("Radius");
-                if ui.add(egui::DragValue::new(&mut r).range(0.01..=1000.0).speed(0.02).suffix(" mm")).changed() {
+                if ui.add(egui::DragValue::new(&mut r).range(0.01..=max_r as f64).speed(0.02).suffix(" mm")).changed() {
                     ui_state.fillet_shown = None; // radius changed → refresh preview
                 }
             });
