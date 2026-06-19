@@ -582,7 +582,9 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                     }
                 }
             }
-            let margin = radius * 1.5;
+            // A small overrun past the edge ends so adjacent fillets meet at a corner,
+            // but not so much that the cut's flat end shows on the neighbouring face.
+            let margin = radius * 0.5;
             let start_shift = scale(axis, -margin);
             let total_len = l + 2.0 * margin;
             let u = |c0: V3| norm(sub(add(c0, scale(n1, radius)), c0));
@@ -637,20 +639,28 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                     body = crate::mesh_union(&body, &fill);
                     any = true;
                 }
+                // Record this concave edge's faces at both endpoints, for corner blending.
+                for &v in &[a, b] {
+                    let entry = corners.entry(vkey(v)).or_insert_with(|| (v, Vec::new()));
+                    for &nrm in &[n1, n2] {
+                        if entry.1.iter().all(|m| dot(*m, nrm) < 0.99) {
+                            entry.1.push(nrm);
+                        }
+                    }
+                }
             }
         }
     }
-    // Corner blends: where ≥3 distinct convex faces meet at a vertex (a box corner), round
-    // it to a sphere octant so the edge fillets join smoothly instead of leaving a notch.
+    // Corner blends: where three filleted faces meet at a vertex, round it to a sphere so
+    // the edge fillets join smoothly. A convex corner (material in 1 of the 8 octants the
+    // three faces carve) subtracts the sphere; a concave corner (a pocket's inside corner,
+    // 7 octants solid) unions a rounded fill.
     let inside = |p: V3| {
         let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
         (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
     };
     for (_, (corner, normals)) in corners {
         if normals.len() >= 3 {
-            // Only blend a *convex* corner (material in exactly one of the eight octants the
-            // three faces carve). A concave corner (a pocket's inside corner, 7 octants
-            // solid) must not get the sphere — that would gouge the geometry.
             let (n1, n2, n3) = (normals[0], normals[1], normals[2]);
             let e = radius * 0.4;
             let mut solid = 0;
@@ -664,11 +674,21 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                     }
                 }
             }
-            if solid != 1 {
-                continue;
-            }
-            if let Some(tool) = corner_sphere_tool(corner, n1, n2, n3, radius) {
-                body = crate::mesh_difference(&body, &tool);
+            // Only the clean corner topologies the sphere models correctly: 1 solid octant
+            // (a protruding convex corner → subtract) or 7 (a recessed concave corner →
+            // union). A 3-octant pocket-rim corner is *not* a sphere (it would scoop a
+            // dimple), so it's left to the edge fillets meeting (a small mark, no scoop).
+            let concave = match solid {
+                1 => false,
+                7 => true,
+                _ => continue,
+            };
+            if let Some(tool) = corner_sphere_tool(corner, n1, n2, n3, radius, concave) {
+                let cand = if concave { crate::mesh_union(&body, &tool) } else { crate::mesh_difference(&body, &tool) };
+                let n0 = body.indices.len();
+                if cand.indices.len() >= n0 / 2 && cand.indices.len() <= n0 * 4 {
+                    body = cand;
+                }
                 any = true;
             }
         }
@@ -962,7 +982,7 @@ fn local_round(body: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<T
 /// Spherical blend tool for a convex corner where three faces (outward normals `n1,n2,n3`)
 /// meet at `corner`: carve `(corner-box − sphere)` so the corner rounds to a sphere octant
 /// tangent to all three faces. Assumes near-orthogonal faces. `None` if degenerate.
-fn corner_sphere_tool(corner: V3, n1: V3, n2: V3, n3: V3, r: f64) -> Option<TriMesh> {
+fn corner_sphere_tool(corner: V3, n1: V3, n2: V3, n3: V3, r: f64, concave: bool) -> Option<TriMesh> {
     // Orthonormalise the frame (Gram–Schmidt); bail if the three faces are near-parallel.
     let e1 = norm(n1);
     let e2 = norm(sub(n2, scale(e1, dot(n2, e1))));
@@ -973,15 +993,22 @@ fn corner_sphere_tool(corner: V3, n1: V3, n2: V3, n3: V3, r: f64) -> Option<TriM
     if len(e3) < 0.3 {
         return None;
     }
-    // Centre at distance r from each of the three faces, inside material.
-    let center = add(corner, scale(add(add(e1, e2), e3), -r));
-    let pad = r;
-    // The box covers only the corner *octant* (from the sphere-centre planes, coord 0, out
-    // past the vertex into air at r+pad). `(box − sphere)` is then just the pointy bit
-    // outside the sphere — carving it rounds the corner without leaving a ball in a cavity.
-    let bbox = make_box(center, e1, e2, e3, 0.0, r + pad);
-    let sphere = make_sphere(center, r, 20, 28);
-    let tool = crate::mesh_difference(&bbox, &sphere);
+    let s = add(add(e1, e2), e3); // the diagonal toward the air octant (outward normals)
+    let tool = if concave {
+        // Concave corner (a pocket's inside corner): the sphere sits in the air octant
+        // tangent to all three faces; the bit of the corner cube outside it is the fill —
+        // union it. The cube spans only [0, r] from the corner so it doesn't add material
+        // past the fillet into the open pocket.
+        let center = add(corner, scale(s, r));
+        let bbox = make_box(corner, e1, e2, e3, 0.0, r);
+        crate::mesh_difference(&bbox, &make_sphere(center, r, 20, 28))
+    } else {
+        // Convex corner: the sphere sits in the material; carving the corner octant outside
+        // it (out past the vertex into air) rounds the corner.
+        let center = add(corner, scale(s, -r));
+        let bbox = make_box(center, e1, e2, e3, 0.0, r + r);
+        crate::mesh_difference(&bbox, &make_sphere(center, r, 20, 28))
+    };
     if tool.indices.len() >= 3 {
         Some(tool)
     } else {
