@@ -13,6 +13,7 @@
 //!    re-extract the surface with surface nets.
 
 use crate::TriMesh;
+use std::collections::HashMap;
 
 type V3 = [f64; 3];
 
@@ -513,6 +514,10 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
 
     let mut body = mesh.clone();
     let mut any = false;
+    // Convex straight-edge endpoints → the distinct face normals meeting there, so a corner
+    // shared by ≥3 faces (a box vertex) can be blended with a sphere afterwards.
+    let mut corners: HashMap<[i64; 3], (V3, Vec<V3>)> = HashMap::new();
+    let vkey = |p: V3| [(p[0] * 1e3).round() as i64, (p[1] * 1e3).round() as i64, (p[2] * 1e3).round() as i64];
     for chain in edges {
         // A circular rim (e.g. a cylinder cap edge) is filleted *only* by the toroidal
         // cut — never by the straight per-segment path (which, run over a whole circle of
@@ -582,6 +587,15 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                     body = crate::mesh_difference(&body, &tool);
                     any = true;
                 }
+                // Record this convex edge's faces at both endpoints, for corner blending.
+                for &v in &[a, b] {
+                    let entry = corners.entry(vkey(v)).or_insert_with(|| (v, Vec::new()));
+                    for &nrm in &[n1, n2] {
+                        if entry.1.iter().all(|m| dot(*m, nrm) < 0.99) {
+                            entry.1.push(nrm);
+                        }
+                    }
+                }
             } else if solid == 3 {
                 // Concave notch (e.g. an inside L): union a quarter-round fill. The rolling
                 // circle sits in the notch (+n1,+n2 side); the fill region runs into the
@@ -611,6 +625,16 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             }
         }
     }
+    // Corner blends: where ≥3 distinct convex faces meet at a vertex (a box corner), round
+    // it to a sphere octant so the edge fillets join smoothly instead of leaving a notch.
+    for (_, (corner, normals)) in corners {
+        if normals.len() >= 3 {
+            if let Some(tool) = corner_sphere_tool(corner, normals[0], normals[1], normals[2], radius) {
+                body = crate::mesh_difference(&body, &tool);
+                any = true;
+            }
+        }
+    }
     if any {
         Some(body)
     } else {
@@ -622,6 +646,94 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
 /// assumed); returns axis × u.
 fn cross_perp(axis: V3, u: V3) -> V3 {
     cross(axis, u)
+}
+
+/// A UV sphere of `radius` centred at `c`.
+fn make_sphere(c: V3, radius: f64, nlat: usize, nlong: usize) -> TriMesh {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let f = |p: V3| [p[0] as f32, p[1] as f32, p[2] as f32];
+    for i in 0..=nlat {
+        let theta = std::f64::consts::PI * i as f64 / nlat as f64; // 0..π
+        let (st, ct) = theta.sin_cos();
+        for j in 0..nlong {
+            let phi = std::f64::consts::TAU * j as f64 / nlong as f64;
+            let (sp, cp) = phi.sin_cos();
+            positions.push(f([c[0] + radius * st * cp, c[1] + radius * st * sp, c[2] + radius * ct]));
+        }
+    }
+    let idx = |i: usize, j: usize| (i * nlong + (j % nlong)) as u32;
+    let mut indices: Vec<u32> = Vec::new();
+    for i in 0..nlat {
+        for j in 0..nlong {
+            let (a, b, cc, d) = (idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j));
+            indices.extend_from_slice(&[a, b, cc, a, cc, d]);
+        }
+    }
+    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    orient_outward(&mut m);
+    fill_normals(&mut m);
+    m
+}
+
+/// An axis-aligned-in-frame box: centred near `c`, spanning `[lo, hi]` along each of the
+/// orthonormal axes `e1`,`e2`,`e3`.
+fn make_box(c: V3, e1: V3, e2: V3, e3: V3, lo: f64, hi: f64) -> TriMesh {
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(8);
+    for &z in &[lo, hi] {
+        for &y in &[lo, hi] {
+            for &x in &[lo, hi] {
+                let p = add(c, add(scale(e1, x), add(scale(e2, y), scale(e3, z))));
+                positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+            }
+        }
+    }
+    // 12 triangles (corner indexing: bit0=x, bit1=y, bit2=z).
+    let q = |a: u32, b: u32, c: u32, d: u32| [a, b, c, a, c, d];
+    let mut indices: Vec<u32> = Vec::new();
+    for f in [
+        q(0, 1, 3, 2), // z=lo
+        q(4, 6, 7, 5), // z=hi
+        q(0, 4, 5, 1), // y=lo
+        q(2, 3, 7, 6), // y=hi
+        q(0, 2, 6, 4), // x=lo
+        q(1, 5, 7, 3), // x=hi
+    ] {
+        indices.extend_from_slice(&f);
+    }
+    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    orient_outward(&mut m);
+    fill_normals(&mut m);
+    m
+}
+
+/// Spherical blend tool for a convex corner where three faces (outward normals `n1,n2,n3`)
+/// meet at `corner`: carve `(corner-box − sphere)` so the corner rounds to a sphere octant
+/// tangent to all three faces. Assumes near-orthogonal faces. `None` if degenerate.
+fn corner_sphere_tool(corner: V3, n1: V3, n2: V3, n3: V3, r: f64) -> Option<TriMesh> {
+    // Orthonormalise the frame (Gram–Schmidt); bail if the three faces are near-parallel.
+    let e1 = norm(n1);
+    let e2 = norm(sub(n2, scale(e1, dot(n2, e1))));
+    if len(e2) < 0.3 {
+        return None;
+    }
+    let e3 = norm(sub(sub(n3, scale(e1, dot(n3, e1))), scale(e2, dot(n3, e2))));
+    if len(e3) < 0.3 {
+        return None;
+    }
+    // Centre at distance r from each of the three faces, inside material.
+    let center = add(corner, scale(add(add(e1, e2), e3), -r));
+    let pad = r;
+    // The box covers only the corner *octant* (from the sphere-centre planes, coord 0, out
+    // past the vertex into air at r+pad). `(box − sphere)` is then just the pointy bit
+    // outside the sphere — carving it rounds the corner without leaving a ball in a cavity.
+    let bbox = make_box(center, e1, e2, e3, 0.0, r + pad);
+    let sphere = make_sphere(center, r, 20, 28);
+    let tool = crate::mesh_difference(&bbox, &sphere);
+    if tool.indices.len() >= 3 {
+        Some(tool)
+    } else {
+        None
+    }
 }
 
 /// Round the edges of `mesh` to roughly `radius`. If `edges` is non-empty, only the parts
