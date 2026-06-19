@@ -132,13 +132,28 @@ fn tri_normal(a: V3, b: V3, c: V3) -> V3 {
 }
 
 /// The two distinct adjacent face normals of the mesh edge `a`–`b` (the faces meeting at
-/// that edge). `None` if the edge isn't shared by two clearly-different faces.
+/// that edge). Faces are found by *proximity to the segment* (a triangle with ≥2 vertices
+/// lying on the line a–b within its span), so it's robust to the committed mesh
+/// re-tessellating or subdividing the edge differently than the stored polyline. `None` if
+/// the edge isn't shared by two clearly-different faces.
 fn adjacent_normals(tris: &[[V3; 3]], a: V3, b: V3, tol: f64) -> Option<(V3, V3)> {
-    let near = |p: V3, q: V3| sub(p, q).iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < tol;
-    let has = |t: &[V3; 3], p: V3| t.iter().any(|&v| near(v, p));
+    let ab = sub(b, a);
+    let span = len(ab);
+    if span < 1e-9 {
+        return None;
+    }
+    let dir = scale(ab, 1.0 / span);
+    let on_seg = |p: V3| {
+        let t = dot(sub(p, a), dir);
+        if t < -tol || t > span + tol {
+            return false;
+        }
+        let proj = add(a, scale(dir, t.clamp(0.0, span)));
+        len(sub(p, proj)) < tol
+    };
     let mut normals: Vec<V3> = Vec::new();
     for t in tris {
-        if has(t, a) && has(t, b) {
+        if t.iter().filter(|&&v| on_seg(v)).count() >= 2 {
             let n = tri_normal(t[0], t[1], t[2]);
             if normals.iter().all(|m| dot(*m, n) < 0.999) {
                 normals.push(n);
@@ -599,25 +614,25 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             } else if solid == 3 {
                 // Concave notch (e.g. an inside L): union a quarter-round fill. The rolling
                 // circle sits in the notch (+n1,+n2 side); the fill region runs into the
-                // material so only the arc is exposed.
+                // material so only the arc is exposed. Unlike the convex subtract, the fill
+                // must NOT overhang the edge ends (a union past the edge adds a stray tab),
+                // so it spans exactly the edge length.
                 let c0 = add(a, scale(add(n1, n2), radius / (1.0 + c))); // centre, in the notch
                 let t1 = add(c0, scale(n1, -radius)); // contact on face 1
                 let t2 = add(c0, scale(n2, -radius)); // contact on face 2
-                let pad = radius;
-                // Cross-section: arc t1→t2 (notch surface), then back through the material.
-                let mut cross: Vec<V3> = vec![add(t1, start_shift)];
+                // Minimal fill: the notch corner bounded by the two faces (a→t1, t2→a) and
+                // the arc. Those side edges sit ON the existing faces (a coplanar union),
+                // so the fill never reaches past a wall the way a "dig into material"
+                // extension would (which pokes out a thin wall at a large radius).
+                let mut cross: Vec<V3> = vec![a, t1];
                 const ARC: usize = 16;
                 for k in 1..ARC {
                     let f = k as f64 / ARC as f64;
-                    // Slerp-ish: interpolate the contact directions around the circle.
                     let dir = norm(add(scale(sub(t1, c0), 1.0 - f), scale(sub(t2, c0), f)));
-                    cross.push(add(add(c0, scale(dir, radius)), start_shift));
+                    cross.push(add(c0, scale(dir, radius)));
                 }
-                cross.push(add(t2, start_shift));
-                cross.push(add(add(t2, scale(n2, -pad)), start_shift)); // into material behind face 2
-                cross.push(add(add(a, scale(add(n1, n2), -pad)), start_shift)); // deep material
-                cross.push(add(add(t1, scale(n1, -pad)), start_shift)); // into material behind face 1
-                let fill = extrude_prism(&cross, axis, total_len);
+                cross.push(t2);
+                let fill = extrude_prism(&cross, axis, l); // exactly the edge length, no overhang
                 if fill.indices.len() >= 3 {
                     body = crate::mesh_union(&body, &fill);
                     any = true;
@@ -627,9 +642,32 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
     }
     // Corner blends: where ≥3 distinct convex faces meet at a vertex (a box corner), round
     // it to a sphere octant so the edge fillets join smoothly instead of leaving a notch.
+    let inside = |p: V3| {
+        let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+        (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+    };
     for (_, (corner, normals)) in corners {
         if normals.len() >= 3 {
-            if let Some(tool) = corner_sphere_tool(corner, normals[0], normals[1], normals[2], radius) {
+            // Only blend a *convex* corner (material in exactly one of the eight octants the
+            // three faces carve). A concave corner (a pocket's inside corner, 7 octants
+            // solid) must not get the sphere — that would gouge the geometry.
+            let (n1, n2, n3) = (normals[0], normals[1], normals[2]);
+            let e = radius * 0.4;
+            let mut solid = 0;
+            for &s1 in &[-1.0_f64, 1.0] {
+                for &s2 in &[-1.0_f64, 1.0] {
+                    for &s3 in &[-1.0_f64, 1.0] {
+                        let p = add(corner, add(scale(n1, s1 * e), add(scale(n2, s2 * e), scale(n3, s3 * e))));
+                        if inside(p) {
+                            solid += 1;
+                        }
+                    }
+                }
+            }
+            if solid != 1 {
+                continue;
+            }
+            if let Some(tool) = corner_sphere_tool(corner, n1, n2, n3, radius) {
                 body = crate::mesh_difference(&body, &tool);
                 any = true;
             }
@@ -706,6 +744,221 @@ fn make_box(c: V3, e1: V3, e2: V3, e3: V3, lo: f64, hi: f64) -> TriMesh {
     m
 }
 
+/// A box spanning `r1`/`r2`/`r3` (each `(lo, hi)`) along orthonormal axes `e1,e2,e3` from
+/// `c`. Used as a clipping region.
+fn make_box_ranges(c: V3, e1: V3, e2: V3, e3: V3, r1: (f64, f64), r2: (f64, f64), r3: (f64, f64)) -> TriMesh {
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(8);
+    for &z in &[r3.0, r3.1] {
+        for &y in &[r2.0, r2.1] {
+            for &x in &[r1.0, r1.1] {
+                let p = add(c, add(scale(e1, x), add(scale(e2, y), scale(e3, z))));
+                positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+            }
+        }
+    }
+    let q = |a: u32, b: u32, cc: u32, d: u32| [a, b, cc, a, cc, d];
+    let mut indices: Vec<u32> = Vec::new();
+    for f in [q(0, 1, 3, 2), q(4, 6, 7, 5), q(0, 4, 5, 1), q(2, 3, 7, 6), q(0, 2, 6, 4), q(1, 5, 7, 3)] {
+        indices.extend_from_slice(&f);
+    }
+    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    orient_outward(&mut m);
+    fill_normals(&mut m);
+    m
+}
+
+/// A clipping region that hugs the `edges` loop as a *tube*: the union of a box per rim
+/// segment (each ±`2·radius` perpendicular and along the loop's normal). This keeps an SDF
+/// round local to the edge curve itself, without filling its bounding box (which, for a big
+/// pocket in a thin frame, would reach the part's outer edges). `None` if not planar.
+fn edge_band_box(edges: &[Vec<[f64; 3]>], radius: f64) -> Option<TriMesh> {
+    // Loop normal (Newell), for the perpendicular/axial box extents.
+    let mut nrm = [0.0; 3];
+    for chain in edges {
+        for i in 0..chain.len() {
+            let p = chain[i];
+            let qn = chain[(i + 1) % chain.len()];
+            nrm[0] += (p[1] - qn[1]) * (p[2] + qn[2]);
+            nrm[1] += (p[2] - qn[2]) * (p[0] + qn[0]);
+            nrm[2] += (p[0] - qn[0]) * (p[1] + qn[1]);
+        }
+    }
+    if len(nrm) < 1e-9 {
+        return None;
+    }
+    let axis = norm(nrm);
+    let m = radius * 2.0;
+    let mut band: Option<TriMesh> = None;
+    for chain in edges {
+        for i in 0..chain.len() {
+            let a = chain[i];
+            let b = chain[(i + 1) % chain.len()];
+            let d = sub(b, a);
+            let l = len(d);
+            if l < 1e-6 {
+                continue;
+            }
+            let e1 = scale(d, 1.0 / l);
+            let e2 = norm(cross(e1, axis));
+            let mid = scale(add(a, b), 0.5);
+            let box_seg = make_box_ranges(mid, e1, e2, axis, (-l * 0.5 - m, l * 0.5 + m), (-m, m), (-m, m));
+            band = Some(match band {
+                Some(acc) => crate::mesh_union(&acc, &box_seg),
+                None => box_seg,
+            });
+        }
+    }
+    band
+}
+
+/// Sweep a closed 2D `profile` (points in `(w, z)` = horizontal-into-material, along-axis)
+/// along the closed loop `pts`, with the profile's `w` axis = the in-plane normal of the
+/// loop (`cross(tangent, axis)·w_sign`) and `z` axis = `axis`. A tube whose cross-section
+/// is constant but rotates to follow the rim — exact for straight runs and arcs alike.
+fn sweep_profile(profile: &[(f64, f64)], pts: &[V3], axis: V3, w_sign: f64) -> TriMesh {
+    let n = pts.len();
+    let np = profile.len();
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * np);
+    for i in 0..n {
+        let prev = pts[(i + n - 1) % n];
+        let next = pts[(i + 1) % n];
+        let t = norm(sub(next, prev));
+        let w = scale(norm(cross(t, axis)), w_sign);
+        for &(wv, zv) in profile {
+            let p = add(pts[i], add(scale(w, wv), scale(axis, zv)));
+            positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+        }
+    }
+    let mut indices: Vec<u32> = Vec::new();
+    for i in 0..n {
+        let i1 = (i + 1) % n;
+        for j in 0..np {
+            let j1 = (j + 1) % np;
+            let (a, b, c, d) =
+                ((i * np + j) as u32, (i1 * np + j) as u32, (i1 * np + j1) as u32, (i * np + j1) as u32);
+            indices.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    orient_outward(&mut m);
+    fill_normals(&mut m);
+    m
+}
+
+/// Exact swept rolling-ball fillet on a *planar convex* rim (a slot pocket, a rounded-
+/// rectangle rim, …): sweep the corner-sliver cross-section along the rim and subtract it.
+/// `None` if the rim isn't planar+convex (caller falls back to the SDF crop).
+fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriMesh, bool)> {
+    if chain.len() < 6 {
+        return None;
+    }
+    let tris: Vec<[V3; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let g = |i: u32| {
+                let p = mesh.positions[i as usize];
+                [p[0] as f64, p[1] as f64, p[2] as f64]
+            };
+            [g(t[0]), g(t[1]), g(t[2])]
+        })
+        .collect();
+    let nn = chain.len();
+    let center = scale(chain.iter().fold([0.0; 3], |a, p| add(a, *p)), 1.0 / nn as f64);
+    let mut nrm = [0.0; 3];
+    for i in 0..nn {
+        let p = chain[i];
+        let q = chain[(i + 1) % nn];
+        nrm[0] += (p[1] - q[1]) * (p[2] + q[2]);
+        nrm[1] += (p[2] - q[2]) * (p[0] + q[0]);
+        nrm[2] += (p[0] - q[0]) * (p[1] + q[1]);
+    }
+    if len(nrm) < 1e-9 {
+        return None;
+    }
+    let axis0 = norm(nrm);
+    // Planarity: every rim point near the plane.
+    if chain.iter().any(|p| dot(sub(*p, center), axis0).abs() > radius * 0.5 + 1e-3) {
+        return None;
+    }
+    // Smoothness: the sweep assumes a tangent-continuous rim (a slot, a rounded rect). A
+    // sharp corner (a square pocket) makes the swept tool self-intersect, so bail and let
+    // the SDF crop handle it.
+    for i in 0..nn {
+        let a = chain[(i + nn - 1) % nn];
+        let b = chain[i];
+        let c = chain[(i + 1) % nn];
+        let (t_in, t_out) = (norm(sub(b, a)), norm(sub(c, b)));
+        if len(sub(b, a)) > 1e-9 && len(sub(c, b)) > 1e-9 && dot(t_in, t_out) < 0.7 {
+            return None; // turn > ~45°
+        }
+    }
+    let inside = |p: V3| {
+        let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+        (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+    };
+    let e = radius * 0.4;
+    let p0 = chain[0];
+    let t0 = norm(sub(chain[1], chain[nn - 1]));
+    // Orient the axis to the cap's outward (air) side.
+    let axis = if inside(add(p0, scale(axis0, e))) { scale(axis0, -1.0) } else { axis0 };
+    // The in-plane normal pointing into material (the +w of the cross-section).
+    let mut w0 = norm(cross(t0, axis));
+    if !inside(add(p0, add(scale(w0, e), scale(axis, -e)))) {
+        w0 = scale(w0, -1.0);
+    }
+    let w_sign = if dot(w0, cross(t0, axis)) > 0.0 { 1.0 } else { -1.0 };
+    // Convex only (one solid quadrant); concave rims fall back.
+    let mut solid = 0;
+    for sc in [-1.0_f64, 1.0] {
+        for sw in [-1.0_f64, 1.0] {
+            if inside(add(p0, add(scale(axis, sc * e), scale(w0, sw * e)))) {
+                solid += 1;
+            }
+        }
+    }
+    if solid != 1 {
+        return None;
+    }
+    // Corner-sliver cross-section in (w, z): material at (+w, −z), rolling circle (r, −r).
+    // Outer edges run into air (w<0 / z>0) so the cut is transversal.
+    let r = radius;
+    let pad = r;
+    const ARC: usize = 14;
+    let mut profile: Vec<(f64, f64)> = vec![(r, 0.0)]; // cap contact
+    for k in 1..ARC {
+        let a = std::f64::consts::FRAC_PI_2 * (1.0 + k as f64 / ARC as f64); // 90°→180°
+        profile.push((r + r * a.cos(), -r + r * a.sin()));
+    }
+    profile.push((0.0, -r)); // wall contact
+    profile.push((-pad, -r)); // into the pocket (air)
+    profile.push((-pad, pad)); // air
+    profile.push((r, pad)); // above the cap (air)
+    let chain_v3: Vec<V3> = chain.to_vec();
+    let tool = sweep_profile(&profile, &chain_v3, axis, w_sign);
+    Some((tool, false))
+}
+
+/// Round a curved/mixed edge (a slot rim, a freeform loop) while keeping the rest of the
+/// body sharp: SDF-round the whole body (which softens every edge), then splice back only
+/// the change inside a box hugging the edge. Convex edges lose their shaved shell; concave
+/// edges gain their fill — both clipped to the edge band.
+fn local_round(body: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
+    let rounded = sdf_round(body, radius, &[])?;
+    let band = edge_band_box(edges, radius)?;
+    let removed = crate::mesh_intersection(&crate::mesh_difference(body, &rounded), &band);
+    let mut out = crate::mesh_difference(body, &removed);
+    let added = crate::mesh_intersection(&crate::mesh_difference(&rounded, body), &band);
+    if added.indices.len() >= 3 {
+        out = crate::mesh_union(&out, &added);
+    }
+    if out.indices.len() >= 3 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Spherical blend tool for a convex corner where three faces (outward normals `n1,n2,n3`)
 /// meet at `corner`: carve `(corner-box − sphere)` so the corner rounds to a sphere octant
 /// tangent to all three faces. Assumes near-orthogonal faces. `None` if degenerate.
@@ -736,20 +989,135 @@ fn corner_sphere_tool(corner: V3, n1: V3, n2: V3, n3: V3, r: f64) -> Option<TriM
     }
 }
 
-/// Round the edges of `mesh` to roughly `radius`. If `edges` is non-empty, only the parts
-/// of the body within ≈`radius` of those edge polylines are rounded (a *selective* fillet
-/// on the picked edges); otherwise every edge is rounded. `None` if the mesh is empty or
-/// the radius is non-positive (caller keeps the original).
+/// A picked edge is "straight" if all its points are collinear (so the tangent-cylinder
+/// path applies). A single 2-point segment counts.
+fn is_straight_edge(chain: &[[f64; 3]]) -> bool {
+    if chain.len() < 2 {
+        return false;
+    }
+    let (a, b) = (chain[0], chain[chain.len() - 1]);
+    let span = len(sub(b, a));
+    if span < 1e-9 {
+        return false;
+    }
+    let dir = norm(sub(b, a));
+    chain.iter().all(|p| {
+        let d = sub(*p, a);
+        len(sub(d, scale(dir, dot(d, dir)))) < span * 0.02 + 1e-4
+    })
+}
+
+/// A loop is "piecewise straight" (a rectangle, a polygon) if every turn between segments
+/// is either ~collinear or a sharp corner — i.e. there are no *gradual* arcs. Such a loop
+/// is filleted as separate straight sides (crisp cylinders), not a swept/SDF curve.
+fn is_piecewise_straight(chain: &[[f64; 3]]) -> bool {
+    let n = chain.len();
+    if n < 3 {
+        return false;
+    }
+    for i in 0..n {
+        let a = chain[(i + n - 1) % n];
+        let b = chain[i];
+        let c = chain[(i + 1) % n];
+        if len(sub(b, a)) < 1e-9 || len(sub(c, b)) < 1e-9 {
+            continue;
+        }
+        let d = dot(norm(sub(b, a)), norm(sub(c, b)));
+        if d > 0.7 && d < 0.995 {
+            return false; // a gradual turn ⇒ an arc, not a corner
+        }
+    }
+    true
+}
+
+/// Split a piecewise-straight loop into its straight runs at the sharp corners.
+fn split_straight_runs(chain: &[[f64; 3]]) -> Vec<Vec<[f64; 3]>> {
+    let n = chain.len();
+    let mut corners = Vec::new();
+    for i in 0..n {
+        let a = chain[(i + n - 1) % n];
+        let b = chain[i];
+        let c = chain[(i + 1) % n];
+        if len(sub(b, a)) > 1e-9 && len(sub(c, b)) > 1e-9 && dot(norm(sub(b, a)), norm(sub(c, b))) < 0.7 {
+            corners.push(i);
+        }
+    }
+    if corners.len() < 2 {
+        return vec![chain.to_vec()];
+    }
+    let mut runs = Vec::new();
+    for k in 0..corners.len() {
+        let (start, end) = (corners[k], corners[(k + 1) % corners.len()]);
+        let mut run = Vec::new();
+        let mut i = start;
+        loop {
+            run.push(chain[i]);
+            if i == end {
+                break;
+            }
+            i = (i + 1) % n;
+        }
+        runs.push(run);
+    }
+    runs
+}
+
+/// Round the picked `edges`: a circular rim → torus, a straight edge → tangent cylinder
+/// (both exact booleans), and anything curved or mixed (a slot rim, a freeform loop) → the
+/// SDF round masked to that edge — which follows the whole outline smoothly instead of
+/// faceting it into starbursts. With no edges, rounds every edge (global SDF).
 pub fn round_mesh(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     if radius <= 1e-6 || mesh.indices.len() < 3 {
         return None;
     }
-    // Picked edges → exact boolean rolling-ball fillet (crisp). Fall back to the SDF round
-    // only if it couldn't handle any picked edge.
-    if !edges.is_empty() {
-        if let Some(m) = fillet_boolean(mesh, radius, edges) {
-            return Some(m);
+    if edges.is_empty() {
+        return sdf_round(mesh, radius, &[]);
+    }
+    let mut boolean_edges: Vec<Vec<[f64; 3]>> = Vec::new();
+    let mut curved_edges: Vec<Vec<[f64; 3]>> = Vec::new();
+    for chain in edges {
+        if fit_circle(chain).is_some() || is_straight_edge(chain) {
+            boolean_edges.push(chain.clone());
+        } else if is_piecewise_straight(chain) {
+            // A rectangle / polygon rim → fillet each straight side with a crisp cylinder.
+            boolean_edges.extend(split_straight_runs(chain));
+        } else {
+            curved_edges.push(chain.clone());
         }
+    }
+    let mut body = mesh.clone();
+    let mut any = false;
+    if !boolean_edges.is_empty() {
+        if let Some(m) = fillet_boolean(&body, radius, &boolean_edges) {
+            body = m;
+            any = true;
+        }
+    }
+    for chain in &curved_edges {
+        // Exact swept fillet for a planar convex rim (a slot); else crop the SDF round.
+        if let Some((tool, is_union)) = fillet_swept(&body, radius, chain) {
+            if tool.indices.len() >= 3 {
+                body = if is_union { crate::mesh_union(&body, &tool) } else { crate::mesh_difference(&body, &tool) };
+                any = true;
+            }
+        } else if let Some(m) = local_round(&body, radius, std::slice::from_ref(chain)) {
+            body = m;
+            any = true;
+        }
+    }
+    if any {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+/// SDF rolling-ball round: sample the signed-distance field on a voxel grid, blur it by the
+/// radius, re-extract with surface nets. If `edges` is non-empty, the round is masked to
+/// the body within ≈radius of those polylines; otherwise every edge rounds.
+fn sdf_round(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
+    if radius <= 1e-6 || mesh.indices.len() < 3 {
+        return None;
     }
     let tris: Vec<[V3; 3]> = mesh
         .indices
@@ -866,8 +1234,10 @@ pub fn round_mesh(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             .flat_map(|chain| chain.windows(2).map(|w| (w[0], w[1])))
             .collect();
         if !segs.is_empty() {
-            let near = (radius * 1.3) as f32;
-            let far = (radius * 2.3).max(radius * 1.3 + h) as f32;
+            // Keep the rounded band tight to the edge so the fillet doesn't reach into
+            // nearby geometry: full effect to ≈1·r, fading out by ≈1.7·r.
+            let near = radius as f32;
+            let far = (radius * 1.7).max(radius + h) as f32;
             for k in 0..nz {
                 for j in 0..ny {
                     for i in 0..nx {

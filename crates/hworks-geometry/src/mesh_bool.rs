@@ -84,6 +84,7 @@ fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 enum Op {
     Union,
     Difference,
+    Intersection,
 }
 
 /// Run a Manifold boolean; `None` if either operand can't be ingested or the result
@@ -93,6 +94,7 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     let r = match op {
         Op::Union => ma.union(&mb),
         Op::Difference => ma.difference(&mb),
+        Op::Intersection => ma.intersection(&mb),
     };
     if r.status().is_err() {
         return None;
@@ -109,6 +111,11 @@ pub fn mesh_union(a: &TriMesh, b: &TriMesh) -> TriMesh {
 /// Boolean **difference** `a − b` of two triangle meshes (Manifold; BSP CSG fallback).
 pub fn mesh_difference(a: &TriMesh, b: &TriMesh) -> TriMesh {
     manifold_boolean(a, b, Op::Difference).unwrap_or_else(|| csg::bsp_difference(a, b))
+}
+
+/// Boolean **intersection** `a ∩ b` of two triangle meshes (Manifold; empty on failure).
+pub fn mesh_intersection(a: &TriMesh, b: &TriMesh) -> TriMesh {
+    manifold_boolean(a, b, Op::Intersection).unwrap_or_default()
 }
 
 #[cfg(test)]

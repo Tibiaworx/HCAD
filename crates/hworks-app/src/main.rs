@@ -34,6 +34,11 @@ use hworks_geometry::{
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct OverlayGizmos;
 
+/// Gizmo group for the drawn sketch profile geometry, given a thicker line width than the
+/// default group (grid, markers, dimensions) for better visibility.
+#[derive(Default, Reflect, GizmoConfigGroup)]
+struct ProfileGizmos;
+
 /// How far a boss reaches back into the body it's built on (flush path). Kept below
 /// the 0.03 tessellation tolerance so any overhang lip is sub-facet (invisible),
 /// while big enough to keep the union robust paired with the tight tolerance.
@@ -107,6 +112,7 @@ fn main() {
         )
         .add_plugins(EguiPlugin::default())
         .init_gizmo_group::<OverlayGizmos>()
+        .init_gizmo_group::<ProfileGizmos>()
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
         .insert_resource(DocRes(Document::with_default_planes()))
         .init_resource::<SketchSession>()
@@ -467,6 +473,9 @@ struct SketchSession {
     /// The cursor's raw position on the sketch plane, before snapping. Used by the
     /// polygon tool so its radius tracks the mouse instead of jumping to a far snap.
     cursor_raw_uv: Option<Vec2>,
+    /// Drag-over box select (Select tool): the anchor corner where the drag started on
+    /// empty space; the opposite corner follows the cursor until release.
+    box_select: Option<Vec2>,
     /// Which closed contours (indices into `sketch.regions()`) are selected for
     /// extrude/cut — the "Selected Contours". Empty means "all closed regions".
     selected_contours: Vec<usize>,
@@ -571,6 +580,8 @@ fn setup(
     // Overlay gizmos draw in front of the solid so the extrude preview/arrow and the
     // cut-depth indicator are visible through the model.
     gizmo_store.config_mut::<OverlayGizmos>().0.depth_bias = -1.0;
+    // Drawn sketch lines are a touch thicker than the grid/markers for visibility.
+    gizmo_store.config_mut::<ProfileGizmos>().0.line.width = 3.2;
 
     let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
     let colors = [
@@ -2387,6 +2398,32 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2, snap: f32) -> usize {
     nearest_point(sketch, uv, snap).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
+/// Where to place the endpoint `i` while it's being dragged: snap onto the nearest *other*
+/// sketch point, body-projected reference point (corner/centre), or on-hover inference
+/// point within the snap tolerance; otherwise the raw cursor `uv`.
+fn snap_drag_target(session: &SketchSession, i: usize, uv: Vec2) -> Vec2 {
+    let snap = session.snap_dist;
+    let mut best: Option<(Vec2, f32)> = None;
+    let mut consider = |p: Vec2| {
+        let d = p.distance(uv);
+        if d <= snap && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((p, d));
+        }
+    };
+    for (j, p) in session.sketch.points.iter().enumerate() {
+        if j != i {
+            consider(Vec2::new(p.x as f32, p.y as f32));
+        }
+    }
+    for p in &session.reference_points {
+        consider(*p);
+    }
+    for p in &session.inference_points {
+        consider(*p);
+    }
+    best.map(|(p, _)| p).unwrap_or(uv)
+}
+
 /// Like `get_or_add_point`, but if the position coincides with a body-projected
 /// reference snap point (a corner/centre), the new point is *locked* there — so the
 /// endpoint stays constrained to that 3D feature through later solves.
@@ -3184,11 +3221,13 @@ fn sketch_interaction(
         session.cursor_edge = None;
     }
 
-    // Line tool: when the in-progress segment is near horizontal/vertical (a 90°
-    // step), snap it square — unless the cursor already locked onto an exact target
-    // (a point or a circle rim), in which case the exact target must win so the line
-    // actually closes on it instead of being pulled square a hair short.
-    if session.tool == Tool::Line && !cursor_locked {
+    // Line tool (and the slot's centre line) — when the in-progress segment is near
+    // horizontal/vertical (a 90° step), snap it square so things stay axis-aligned —
+    // unless the cursor already locked onto an exact target (a point or a circle rim),
+    // in which case the exact target must win so the line closes on it.
+    let square_tool =
+        session.tool == Tool::Line || (session.tool == Tool::Slot && session.pending_b.is_none());
+    if square_tool && !cursor_locked {
         if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
             let on_point = nearest_point(&session.sketch, cur, snap).is_some();
             let v = cur - start;
@@ -3348,6 +3387,9 @@ fn sketch_interaction(
         // picked text entity (font/style/string/arc/…).
         session.selected_entities.clear();
     }
+    if session.tool != Tool::Select {
+        session.box_select = None;
+    }
 
     match session.tool {
         Tool::Select => {
@@ -3479,7 +3521,9 @@ fn sketch_interaction(
                                     session.selected_entities.clear();
                                 }
                             } else {
+                                // Empty space → start a drag-over box select.
                                 session.selected_entities.clear();
+                                session.box_select = active_uv;
                             }
                         }
                     }
@@ -3498,9 +3542,11 @@ fn sketch_interaction(
             } else if let Some(i) = session.drag {
                 if pressed {
                     if let Some(uv) = active_uv {
+                        // Snap the dragged endpoint onto a nearby *other* point / corner.
+                        let target = snap_drag_target(&session, i, uv);
                         if let Some(p) = session.sketch.points.get_mut(i) {
-                            p.x = uv.x as f64;
-                            p.y = uv.y as f64;
+                            p.x = target.x as f64;
+                            p.y = target.y as f64;
                         }
                         session.sketch.solve_with_fixed(&[i]);
                     }
@@ -3518,6 +3564,35 @@ fn sketch_interaction(
                 }
                 if just_released {
                     session.dim_drag = None;
+                }
+            }
+            // Drag-over box select: on release, select every entity whose endpoints all
+            // fall inside the box (a window select).
+            if let Some(start) = session.box_select {
+                if just_released {
+                    if let Some(end) = active_uv {
+                        let (lo, hi) = (start.min(end), start.max(end));
+                        if (hi - lo).length() > session.snap_dist * 0.5 {
+                            let in_box = |uv: Vec2| uv.cmpge(lo).all() && uv.cmple(hi).all();
+                            let mut sel = Vec::new();
+                            for (i, _) in session.sketch.entities.iter().enumerate() {
+                                let pts = entity_points(&session.sketch, i);
+                                if !pts.is_empty()
+                                    && pts.iter().all(|&p| {
+                                        session
+                                            .sketch
+                                            .points
+                                            .get(p)
+                                            .is_some_and(|q| in_box(Vec2::new(q.x as f32, q.y as f32)))
+                                    })
+                                {
+                                    sel.push(i);
+                                }
+                            }
+                            session.selected_entities = sel;
+                        }
+                    }
+                    session.box_select = None;
                 }
             }
         }
@@ -3897,6 +3972,9 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 let end_edge = session.cursor_edge;
                 maybe_add_point_on_edge(session, b, end_edge);
                 session.dirty = true;
+                // A construction line is a one-shot: revert to the regular line tool after
+                // drawing one (re-pick "Construction Line" for another).
+                session.construction = false;
             } else {
                 session.pending = Some(uv);
                 session.pending_edge = session.cursor_edge; // remember the start's edge
@@ -4998,9 +5076,9 @@ fn do_regenerate(
             // Keep a B-rep handle (truck's partial body) so "a body exists" logic still
             // holds; the displayed geometry is the full mesh-kernel result.
             part.solid = rebuilt;
-            ui_state.last_error = Some(
-                "Built with the robust mesh kernel — an exact boolean was too complex, so this feature's faces are triangulated.".into(),
-            );
+            // The mesh kernel succeeded — the geometry built fine, so this isn't an error
+            // (only a true failure to generate geometry warrants the banner).
+            ui_state.last_error = None;
             info!("Regenerate: used the mesh-boolean fallback for {} operation(s).", failures.len());
         }
         // Even the mesh kernel couldn't do it — keep whatever the exact path produced
@@ -5095,18 +5173,50 @@ fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
 /// to the wrong one. Robust topological naming (DESIGN.md §4.3) is the eventual fix.
 fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
     let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
     let mesh = tessellate(body, 0.2).mesh;
-    if mesh.positions.is_empty() {
+    if mesh.indices.len() < 3 {
         return plane.clone();
     }
-    let max_proj = mesh
-        .positions
-        .iter()
-        .map(|p| Vec3::from_array(*p).dot(n))
-        .fold(f32::NEG_INFINITY, f32::max);
-    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
-    let shifted = o + n * (max_proj - o.dot(n));
-    PlaneRef { origin: [shifted.x as f64, shifted.y as f64, shifted.z as f64], ..plane.clone() }
+    let o_n = o.dot(n);
+    // The origin projects to (0,0) in the plane's (u,v); find the body face parallel to the
+    // sketch plane that lies *under the sketch's footprint* (contains the origin in-plane)
+    // and snap the origin onto it along the normal — the face the sketch actually sits on,
+    // even after an upstream edit moved it. (The old global-extreme rule sent an angled
+    // face's origin off to a far corner.)
+    let in_tri = |p: Vec2, a: Vec2, b: Vec2, c: Vec2| {
+        let s = |p: Vec2, a: Vec2, b: Vec2| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        let (d1, d2, d3) = (s(p, a, b), s(p, b, c), s(p, c, a));
+        let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        !(neg && pos)
+    };
+    let to2d = |p: Vec3| Vec2::new((p - o).dot(u), (p - o).dot(v));
+    let mut best: Option<f32> = None;
+    for t in mesh.indices.chunks(3) {
+        let p = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        let tn = (b - a).cross(c - a).normalize_or_zero();
+        if tn.dot(n).abs() < 0.9 {
+            continue; // not a face parallel to the sketch plane
+        }
+        if !in_tri(Vec2::ZERO, to2d(a), to2d(b), to2d(c)) {
+            continue; // sketch origin isn't over this face
+        }
+        let off = a.dot(n);
+        if best.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs()) {
+            best = Some(off); // the parallel face nearest the original origin along n
+        }
+    }
+    match best {
+        Some(off) => {
+            let shifted = o + n * (off - o_n);
+            PlaneRef { origin: [shifted.x as f64, shifted.y as f64, shifted.z as f64], ..plane.clone() }
+        }
+        None => plane.clone(), // no face under the sketch → leave the plane where it is
+    }
 }
 
 /// Resolve the selected-contour indices against a sketch's regions. An empty
@@ -5703,6 +5813,7 @@ fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
 fn draw_sketch(
     mut gizmos: Gizmos,
     mut overlay: Gizmos<OverlayGizmos>,
+    mut profile: Gizmos<ProfileGizmos>,
     session: Res<SketchSession>,
     ui_state: Res<UiState>,
     cam_q: Query<&OrbitCamera>,
@@ -5750,7 +5861,7 @@ fn draw_sketch(
                     // Dashed so construction geometry is distinguishable at a glance.
                     dashed_line(&mut gizmos, wa, wb, construction, 0.16, 0.12);
                 } else {
-                    gizmos.line(wa, wb, solid);
+                    profile.line(wa, wb, solid);
                 }
             }
             SketchEntity::Circle { center, radius, construction: is_con } => {
@@ -5771,7 +5882,7 @@ fn draw_sketch(
                     }
                 } else {
                     let iso = Isometry3d::new(ap.to_world(cu), plane_rot);
-                    gizmos.circle(iso, r, circle_col);
+                    profile.circle(iso, r, circle_col);
                     // Faint diameter leader toward the Ø callout (drawn by the UI).
                     let dcol = Color::srgba(0.55, 0.85, 1.0, 0.5);
                     let d = Vec2::splat(0.707) * r;
@@ -5787,19 +5898,19 @@ fn draw_sketch(
                     .collect();
                 if pts.len() >= 2 {
                     let poly = tessellate_spline(&pts, *closed, *control);
-                    let col = if *is_con { construction } else { solid };
+                    let mut seg = |a: Vec2, b: Vec2| {
+                        if *is_con {
+                            gizmos.line(ap.to_world(a), ap.to_world(b), construction);
+                        } else {
+                            profile.line(ap.to_world(a), ap.to_world(b), solid);
+                        }
+                    };
                     for w in poly.windows(2) {
-                        let a = Vec2::new(w[0][0] as f32, w[0][1] as f32);
-                        let b = Vec2::new(w[1][0] as f32, w[1][1] as f32);
-                        gizmos.line(ap.to_world(a), ap.to_world(b), col);
+                        seg(Vec2::new(w[0][0] as f32, w[0][1] as f32), Vec2::new(w[1][0] as f32, w[1][1] as f32));
                     }
                     if *closed {
                         let (f, l) = (poly[0], poly[poly.len() - 1]);
-                        gizmos.line(
-                            ap.to_world(Vec2::new(l[0] as f32, l[1] as f32)),
-                            ap.to_world(Vec2::new(f[0] as f32, f[1] as f32)),
-                            col,
-                        );
+                        seg(Vec2::new(l[0] as f32, l[1] as f32), Vec2::new(f[0] as f32, f[1] as f32));
                     }
                 }
             }
@@ -5810,12 +5921,15 @@ fn draw_sketch(
                         Some(pm) => tessellate_arc_slot([pa.x, pa.y], pm, [pb.x, pb.y], *radius),
                         None => tessellate_slot([pa.x, pa.y], [pb.x, pb.y], *radius),
                     };
-                    let col = if *is_con { construction } else { solid };
                     let n = poly.len();
                     for k in 0..n {
                         let p = Vec2::new(poly[k][0] as f32, poly[k][1] as f32);
                         let q = Vec2::new(poly[(k + 1) % n][0] as f32, poly[(k + 1) % n][1] as f32);
-                        gizmos.line(ap.to_world(p), ap.to_world(q), col);
+                        if *is_con {
+                            gizmos.line(ap.to_world(p), ap.to_world(q), construction);
+                        } else {
+                            profile.line(ap.to_world(p), ap.to_world(q), solid);
+                        }
                     }
                     // Faint centre-to-centre line.
                     gizmos.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), Color::srgba(0.9, 0.45, 0.95, 0.5));
@@ -5828,7 +5942,7 @@ fn draw_sketch(
                     for k in 0..n {
                         let p = Vec2::new(loop_[k][0] as f32, loop_[k][1] as f32);
                         let q = Vec2::new(loop_[(k + 1) % n][0] as f32, loop_[(k + 1) % n][1] as f32);
-                        gizmos.line(ap.to_world(p), ap.to_world(q), solid);
+                        profile.line(ap.to_world(p), ap.to_world(q), solid);
                     }
                 }
             }
@@ -5911,17 +6025,38 @@ fn draw_sketch(
         }
     }
 
-    // Body-edge hover highlight while sketching: a bright glow on the edge under the
-    // cursor (straight or arc), so you can see what a line will snap to / run along.
+    // Drag-over box-select rectangle (Select tool), drawn from the anchor to the cursor.
+    if let (Some(start), Some(cur)) = (session.box_select, session.cursor_uv) {
+        let col = Color::srgba(0.45, 0.85, 1.0, 0.8);
+        let c = [start, Vec2::new(cur.x, start.y), cur, Vec2::new(start.x, cur.y)];
+        for k in 0..4 {
+            gizmos.line(ap.to_world(c[k]), ap.to_world(c[(k + 1) % 4]), col);
+        }
+    }
+
+    // Highlight the selected entities (e.g. from a box select) so the selection is visible.
+    let selcol = Color::srgb(0.3, 1.0, 0.5);
+    for &i in &session.selected_entities {
+        match session.sketch.entities.get(i) {
+            Some(SketchEntity::Line { a, b, .. }) => {
+                profile.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), selcol);
+            }
+            Some(SketchEntity::Circle { center, radius, .. }) => {
+                let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
+                profile.circle(iso, *radius as f32, selcol);
+            }
+            _ => {}
+        }
+    }
+
+    // Body-edge hover highlight while sketching: a single orange line on the edge under
+    // the cursor (matching the 3D edge-selection highlight), so you can see what a line
+    // will snap to / run along.
     if let Some(es) = session.hover_edge {
-        let glow = Color::srgb(1.0, 0.9, 0.35);
+        let glow = Color::srgb(1.0, 0.6, 0.1);
         match es {
             EdgeSnap::Line([a, b]) => {
-                let (wa, wb) = (ap.to_world(a), ap.to_world(b));
-                let off = ap.n.cross((wb - wa).normalize_or_zero()).normalize_or_zero() * (ms * 0.2);
-                gizmos.line(wa, wb, glow);
-                gizmos.line(wa + off, wb + off, glow);
-                gizmos.line(wa - off, wb - off, glow);
+                gizmos.line(ap.to_world(a), ap.to_world(b), glow);
             }
             EdgeSnap::Arc { center, radius, a, b } => {
                 // Sample the arc from a→b (the shorter way around the centre).
