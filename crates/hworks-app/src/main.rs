@@ -313,6 +313,9 @@ struct UiState {
     fillet_shown: Option<f32>,
     /// A confirmed fillet to append to the timeline; consumed by `apply_fillet`.
     fillet_request: Option<f64>,
+    /// While the Fillet PM is open, the edges (world-space polylines) the user has picked
+    /// to round. Empty = round every edge.
+    fillet_edges: Vec<Vec<[f64; 3]>>,
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -709,6 +712,7 @@ fn ui_system(
     cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     part: Res<Part>,
     mut font_previews: ResMut<FontPreviews>,
+    edge_sel: Res<EdgeSelection>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
 
@@ -1092,9 +1096,16 @@ fn ui_system(
                         ui.label(egui::RichText::new("Select a sketch or draw a closed profile.").italics().weak());
                     }
                     ui.add_enabled_ui(part.mesh.is_some() && !in_sketch, |ui| {
-                        if ui.button("Fillet").on_hover_text("Round all edges of the body by a radius").clicked() {
+                        if ui.button("Fillet").on_hover_text("Round picked edges by a radius — click edges on the body").clicked() {
                             ui_state.pending_fillet = Some(0.2);
                             ui_state.fillet_shown = None;
+                            ui_state.fillet_edges.clear();
+                            // Seed from a pre-selected edge, if any (click an edge, then Fillet).
+                            if edge_sel.chain.len() >= 2 {
+                                let poly: Vec<[f64; 3]> =
+                                    edge_sel.chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+                                ui_state.fillet_edges.push(poly);
+                            }
                         }
                     });
                 }
@@ -1284,12 +1295,42 @@ fn ui_system(
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Radius");
-                ui.add(egui::DragValue::new(&mut r).range(0.01..=1000.0).speed(0.02).suffix(" mm"));
+                if ui.add(egui::DragValue::new(&mut r).range(0.01..=1000.0).speed(0.02).suffix(" mm")).changed() {
+                    ui_state.fillet_shown = None; // radius changed → refresh preview
+                }
             });
+            let n_edges = ui_state.fillet_edges.len();
+            ui.horizontal(|ui| {
+                ui.strong(format!("Edges to fillet  ({n_edges})"));
+                if n_edges > 0 && ui.small_button("Clear").clicked() {
+                    ui_state.fillet_edges.clear();
+                    ui_state.fillet_shown = None;
+                }
+            });
+            // SolidWorks-style selection list: one row per picked edge, removable.
+            let mut remove: Option<usize> = None;
+            egui::ScrollArea::vertical().id_salt("fillet_edge_list").max_height(140.0).show(ui, |ui| {
+                for i in 0..n_edges {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").on_hover_text("Remove this edge").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.label(format!("Edge {}", i + 1));
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                ui_state.fillet_edges.remove(i);
+                ui_state.fillet_shown = None;
+            }
             ui.label(
-                egui::RichText::new("Rounds every edge of the body by this radius (mesh).\nThe preview updates as you change it.")
-                    .weak()
-                    .small(),
+                egui::RichText::new(if n_edges == 0 {
+                    "Click edges on the body to pick which to round.\n(No edges picked = round every edge.)"
+                } else {
+                    "Click more edges to add, or a picked edge again to remove."
+                })
+                .weak()
+                .small(),
             );
             ui.separator();
             if commit {
@@ -1299,6 +1340,7 @@ fn ui_system(
             } else if cancel {
                 ui_state.pending_fillet = None;
                 ui_state.fillet_shown = None;
+                ui_state.fillet_edges.clear();
                 ui_state.regen = true; // rebuild without the preview
             } else {
                 ui_state.pending_fillet = Some(r.max(0.01));
@@ -1786,8 +1828,9 @@ fn ui_system(
                             });
                             resp.header_response.rect
                         }
-                        FeatureKind::Fillet { radius } => {
-                            let resp = ui.selectable_label(selected, styled(format!("⬤ Fillet  (r {radius:.2})")));
+                        FeatureKind::Fillet { radius, edges } => {
+                            let scope = if edges.is_empty() { "all edges".to_string() } else { format!("{} edge(s)", edges.len()) };
+                            let resp = ui.selectable_label(selected, styled(format!("⬤ Fillet  (r {radius:.2}, {scope})")));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -2908,12 +2951,30 @@ fn sketch_interaction(
     mut ui_state: ResMut<UiState>,
     time: Res<Time>,
 ) {
-    if blocking.0 {
-        return;
-    }
     let Ok(window) = windows.single() else { return };
     let Ok((camera, cam_gt, mut cam_tf, mut orbit)) = cam_q.single_mut() else { return };
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
+
+    // Fillet edge picking runs *before* the egui pointer-block: while the Fillet panel is
+    // open, a focused widget makes egui greedy for the pointer, which would otherwise eat
+    // the click. Gating on an actual body-edge hit keeps it safe — a hit means the cursor
+    // is on the body, not the panel.
+    if ui_state.pending_fillet.is_some() && buttons.just_pressed(MouseButton::Left) {
+        if let Some(cursor) = window.cursor_position() {
+            if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
+                let (chain, closed) = edge_chain(&part.edges, si);
+                if chain.len() >= 2 {
+                    toggle_fillet_edge(&mut ui_state, &chain);
+                    edge_sel.set(chain, closed);
+                }
+            }
+        }
+        return;
+    }
+
+    if blocking.0 {
+        return;
+    }
 
     let active_uv = session.plane.as_ref().and_then(|ap| ray_plane(ap, &ray).map(|(_, uv)| uv));
 
@@ -3965,6 +4026,32 @@ fn register_system_fonts(ctx: &egui::Context, previews: &mut FontPreviews) {
     previews.done = true;
 }
 
+/// An edge's orientation-independent identity: its two extreme endpoints, quantised. Used
+/// so distinct edges always stay distinct in the fillet set and only a genuine re-click of
+/// the same edge toggles it off.
+fn fillet_edge_key(poly: &[[f64; 3]]) -> ([i64; 3], [i64; 3]) {
+    let q = |p: [f64; 3]| [(p[0] * 1e3).round() as i64, (p[1] * 1e3).round() as i64, (p[2] * 1e3).round() as i64];
+    let (a, b) = (q(poly[0]), q(poly[poly.len() - 1]));
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Add a body edge (its world-space polyline) to the fillet set, or remove it if the same
+/// edge is clicked again. Refreshes the preview.
+fn toggle_fillet_edge(ui_state: &mut UiState, chain: &[Vec3]) {
+    let poly: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+    let key = fillet_edge_key(&poly);
+    let before = ui_state.fillet_edges.len();
+    ui_state.fillet_edges.retain(|e| fillet_edge_key(e) != key);
+    if ui_state.fillet_edges.len() == before {
+        ui_state.fillet_edges.push(poly); // wasn't present → add it
+    }
+    ui_state.fillet_shown = None; // recompute the preview
+}
+
 /// Fill in sensible Text-tool defaults the first time it's opened (the system default
 /// font, a non-empty string, a visible height).
 fn init_text_defaults(session: &mut SketchSession) {
@@ -4461,7 +4548,9 @@ fn do_solid_op(
     let regions: Vec<usize> =
         session.selected_contours.iter().copied().filter(|&i| i < region_count).collect();
 
-    if matches!(op, SolidOp::Cut(_)) && part.solid.is_none() {
+    // A body exists if there's geometry — either an exact B-rep solid *or* a mesh body
+    // (after a fillet/seamless build, `part.solid` is None but `part.mesh` is the body).
+    if matches!(op, SolidOp::Cut(_)) && part.solid.is_none() && part.mesh.is_none() {
         warn!("Cut: there is no body yet — extrude a boss first.");
         return;
     }
@@ -4782,10 +4871,10 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                     });
                 }
             }
-            // Round every edge of the current body by the fillet radius.
-            FeatureKind::Fillet { radius } => {
+            // Round the body's (picked, or all) edges by the fillet radius.
+            FeatureKind::Fillet { radius, edges } => {
                 if let Some(b) = body.take() {
-                    body = Some(round_mesh(&b, *radius).unwrap_or(b));
+                    body = Some(round_mesh(&b, *radius, edges).unwrap_or(b));
                 }
             }
         }
@@ -4934,8 +5023,9 @@ fn apply_fillet(
     mut history: ResMut<History>,
 ) {
     let Some(radius) = ui_state.fillet_request.take() else { return };
+    let edges = std::mem::take(&mut ui_state.fillet_edges);
     history.snapshot(&doc.0);
-    doc.0.add_feature(FeatureKind::Fillet { radius });
+    doc.0.add_feature(FeatureKind::Fillet { radius, edges });
     doc.0.rollback = doc.0.features.len();
     ui_state.selected = Some(doc.0.features.len() - 1);
     ui_state.regen = true;
@@ -4962,7 +5052,8 @@ fn fillet_preview(
         ui_state.fillet_shown = Some(r);
         return;
     };
-    let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| round_mesh(&base, r as f64)))
+    let edges = ui_state.fillet_edges.clone();
+    let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| round_mesh(&base, r as f64, &edges)))
         .ok()
         .flatten()
         .unwrap_or(base);
@@ -6505,10 +6596,11 @@ fn draw_edge_selection(
     mut gizmos: Gizmos,
     sel: Res<EdgeSelection>,
     session: Res<SketchSession>,
+    ui_state: Res<UiState>,
     cam_q: Query<&GlobalTransform, With<Camera3d>>,
 ) {
-    if session.plane.is_some() || sel.chain.len() < 2 {
-        return; // only in view mode, only with a selection
+    if session.plane.is_some() {
+        return; // only in view mode
     }
     let Ok(cam) = cam_q.single() else { return };
     let cam_pos = cam.translation();
@@ -6516,6 +6608,21 @@ fn draw_edge_selection(
     const TOWARD_CAM: f32 = 0.004;
     let nudge = |p: Vec3| p + (cam_pos - p) * TOWARD_CAM;
 
+    // While the Fillet PM is open, highlight every edge picked to round (bright yellow).
+    if ui_state.pending_fillet.is_some() {
+        let fcol = Color::srgb(1.0, 0.95, 0.2);
+        for edge in &ui_state.fillet_edges {
+            for w in edge.windows(2) {
+                let a = Vec3::new(w[0][0] as f32, w[0][1] as f32, w[0][2] as f32);
+                let b = Vec3::new(w[1][0] as f32, w[1][1] as f32, w[1][2] as f32);
+                gizmos.line(nudge(a), nudge(b), fcol);
+            }
+        }
+    }
+
+    if sel.chain.len() < 2 {
+        return;
+    }
     let col = Color::srgb(1.0, 0.6, 0.1);
     for w in sel.chain.windows(2) {
         gizmos.line(nudge(w[0]), nudge(w[1]), col);

@@ -56,8 +56,9 @@ pub enum FeatureKind {
     Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
     /// Cut: subtract the chosen swept `regions` from the body (empty = all).
     Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
-    /// Fillet: round every edge of the current body by `radius` (a global mesh round).
-    Fillet { radius: f64 },
+    /// Fillet: round body edges by `radius` (a mesh round). `edges` are the picked edge
+    /// polylines (world space) to round; empty means "round every edge".
+    Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
     // Revolve / … arrive at M8+.
 }
 
@@ -136,7 +137,10 @@ impl Document {
                     ct += 1;
                     format!("[cut]    Cut{ct}  h={distance:.1}")
                 }
-                FeatureKind::Fillet { radius } => format!("[fillet] Fillet  r={radius:.2}"),
+                FeatureKind::Fillet { radius, edges } => {
+                    let scope = if edges.is_empty() { "all".to_string() } else { format!("{}", edges.len()) };
+                    format!("[fillet] Fillet  r={radius:.2} ({scope})")
+                }
             })
             .collect()
     }

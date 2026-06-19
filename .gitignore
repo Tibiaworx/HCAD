@@ -14,3 +14,4 @@ run.log
 *.swp
 .DS_Store
 Thumbs.db
+fillet_dbg.txt
