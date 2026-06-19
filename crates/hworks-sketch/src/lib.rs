@@ -37,7 +37,14 @@ pub enum SketchEntity {
         #[serde(default)]
         reference: bool,
     },
-    Circle { center: usize, radius: f64 },
+    Circle {
+        center: usize,
+        radius: f64,
+        /// A construction circle guides/sizes (e.g. a polygon's circumscribed circle)
+        /// but isn't a profile boundary, so it doesn't form a fillable region.
+        #[serde(default)]
+        construction: bool,
+    },
     Point { at: usize },
     /// A smooth spline through (or guided by) its `points`. `control == false` ⇒ the
     /// curve passes *through* the points (interpolating Catmull-Rom); `control == true`
@@ -64,6 +71,78 @@ pub enum SketchEntity {
         #[serde(default)]
         mid: Option<usize>,
     },
+    /// Outlined text. The glyph outlines are *baked* once (in the app, from a system
+    /// font) into `contours` — closed loops in normalized EM space (baseline at y=0, cap
+    /// height ≈ 1, x advancing right; counters/holes included). They're transformed by
+    /// `origin` (a sketch point = baseline start), `height`, `rotation`, optional `mirror`
+    /// and `arc` (text-on-arc radius) to produce the actual profile. The remaining fields
+    /// are the parameters kept so the UI can re-bake on a font/style/text edit.
+    Text {
+        origin: usize,
+        contours: Vec<Vec<[f64; 2]>>,
+        height: f64,
+        #[serde(default)]
+        rotation: f64,
+        #[serde(default)]
+        mirror: bool,
+        #[serde(default)]
+        arc: f64,
+        text: String,
+        font: String,
+        #[serde(default)]
+        bold: bool,
+        #[serde(default)]
+        italic: bool,
+        #[serde(default)]
+        spacing: f64,
+    },
+}
+
+/// Transform baked text `contours` (normalized EM space) into sketch-plane space using
+/// the baseline `origin`, `height` scale, `rotation` (rad), `mirror` (flip X), and `arc`
+/// (text-on-arc radius; 0 = straight). Returns closed loops ready to fill/extrude.
+pub fn text_contours(
+    origin: [f64; 2],
+    contours: &[Vec<[f64; 2]>],
+    height: f64,
+    rotation: f64,
+    mirror: bool,
+    arc: f64,
+) -> Vec<Vec<[f64; 2]>> {
+    let (sr, cr) = rotation.sin_cos();
+    let map = |p: [f64; 2]| -> [f64; 2] {
+        // 1) scale to height (normalized cap height ≈ 1).
+        let mut x = p[0] * height;
+        let y = p[1] * height;
+        if mirror {
+            x = -x;
+        }
+        // 2) optional arc warp: bend the baseline onto a circle of radius |arc|. Positive
+        //    arc curves the text upward (centre above), negative downward.
+        let (mut lx, mut ly) = (x, y);
+        if arc.abs() > 1e-9 {
+            let r = arc;
+            let a = x / r; // arc angle from the baseline start
+            lx = (r - y) * a.sin();
+            ly = r - (r - y) * a.cos();
+        }
+        // 3) rotate about the origin, then translate.
+        [
+            origin[0] + lx * cr - ly * sr,
+            origin[1] + lx * sr + ly * cr,
+        ]
+    };
+    contours
+        .iter()
+        .map(|c| {
+            let mut out: Vec<[f64; 2]> = c.iter().map(|&p| map(p)).collect();
+            // Mirroring flips winding; reverse so fill orientation stays consistent.
+            if mirror {
+                out.reverse();
+            }
+            out
+        })
+        .collect()
 }
 
 /// Geometric and dimensional relations the solver drives the geometry to satisfy.
@@ -173,7 +252,14 @@ impl Sketch {
 
     /// Add a circle from a center point and radius.
     pub fn add_circle(&mut self, center: usize, radius: f64) {
-        self.entities.push(SketchEntity::Circle { center, radius });
+        self.entities.push(SketchEntity::Circle { center, radius, construction: false });
+    }
+
+    /// Add a construction circle (guides/sizes geometry but forms no profile region).
+    /// Returns its entity index so callers can constrain points onto its rim.
+    pub fn add_construction_circle(&mut self, center: usize, radius: f64) -> usize {
+        self.entities.push(SketchEntity::Circle { center, radius, construction: true });
+        self.entities.len() - 1
     }
 
     /// Remove all geometry, leaving an empty sketch (used when (re)entering a plane).
@@ -269,7 +355,7 @@ impl Sketch {
         let mut found = None;
         let mut circles = 0;
         for e in &self.entities {
-            if let SketchEntity::Circle { center, radius } = e {
+            if let SketchEntity::Circle { center, radius, .. } = e {
                 found = Some((*center, *radius));
                 circles += 1;
             }
@@ -351,7 +437,7 @@ impl Sketch {
         }
 
         for e in &self.entities {
-            if let SketchEntity::Circle { center, radius } = e {
+            if let SketchEntity::Circle { center, radius, .. } = e {
                 if let Some(c) = self.points.get(*center) {
                     const SEG: usize = 48;
                     contours.push(
@@ -413,7 +499,7 @@ impl Sketch {
                         segs.push(([pa.x, pa.y], [pb.x, pb.y]));
                     }
                 }
-                SketchEntity::Circle { center, radius } => {
+                SketchEntity::Circle { center, radius, construction: false } => {
                     if let Some(c) = self.points.get(*center) {
                         const SEG: usize = 64;
                         let mut prev = [c.x + radius, c.y];
@@ -453,7 +539,20 @@ impl Sketch {
                         }
                     }
                 }
+                SketchEntity::Text { origin, contours, height, rotation, mirror, arc, .. } => {
+                    if let Some(o) = self.points.get(*origin) {
+                        for loop_ in text_contours([o.x, o.y], contours, *height, *rotation, *mirror, *arc) {
+                            for w in loop_.windows(2) {
+                                segs.push((w[0], w[1]));
+                            }
+                            if loop_.len() >= 2 {
+                                segs.push((loop_[loop_.len() - 1], loop_[0]));
+                            }
+                        }
+                    }
+                }
                 SketchEntity::Line { .. }
+                | SketchEntity::Circle { .. }
                 | SketchEntity::Point { .. }
                 | SketchEntity::Spline { .. }
                 | SketchEntity::Slot { .. } => {}
@@ -824,6 +923,7 @@ fn entity_point_indices(e: &SketchEntity) -> Vec<usize> {
             v.extend(mid.iter().copied());
             v
         }
+        SketchEntity::Text { origin, .. } => vec![*origin],
     }
 }
 
@@ -870,6 +970,7 @@ fn remap_entity(e: &mut SketchEntity, m: &[usize]) {
                 *p = m[*p];
             }
         }
+        SketchEntity::Text { origin, .. } => *origin = m[*origin],
     }
 }
 
@@ -1072,7 +1173,7 @@ impl Sketch {
             .collect();
         for (center_pt, value) in radii {
             for e in self.entities.iter_mut() {
-                if let SketchEntity::Circle { center, radius } = e {
+                if let SketchEntity::Circle { center, radius, .. } = e {
                     if *center == center_pt {
                         *radius = value.max(1e-4);
                     }
@@ -1089,12 +1190,12 @@ impl Sketch {
             .collect();
         for (a, b) in pairs {
             let ra = self.entities.iter().find_map(|e| match e {
-                SketchEntity::Circle { center, radius } if *center == a => Some(*radius),
+                SketchEntity::Circle { center, radius, .. } if *center == a => Some(*radius),
                 _ => None,
             });
             if let Some(ra) = ra {
                 for e in self.entities.iter_mut() {
-                    if let SketchEntity::Circle { center, radius } = e {
+                    if let SketchEntity::Circle { center, radius, .. } = e {
                         if *center == b {
                             *radius = ra;
                         }
@@ -1241,7 +1342,7 @@ impl Sketch {
                         .entities
                         .iter()
                         .find_map(|e| match e {
-                            SketchEntity::Circle { center: cc, radius } if cc == center => Some(*radius),
+                            SketchEntity::Circle { center: cc, radius, .. } if cc == center => Some(*radius),
                             _ => None,
                         })
                         .unwrap_or(dist); // circle gone → no-op residual
@@ -1580,7 +1681,7 @@ mod tests {
             .entities
             .iter()
             .find_map(|e| match e {
-                SketchEntity::Circle { center, radius } if *center == b => Some(*radius),
+                SketchEntity::Circle { center, radius, .. } if *center == b => Some(*radius),
                 _ => None,
             })
             .unwrap();

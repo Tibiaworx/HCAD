@@ -12,7 +12,9 @@ use truck_meshalgo::prelude::*;
 use truck_modeling::{builder, Point3, Vector3};
 
 mod csg;
+mod fillet;
 mod mesh_bool;
+pub use fillet::round_mesh;
 pub use mesh_bool::{mesh_difference, mesh_union};
 
 /// A tessellated triangle mesh handed up to the renderer.

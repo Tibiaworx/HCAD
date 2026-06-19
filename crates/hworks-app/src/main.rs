@@ -25,8 +25,8 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
     cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap, extrude_tool_mesh,
-    mesh_difference, mesh_tessellation, mesh_union, tessellate, union_tol, KSolid, PlaneBasis,
-    Tessellation, TriMesh,
+    mesh_difference, mesh_tessellation, mesh_union, round_mesh, tessellate, union_tol, KSolid,
+    PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -39,9 +39,11 @@ struct OverlayGizmos;
 /// while big enough to keep the union robust paired with the tight tolerance.
 const BOSS_OVERLAP: f64 = 0.01;
 use hworks_sketch::{
-    point_in_poly, tessellate_arc_slot, tessellate_slot, tessellate_spline, Constraint, DimAxis, Sketch,
-    SketchEntity,
+    point_in_poly, tessellate_arc_slot, tessellate_slot, tessellate_spline, text_contours, Constraint,
+    DimAxis, Sketch, SketchEntity,
 };
+
+mod text;
 
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
 const EXTRUDE_DISTANCE: f64 = 2.0;
@@ -111,6 +113,7 @@ fn main() {
         .init_resource::<Part>()
         .init_resource::<UiState>()
         .init_resource::<UiBlocking>()
+        .init_resource::<FontPreviews>()
         .init_resource::<History>()
         .init_resource::<EdgeSelection>()
         .add_systems(Startup, setup)
@@ -126,7 +129,9 @@ fn main() {
                 handle_edit_sketch,
                 handle_exit_sketch,
                 do_solid_op,
+                apply_fillet,
                 do_regenerate,
+                fillet_preview,
                 handle_new_part,
                 highlight_face,
                 update_plane_visibility,
@@ -156,7 +161,9 @@ enum Tool {
     Circle,
     Rectangle,
     Slot,
+    Polygon,
     Spline,
+    Text,
     Dimension,
 }
 
@@ -184,6 +191,15 @@ enum SlotMode {
     Arc,
 }
 
+/// An in-progress drag of a placed Text entity's on-canvas handle.
+#[derive(Clone, Copy)]
+enum TextHandle {
+    /// Drag to scale: the entity index. Height follows the cursor's distance from origin.
+    Scale(usize),
+    /// Drag to rotate: the entity index. Rotation follows the cursor's angle about origin.
+    Rotate(usize),
+}
+
 /// A body edge the cursor can snap to while sketching: a straight edge (its uv
 /// endpoints) or a rounded edge / fillet arc (its centre + radius in plane uv).
 #[derive(Clone, Copy)]
@@ -200,6 +216,8 @@ impl Tool {
             Tool::Circle => "Circle",
             Tool::Rectangle => "Rectangle",
             Tool::Slot => "Slot",
+            Tool::Polygon => "Polygon",
+            Tool::Text => "Text",
             Tool::Spline => "Spline",
             Tool::Dimension => "Dimension",
         }
@@ -287,6 +305,14 @@ struct UiState {
     /// exact B-rep kernel. This fuses coincident/coplanar faces — so adjacent features
     /// with shared walls merge *seamlessly* — at the cost of triangulated (mesh) faces.
     seamless: bool,
+    /// The Fillet tool's PropertyManager is open, configuring this radius. While set, the
+    /// viewport shows a live rounded preview of the current body.
+    pending_fillet: Option<f32>,
+    /// The radius the on-screen fillet preview was last built at (so it only recomputes
+    /// when the value actually changes).
+    fillet_shown: Option<f32>,
+    /// A confirmed fillet to append to the timeline; consumed by `apply_fillet`.
+    fillet_request: Option<f64>,
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -297,9 +323,23 @@ enum Tab {
     Sketch,
 }
 
-/// True while egui wants the pointer — suppresses viewport drawing/orbit.
+/// `.0`: egui wants the pointer (suppress viewport drawing/orbit). `.1`: egui wants the
+/// keyboard, e.g. a text field is focused (suppress sketch keyboard shortcuts).
 #[derive(Resource, Default)]
-struct UiBlocking(bool);
+struct UiBlocking(bool, bool);
+
+/// System fonts registered with egui so the Text tool's font dropdown can render each
+/// name in its own typeface. Populated once, the first time the Text panel is shown.
+#[derive(Resource, Default)]
+struct FontPreviews {
+    /// Registration has been requested (`set_fonts` called).
+    done: bool,
+    /// The registered fonts are actually bound in egui (true from the frame *after*
+    /// `set_fonts`, since it only takes effect on the next pass). Only render names in
+    /// their own typeface once this is set, or egui panics on the unbound family.
+    ready: bool,
+    families: std::collections::HashSet<String>,
+}
 
 #[derive(Resource, Default)]
 struct Part {
@@ -378,6 +418,22 @@ struct SketchSession {
     rect_mode: RectMode,
     /// Slot-tool variant (straight / centrepoint / arc).
     slot_mode: SlotMode,
+    /// Polygon tool: number of sides (left-hand parameter), default 6.
+    polygon_sides: usize,
+    /// Text tool parameters (left-hand panel). `text_arc` is the text-on-arc radius (0 =
+    /// straight); `text_mirror` reverses the text. `text_font_init` lazily fills the font
+    /// name from the system default the first time the Text tool is opened.
+    text_string: String,
+    text_font: String,
+    text_font_init: bool,
+    text_bold: bool,
+    text_italic: bool,
+    text_spacing: f64,
+    text_height: f32,
+    text_arc: f64,
+    text_mirror: bool,
+    /// An on-canvas handle drag in progress on a placed Text entity.
+    text_handle: Option<TextHandle>,
     pending: Option<Vec2>,
     /// Second anchored point — the parallelogram's first side / the slot's second centre.
     pending_b: Option<Vec2>,
@@ -405,6 +461,9 @@ struct SketchSession {
     dirty: bool,
     op_request: Option<SolidOp>,
     cursor_uv: Option<Vec2>,
+    /// The cursor's raw position on the sketch plane, before snapping. Used by the
+    /// polygon tool so its radius tracks the mouse instead of jumping to a far snap.
+    cursor_raw_uv: Option<Vec2>,
     /// Which closed contours (indices into `sketch.regions()`) are selected for
     /// extrude/cut — the "Selected Contours". Empty means "all closed regions".
     selected_contours: Vec<usize>,
@@ -649,8 +708,18 @@ fn ui_system(
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
     cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     part: Res<Part>,
+    mut font_previews: ResMut<FontPreviews>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+
+    // The first time the Text tool is active, register the system fonts with egui so the
+    // font dropdown can render each name in its own typeface. `set_fonts` only applies on
+    // the next pass, so previews stay off (`ready == false`) until the following frame.
+    if session.tool == Tool::Text && session.plane.is_some() && !font_previews.done {
+        register_system_fonts(ctx, &mut font_previews);
+    } else if font_previews.done && !font_previews.ready {
+        font_previews.ready = true;
+    }
 
     // Sanitize every value that feeds an egui number widget — a NaN/∞ crashes egui's
     // "smart aim" code. (The solver already rejects NaN; this is the last line.)
@@ -947,6 +1016,29 @@ fn ui_system(
                             pick(ui, SlotMode::Centerpoint, "Centerpoint Slot", "Centre, then one end, then the width");
                             pick(ui, SlotMode::Arc, "3-Point Arc Slot", "Two ends, bend into an arc, then the width");
                         });
+                        // Polygon tool: click centre, then a vertex. Side count lives in the
+                        // left-hand parameter panel.
+                        if ui
+                            .selectable_label(session.tool == Tool::Polygon, "Polygon")
+                            .on_hover_text("Click the centre, then a vertex — sides set in the panel on the left")
+                            .clicked()
+                        {
+                            if session.polygon_sides == 0 {
+                                session.polygon_sides = 6;
+                            }
+                            session.tool = Tool::Polygon;
+                            session.pending = None;
+                        }
+                        // Text tool: parameters (font, style, arc, …) live in the left panel.
+                        if ui
+                            .selectable_label(session.tool == Tool::Text, "Text")
+                            .on_hover_text("Place outlined text — font and options in the panel on the left")
+                            .clicked()
+                        {
+                            init_text_defaults(&mut session);
+                            session.tool = Tool::Text;
+                            session.pending = None;
+                        }
                         if ui
                             .selectable_label(session.tool == Tool::Dimension, "Dimension")
                             .on_hover_text("Click two points to set an exact distance (M)")
@@ -999,6 +1091,12 @@ fn ui_system(
                     if !can_extrude {
                         ui.label(egui::RichText::new("Select a sketch or draw a closed profile.").italics().weak());
                     }
+                    ui.add_enabled_ui(part.mesh.is_some() && !in_sketch, |ui| {
+                        if ui.button("Fillet").on_hover_text("Round all edges of the body by a radius").clicked() {
+                            ui_state.pending_fillet = Some(0.2);
+                            ui_state.fillet_shown = None;
+                        }
+                    });
                 }
             }
         });
@@ -1007,6 +1105,205 @@ fn ui_system(
 
     // ---- Left panel: PropertyManager (if configuring) else FeatureManager ----
     egui::SidePanel::left("left_panel").default_width(240.0).show(ctx, |ui| {
+        // Polygon-tool parameters (SolidWorks-style PropertyManager): the side count.
+        if session.tool == Tool::Polygon && session.plane.is_some() {
+            ui.heading("Polygon");
+            ui.separator();
+            if session.polygon_sides == 0 {
+                session.polygon_sides = 6;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Sides");
+                let mut n = session.polygon_sides as u32;
+                if ui
+                    .add(egui::DragValue::new(&mut n).range(3..=64).speed(0.1))
+                    .on_hover_text("Number of sides of the regular polygon")
+                    .changed()
+                {
+                    session.polygon_sides = n.clamp(3, 64) as usize;
+                }
+            });
+            ui.label(
+                egui::RichText::new("Click the centre, then a vertex. The dashed circle is\nconstruction geometry — snap to it or dimension its radius.")
+                    .weak()
+                    .small(),
+            );
+            ui.separator();
+        }
+        // Text-tool parameters (also edit the selected text entity live).
+        if session.tool == Tool::Text && session.plane.is_some() {
+            init_text_defaults(&mut session);
+            ui.heading("Text");
+            ui.separator();
+            // If a single placed text is selected, edits apply to it; otherwise they set
+            // up the next placement.
+            let sel_text = session
+                .selected_entities
+                .iter()
+                .copied()
+                .find(|&i| matches!(session.sketch.entities.get(i), Some(SketchEntity::Text { .. })));
+
+            let mut rebake = false; // font/style/string/spacing changed → re-outline
+            let mut xform = false; // height/arc/mirror changed → just re-solve
+
+            ui.label("Text");
+            let mut s = session.text_string.clone();
+            if ui.add(egui::TextEdit::multiline(&mut s).desired_rows(2)).changed() {
+                session.text_string = s;
+                rebake = true;
+            }
+
+            let cur_font = session.text_font.clone();
+            // Render each name in its own typeface, but only once the fonts are actually
+            // bound in egui (a frame after registration) — else the family lookup panics.
+            let previews_ready = font_previews.ready;
+            let preview = |fam: &str| -> egui::WidgetText {
+                if previews_ready && font_previews.families.contains(fam) {
+                    egui::RichText::new(fam)
+                        .font(egui::FontId::new(16.0, egui::FontFamily::Name(std::sync::Arc::from(fam))))
+                        .into()
+                } else {
+                    egui::RichText::new(fam).into()
+                }
+            };
+            egui::ComboBox::from_label("Font")
+                .selected_text(if cur_font.is_empty() { egui::WidgetText::from("—") } else { preview(&cur_font) })
+                .show_ui(ui, |ui| {
+                    for fam in text::families() {
+                        let sel = session.text_font == fam;
+                        if ui.selectable_label(sel, preview(&fam)).clicked() {
+                            session.text_font = fam;
+                            rebake = true;
+                        }
+                    }
+                });
+
+            ui.horizontal(|ui| {
+                let mut b = session.text_bold;
+                if ui.toggle_value(&mut b, "Bold").changed() {
+                    session.text_bold = b;
+                    rebake = true;
+                }
+                let mut it = session.text_italic;
+                if ui.toggle_value(&mut it, "Italic").changed() {
+                    session.text_italic = it;
+                    rebake = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Spacing");
+                let mut sp = session.text_spacing;
+                if ui.add(egui::DragValue::new(&mut sp).range(-0.3..=2.0).speed(0.005)).changed() {
+                    session.text_spacing = sp;
+                    rebake = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Height");
+                let mut h = session.text_height;
+                if ui.add(egui::DragValue::new(&mut h).range(0.05..=1000.0).speed(0.02)).changed() {
+                    session.text_height = h.max(0.05);
+                    xform = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Arc R");
+                let mut a = session.text_arc;
+                if ui.add(egui::DragValue::new(&mut a).speed(0.05)).on_hover_text("Text-on-arc radius (0 = straight; ± curves up/down)").changed() {
+                    session.text_arc = a;
+                    xform = true;
+                }
+            });
+            let mut mir = session.text_mirror;
+            if ui.checkbox(&mut mir, "Reverse (mirror)").changed() {
+                session.text_mirror = mir;
+                xform = true;
+            }
+
+            // Push edits onto the selected entity.
+            if let Some(idx) = sel_text {
+                let (nh, na, nm, nt, nf, nb, ni, ns) = (
+                    session.text_height.max(0.05) as f64,
+                    session.text_arc,
+                    session.text_mirror,
+                    session.text_string.clone(),
+                    session.text_font.clone(),
+                    session.text_bold,
+                    session.text_italic,
+                    session.text_spacing,
+                );
+                if let Some(SketchEntity::Text { height, arc, mirror, text, font, bold, italic, spacing, .. }) =
+                    session.sketch.entities.get_mut(idx)
+                {
+                    *height = nh;
+                    *arc = na;
+                    *mirror = nm;
+                    *text = nt;
+                    *font = nf;
+                    *bold = nb;
+                    *italic = ni;
+                    *spacing = ns;
+                }
+                if rebake {
+                    rebake_text(&mut session, idx);
+                }
+                if rebake || xform {
+                    session.dirty = true;
+                }
+            }
+            ui.label(
+                egui::RichText::new("Click in the sketch to place. Select it, then drag the\nsquare to scale or the circle to rotate.")
+                    .weak()
+                    .small(),
+            );
+            ui.separator();
+        }
+        // Fillet PropertyManager: a single radius, with a live rounded preview.
+        if let Some(mut r) = ui_state.pending_fillet {
+            if !r.is_finite() {
+                r = 0.2;
+            }
+            ui.heading("Fillet");
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70)))
+                    .clicked()
+                {
+                    commit = true;
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55)))
+                    .clicked()
+                {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Radius");
+                ui.add(egui::DragValue::new(&mut r).range(0.01..=1000.0).speed(0.02).suffix(" mm"));
+            });
+            ui.label(
+                egui::RichText::new("Rounds every edge of the body by this radius (mesh).\nThe preview updates as you change it.")
+                    .weak()
+                    .small(),
+            );
+            ui.separator();
+            if commit {
+                ui_state.fillet_request = Some(r as f64);
+                ui_state.pending_fillet = None;
+                ui_state.fillet_shown = None;
+            } else if cancel {
+                ui_state.pending_fillet = None;
+                ui_state.fillet_shown = None;
+                ui_state.regen = true; // rebuild without the preview
+            } else {
+                ui_state.pending_fillet = Some(r.max(0.01));
+            }
+        }
         if let Some(mut op) = ui_state.pending.clone() {
             // PropertyManager laid out like SolidWorks' Boss-Extrude.
             // Guard the depth: a non-finite value would crash egui's DragValue.
@@ -1489,6 +1786,19 @@ fn ui_system(
                             });
                             resp.header_response.rect
                         }
+                        FeatureKind::Fillet { radius } => {
+                            let resp = ui.selectable_label(selected, styled(format!("⬤ Fillet  (r {radius:.2})")));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
                     };
                     feat_rows.push((i, row));
                 }
@@ -1782,7 +2092,7 @@ fn ui_system(
         }
         // Diameter callout (Ø) for circles without an explicit radius dimension.
         for (k, e) in session.sketch.entities.iter().enumerate() {
-            if let SketchEntity::Circle { center, radius } = e {
+            if let SketchEntity::Circle { center, radius, .. } = e {
                 if dimensioned_centers.contains(center) {
                     continue;
                 }
@@ -1977,6 +2287,7 @@ fn ui_system(
     }
 
     blocking.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
+    blocking.1 = ctx.wants_keyboard_input();
     Ok(())
 }
 
@@ -2041,7 +2352,7 @@ fn get_or_add_point_ref(session: &mut SketchSession, uv: Vec2, snap: f32) -> usi
 fn maybe_add_point_on_circle(sketch: &mut Sketch, p: usize, tol: f32) {
     let pp = sketch.points[p];
     let on = sketch.entities.iter().find_map(|e| match e {
-        SketchEntity::Circle { center, radius } if *center != p => {
+        SketchEntity::Circle { center, radius, .. } if *center != p => {
             let c = sketch.points[*center];
             let d = (((pp.x - c.x).powi(2) + (pp.y - c.y).powi(2)).sqrt() - *radius).abs() as f32;
             (d <= tol).then_some(*center)
@@ -2156,7 +2467,7 @@ fn nearest_entity(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
                 };
                 (uv - (a + ab * t)).length()
             }
-            SketchEntity::Circle { center, radius } => {
+            SketchEntity::Circle { center, radius, .. } => {
                 ((uv - p(*center)).length() - *radius as f32).abs()
             }
             SketchEntity::Spline { points, closed, control, .. } => {
@@ -2203,6 +2514,28 @@ fn nearest_entity(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
                 }
                 _ => continue,
             },
+            SketchEntity::Text { origin, contours, height, rotation, mirror, arc, .. } => {
+                let o = match sketch.points.get(*origin) {
+                    Some(o) => [o.x, o.y],
+                    None => continue,
+                };
+                let mut dmin = f32::MAX;
+                for l in text_contours(o, contours, *height, *rotation, *mirror, *arc) {
+                    let n = l.len();
+                    for k in 0..n {
+                        let a = Vec2::new(l[k][0] as f32, l[k][1] as f32);
+                        let b = Vec2::new(l[(k + 1) % n][0] as f32, l[(k + 1) % n][1] as f32);
+                        let ab = b - a;
+                        let t = if ab.length_squared() > 1e-9 {
+                            ((uv - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        dmin = dmin.min((uv - (a + ab * t)).length());
+                    }
+                }
+                dmin
+            }
             SketchEntity::Point { .. } => continue,
         };
         if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
@@ -2218,7 +2551,7 @@ fn inference_points(sketch: &Sketch, i: usize) -> Vec<Vec2> {
     let p = |j: usize| Vec2::new(sketch.points[j].x as f32, sketch.points[j].y as f32);
     match sketch.entities.get(i) {
         Some(SketchEntity::Line { a, b, .. }) => vec![(p(*a) + p(*b)) * 0.5],
-        Some(SketchEntity::Circle { center, radius }) => {
+        Some(SketchEntity::Circle { center, radius, .. }) => {
             let c = p(*center);
             let r = *radius as f32;
             vec![
@@ -2265,7 +2598,7 @@ fn entity_line(sketch: &Sketch, i: usize) -> Option<(usize, usize)> {
 /// The (centre index, radius) of a circle entity, if `i` is a circle.
 fn entity_circle(sketch: &Sketch, i: usize) -> Option<(usize, f64)> {
     match sketch.entities.get(i) {
-        Some(SketchEntity::Circle { center, radius }) => Some((*center, *radius)),
+        Some(SketchEntity::Circle { center, radius, .. }) => Some((*center, *radius)),
         _ => None,
     }
 }
@@ -2278,6 +2611,7 @@ fn entity_points(sketch: &Sketch, i: usize) -> Vec<usize> {
         Some(SketchEntity::Point { at }) => vec![*at],
         Some(SketchEntity::Spline { points, .. }) => points.clone(),
         Some(SketchEntity::Slot { a, b, .. }) => vec![*a, *b],
+        Some(SketchEntity::Text { origin, .. }) => vec![*origin],
         None => vec![],
     }
 }
@@ -2690,7 +3024,11 @@ fn sketch_interaction(
         // Each circle's centre + 4 quadrant points (top/bottom/left/right), always —
         // so connecting lines can be lined up to the rim to enclose a region.
         for e in &session.sketch.entities {
-            if let SketchEntity::Circle { center, radius } = e {
+            // Construction circles (e.g. a polygon's circumscribed circle) deliberately do
+            // *not* seed the quadrant/rim snap cloud — otherwise every later point gets
+            // yanked onto earlier polygons' guide circles. Their centre is still a normal
+            // snappable point.
+            if let SketchEntity::Circle { center, radius, construction: false } = e {
                 if let Some(c) = session.sketch.points.get(*center) {
                     let (cc, r) = (Vec2::new(c.x as f32, c.y as f32), *radius as f32);
                     snaps.push(cc + Vec2::new(r, 0.0));
@@ -2757,6 +3095,7 @@ fn sketch_interaction(
             }
         }
         session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &snaps, snap));
+        session.cursor_raw_uv = active_uv;
         // Did we actually land on a snap target (vs. just free space)?
         cursor_locked = active_uv.is_some_and(|uv| snaps.iter().any(|p| p.distance(uv) <= snap));
         // Is the (snapped) cursor sitting on the hovered edge? If so, placing a point
@@ -2929,13 +3268,59 @@ fn sketch_interaction(
     if session.tool != Tool::Slot {
         session.pending_c = None; // the arc-slot bend point belongs only to the slot tool
     }
-    if session.tool != Tool::Select {
+    if session.tool != Tool::Select && session.tool != Tool::Text {
+        // Keep a selection alive into the Text tool so its panel can live-edit the
+        // picked text entity (font/style/string/arc/…).
         session.selected_entities.clear();
     }
 
     match session.tool {
         Tool::Select => {
             if just_pressed {
+                // A Text entity's on-canvas handles take priority: grab the square to
+                // scale or the circle to rotate it.
+                if let Some(uv) = active_uv {
+                    let mut grabbed = None;
+                    for i in 0..session.sketch.entities.len() {
+                        if let Some((sc, rot, _)) = text_handles(&session.sketch, i) {
+                            if rot.distance(uv) <= snap * 1.2 {
+                                grabbed = Some(TextHandle::Rotate(i));
+                                break;
+                            }
+                            if sc.distance(uv) <= snap * 1.2 {
+                                grabbed = Some(TextHandle::Scale(i));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(h) = grabbed {
+                        session.text_handle = Some(h);
+                        let idx = match h {
+                            TextHandle::Scale(i) | TextHandle::Rotate(i) => i,
+                        };
+                        session.selected_entities.clear();
+                        session.selected_entities.push(idx);
+                        // Mirror the entity's params into the panel fields (own them first
+                        // so the immutable borrow ends before we write back).
+                        let params = match session.sketch.entities.get(idx) {
+                            Some(SketchEntity::Text { text, font, bold, italic, spacing, height, arc, mirror, .. }) => {
+                                Some((text.clone(), font.clone(), *bold, *italic, *spacing, *height as f32, *arc, *mirror))
+                            }
+                            _ => None,
+                        };
+                        if let Some((t, f, b, it, sp, hh, ar, mi)) = params {
+                            session.text_string = t;
+                            session.text_font = f;
+                            session.text_bold = b;
+                            session.text_italic = it;
+                            session.text_spacing = sp;
+                            session.text_height = hh;
+                            session.text_arc = ar;
+                            session.text_mirror = mi;
+                        }
+                        return;
+                    }
+                }
                 // Double-click a dimension to reopen its Modify box (like SolidWorks).
                 let now = time.elapsed_secs();
                 let double = now - session.last_click_t < 0.4;
@@ -3025,7 +3410,17 @@ fn sketch_interaction(
                     }
                 }
             }
-            if let Some(i) = session.drag {
+            // Dragging a Text handle: scale (height from origin distance) or rotate.
+            if let Some(h) = session.text_handle {
+                if pressed {
+                    if let Some(uv) = active_uv {
+                        apply_text_handle(&mut session, h, uv);
+                    }
+                }
+                if just_released {
+                    session.text_handle = None;
+                }
+            } else if let Some(i) = session.drag {
                 if pressed {
                     if let Some(uv) = active_uv {
                         if let Some(p) = session.sketch.points.get_mut(i) {
@@ -3051,7 +3446,7 @@ fn sketch_interaction(
                 }
             }
         }
-        Tool::Line | Tool::Circle | Tool::Rectangle | Tool::Slot if just_pressed => {
+        Tool::Line | Tool::Circle | Tool::Rectangle | Tool::Slot | Tool::Polygon | Tool::Text if just_pressed => {
             // Use the snapped cursor so endpoints land on midpoints / quadrants / centres.
             if let Some(uv) = session.cursor_uv {
                 place_point(&mut session, uv);
@@ -3528,9 +3923,194 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 }
             }
         },
+        Tool::Polygon => {
+            // 1st click → centre; 2nd click → a vertex (sets the circumscribed radius
+            // and the orientation).
+            if let Some(center) = session.pending.take() {
+                let rim = poly_rim(session).unwrap_or(uv);
+                commit_polygon(session, center, rim);
+                session.dirty = true;
+            } else {
+                session.pending = Some(uv);
+                session.request_live_focus = true;
+            }
+        }
+        Tool::Text => {
+            // A single click drops the text at the cursor (its baseline start).
+            commit_text(session, uv);
+            session.dirty = true;
+        }
         // Spline points are placed in `sketch_interaction` (it needs the full point list).
         Tool::Select | Tool::Dimension | Tool::Spline => {}
     }
+}
+
+/// Register one (regular) face per system font family with egui, under a `Name` family
+/// equal to the family name, so the font dropdown can render each entry in its own
+/// typeface. Done once; reads font files (capped to skip huge CJK files), then rebuilds
+/// egui's font atlas a single time.
+fn register_system_fonts(ctx: &egui::Context, previews: &mut FontPreviews) {
+    let mut defs = egui::FontDefinitions::default(); // keep egui's built-in UI fonts
+    for (family, bytes, index) in text::family_preview_data(4 * 1024 * 1024) {
+        let mut fd = egui::FontData::from_owned(bytes);
+        fd.index = index;
+        defs.font_data.insert(family.clone(), std::sync::Arc::new(fd));
+        defs.families
+            .entry(egui::FontFamily::Name(std::sync::Arc::from(family.as_str())))
+            .or_default()
+            .push(family.clone());
+        previews.families.insert(family);
+    }
+    ctx.set_fonts(defs);
+    previews.done = true;
+}
+
+/// Fill in sensible Text-tool defaults the first time it's opened (the system default
+/// font, a non-empty string, a visible height).
+fn init_text_defaults(session: &mut SketchSession) {
+    if !session.text_font_init {
+        session.text_font = text::default_family();
+        session.text_font_init = true;
+    }
+    if session.text_string.is_empty() {
+        session.text_string = "Text".to_string();
+    }
+    if session.text_height <= 0.0 {
+        session.text_height = 1.0;
+    }
+}
+
+/// Bake the current text parameters into outline contours and add a Text entity whose
+/// baseline starts at `at`. No-op (with a status hint) if the font yields no outlines.
+fn commit_text(session: &mut SketchSession, at: Vec2) {
+    let contours = text::glyph_contours(
+        &session.text_font,
+        session.text_bold,
+        session.text_italic,
+        &session.text_string,
+        session.text_spacing,
+    );
+    if contours.is_empty() {
+        return;
+    }
+    let origin = session.sketch.add_point(at.x as f64, at.y as f64);
+    session.sketch.entities.push(SketchEntity::Text {
+        origin,
+        contours,
+        height: session.text_height.max(0.05) as f64,
+        rotation: 0.0,
+        mirror: session.text_mirror,
+        arc: session.text_arc,
+        text: session.text_string.clone(),
+        font: session.text_font.clone(),
+        bold: session.text_bold,
+        italic: session.text_italic,
+        spacing: session.text_spacing,
+    });
+}
+
+/// Re-bake the outline contours of the Text entity at `idx` from its stored parameters
+/// (after a font / style / string / spacing edit), keeping its placement transform.
+fn rebake_text(session: &mut SketchSession, idx: usize) {
+    let params = match session.sketch.entities.get(idx) {
+        Some(SketchEntity::Text { text, font, bold, italic, spacing, .. }) => {
+            (text.clone(), font.clone(), *bold, *italic, *spacing)
+        }
+        _ => return,
+    };
+    let baked = text::glyph_contours(&params.1, params.2, params.3, &params.0, params.4);
+    if baked.is_empty() {
+        return;
+    }
+    if let Some(SketchEntity::Text { contours, .. }) = session.sketch.entities.get_mut(idx) {
+        *contours = baked;
+        session.dirty = true;
+    }
+}
+
+/// Apply a Text handle drag: `Scale` sets the height from the cursor's distance to the
+/// origin; `Rotate` sets the rotation from the cursor's angle about the origin.
+fn apply_text_handle(session: &mut SketchSession, handle: TextHandle, cur: Vec2) {
+    let idx = match handle {
+        TextHandle::Scale(i) | TextHandle::Rotate(i) => i,
+    };
+    let (origin, height, mirror, arc) = match session.sketch.entities.get(idx) {
+        Some(SketchEntity::Text { origin, height, mirror, arc, .. }) => (*origin, *height, *mirror, *arc),
+        _ => return,
+    };
+    let contours = match session.sketch.entities.get(idx) {
+        Some(SketchEntity::Text { contours, .. }) => contours.clone(),
+        _ => return,
+    };
+    let Some(op) = session.sketch.points.get(origin) else { return };
+    let o = Vec2::new(op.x as f32, op.y as f32);
+    // Reference handle vectors at rotation = 0 (the unrotated frame).
+    let loops0 = text_contours([o.x as f64, o.y as f64], &contours, height, 0.0, mirror, arc);
+    let (mut minx, mut maxx, mut miny, mut maxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for l in &loops0 {
+        for p in l {
+            minx = minx.min(p[0]);
+            maxx = maxx.max(p[0]);
+            miny = miny.min(p[1]);
+            maxy = maxy.max(p[1]);
+        }
+    }
+    if minx > maxx {
+        return;
+    }
+    let to_cursor = cur - o;
+    match handle {
+        TextHandle::Rotate(_) => {
+            let base = Vec2::new(((minx + maxx) * 0.5) as f32, maxy as f32);
+            let rvec = base + Vec2::new(0.0, (0.6 * height).max(0.1) as f32) - o;
+            if to_cursor.length() > 1e-4 && rvec.length() > 1e-4 {
+                let rot = to_cursor.y.atan2(to_cursor.x) - rvec.y.atan2(rvec.x);
+                if let Some(SketchEntity::Text { rotation, .. }) = session.sketch.entities.get_mut(idx) {
+                    *rotation = rot as f64;
+                }
+            }
+        }
+        TextHandle::Scale(_) => {
+            let svec = Vec2::new(maxx as f32, miny as f32) - o;
+            let unit = (svec.length() / height.max(0.05) as f32).max(1e-4);
+            let new_h = (to_cursor.length() / unit).max(0.05);
+            if let Some(SketchEntity::Text { height: hh, .. }) = session.sketch.entities.get_mut(idx) {
+                *hh = new_h as f64;
+            }
+            session.text_height = new_h;
+        }
+    }
+    session.dirty = true;
+}
+
+/// On-canvas handle positions (plane uv) for the Text entity at `idx`: `(scale, rotate,
+/// base)`. The scale handle sits at the bounding box's advance-side bottom corner; the
+/// rotate handle floats above the box top centre (`base` is on the box edge below it).
+fn text_handles(sketch: &Sketch, idx: usize) -> Option<(Vec2, Vec2, Vec2)> {
+    let (origin, contours, height, rotation, mirror, arc) = match sketch.entities.get(idx) {
+        Some(SketchEntity::Text { origin, contours, height, rotation, mirror, arc, .. }) => {
+            (*origin, contours, *height, *rotation, *mirror, *arc)
+        }
+        _ => return None,
+    };
+    let o = sketch.points.get(origin)?;
+    let loops = text_contours([o.x, o.y], contours, height, rotation, mirror, arc);
+    let (mut minx, mut maxx, mut miny, mut maxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for l in &loops {
+        for p in l {
+            minx = minx.min(p[0]);
+            maxx = maxx.max(p[0]);
+            miny = miny.min(p[1]);
+            maxy = maxy.max(p[1]);
+        }
+    }
+    if minx > maxx {
+        return None;
+    }
+    let scale = Vec2::new(maxx as f32, miny as f32);
+    let base = Vec2::new(((minx + maxx) * 0.5) as f32, maxy as f32);
+    let rotate = base + Vec2::new(0.0, (0.6 * height).max(0.1) as f32);
+    Some((scale, rotate, base))
 }
 
 /// Build a slot entity from end centres `a`,`b`, optional arc bend `mid`, and half-width `r`.
@@ -3547,6 +4127,54 @@ fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>,
         mid: pmid,
     });
     session.dirty = true;
+}
+
+/// The polygon's rim/vertex point while dragging: the raw (unsnapped) cursor, snapped
+/// only to a genuine sketch point within tolerance. This keeps the size tracking the
+/// mouse — the broad rim/quadrant/reference snap cloud (whose tolerance grows with zoom)
+/// no longer yanks the vertex to a far target — while still letting a vertex anchor on an
+/// existing point.
+fn poly_rim(session: &SketchSession) -> Option<Vec2> {
+    let raw = session.cursor_raw_uv?;
+    if let Some(i) = nearest_point(&session.sketch, raw, session.snap_dist) {
+        if let Some(p) = session.sketch.points.get(i) {
+            return Some(Vec2::new(p.x as f32, p.y as f32));
+        }
+    }
+    Some(raw)
+}
+
+/// Regular polygon inscribed in (circumscribed by) a construction circle: `center` is the
+/// middle, `rim` is one vertex (sets the radius and the orientation). Emits the centre
+/// point, a dashed construction circle through the vertices, the N solid edges, and a
+/// `PointOnCircle` per vertex so dimensioning the circle's radius resizes the whole shape.
+fn commit_polygon(session: &mut SketchSession, center: Vec2, rim: Vec2) {
+    let n = session.polygon_sides.max(3);
+    let r = (rim - center).length().max(0.01);
+    let theta0 = (rim - center).y.atan2((rim - center).x);
+    // A dedicated (non-merged) centre point: `PointOnCircle` resolves a vertex's radius by
+    // finding the circle on its centre point, so concentric polygons MUST NOT share one
+    // centre point — else every vertex would read the first (largest) circle's radius and
+    // collapse onto it. Each polygon gets its own centre + its own construction circle.
+    let cp = session.sketch.add_point(center.x as f64, center.y as f64);
+    session.sketch.add_construction_circle(cp, r as f64);
+    let mut verts = Vec::with_capacity(n);
+    for k in 0..n {
+        let ang = theta0 + std::f32::consts::TAU * k as f32 / n as f32;
+        let p = center + Vec2::new(ang.cos(), ang.sin()) * r;
+        verts.push(session.sketch.add_point(p.x as f64, p.y as f64));
+    }
+    // The polygon edges are the profile, so they're always solid — only the circumscribed
+    // circle is construction. (Don't inherit the sticky Line-tool construction toggle, or
+    // the whole polygon becomes a guide and the profile reads as open.)
+    for k in 0..n {
+        let a = verts[k];
+        let b = verts[(k + 1) % n];
+        session.sketch.add_line(a, b, false);
+    }
+    for &v in &verts {
+        session.sketch.constraints.push(Constraint::PointOnCircle { p: v, center: cp });
+    }
 }
 
 /// Width of an arc slot = the cursor's distance from the arc centre line through a,p,b
@@ -3622,8 +4250,17 @@ fn commit_parallelogram(s: &mut Sketch, a: Vec2, b: Vec2, c: Vec2, construction:
     s.constraints.push(Constraint::Parallel(pb, pc, pa, pd)); // BC ∥ AD
 }
 
-fn handle_keys(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<SketchSession>) {
+fn handle_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut session: ResMut<SketchSession>,
+    blocking: Res<UiBlocking>,
+) {
     if session.plane.is_none() {
+        return;
+    }
+    // A focused egui text field (e.g. the Text tool's string box) owns the keyboard —
+    // don't let letter shortcuts (S/L/C/…) fire while the user is typing.
+    if blocking.1 {
         return;
     }
     if keys.just_pressed(KeyCode::KeyS) {
@@ -3697,7 +4334,15 @@ fn handle_keys(keys: Res<ButtonInput<KeyCode>>, mut session: ResMut<SketchSessio
 }
 
 /// Ctrl+Z = undo, Ctrl+Shift+Z / Ctrl+Y = redo.
-fn history_keys(keys: Res<ButtonInput<KeyCode>>, mut ui_state: ResMut<UiState>) {
+fn history_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut ui_state: ResMut<UiState>,
+    blocking: Res<UiBlocking>,
+) {
+    // Don't hijack Ctrl+Z / Ctrl+A etc. from a focused text field.
+    if blocking.1 {
+        return;
+    }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if !ctrl {
         return;
@@ -3870,7 +4515,7 @@ fn handle_edit_sketch(
         | FeatureKind::Cut { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } => return,
     };
     let ap = active_plane_from_ref(&plane, "Face");
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -3942,7 +4587,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -3977,6 +4622,24 @@ fn regenerate(doc: &Document) -> Option<KSolid> {
 }
 
 /// Like [`regenerate`] but also returns a human-readable message per feature that
+/// True if any extrude/cut feature's sketch contains outlined text. Such models are
+/// built with the mesh kernel — truck's exact booleans choke (and can stack-overflow)
+/// on the hundreds of glyph faces a text profile produces.
+fn doc_has_text(doc: &Document) -> bool {
+    doc.features.iter().any(|f| {
+        let sketch = match &f.kind {
+            FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } => sketch,
+            _ => return false,
+        };
+        sketch.entities.iter().any(|e| matches!(e, SketchEntity::Text { .. }))
+    })
+}
+
+/// True if the model has a fillet feature — those are mesh-only (truck can't fillet).
+fn doc_has_fillet(doc: &Document) -> bool {
+    doc.features.iter().any(|f| matches!(f.kind, FeatureKind::Fillet { .. }))
+}
+
 /// failed to build, so the UI can tell the user which operation didn't apply.
 fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
     let mut failures: Vec<String> = Vec::new();
@@ -4038,6 +4701,11 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                         failures.push("Cut failed — the kernel rejected this cut (often a self-touching profile or a coincident wall; try nudging the sketch).".into());
                     }
                 }
+            }
+            // A fillet rounds the mesh, so a model containing one always builds via the
+            // mesh path — this exact-kernel path never actually runs with a fillet present.
+            FeatureKind::Fillet { .. } => {
+                failures.push("Fillet needs the mesh kernel.".into());
             }
         }
     }
@@ -4114,6 +4782,12 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                     });
                 }
             }
+            // Round every edge of the current body by the fillet radius.
+            FeatureKind::Fillet { radius } => {
+                if let Some(b) = body.take() {
+                    body = Some(round_mesh(&b, *radius).unwrap_or(b));
+                }
+            }
         }
     }
     body
@@ -4138,10 +4812,15 @@ fn do_regenerate(
     // Vertices move when the model rebuilds, so any edge selection is stale.
     edge_sel.clear();
 
+    // Text produces hundreds of tiny glyph faces; truck's recursive B-rep booleans can
+    // *stack-overflow* on that (a hard abort `catch_unwind` can't trap), so any model
+    // containing text is built with the robust mesh kernel from the start.
+    let force_mesh = ui_state.seamless || doc_has_text(&doc.0) || doc_has_fillet(&doc.0);
+
     // Seamless mode: build the whole model with the mesh kernel (Manifold), which fuses
     // coincident/coplanar faces so adjacent features merge without a seam. The exact
     // path's seams come from truck not merging shared faces; mesh has no such limit.
-    if ui_state.seamless {
+    if force_mesh {
         let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc.0)))
             .unwrap_or(None);
         for e in &existing {
@@ -4246,6 +4925,53 @@ fn do_regenerate(
             }
         }
     }
+}
+
+/// Append a confirmed fillet to the timeline and trigger a rebuild.
+fn apply_fillet(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+) {
+    let Some(radius) = ui_state.fillet_request.take() else { return };
+    history.snapshot(&doc.0);
+    doc.0.add_feature(FeatureKind::Fillet { radius });
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// While the Fillet PropertyManager is open, show a live rounded preview of the current
+/// body — recomputed only when the radius changes (rounding is expensive).
+fn fillet_preview(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ui_state: ResMut<UiState>,
+    part: Res<Part>,
+    existing: Query<Entity, With<SolidPart>>,
+) {
+    if ui_state.regen {
+        return; // a full rebuild this frame supersedes the preview
+    }
+    let Some(r) = ui_state.pending_fillet else { return };
+    if ui_state.fillet_shown == Some(r) {
+        return; // already showing this radius
+    }
+    let Some(base) = part.mesh.clone() else {
+        ui_state.fillet_shown = Some(r);
+        return;
+    };
+    let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| round_mesh(&base, r as f64)))
+        .ok()
+        .flatten()
+        .unwrap_or(base);
+    let tess = mesh_tessellation(rounded);
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+    ui_state.fillet_shown = Some(r);
 }
 
 /// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
@@ -4922,14 +5648,30 @@ fn draw_sketch(
                     gizmos.line(wa, wb, solid);
                 }
             }
-            SketchEntity::Circle { center, radius } => {
+            SketchEntity::Circle { center, radius, construction: is_con } => {
                 let cu = uv_of(*center);
-                let iso = Isometry3d::new(ap.to_world(cu), plane_rot);
-                gizmos.circle(iso, *radius as f32, circle_col);
-                // Faint diameter leader toward the Ø callout (drawn by the UI).
-                let dcol = Color::srgba(0.55, 0.85, 1.0, 0.5);
-                let d = Vec2::splat(0.707) * (*radius as f32);
-                gizmos.line(ap.to_world(cu - d), ap.to_world(cu + d), dcol);
+                let r = *radius as f32;
+                if *is_con {
+                    // Construction circle (e.g. a polygon's circumscribed circle): a dashed
+                    // ring so it reads as a guide, not a profile boundary.
+                    const SEG: usize = 64;
+                    let mut prev = cu + Vec2::new(r, 0.0);
+                    for k in 1..=SEG {
+                        let a = std::f32::consts::TAU * k as f32 / SEG as f32;
+                        let p = cu + Vec2::new(r * a.cos(), r * a.sin());
+                        if k % 2 == 0 {
+                            gizmos.line(ap.to_world(prev), ap.to_world(p), construction);
+                        }
+                        prev = p;
+                    }
+                } else {
+                    let iso = Isometry3d::new(ap.to_world(cu), plane_rot);
+                    gizmos.circle(iso, r, circle_col);
+                    // Faint diameter leader toward the Ø callout (drawn by the UI).
+                    let dcol = Color::srgba(0.55, 0.85, 1.0, 0.5);
+                    let d = Vec2::splat(0.707) * r;
+                    gizmos.line(ap.to_world(cu - d), ap.to_world(cu + d), dcol);
+                }
             }
             SketchEntity::Point { .. } => {}
             SketchEntity::Spline { points, closed, construction: is_con, control } => {
@@ -4973,6 +5715,34 @@ fn draw_sketch(
                     // Faint centre-to-centre line.
                     gizmos.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), Color::srgba(0.9, 0.45, 0.95, 0.5));
                 }
+            }
+            SketchEntity::Text { origin, contours, height, rotation, mirror, arc, .. } => {
+                let o = uv_of(*origin);
+                for loop_ in text_contours([o.x as f64, o.y as f64], contours, *height as f64, *rotation, *mirror, *arc) {
+                    let n = loop_.len();
+                    for k in 0..n {
+                        let p = Vec2::new(loop_[k][0] as f32, loop_[k][1] as f32);
+                        let q = Vec2::new(loop_[(k + 1) % n][0] as f32, loop_[(k + 1) % n][1] as f32);
+                        gizmos.line(ap.to_world(p), ap.to_world(q), solid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Text manipulation handles: for every placed Text entity, a scale handle (square,
+    // bottom-right corner of its box) and a rotate handle (circle, above the box) so it
+    // can be enlarged/rotated on-canvas with the Select tool.
+    for (i, e) in session.sketch.entities.iter().enumerate() {
+        if let SketchEntity::Text { .. } = e {
+            if let Some((sc, rot, base)) = text_handles(&session.sketch, i) {
+                let selected = session.selected_entities.contains(&i);
+                let hcol = if selected { Color::srgb(0.2, 0.95, 0.4) } else { Color::srgba(0.2, 0.8, 0.95, 0.6) };
+                // Rotate handle: a small circle with a stalk from the box top.
+                gizmos.line(ap.to_world(base), ap.to_world(rot), hcol);
+                gizmos.circle(Isometry3d::new(ap.to_world(rot), plane_rot), 0.12 * ms, hcol);
+                // Scale handle: a little square marker.
+                draw_marker(&mut gizmos, ap, sc, hcol, ms);
             }
         }
     }
@@ -5026,7 +5796,7 @@ fn draw_sketch(
                     Some(SketchEntity::Line { a, b, .. }) => {
                         gizmos.line(ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)), hov);
                     }
-                    Some(SketchEntity::Circle { center, radius }) => {
+                    Some(SketchEntity::Circle { center, radius, .. }) => {
                         let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
                         gizmos.circle(iso, *radius as f32, hov);
                     }
@@ -5084,7 +5854,7 @@ fn draw_sketch(
                 draw_marker(&mut gizmos, ap, uv_of(*a), sel_col, ms);
                 draw_marker(&mut gizmos, ap, uv_of(*b), sel_col, ms);
             }
-            Some(SketchEntity::Circle { center, radius }) => {
+            Some(SketchEntity::Circle { center, radius, .. }) => {
                 let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
                 gizmos.circle(iso, *radius as f32, sel_col);
                 gizmos.circle(iso, *radius as f32 + 0.03, sel_col);
@@ -5276,7 +6046,34 @@ fn draw_sketch(
                     }
                 }
             }
-            Tool::Select | Tool::Dimension | Tool::Spline => {}
+            // Polygon: centre is `start`, cursor is a vertex. Preview the N edges and the
+            // dashed circumscribed circle.
+            Tool::Polygon => {
+                let n = session.polygon_sides.max(3);
+                let rim = poly_rim(&session).unwrap_or(cur);
+                let r = (rim - start).length();
+                let theta0 = (rim - start).y.atan2((rim - start).x);
+                let vert = |k: usize| {
+                    let a = theta0 + std::f32::consts::TAU * k as f32 / n as f32;
+                    start + Vec2::new(a.cos(), a.sin()) * r
+                };
+                for k in 0..n {
+                    gizmos.line(ap.to_world(vert(k)), ap.to_world(vert((k + 1) % n)), preview_col);
+                }
+                // Dashed circumscribed circle.
+                const SEG: usize = 64;
+                let mut prev = start + Vec2::new(r, 0.0);
+                for k in 1..=SEG {
+                    let a = std::f32::consts::TAU * k as f32 / SEG as f32;
+                    let p = start + Vec2::new(r * a.cos(), r * a.sin());
+                    if k % 2 == 0 {
+                        gizmos.line(ap.to_world(prev), ap.to_world(p), construction);
+                    }
+                    prev = p;
+                }
+            }
+            // Text commits on a single click (no rubber-band preview).
+            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col, ms);
     }

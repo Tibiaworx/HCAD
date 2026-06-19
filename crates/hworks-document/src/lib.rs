@@ -56,7 +56,9 @@ pub enum FeatureKind {
     Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
     /// Cut: subtract the chosen swept `regions` from the body (empty = all).
     Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
-    // Revolve / Fillet / … arrive at M8+.
+    /// Fillet: round every edge of the current body by `radius` (a global mesh round).
+    Fillet { radius: f64 },
+    // Revolve / … arrive at M8+.
 }
 
 /// One node in the feature timeline.
@@ -134,6 +136,7 @@ impl Document {
                     ct += 1;
                     format!("[cut]    Cut{ct}  h={distance:.1}")
                 }
+                FeatureKind::Fillet { radius } => format!("[fillet] Fillet  r={radius:.2}"),
             })
             .collect()
     }

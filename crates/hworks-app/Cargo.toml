@@ -14,6 +14,8 @@ bevy = { workspace = true }
 bevy_egui = "0.39"
 ron = "0.8"
 rfd = "0.15"
+ttf-parser = "0.25"
+ab_glyph = "0.2"
 hworks-document = { path = "../hworks-document" }
 hworks-sketch = { path = "../hworks-sketch" }
 hworks-geometry = { path = "../hworks-geometry" }
