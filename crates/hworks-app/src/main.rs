@@ -24,7 +24,7 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
+    bevel_feature_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
     extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, round_mesh,
     tessellate, threaded_hole, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
@@ -6929,13 +6929,18 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
 /// Note: this fallback uses each feature's stored plane (no re-projection against the
 /// live body), which is correct for a straight build-up; an *edited* upstream feature
 /// may not shift downstream geometry here the way the exact path does.
-fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
+/// Rebuild the mesh-kernel body, plus the selectable feature edges emitted by the *last*
+/// bevel (fillet/chamfer) if it's still the final body operation — those tangent/hard edges
+/// are otherwise invisible to angle-based edge extraction, so we plumb them out explicitly.
+fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
     let mut body: Option<TriMesh> = None;
+    let mut bevel_edges: Vec<[[f32; 3]; 2]> = Vec::new();
     let end = doc.rollback.min(doc.features.len());
     for feature in &doc.features[..end] {
         match &feature.kind {
             FeatureKind::Plane(_) | FeatureKind::Sketch { .. } => {}
             FeatureKind::Extrude { sketch, regions, plane, distance } => {
+                bevel_edges.clear();
                 let all = sketch.regions();
                 // Reproject onto the live body's matching face (like the exact path), so a
                 // boss stacks on the *current* top rather than the stale stored plane.
@@ -6979,6 +6984,7 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                 }
             }
             FeatureKind::Cut { sketch, regions, plane, distance } => {
+                bevel_edges.clear();
                 let Some(cur0) = &body else { continue };
                 let all = sketch.regions();
                 // Reproject onto the live body's top face (like the exact path) so the cut
@@ -7010,8 +7016,18 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                     .ok()
                     .flatten();
                     body = Some(match beveled {
-                        Some(m) => m,
-                        None => round_mesh(&b, *radius, edges).unwrap_or(b),
+                        // Bevel engine succeeded → record its tangent edges as selectable.
+                        Some(m) => {
+                            bevel_edges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                bevel_feature_edges(&b, *radius, edges)
+                            }))
+                            .unwrap_or_default();
+                            m
+                        }
+                        None => {
+                            bevel_edges.clear();
+                            round_mesh(&b, *radius, edges).unwrap_or(b)
+                        }
                     });
                 }
             }
@@ -7025,13 +7041,23 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                     .ok()
                     .flatten();
                     body = Some(match beveled {
-                        Some(m) => m,
-                        None => chamfer_mesh(&b, *distance, edges).unwrap_or(b),
+                        Some(m) => {
+                            bevel_edges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                bevel_feature_edges(&b, *distance, edges)
+                            }))
+                            .unwrap_or_default();
+                            m
+                        }
+                        None => {
+                            bevel_edges.clear();
+                            chamfer_mesh(&b, *distance, edges).unwrap_or(b)
+                        }
                     });
                 }
             }
             // Reflect the body across the plane and union it with the original.
             FeatureKind::Mirror { plane } => {
+                bevel_edges.clear(); // body changes → any prior bevel edges are stale
                 if let Some(b) = body.take() {
                     let refl = mirror_mesh(&b, plane.origin, plane.normal);
                     body = Some(mesh_union(&b, &refl));
@@ -7039,13 +7065,14 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
             }
             // Tap a threaded hole / thread a boss.
             FeatureKind::Thread { origin, axis, major_d, pitch, depth, internal, rh } => {
+                bevel_edges.clear();
                 if let Some(b) = body.take() {
                     body = Some(threaded_hole(&b, *origin, *axis, *major_d, *pitch, *depth, *internal, *rh).unwrap_or(b));
                 }
             }
         }
     }
-    body
+    body.map(|m| (m, bevel_edges))
 }
 
 /// Consume a regenerate request: rebuild the solid from the timeline and refresh
@@ -7082,8 +7109,10 @@ fn do_regenerate(
             commands.entity(e).despawn();
         }
         match mesh {
-            Some(m) if !m.positions.is_empty() => {
-                let tess = mesh_tessellation(m);
+            Some((m, bevel_edges)) if !m.positions.is_empty() => {
+                let mut tess = mesh_tessellation(m);
+                // Add the bevel's tangent/hard edges so the rounded edges are selectable.
+                tess.edges.extend(bevel_edges);
                 part.mesh = Some(tess.mesh.clone());
                 part.edges = tess.edges.clone();
                 part.tangent_edges = tess.tangent_edges.clone();
@@ -7141,8 +7170,9 @@ fn do_regenerate(
     let mesh_body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc.0)))
         .unwrap_or(None);
     match mesh_body {
-        Some(mesh) if !mesh.positions.is_empty() => {
-            let tess = mesh_tessellation(mesh);
+        Some((mesh, bevel_edges)) if !mesh.positions.is_empty() => {
+            let mut tess = mesh_tessellation(mesh);
+            tess.edges.extend(bevel_edges);
             part.mesh = Some(tess.mesh.clone());
             part.edges = tess.edges.clone();
             part.tangent_edges = tess.tangent_edges.clone();

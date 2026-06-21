@@ -582,6 +582,47 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
     bevel_mesh_selected(mesh, r, seg, &[])
 }
 
+/// The **selectable feature edges** a bevel produces: for each rounded edge, the two curves
+/// where the rounded strip meets its adjacent flat faces (a fillet's tangent edges, or a
+/// chamfer's hard edges). These follow the inset face boundary, so they sit exactly on the
+/// rounded body and chain up for picking. `picked` empty = every edge (matches `bevel_mesh`).
+/// Returns segments in the same `[[f32;3];2]` form the renderer/picker use.
+pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Vec<[[f32; 3]; 2]> {
+    let topo = build_topo(mesh);
+    let all = picked.is_empty();
+    let selected: Vec<bool> = topo.edges.iter().map(|e| all || edge_is_picked(&topo, e, picked)).collect();
+    if !selected.iter().any(|&s| s) {
+        return Vec::new();
+    }
+    let mut corner: HashMap<(usize, usize), V3> = HashMap::new();
+    for fi in 0..topo.faces.len() {
+        let rings = inset_loops(&topo, fi, r, &selected);
+        for (li, lp) in topo.faces[fi].loops.iter().enumerate() {
+            for (k, &vi) in lp.iter().enumerate() {
+                corner.insert((vi, fi), rings[li][k]);
+            }
+        }
+    }
+    let f32a = |p: V3| [p[0] as f32, p[1] as f32, p[2] as f32];
+    let mut out = Vec::new();
+    for fi in 0..topo.faces.len() {
+        for lp in &topo.faces[fi].loops {
+            let m = lp.len();
+            for k in 0..m {
+                let (a, b) = (lp[k], lp[(k + 1) % m]);
+                // Emit the inset boundary segment along each *selected* model edge — that's the
+                // flat↔strip seam (one per adjacent face → both tangent edges of the round).
+                if topo.edge_between(a, b).is_some_and(|ei| selected[ei]) {
+                    let pa = corner.get(&(a, fi)).copied().unwrap_or(topo.verts[a]);
+                    let pb = corner.get(&(b, fi)).copied().unwrap_or(topo.verts[b]);
+                    out.push([f32a(pa), f32a(pb)]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Bevel a solid by `r` with `seg` arc segments via mesh surgery (no CSG). `picked` is the set
 /// of world-space edge polylines to round; an **empty** list rounds every edge. Non-selected
 /// edges stay sharp, so corners where rounded and sharp edges meet are stitched with an end-cap
@@ -952,6 +993,29 @@ mod tests {
         // A second cut sketched on the top frame (origin at (9,9,6)) must reproject to z=6.
         let z = reproject_z(&body, [9.0, 9.0, 6.0]);
         assert!((z - 6.0).abs() < 0.01, "reproject snapped cut plane to z={z}, not the top (6)");
+    }
+
+    #[test]
+    fn fillet_cylinder_top_rim() {
+        // A cylinder (32-gon prism). Fillet its top circular rim and check the bevel succeeds
+        // and emits feature edges following the circle (so they're selectable).
+        let n = 32;
+        let circ: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [5.0 + 4.0 * a.cos(), 5.0 + 4.0 * a.sin()]
+            })
+            .collect();
+        let cyl = extrude_tool_mesh(&circ, &[], &xy(), 0.0, 6.0).unwrap();
+        // Pick the whole top rim (z=6): one polyline around the circle.
+        let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], 6.0]).collect();
+        rim.push(rim[0]);
+        let picked = vec![rim];
+        let body = bevel_mesh_selected(&cyl, 0.5, 3, &picked).expect("cylinder rim fillets");
+        assert!(is_watertight(&body), "cylinder rim fillet must be closed");
+        // Two tangent circles (top-flat↔torus and torus↔side), ~32 segments each.
+        let edges = bevel_feature_edges(&cyl, 0.5, &picked);
+        assert!(edges.len() > 30, "should emit a ring of tangent edges, got {}", edges.len());
     }
 
     #[test]

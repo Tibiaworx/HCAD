@@ -15,7 +15,7 @@ mod bevel;
 mod csg;
 mod fillet;
 mod mesh_bool;
-pub use bevel::{bevel_mesh, bevel_mesh_selected};
+pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_selected};
 pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
 pub use mesh_bool::{mesh_difference, mesh_intersection, mesh_union, mirror_mesh};
 
