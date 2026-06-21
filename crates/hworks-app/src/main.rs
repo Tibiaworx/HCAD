@@ -179,6 +179,19 @@ enum Tool {
     Spline,
     Text,
     Dimension,
+    Pattern,
+}
+
+/// Pattern-tool variant.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum PatternMode {
+    /// Repeat the selection along one or two directions (rows × columns).
+    #[default]
+    Linear,
+    /// Repeat the selection around a centre point.
+    Circular,
+    /// Tile copies of the selection to fill a chosen closed region.
+    Fill,
 }
 
 /// Rectangle-tool variant.
@@ -234,6 +247,7 @@ impl Tool {
             Tool::Text => "Text",
             Tool::Spline => "Spline",
             Tool::Dimension => "Dimension",
+            Tool::Pattern => "Pattern",
         }
     }
 }
@@ -441,6 +455,21 @@ struct SketchSession {
     /// A dimension (constraint index) selected on the canvas — highlighted, and removable
     /// with Delete / the red ✕ in the panel.
     selected_dim: Option<usize>,
+    /// Pattern tool: which variant, and its parameters (linear rows/cols + spacing,
+    /// circular centre/count/angle, fill spacing/margin). Operates on the current
+    /// selection (entities to copy; for Fill, a chosen closed region is the boundary).
+    pattern_mode: PatternMode,
+    pat_count1: u32,
+    pat_count2: u32,
+    pat_spacing1: f32,
+    pat_spacing2: f32,
+    pat_circ_count: u32,
+    pat_circ_angle: f32,
+    pat_circ_center: Vec2,
+    pat_center_set: bool,
+    pat_fill_spacing: f32,
+    pat_fill_margin: f32,
+    pattern_init: bool,
     /// Per-operation undo/redo *within* the sketch (so Ctrl+Z reverts the last line /
     /// dimension / drag, not the whole sketch feature). `undo_baseline` holds the last
     /// recorded stable state; `undo_fp` its fingerprint, so a change is detected cheaply.
@@ -1172,6 +1201,31 @@ fn ui_system(
                             session.tool = Tool::Dimension;
                             session.pending = None;
                         }
+                        // Pattern tool + a ▾ dropdown: linear / circular / fill. Select the
+                        // entities to repeat first; parameters live in the left panel.
+                        if ui
+                            .selectable_label(session.tool == Tool::Pattern, "Pattern")
+                            .on_hover_text("Repeat the selected sketch geometry — options in the panel on the left")
+                            .clicked()
+                        {
+                            init_pattern_defaults(&mut session);
+                            session.tool = Tool::Pattern;
+                            session.pending = None;
+                        }
+                        egui::Popup::menu(&dropdown_arrow(ui, "Pattern variants")).show(|ui| {
+                            let pat_on = session.tool == Tool::Pattern;
+                            let mut pick = |ui: &mut egui::Ui, m: PatternMode, name: &str, tip: &str| {
+                                if ui.selectable_label(pat_on && session.pattern_mode == m, name).on_hover_text(tip).clicked() {
+                                    init_pattern_defaults(&mut session);
+                                    session.pattern_mode = m;
+                                    session.tool = Tool::Pattern;
+                                    session.pending = None;
+                                }
+                            };
+                            pick(ui, PatternMode::Linear, "Linear Pattern", "Rows × columns at a set spacing");
+                            pick(ui, PatternMode::Circular, "Circular Pattern", "Copies revolved around a centre");
+                            pick(ui, PatternMode::Fill, "Fill Pattern", "Tile copies to fill a selected closed region");
+                        });
                         let mut snap = !session.hide_inference;
                         if ui
                             .checkbox(&mut snap, "Snap pts")
@@ -1247,6 +1301,7 @@ fn ui_system(
 
     // ---- Left panel: PropertyManager (if configuring) else FeatureManager ----
     egui::SidePanel::left("left_panel").default_width(240.0).show(ctx, |ui| {
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // Polygon-tool parameters (SolidWorks-style PropertyManager): the side count.
         if session.tool == Tool::Polygon && session.plane.is_some() {
             ui.heading("Polygon");
@@ -1350,6 +1405,135 @@ fn ui_system(
                     }
                 }
             }
+            ui.separator();
+        }
+        // Pattern-tool parameters (operates on the current selection).
+        if session.tool == Tool::Pattern && session.plane.is_some() {
+            init_pattern_defaults(&mut session);
+            let mode = session.pattern_mode;
+            ui.heading(match mode {
+                PatternMode::Linear => "Linear Pattern",
+                PatternMode::Circular => "Circular Pattern",
+                PatternMode::Fill => "Fill Pattern",
+            });
+            ui.separator();
+            // Mode picker (mirrors the toolbar dropdown).
+            ui.horizontal(|ui| {
+                for (m, name) in [
+                    (PatternMode::Linear, "Linear"),
+                    (PatternMode::Circular, "Circular"),
+                    (PatternMode::Fill, "Fill"),
+                ] {
+                    if ui.selectable_label(mode == m, name).clicked() {
+                        session.pattern_mode = m;
+                    }
+                }
+            });
+            ui.separator();
+
+            let seed_count = session
+                .selected_entities
+                .iter()
+                .filter(|&&i| {
+                    !matches!(
+                        session.sketch.entities.get(i),
+                        None | Some(SketchEntity::Line { reference: true, .. }) | Some(SketchEntity::Text { .. })
+                    )
+                })
+                .count();
+            ui.label(format!("Entities to repeat: {seed_count}"));
+            ui.label(egui::RichText::new("Click sketch geometry to (de)select it.").weak().small());
+            ui.add_space(4.0);
+
+            match session.pattern_mode {
+                PatternMode::Linear => {
+                    egui::Grid::new("lin_pat").num_columns(2).show(ui, |ui| {
+                        ui.label("Direction 1 count");
+                        ui.add(egui::DragValue::new(&mut session.pat_count1).range(1..=200).speed(0.1));
+                        ui.end_row();
+                        ui.label("Direction 1 spacing");
+                        ui.add(egui::DragValue::new(&mut session.pat_spacing1).speed(0.05).suffix(" mm"));
+                        ui.end_row();
+                        ui.label("Direction 2 count");
+                        ui.add(egui::DragValue::new(&mut session.pat_count2).range(1..=200).speed(0.1));
+                        ui.end_row();
+                        ui.label("Direction 2 spacing");
+                        ui.add(egui::DragValue::new(&mut session.pat_spacing2).speed(0.05).suffix(" mm"));
+                        ui.end_row();
+                    });
+                    ui.label(egui::RichText::new("Direction 1 is the sketch X axis, direction 2 the Y axis.").weak().small());
+                }
+                PatternMode::Circular => {
+                    egui::Grid::new("circ_pat").num_columns(2).show(ui, |ui| {
+                        ui.label("Instances");
+                        ui.add(egui::DragValue::new(&mut session.pat_circ_count).range(2..=360).speed(0.1));
+                        ui.end_row();
+                        ui.label("Total angle");
+                        ui.add(egui::DragValue::new(&mut session.pat_circ_angle).range(1.0..=360.0).speed(0.5).suffix("°"));
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        let mut cx = session.pat_circ_center.x;
+                        let mut cy = session.pat_circ_center.y;
+                        ui.label("Centre");
+                        if ui.add(egui::DragValue::new(&mut cx).speed(0.05).prefix("x ")).changed() {
+                            session.pat_circ_center.x = cx;
+                            session.pat_center_set = true;
+                        }
+                        if ui.add(egui::DragValue::new(&mut cy).speed(0.05).prefix("y ")).changed() {
+                            session.pat_circ_center.y = cy;
+                            session.pat_center_set = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Centre on selection").clicked() {
+                            let seeds: Vec<usize> = session.selected_entities.clone();
+                            session.pat_circ_center = selection_centroid(&session.sketch, &seeds);
+                            session.pat_center_set = true;
+                        }
+                        if ui.button("Origin").clicked() {
+                            session.pat_circ_center = Vec2::ZERO;
+                            session.pat_center_set = true;
+                        }
+                    });
+                    if !session.pat_center_set {
+                        ui.label(egui::RichText::new("Centre defaults to the selection's centroid.").weak().small());
+                    }
+                }
+                PatternMode::Fill => {
+                    egui::Grid::new("fill_pat").num_columns(2).show(ui, |ui| {
+                        ui.label("Spacing");
+                        ui.add(egui::DragValue::new(&mut session.pat_fill_spacing).range(0.05..=1000.0).speed(0.05).suffix(" mm"));
+                        ui.end_row();
+                        ui.label("Border margin");
+                        ui.add(egui::DragValue::new(&mut session.pat_fill_margin).range(0.0..=1000.0).speed(0.05).suffix(" mm"));
+                        ui.end_row();
+                    });
+                    let region = session.selected_contours.first().is_some();
+                    ui.label(if region {
+                        egui::RichText::new("Boundary region: selected ✓").color(egui::Color32::from_rgb(90, 200, 120))
+                    } else {
+                        egui::RichText::new("Click inside a closed region to set the fill boundary.").color(egui::Color32::from_rgb(230, 170, 60))
+                    });
+                }
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Apply").fill(egui::Color32::from_rgb(40, 110, 70))).clicked() {
+                    match apply_pattern(&mut session) {
+                        Ok(_) => {
+                            session.selected_entities.clear();
+                            session.selected_contours.clear();
+                        }
+                        Err(msg) => ui_state.last_error = Some(msg),
+                    }
+                }
+                if ui.button("Done").clicked() {
+                    session.tool = Tool::Select;
+                    session.selected_entities.clear();
+                }
+            });
             ui.separator();
         }
         // Text-tool parameters (also edit the selected text entity live).
@@ -2338,6 +2522,7 @@ fn ui_system(
                 );
             }
         }
+      });
     });
 
     // ---- Bottom status bar ----
@@ -3260,12 +3445,16 @@ fn inference_points(sketch: &Sketch, i: usize) -> Vec<Vec2> {
 
 /// Snap `uv` to the nearest inference point within `thresh`, else return it.
 fn snap_to_inference(uv: Vec2, points: &[Vec2], thresh: f32) -> Vec2 {
+    nearest_within(uv, points, thresh).unwrap_or(uv)
+}
+
+/// The nearest of `points` to `uv` within `thresh`, if any.
+fn nearest_within(uv: Vec2, points: &[Vec2], thresh: f32) -> Option<Vec2> {
     points
         .iter()
         .copied()
         .filter(|p| p.distance(uv) <= thresh)
         .min_by(|a, b| a.distance(uv).total_cmp(&b.distance(uv)))
-        .unwrap_or(uv)
 }
 
 /// Snap a circle's `raw` radius to a nearby reference circle's radius (within
@@ -3759,8 +3948,11 @@ fn sketch_interaction(
         for p in &session.sketch.points {
             snaps.push(Vec2::new(p.x as f32, p.y as f32));
         }
-        // Each circle's centre + 4 quadrant points (top/bottom/left/right), always —
-        // so connecting lines can be lined up to the rim to enclose a region.
+        // Circle perimeters (quadrants + the nearest point on the rim) are *lower priority*
+        // than explicit geometry: a line or point in front of a circle must win, so the
+        // cursor isn't yanked past the line onto the rim behind it. These go in a separate
+        // pool that's only consulted when nothing stronger is within range.
+        let mut rim_snaps: Vec<Vec2> = Vec::new();
         for e in &session.sketch.entities {
             // Construction circles (e.g. a polygon's circumscribed circle) deliberately do
             // *not* seed the quadrant/rim snap cloud — otherwise every later point gets
@@ -3769,14 +3961,14 @@ fn sketch_interaction(
             if let SketchEntity::Circle { center, radius, construction: false } = e {
                 if let Some(c) = session.sketch.points.get(*center) {
                     let (cc, r) = (Vec2::new(c.x as f32, c.y as f32), *radius as f32);
-                    snaps.push(cc + Vec2::new(r, 0.0));
-                    snaps.push(cc + Vec2::new(-r, 0.0));
-                    snaps.push(cc + Vec2::new(0.0, r));
-                    snaps.push(cc + Vec2::new(0.0, -r));
+                    rim_snaps.push(cc + Vec2::new(r, 0.0));
+                    rim_snaps.push(cc + Vec2::new(-r, 0.0));
+                    rim_snaps.push(cc + Vec2::new(0.0, r));
+                    rim_snaps.push(cc + Vec2::new(0.0, -r));
                     if let Some(uv) = active_uv {
                         let to = uv - cc;
                         if to.length() > 1e-4 {
-                            snaps.push(cc + to.normalize() * r); // nearest point on the rim
+                            rim_snaps.push(cc + to.normalize() * r); // nearest point on the rim
                         }
                     }
                 }
@@ -3788,7 +3980,23 @@ fn sketch_interaction(
             for (cc, r) in &session.reference_circles {
                 let to = uv - *cc;
                 if to.length() > 1e-4 {
-                    snaps.push(*cc + to.normalize() * *r);
+                    rim_snaps.push(*cc + to.normalize() * *r);
+                }
+            }
+        }
+        // The nearest point *along* each sketch line's span — so a line is snappable
+        // anywhere on its length (not just its ends) and reliably beats a circle behind it.
+        if let Some(uv) = active_uv {
+            for e in &session.sketch.entities {
+                if let SketchEntity::Line { a, b, .. } = e {
+                    if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
+                        let va = Vec2::new(pa.x as f32, pa.y as f32);
+                        let vb = Vec2::new(pb.x as f32, pb.y as f32);
+                        let cp = closest_on_segment(uv, va, vb);
+                        if cp.distance(uv) <= snap {
+                            snaps.push(cp);
+                        }
+                    }
                 }
             }
         }
@@ -3832,7 +4040,13 @@ fn sketch_interaction(
                 }
             }
         }
-        session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &snaps, snap));
+        // Strong geometry (points, line spans, straight edges) wins; circle perimeters are
+        // only used when nothing stronger is within range.
+        session.cursor_uv = active_uv.map(|uv| {
+            nearest_within(uv, &snaps, snap)
+                .or_else(|| nearest_within(uv, &rim_snaps, snap))
+                .unwrap_or(uv)
+        });
         session.cursor_raw_uv = active_uv;
         // Is the (snapped) cursor sitting on the hovered edge? If so, placing a point
         // here will add a point-on-edge relation.
@@ -3908,7 +4122,7 @@ fn sketch_interaction(
     }
 
     // Entity under the cursor (Select tool) for hover highlighting.
-    session.hover_entity = if session.plane.is_some() && session.tool == Tool::Select {
+    session.hover_entity = if session.plane.is_some() && matches!(session.tool, Tool::Select | Tool::Pattern) {
         active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, snap * 1.5))
     } else {
         None
@@ -4045,17 +4259,17 @@ fn sketch_interaction(
     if session.tool != Tool::Slot {
         session.pending_c = None; // the arc-slot bend point belongs only to the slot tool
     }
-    if session.tool != Tool::Select && session.tool != Tool::Text {
-        // Keep a selection alive into the Text tool so its panel can live-edit the
-        // picked text entity (font/style/string/arc/…).
+    if session.tool != Tool::Select && session.tool != Tool::Text && session.tool != Tool::Pattern {
+        // Keep a selection alive into the Text tool (live-edit the picked text) and the
+        // Pattern tool (the selection is what gets repeated).
         session.selected_entities.clear();
     }
-    if session.tool != Tool::Select {
+    if session.tool != Tool::Select && session.tool != Tool::Pattern {
         session.box_select = None;
     }
 
     match session.tool {
-        Tool::Select => {
+        Tool::Select | Tool::Pattern => {
             if just_pressed {
                 // A Text entity's on-canvas handles take priority: grab the square to
                 // scale or the circle to rotate it.
@@ -4490,6 +4704,254 @@ fn add_radius_dim(sketch: &mut Sketch, center: usize, radius: f64) -> Option<usi
     }
     sketch.constraints.push(Constraint::Radius { center, value: radius, diameter: true });
     Some(sketch.constraints.len() - 1)
+}
+
+/// Add a new point at `xf(existing point)` and return its index — used to clone an
+/// entity through a translation/rotation when patterning.
+fn xf_point(sketch: &mut Sketch, pi: usize, xf: &impl Fn(Vec2) -> Vec2) -> usize {
+    let p = sketch.points[pi];
+    let np = xf(Vec2::new(p.x as f32, p.y as f32));
+    sketch.add_point(np.x as f64, np.y as f64)
+}
+
+/// Append a copy of entity `idx` with all its points mapped through `xf` (a pattern
+/// instance). Reference lines and text are skipped. New geometry is unconstrained.
+fn duplicate_entity(sketch: &mut Sketch, idx: usize, xf: &impl Fn(Vec2) -> Vec2) {
+    let Some(e) = sketch.entities.get(idx).cloned() else { return };
+    let new = match e {
+        SketchEntity::Line { a, b, construction, reference: false } => {
+            let (a, b) = (xf_point(sketch, a, xf), xf_point(sketch, b, xf));
+            SketchEntity::Line { a, b, construction, reference: false }
+        }
+        SketchEntity::Circle { center, radius, construction } => {
+            let center = xf_point(sketch, center, xf);
+            SketchEntity::Circle { center, radius, construction }
+        }
+        SketchEntity::Slot { a, b, radius, construction, mid } => {
+            let a = xf_point(sketch, a, xf);
+            let b = xf_point(sketch, b, xf);
+            let mid = mid.map(|m| xf_point(sketch, m, xf));
+            SketchEntity::Slot { a, b, radius, construction, mid }
+        }
+        SketchEntity::Spline { points, closed, construction, control } => {
+            let points = points.iter().map(|&pi| xf_point(sketch, pi, xf)).collect();
+            SketchEntity::Spline { points, closed, construction, control }
+        }
+        SketchEntity::Point { at } => SketchEntity::Point { at: xf_point(sketch, at, xf) },
+        _ => return, // reference line / text: not patterned
+    };
+    sketch.entities.push(new);
+}
+
+/// The outline polylines of an entity in plane-uv — used to draw a ghost pattern preview.
+/// A line is one open segment; a circle / slot a closed loop; a spline its tessellation.
+fn entity_preview_polylines(sketch: &Sketch, idx: usize) -> Vec<Vec<Vec2>> {
+    let pt = |i: usize| sketch.points.get(i).map(|p| Vec2::new(p.x as f32, p.y as f32));
+    match sketch.entities.get(idx) {
+        Some(SketchEntity::Line { a, b, .. }) => match (pt(*a), pt(*b)) {
+            (Some(a), Some(b)) => vec![vec![a, b]],
+            _ => vec![],
+        },
+        Some(SketchEntity::Circle { center, radius, .. }) => match pt(*center) {
+            Some(c) => {
+                const SEG: usize = 48;
+                let r = *radius as f32;
+                vec![(0..=SEG)
+                    .map(|k| {
+                        let a = std::f32::consts::TAU * k as f32 / SEG as f32;
+                        c + Vec2::new(r * a.cos(), r * a.sin())
+                    })
+                    .collect()]
+            }
+            None => vec![],
+        },
+        Some(SketchEntity::Slot { a, b, radius, mid, .. }) => match (pt(*a), pt(*b)) {
+            (Some(pa), Some(pb)) => {
+                let poly = match mid.and_then(|m| pt(m)) {
+                    Some(pm) => tessellate_arc_slot([pa.x as f64, pa.y as f64], [pm.x as f64, pm.y as f64], [pb.x as f64, pb.y as f64], *radius),
+                    None => tessellate_slot([pa.x as f64, pa.y as f64], [pb.x as f64, pb.y as f64], *radius),
+                };
+                let mut v: Vec<Vec2> = poly.iter().map(|p| Vec2::new(p[0] as f32, p[1] as f32)).collect();
+                if let Some(f) = v.first().copied() {
+                    v.push(f); // close the loop
+                }
+                vec![v]
+            }
+            _ => vec![],
+        },
+        Some(SketchEntity::Spline { points, closed, control, .. }) => {
+            let pts: Vec<[f64; 2]> = points.iter().filter_map(|&i| pt(i)).map(|p| [p.x as f64, p.y as f64]).collect();
+            if pts.len() >= 2 {
+                let poly = tessellate_spline(&pts, *closed, *control);
+                vec![poly.iter().map(|p| Vec2::new(p[0] as f32, p[1] as f32)).collect()]
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Centroid of all points referenced by the given entities.
+fn selection_centroid(sketch: &Sketch, entities: &[usize]) -> Vec2 {
+    let mut sum = Vec2::ZERO;
+    let mut n = 0.0;
+    for &i in entities {
+        for p in entity_points(sketch, i) {
+            if let Some(q) = sketch.points.get(p) {
+                sum += Vec2::new(q.x as f32, q.y as f32);
+                n += 1.0;
+            }
+        }
+    }
+    if n > 0.0 {
+        sum / n
+    } else {
+        Vec2::ZERO
+    }
+}
+
+/// One pattern instance as an affine map: `p' = center + R(theta)·(p − center) + off`.
+/// Translations leave `center`/`theta` zero; rotations leave `off` zero.
+#[derive(Clone, Copy)]
+struct Xf {
+    center: Vec2,
+    cos: f32,
+    sin: f32,
+    off: Vec2,
+}
+
+impl Xf {
+    fn translate(off: Vec2) -> Self {
+        Xf { center: Vec2::ZERO, cos: 1.0, sin: 0.0, off }
+    }
+    fn rotate(center: Vec2, theta: f32) -> Self {
+        Xf { center, cos: theta.cos(), sin: theta.sin(), off: Vec2::ZERO }
+    }
+    fn apply(&self, p: Vec2) -> Vec2 {
+        let d = p - self.center;
+        self.center + Vec2::new(d.x * self.cos - d.y * self.sin, d.x * self.sin + d.y * self.cos) + self.off
+    }
+}
+
+/// The selected entities that can serve as a pattern seed (no reference lines / text).
+fn pattern_seeds(session: &SketchSession) -> Vec<usize> {
+    session
+        .selected_entities
+        .iter()
+        .copied()
+        .filter(|&i| {
+            !matches!(
+                session.sketch.entities.get(i),
+                None | Some(SketchEntity::Line { reference: true, .. }) | Some(SketchEntity::Text { .. })
+            )
+        })
+        .collect()
+}
+
+/// The instance transforms for the current pattern (excluding the seed/original). Shared by
+/// the live preview and Apply so they always match. `Err` carries a banner-friendly reason.
+fn pattern_instances(session: &SketchSession, seeds: &[usize]) -> Result<Vec<Xf>, String> {
+    let mut xfs = Vec::new();
+    match session.pattern_mode {
+        PatternMode::Linear => {
+            if seeds.is_empty() {
+                return Err("Pattern: select the sketch geometry to repeat first.".into());
+            }
+            let (n1, n2) = (session.pat_count1.max(1), session.pat_count2.max(1));
+            let (s1, s2) = (session.pat_spacing1, session.pat_spacing2);
+            for i in 0..n1 {
+                for j in 0..n2 {
+                    if i == 0 && j == 0 {
+                        continue;
+                    }
+                    xfs.push(Xf::translate(Vec2::new(i as f32 * s1, j as f32 * s2)));
+                }
+            }
+        }
+        PatternMode::Circular => {
+            if seeds.is_empty() {
+                return Err("Pattern: select the sketch geometry to repeat first.".into());
+            }
+            let count = session.pat_circ_count.max(2);
+            let center = if session.pat_center_set {
+                session.pat_circ_center
+            } else {
+                selection_centroid(&session.sketch, seeds)
+            };
+            let full = (session.pat_circ_angle - 360.0).abs() < 0.5;
+            let divs = if full { count as f32 } else { (count.max(2) - 1) as f32 };
+            let step = session.pat_circ_angle.to_radians() / divs;
+            for k in 1..count {
+                xfs.push(Xf::rotate(center, step * k as f32));
+            }
+        }
+        PatternMode::Fill => {
+            let regions = session.sketch.regions();
+            let Some(&bi) = session.selected_contours.first() else {
+                return Err("Fill: click inside a closed region to choose the boundary to fill.".into());
+            };
+            let Some(region) = regions.get(bi) else {
+                return Err("Fill: the chosen boundary region no longer exists.".into());
+            };
+            if seeds.is_empty() {
+                return Err("Fill: select a small shape (the seed) to tile with.".into());
+            }
+            let seedc = selection_centroid(&session.sketch, seeds);
+            let outer = &region.outer;
+            let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+            for p in outer {
+                lo[0] = lo[0].min(p[0]);
+                lo[1] = lo[1].min(p[1]);
+                hi[0] = hi[0].max(p[0]);
+                hi[1] = hi[1].max(p[1]);
+            }
+            let sp = session.pat_fill_spacing.max(0.05) as f64;
+            let m = session.pat_fill_margin.max(0.0) as f64;
+            let inside = |x: f64, y: f64| {
+                point_in_poly([x, y], outer) && !region.holes.iter().any(|h| point_in_poly([x, y], h))
+            };
+            let ok = |x: f64, y: f64| {
+                inside(x, y)
+                    && (m <= 0.0
+                        || (inside(x + m, y) && inside(x - m, y) && inside(x, y + m) && inside(x, y - m)))
+            };
+            // Cap the instance count so a tiny spacing can't spawn a runaway preview.
+            let mut y = lo[1];
+            while y <= hi[1] && xfs.len() < 5000 {
+                let mut x = lo[0];
+                while x <= hi[0] && xfs.len() < 5000 {
+                    if ok(x, y) {
+                        let off = Vec2::new(x as f32 - seedc.x, y as f32 - seedc.y);
+                        if off.length() > 1e-3 {
+                            xfs.push(Xf::translate(off));
+                        }
+                    }
+                    x += sp;
+                }
+                y += sp;
+            }
+        }
+    }
+    if xfs.is_empty() {
+        return Err("Pattern: nothing was generated (check counts / spacing / boundary).".into());
+    }
+    Ok(xfs)
+}
+
+/// Generate a pattern of the selected geometry. Returns the number of copies made, or an
+/// error string for the banner. The seed geometry stays; new instances are appended.
+fn apply_pattern(session: &mut SketchSession) -> Result<usize, String> {
+    let seeds = pattern_seeds(session);
+    let xfs = pattern_instances(session, &seeds)?;
+    for xf in &xfs {
+        let map = |p: Vec2| xf.apply(p);
+        for &e in &seeds {
+            duplicate_entity(&mut session.sketch, e, &map);
+        }
+    }
+    session.dirty = true;
+    Ok(xfs.len() * seeds.len())
 }
 
 /// The index of a dimension whose label sits within `tol` (plane uv) of `uv` — used
@@ -4931,8 +5393,9 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             commit_text(session, uv);
             session.dirty = true;
         }
-        // Spline points are placed in `sketch_interaction` (it needs the full point list).
-        Tool::Select | Tool::Dimension | Tool::Spline => {}
+        // Spline points are placed in `sketch_interaction` (it needs the full point list);
+        // Pattern selects/repeats existing geometry rather than placing points.
+        Tool::Select | Tool::Dimension | Tool::Spline | Tool::Pattern => {}
     }
 }
 
@@ -4996,6 +5459,22 @@ fn init_text_defaults(session: &mut SketchSession) {
     if session.text_height <= 0.0 {
         session.text_height = 1.0;
     }
+}
+
+/// Seed sensible pattern defaults the first time the Pattern tool is opened in a session.
+fn init_pattern_defaults(session: &mut SketchSession) {
+    if session.pattern_init {
+        return;
+    }
+    session.pattern_init = true;
+    session.pat_count1 = 3;
+    session.pat_count2 = 1;
+    session.pat_spacing1 = 2.0;
+    session.pat_spacing2 = 2.0;
+    session.pat_circ_count = 6;
+    session.pat_circ_angle = 360.0;
+    session.pat_fill_spacing = 1.5;
+    session.pat_fill_margin = 0.0;
 }
 
 /// Bake the current text parameters into outline contours and add a Text entity whose
@@ -7249,8 +7728,9 @@ fn draw_sketch(
                     prev = p;
                 }
             }
-            // Text commits on a single click (no rubber-band preview).
-            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text => {}
+            // Text commits on a single click (no rubber-band preview); Pattern repeats
+            // existing geometry rather than rubber-banding a new entity.
+            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text | Tool::Pattern => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col, ms);
     }
@@ -7272,6 +7752,26 @@ fn draw_sketch(
         }
         for p in &session.spline_pts {
             draw_marker(&mut gizmos, ap, *p, point_col, ms);
+        }
+    }
+
+    // ---- Pattern preview: ghost copies of the selection at the instance transforms ----
+    if session.tool == Tool::Pattern {
+        let seeds = pattern_seeds(&session);
+        if let Ok(xfs) = pattern_instances(&session, &seeds) {
+            let ghost = Color::srgba(0.35, 0.85, 1.0, 0.7);
+            // Cache each seed's outline once, then stamp it at every instance transform.
+            let outlines: Vec<Vec<Vec<Vec2>>> =
+                seeds.iter().map(|&e| entity_preview_polylines(&session.sketch, e)).collect();
+            for xf in &xfs {
+                for polylines in &outlines {
+                    for poly in polylines {
+                        for w in poly.windows(2) {
+                            gizmos.line(ap.to_world(xf.apply(w[0])), ap.to_world(xf.apply(w[1])), ghost);
+                        }
+                    }
+                }
+            }
         }
     }
 

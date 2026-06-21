@@ -1173,15 +1173,17 @@ pub fn chamfer_mesh(mesh: &TriMesh, dist: f64, edges: &[Vec<[f64; 3]>]) -> Optio
     let diag = len(sub(hi, lo)).max(1.0);
     let tol = diag * 1e-4;
 
-    let mut body = mesh.clone();
-    let mut any = false;
-    // Collect the straight segments to bevel (a chain itself, or its straight runs).
+    // Build one wedge tool per straight *run* (using the run's endpoints — a run is
+    // collinear, so a single wedge spans it) and one cone per circular rim. Crucially this
+    // is *not* per tessellated point: a straight body edge is often split into many
+    // collinear points, and a Manifold boolean per pair would re-mesh the whole body dozens
+    // of times and freeze the app. One boolean per run keeps it snappy, like the fillet.
+    let mut tools: Vec<TriMesh> = Vec::new();
     for chain in edges {
         if fit_circle(chain).is_some() {
             if let Some(tool) = chamfer_circular(&tris, dist, chain) {
                 if tool.indices.len() >= 3 {
-                    body = crate::mesh_difference(&body, &tool);
-                    any = true;
+                    tools.push(tool);
                 }
             }
             continue;
@@ -1194,21 +1196,25 @@ pub fn chamfer_mesh(mesh: &TriMesh, dist: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             continue; // curved/slot chamfer not handled in v1
         };
         for run in &runs {
-            for w in run.windows(2) {
-                if let Some(tool) = chamfer_straight_seg(&tris, dist, w[0], w[1], tol) {
-                    if tool.indices.len() >= 3 {
-                        body = crate::mesh_difference(&body, &tool);
-                        any = true;
-                    }
+            if run.len() < 2 {
+                continue;
+            }
+            let (a, b) = (run[0], run[run.len() - 1]);
+            if let Some(tool) = chamfer_straight_seg(&tris, dist, a, b, tol) {
+                if tool.indices.len() >= 3 {
+                    tools.push(tool);
                 }
             }
         }
     }
-    if any {
-        Some(body)
-    } else {
-        None
+    if tools.is_empty() {
+        return None;
     }
+    let mut body = mesh.clone();
+    for tool in &tools {
+        body = crate::mesh_difference(&body, tool);
+    }
+    Some(body)
 }
 
 /// Wedge tool for a straight convex edge `a`–`b`: the triangle (edge, contact-on-face-1,
@@ -1240,8 +1246,14 @@ fn chamfer_straight_seg(tris: &[[V3; 3]], dist: f64, a: V3, b: V3, tol: f64) -> 
         return None;
     }
     // In-plane directions along each face, away from the edge into the material (the
-    // inward bisector projected onto each face).
-    let inward = norm(scale(add(n1, n2), -1.0));
+    // inward bisector projected onto each face). A nearly-flat edge (n1 ≈ −n2) makes the
+    // bisector degenerate — bail rather than emit a NaN/blown-up prism that would make the
+    // Manifold boolean choke.
+    let bis = add(n1, n2);
+    if len(bis) < 1e-3 {
+        return None;
+    }
+    let inward = norm(scale(bis, -1.0));
     let f1 = norm(sub(inward, scale(n1, dot(inward, n1))));
     let f2 = norm(sub(inward, scale(n2, dot(inward, n2))));
     let p1 = add(a, scale(f1, dist));
@@ -1249,6 +1261,10 @@ fn chamfer_straight_seg(tris: &[[V3; 3]], dist: f64, a: V3, b: V3, tol: f64) -> 
     let margin = dist * 0.5;
     let shift = scale(axis, -margin);
     let cross = [add(a, shift), add(p1, shift), add(p2, shift)];
+    // Reject any non-finite vertex — a degenerate cross-section can otherwise hang the CSG.
+    if cross.iter().any(|p| p.iter().any(|c| !c.is_finite())) {
+        return None;
+    }
     Some(extrude_prism(&cross, axis, l + 2.0 * margin))
 }
 
