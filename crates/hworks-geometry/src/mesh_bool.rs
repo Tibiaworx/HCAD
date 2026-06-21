@@ -118,6 +118,45 @@ pub fn mesh_intersection(a: &TriMesh, b: &TriMesh) -> TriMesh {
     manifold_boolean(a, b, Op::Intersection).unwrap_or_default()
 }
 
+/// Reflect a mesh across the plane through `origin` with `normal`. Reflection reverses
+/// orientation, so triangle winding is swapped (and normals reflected+negated) to keep the
+/// surface outward-facing — ready to union with the original for a mirror.
+pub fn mirror_mesh(mesh: &TriMesh, origin: [f64; 3], normal: [f64; 3]) -> TriMesh {
+    let nl = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if nl < 1e-12 {
+        return mesh.clone();
+    }
+    let n = [normal[0] / nl, normal[1] / nl, normal[2] / nl];
+    let o = origin;
+    let reflect_pt = |p: &[f32; 3]| -> [f32; 3] {
+        let d = [p[0] as f64 - o[0], p[1] as f64 - o[1], p[2] as f64 - o[2]];
+        let dot = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+        [
+            (p[0] as f64 - 2.0 * dot * n[0]) as f32,
+            (p[1] as f64 - 2.0 * dot * n[1]) as f32,
+            (p[2] as f64 - 2.0 * dot * n[2]) as f32,
+        ]
+    };
+    let reflect_nrm = |m: &[f32; 3]| -> [f32; 3] {
+        let dot = m[0] as f64 * n[0] + m[1] as f64 * n[1] + m[2] as f64 * n[2];
+        // Reflected then negated (winding is also swapped) so it points back outward.
+        [
+            -((m[0] as f64 - 2.0 * dot * n[0]) as f32),
+            -((m[1] as f64 - 2.0 * dot * n[1]) as f32),
+            -((m[2] as f64 - 2.0 * dot * n[2]) as f32),
+        ]
+    };
+    let mut out = TriMesh {
+        positions: mesh.positions.iter().map(reflect_pt).collect(),
+        normals: mesh.normals.iter().map(reflect_nrm).collect(),
+        indices: Vec::with_capacity(mesh.indices.len()),
+    };
+    for t in mesh.indices.chunks_exact(3) {
+        out.indices.extend([t[0], t[2], t[1]]); // swap winding to restore orientation
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

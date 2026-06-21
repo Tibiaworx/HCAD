@@ -15,7 +15,7 @@ mod csg;
 mod fillet;
 mod mesh_bool;
 pub use fillet::{chamfer_mesh, round_mesh};
-pub use mesh_bool::{mesh_difference, mesh_intersection, mesh_union};
+pub use mesh_bool::{mesh_difference, mesh_intersection, mesh_union, mirror_mesh};
 
 /// A tessellated triangle mesh handed up to the renderer.
 #[derive(Debug, Default, Clone)]

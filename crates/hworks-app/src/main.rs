@@ -25,8 +25,8 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
     chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
-    extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, round_mesh, tessellate,
-    union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
+    extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, round_mesh,
+    tessellate, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -140,9 +140,11 @@ fn main() {
                     do_solid_op,
                     apply_fillet,
                     apply_chamfer,
+                    apply_mirror_feature,
                     do_regenerate,
                     fillet_preview,
                     chamfer_preview,
+                    mirror_preview,
                 ),
                 (
                     handle_new_part,
@@ -180,6 +182,7 @@ enum Tool {
     Text,
     Dimension,
     Pattern,
+    Mirror,
 }
 
 /// Pattern-tool variant.
@@ -248,6 +251,7 @@ impl Tool {
             Tool::Spline => "Spline",
             Tool::Dimension => "Dimension",
             Tool::Pattern => "Pattern",
+            Tool::Mirror => "Mirror",
         }
     }
 }
@@ -348,6 +352,21 @@ struct UiState {
     pending_chamfer: Option<f32>,
     chamfer_shown: Option<f32>,
     chamfer_request: Option<f64>,
+    /// Mirror feature: the chosen mirror plane while the PM is open (0=Front, 1=Top,
+    /// 2=Right), the plane currently previewed, and a confirmed mirror to append.
+    pending_mirror: Option<u8>,
+    mirror_shown: Option<u8>,
+    mirror_request: Option<u8>,
+}
+
+/// A `PlaneRef` for one of the three standard reference planes (0=Front, 1=Top, 2=Right),
+/// matching `Document::with_default_planes`.
+fn standard_plane_ref(which: u8) -> PlaneRef {
+    match which {
+        1 => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] }, // Top (XZ)
+        2 => PlaneRef { origin: [0.0; 3], u: [0.0, 0.0, -1.0], v: [0.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0] }, // Right (YZ)
+        _ => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }, // Front (XY)
+    }
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -467,6 +486,9 @@ struct SketchSession {
     pat_circ_angle: f32,
     pat_circ_center: Vec2,
     pat_center_set: bool,
+    /// While true, the next canvas click sets the circular-pattern centre (snapped to a
+    /// point / endpoint), instead of selecting geometry.
+    pattern_pick_center: bool,
     pat_fill_spacing: f32,
     pat_fill_margin: f32,
     pattern_init: bool,
@@ -1226,6 +1248,16 @@ fn ui_system(
                             pick(ui, PatternMode::Circular, "Circular Pattern", "Copies revolved around a centre");
                             pick(ui, PatternMode::Fill, "Fill Pattern", "Tile copies to fill a selected closed region");
                         });
+                        // Mirror: reflect the selection across a selected line (a construction
+                        // centre line is the natural axis).
+                        if ui
+                            .selectable_label(session.tool == Tool::Mirror, "Mirror")
+                            .on_hover_text("Reflect selected geometry across a selected line — options in the panel on the left")
+                            .clicked()
+                        {
+                            session.tool = Tool::Mirror;
+                            session.pending = None;
+                        }
                         let mut snap = !session.hide_inference;
                         if ui
                             .checkbox(&mut snap, "Snap pts")
@@ -1291,6 +1323,12 @@ fn ui_system(
                             ui_state.chamfer_shown = None;
                             ui_state.pending_fillet = None;
                             seed(&mut ui_state);
+                        }
+                        if ui.button("Mirror").on_hover_text("Reflect the whole body across a plane and union it (a symmetric part)").clicked() {
+                            ui_state.pending_mirror = Some(0);
+                            ui_state.mirror_shown = None;
+                            ui_state.pending_fillet = None;
+                            ui_state.pending_chamfer = None;
                         }
                     });
                 }
@@ -1490,13 +1528,25 @@ fn ui_system(
                             let seeds: Vec<usize> = session.selected_entities.clone();
                             session.pat_circ_center = selection_centroid(&session.sketch, &seeds);
                             session.pat_center_set = true;
+                            session.pattern_pick_center = false;
                         }
                         if ui.button("Origin").clicked() {
                             session.pat_circ_center = Vec2::ZERO;
                             session.pat_center_set = true;
+                            session.pattern_pick_center = false;
                         }
                     });
-                    if !session.pat_center_set {
+                    let picking = session.pattern_pick_center;
+                    if ui
+                        .selectable_label(picking, "🖈 Pick centre on canvas")
+                        .on_hover_text("Then click a point / endpoint in the sketch to use as the revolve centre")
+                        .clicked()
+                    {
+                        session.pattern_pick_center = !picking;
+                    }
+                    if session.pattern_pick_center {
+                        ui.label(egui::RichText::new("Click a point or endpoint to set the centre…").color(egui::Color32::from_rgb(120, 200, 255)).small());
+                    } else if !session.pat_center_set {
                         ui.label(egui::RichText::new("Centre defaults to the selection's centroid.").weak().small());
                     }
                 }
@@ -1526,6 +1576,46 @@ fn ui_system(
                             session.selected_entities.clear();
                             session.selected_contours.clear();
                         }
+                        Err(msg) => ui_state.last_error = Some(msg),
+                    }
+                }
+                if ui.button("Done").clicked() {
+                    session.tool = Tool::Select;
+                    session.selected_entities.clear();
+                }
+            });
+            ui.separator();
+        }
+        // Mirror-tool parameters (operates on the current selection).
+        if session.tool == Tool::Mirror && session.plane.is_some() {
+            ui.heading("Mirror");
+            ui.separator();
+            let axis = mirror_axis(&session);
+            match axis {
+                Some((ai, _, _)) => {
+                    let kind = if matches!(session.sketch.entities.get(ai), Some(SketchEntity::Line { construction: true, .. })) {
+                        "construction centre line"
+                    } else {
+                        "line"
+                    };
+                    ui.label(egui::RichText::new(format!("Mirror line: selected ({kind}) ✓")).color(egui::Color32::from_rgb(90, 200, 120)));
+                    let n = mirror_seeds(&session, ai).len();
+                    ui.label(format!("Geometry to mirror: {n}"));
+                }
+                None => {
+                    ui.label(egui::RichText::new("Select a line (or construction centre line) as the mirror axis.").color(egui::Color32::from_rgb(230, 170, 60)));
+                }
+            }
+            ui.label(
+                egui::RichText::new("Click the geometry to reflect and the line to mirror across.\nA construction centre line is used as the axis if selected.")
+                    .weak()
+                    .small(),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Apply").fill(egui::Color32::from_rgb(40, 110, 70))).clicked() {
+                    match apply_mirror(&mut session) {
+                        Ok(_) => session.selected_entities.clear(),
                         Err(msg) => ui_state.last_error = Some(msg),
                     }
                 }
@@ -1826,6 +1916,40 @@ fn ui_system(
                 ui_state.regen = true;
             } else {
                 ui_state.pending_chamfer = Some(d.max(0.01));
+            }
+        }
+        if let Some(mut which) = ui_state.pending_mirror {
+            ui.heading("Mirror");
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            ui.label("Mirror plane");
+            for (k, name) in [(0u8, "Front (XY)"), (1, "Top (XZ)"), (2, "Right (YZ)")] {
+                if ui.radio(which == k, name).clicked() {
+                    which = k;
+                    ui_state.mirror_shown = None;
+                }
+            }
+            ui.label(egui::RichText::new("The body is reflected across this plane and unioned with the original.").weak().small());
+            ui.separator();
+            if commit {
+                ui_state.mirror_request = Some(which);
+                ui_state.pending_mirror = None;
+                ui_state.mirror_shown = None;
+            } else if cancel {
+                ui_state.pending_mirror = None;
+                ui_state.mirror_shown = None;
+                ui_state.regen = true;
+            } else {
+                ui_state.pending_mirror = Some(which);
             }
         }
         if let Some(mut op) = ui_state.pending.clone() {
@@ -2154,6 +2278,7 @@ fn ui_system(
             // ---- Add Relations ----
             let mut applied: Option<Constraint> = None;
             let mut dist_request = false;
+            let mut angle_request = false;
             let mut equal_request = false;
             // Entity indices of the selected lines (parallel to `lines`), so we can tell
             // which is a body-edge reference line when dimensioning.
@@ -2186,7 +2311,23 @@ fn ui_system(
                 {
                     dist_request = true;
                 }
+                if ui.add_enabled(two_lines, egui::Button::new("Angle"))
+                    .on_hover_text("Angle dimension between the two selected lines (the first stays fixed when edited)")
+                    .clicked()
+                {
+                    angle_request = true;
+                }
             });
+            // Angle dimension between exactly the two selected lines (more reliable than the
+            // click-to-convert flow, which can grab a nearby line). First line is the
+            // reference that stays put when the angle is later edited.
+            if angle_request && two_lines {
+                if let Some(ci) = add_angle_dim(&mut session.sketch, line_entities[0], line_entities[1]) {
+                    session.selected_entities.clear();
+                    open_dim_edit(&mut session, ci, None);
+                    session.needs_apply = true;
+                }
+            }
             // Distance dimension between the two selected lines (point-to-line). The body
             // edge (a reference line) is the base; an endpoint of the other line is driven.
             if dist_request && two_lines {
@@ -2422,6 +2563,19 @@ fn ui_system(
                         }
                         FeatureKind::Chamfer { distance, edges } => {
                             let resp = ui.selectable_label(selected, styled(format!("⬤ Chamfer  (d {distance:.2}, {} edge(s))", edges.len())));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::Mirror { .. } => {
+                            let resp = ui.selectable_label(selected, styled("◧ Mirror".to_string()));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -2677,7 +2831,13 @@ fn ui_system(
                     .fixed_pos(egui::pos2(screen.x, screen.y))
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(text).color(col).strong()).sense(egui::Sense::click()))
+                        // Never wrap — keep the value on one line even near a screen edge
+                        // (otherwise "90.0°" stacks one character per row).
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).color(col).strong())
+                                .wrap_mode(egui::TextWrapMode::Extend)
+                                .sense(egui::Sense::click()),
+                        )
                     })
                     .inner
             })
@@ -2976,16 +3136,25 @@ fn ui_system(
                             }
                             if resp.changed() {
                                 let v = session.dim_buf.max(0.001);
+                                // For an angle, keep the *first* (reference) line fixed so
+                                // only the second line swings to the new angle — like SW.
+                                let mut angle_ref: Option<[usize; 2]> = None;
                                 match session.sketch.constraints.get_mut(ci) {
                                     Some(Constraint::Distance { value, .. }) => *value = v,
                                     Some(Constraint::Radius { value, diameter, .. }) => {
                                         *value = if *diameter { v * 0.5 } else { v };
                                     }
-                                    Some(Constraint::Angle { value, .. }) => *value = (v as f64).to_radians(),
+                                    Some(Constraint::Angle { value, a, b, .. }) => {
+                                        *value = (v as f64).to_radians();
+                                        angle_ref = Some([*a, *b]);
+                                    }
                                     Some(Constraint::PointLineDistance { value, .. }) => *value = v,
                                     _ => {}
                                 }
-                                session.sketch.solve();
+                                match angle_ref {
+                                    Some(fixed) => session.sketch.solve_with_fixed(&fixed),
+                                    None => session.sketch.solve(),
+                                }
                             }
                             // Per-kind toggle controls (Ø/R, or aligned/H/V).
                             match kind {
@@ -4122,7 +4291,7 @@ fn sketch_interaction(
     }
 
     // Entity under the cursor (Select tool) for hover highlighting.
-    session.hover_entity = if session.plane.is_some() && matches!(session.tool, Tool::Select | Tool::Pattern) {
+    session.hover_entity = if session.plane.is_some() && matches!(session.tool, Tool::Select | Tool::Pattern | Tool::Mirror) {
         active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, snap * 1.5))
     } else {
         None
@@ -4132,6 +4301,23 @@ fn sketch_interaction(
     let pressed = buttons.pressed(MouseButton::Left);
     let just_released = buttons.just_released(MouseButton::Left);
 
+    // Circular-pattern centre pick: the next click sets the revolve centre from the snapped
+    // cursor (a point / endpoint), instead of selecting geometry.
+    if session.pattern_pick_center {
+        if session.tool == Tool::Pattern && session.pattern_mode == PatternMode::Circular {
+            if just_pressed {
+                if let Some(uv) = session.cursor_uv {
+                    session.pat_circ_center = uv;
+                    session.pat_center_set = true;
+                }
+                session.pattern_pick_center = false;
+                return; // consume the click so it doesn't also toggle a selection
+            }
+        } else {
+            session.pattern_pick_center = false; // mode/tool changed → cancel the pick
+        }
+    }
+
     // While the dimension Modify box is open it stays put on the measurement bar (the
     // dimension line is positioned by a default offset, draggable later with the Select
     // tool). A click confirms it; if the open dimension is a line length and a *second*
@@ -4139,13 +4325,33 @@ fn sketch_interaction(
     if let Some(ci) = session.dim_edit {
         if just_pressed {
             // Angle conversion: open dim is a line length and a different line is clicked.
+            // Pick the nearest *line* under the cursor (a sketch line in preference to a
+            // body-edge reference line) so the angle is between the lines you actually click.
             let convert = session.dim_line.and_then(|l1| {
-                let e2 = active_uv.and_then(|uv| nearest_entity(&session.sketch, uv, snap * 2.0))?;
-                if e2 != l1 && entity_line(&session.sketch, e2).is_some() {
-                    Some((l1, e2))
-                } else {
-                    None
+                let uv = active_uv?;
+                let mut best: Option<(usize, bool, f32)> = None; // (entity, is_ref, dist)
+                for (i, e) in session.sketch.entities.iter().enumerate() {
+                    if i == l1 {
+                        continue;
+                    }
+                    if let SketchEntity::Line { a, b, reference, .. } = e {
+                        if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
+                            let va = Vec2::new(pa.x as f32, pa.y as f32);
+                            let vb = Vec2::new(pb.x as f32, pb.y as f32);
+                            let d = closest_on_segment(uv, va, vb).distance(uv);
+                            if d <= snap * 2.0 {
+                                // Prefer a non-reference line; among equals, the nearer one.
+                                let better = best.map_or(true, |(_, bref, bd)| {
+                                    (*reference, d) < (bref, bd) || (*reference == bref && d < bd)
+                                });
+                                if better {
+                                    best = Some((i, *reference, d));
+                                }
+                            }
+                        }
+                    }
                 }
+                best.map(|(i, _, _)| (l1, i))
             });
             if let Some((l1, l2)) = convert {
                 if let Some(ci2) = convert_length_to_angle(&mut session, ci, l1, l2) {
@@ -4259,17 +4465,17 @@ fn sketch_interaction(
     if session.tool != Tool::Slot {
         session.pending_c = None; // the arc-slot bend point belongs only to the slot tool
     }
-    if session.tool != Tool::Select && session.tool != Tool::Text && session.tool != Tool::Pattern {
+    if !matches!(session.tool, Tool::Select | Tool::Text | Tool::Pattern | Tool::Mirror) {
         // Keep a selection alive into the Text tool (live-edit the picked text) and the
-        // Pattern tool (the selection is what gets repeated).
+        // Pattern / Mirror tools (the selection is what gets repeated / reflected).
         session.selected_entities.clear();
     }
-    if session.tool != Tool::Select && session.tool != Tool::Pattern {
+    if !matches!(session.tool, Tool::Select | Tool::Pattern | Tool::Mirror) {
         session.box_select = None;
     }
 
     match session.tool {
-        Tool::Select | Tool::Pattern => {
+        Tool::Select | Tool::Pattern | Tool::Mirror => {
             if just_pressed {
                 // A Text entity's on-canvas handles take priority: grab the square to
                 // scale or the circle to rotate it.
@@ -4954,6 +5160,68 @@ fn apply_pattern(session: &mut SketchSession) -> Result<usize, String> {
     Ok(xfs.len() * seeds.len())
 }
 
+/// Reflect point `p` across the infinite line through `a`–`b`.
+fn reflect_across(p: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let d = (b - a).normalize_or_zero();
+    if d == Vec2::ZERO {
+        return p;
+    }
+    let v = p - a;
+    a + d * (2.0 * v.dot(d)) - v
+}
+
+/// Among the selected entities, the one to use as the mirror axis: a construction line is
+/// preferred (the natural centre line), else any line. Returns its (entity index, endpoints).
+fn mirror_axis(session: &SketchSession) -> Option<(usize, Vec2, Vec2)> {
+    let ep = |i: usize| {
+        entity_line(&session.sketch, i).map(|(a, b)| {
+            let pa = session.sketch.points[a];
+            let pb = session.sketch.points[b];
+            (Vec2::new(pa.x as f32, pa.y as f32), Vec2::new(pb.x as f32, pb.y as f32))
+        })
+    };
+    // Prefer a construction line; otherwise the first selected line.
+    let con = session.selected_entities.iter().copied().find(|&i| {
+        matches!(session.sketch.entities.get(i), Some(SketchEntity::Line { construction: true, .. }))
+    });
+    let axis = con.or_else(|| session.selected_entities.iter().copied().find(|&i| entity_line(&session.sketch, i).is_some()))?;
+    let (a, b) = ep(axis)?;
+    Some((axis, a, b))
+}
+
+/// Entities to mirror = selected geometry minus the axis line (and minus reference/text).
+fn mirror_seeds(session: &SketchSession, axis: usize) -> Vec<usize> {
+    session
+        .selected_entities
+        .iter()
+        .copied()
+        .filter(|&i| {
+            i != axis
+                && !matches!(
+                    session.sketch.entities.get(i),
+                    None | Some(SketchEntity::Line { reference: true, .. }) | Some(SketchEntity::Text { .. })
+                )
+        })
+        .collect()
+}
+
+/// Reflect the selected geometry across the selected axis line, appending the copies.
+fn apply_mirror(session: &mut SketchSession) -> Result<usize, String> {
+    let Some((axis, a, b)) = mirror_axis(session) else {
+        return Err("Mirror: select a line (or construction centre line) to mirror across.".into());
+    };
+    let seeds = mirror_seeds(session, axis);
+    if seeds.is_empty() {
+        return Err("Mirror: also select the geometry to mirror.".into());
+    }
+    let map = |p: Vec2| reflect_across(p, a, b);
+    for &e in &seeds {
+        duplicate_entity(&mut session.sketch, e, &map);
+    }
+    session.dirty = true;
+    Ok(seeds.len())
+}
+
 /// The index of a dimension whose label sits within `tol` (plane uv) of `uv` — used
 /// to click an existing dimension and reopen its Modify box.
 fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
@@ -5006,22 +5274,50 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
 
 /// Replace a freshly-placed line-length dimension (`ci`) with an angle dimension
 /// between lines `l1` and `l2`. Returns the new constraint index.
+/// Add an angle dimension between two line entities (or return the existing one). The
+/// stored angle is kept positive by ordering the lines so the directed angle is ≥ 0; the
+/// first line in that order is the reference that stays put when the dimension is edited.
+fn add_angle_dim(sketch: &mut Sketch, l1: usize, l2: usize) -> Option<usize> {
+    let (a, b) = entity_line(sketch, l1)?;
+    let (c, d) = entity_line(sketch, l2)?;
+    if let Some(i) = sketch.constraints.iter().position(|k| {
+        matches!(k, Constraint::Angle { a: x, b: y, c: z, d: w, .. }
+            if (*x == a && *y == b && *z == c && *w == d) || (*x == c && *y == d && *z == a && *w == b))
+    }) {
+        return Some(i);
+    }
+    let p = |i: usize| {
+        let q = sketch.points[i];
+        Vec2::new(q.x as f32, q.y as f32)
+    };
+    let vertex = line_intersection(p(a), p(b), p(c), p(d)).unwrap_or((p(a) + p(b) + p(c) + p(d)) * 0.25);
+    // Order each line so its *first* point is the one nearer the vertex; then (second −
+    // first) is the ray pointing away from the vertex, and the directed angle between the
+    // two rays is the actual wedge between the lines as drawn (not its supplement).
+    let (a, b) = if (p(a) - vertex).length() <= (p(b) - vertex).length() { (a, b) } else { (b, a) };
+    let (c, d) = if (p(c) - vertex).length() <= (p(d) - vertex).length() { (c, d) } else { (d, c) };
+    let (v1, v2) = (p(b) - p(a), p(d) - p(c));
+    let mut ang = (v1.x * v2.y - v1.y * v2.x).atan2(v1.x * v2.x + v1.y * v2.y) as f64;
+    let (mut aa, mut bb, mut cc, mut dd) = (a, b, c, d);
+    if ang < 0.0 {
+        // Reverse the line order so the wedge angle reads positive.
+        ang = -ang;
+        std::mem::swap(&mut aa, &mut cc);
+        std::mem::swap(&mut bb, &mut dd);
+    }
+    let off = (v1.length().min(v2.length()) * 0.4).max(1.0) as f64;
+    sketch.constraints.push(Constraint::Angle { a: aa, b: bb, c: cc, d: dd, value: ang, offset: off });
+    Some(sketch.constraints.len() - 1)
+}
+
 fn convert_length_to_angle(session: &mut SketchSession, ci: usize, l1: usize, l2: usize) -> Option<usize> {
-    let (a, b) = entity_line(&session.sketch, l1)?;
-    let (c, d) = entity_line(&session.sketch, l2)?;
     // Drop the length dim we just made (it's the last one) so the angle replaces it.
     if ci + 1 == session.sketch.constraints.len() {
         session.sketch.constraints.pop();
     }
-    let p = |i: usize| {
-        let q = session.sketch.points[i];
-        Vec2::new(q.x as f32, q.y as f32)
-    };
-    let (v1, v2) = (p(b) - p(a), p(d) - p(c));
-    let ang = (v1.x * v2.y - v1.y * v2.x).atan2(v1.x * v2.x + v1.y * v2.y) as f64;
-    let off = (v1.length().min(v2.length()) * 0.4).max(1.0) as f64;
-    session.sketch.constraints.push(Constraint::Angle { a, b, c, d, value: ang, offset: off });
-    Some(session.sketch.constraints.len() - 1)
+    // Reuse the shared builder so the click-convert and the relations-panel "Angle" button
+    // produce identical (vertex-first, positive-wedge) angle dimensions.
+    add_angle_dim(&mut session.sketch, l1, l2)
 }
 
 /// The two endpoints of a linear dimension's offset line plus its label anchor, all
@@ -5132,11 +5428,18 @@ fn line_intersection(p1: Vec2, p2: Vec2, p3: Vec2, p4: Vec2) -> Option<Vec2> {
 }
 
 /// The vertex and label anchor of an angle dimension between lines (a→b) and (c→d).
-/// The label sits `offset` out along the bisector from the vertex.
+/// The label sits `offset` out along the bisector from the vertex, on the side *between*
+/// the two lines as they emanate from the vertex (so the arc spans the lines you picked).
 fn angle_dim_geometry(a2: Vec2, b2: Vec2, c2: Vec2, d2: Vec2, offset: f32) -> (Vec2, Vec2) {
     let vertex = line_intersection(a2, b2, c2, d2).unwrap_or((a2 + b2 + c2 + d2) * 0.25);
-    let dir1 = (b2 - a2).normalize_or_zero();
-    let dir2 = (d2 - c2).normalize_or_zero();
+    // Rays pointing away from the vertex along each line (toward the line's far endpoint),
+    // so the bisector lands in the wedge actually between the two drawn lines.
+    let ray = |p: Vec2, q: Vec2| {
+        let far = if (p - vertex).length() >= (q - vertex).length() { p } else { q };
+        (far - vertex).normalize_or_zero()
+    };
+    let dir1 = ray(a2, b2);
+    let dir2 = ray(c2, d2);
     let mut bisect = (dir1 + dir2).normalize_or_zero();
     if bisect == Vec2::ZERO {
         bisect = Vec2::new(-dir1.y, dir1.x);
@@ -5394,8 +5697,8 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             session.dirty = true;
         }
         // Spline points are placed in `sketch_interaction` (it needs the full point list);
-        // Pattern selects/repeats existing geometry rather than placing points.
-        Tool::Select | Tool::Dimension | Tool::Spline | Tool::Pattern => {}
+        // Pattern / Mirror act on existing geometry rather than placing points.
+        Tool::Select | Tool::Dimension | Tool::Spline | Tool::Pattern | Tool::Mirror => {}
     }
 }
 
@@ -6049,7 +6352,7 @@ fn handle_edit_sketch(
         | FeatureKind::Cut { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } => return,
     };
     let ap = active_plane_from_ref(&plane, "Face");
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -6125,7 +6428,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -6177,7 +6480,7 @@ fn doc_has_text(doc: &Document) -> bool {
 fn doc_has_fillet(doc: &Document) -> bool {
     doc.features
         .iter()
-        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. }))
+        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. }))
 }
 
 /// failed to build, so the UI can tell the user which operation didn't apply.
@@ -6242,10 +6545,10 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            // A fillet/chamfer reshapes the mesh, so a model with one always builds via the
-            // mesh path — this exact-kernel path never actually runs with one present.
-            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } => {
-                failures.push("Fillet/chamfer needs the mesh kernel.".into());
+            // A fillet/chamfer/mirror reshapes the mesh, so a model with one always builds
+            // via the mesh path — this exact-kernel path never runs with one present.
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } => {
+                failures.push("Fillet/chamfer/mirror needs the mesh kernel.".into());
             }
         }
     }
@@ -6332,6 +6635,13 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
             FeatureKind::Chamfer { distance, edges } => {
                 if let Some(b) = body.take() {
                     body = Some(chamfer_mesh(&b, *distance, edges).unwrap_or(b));
+                }
+            }
+            // Reflect the body across the plane and union it with the original.
+            FeatureKind::Mirror { plane } => {
+                if let Some(b) = body.take() {
+                    let refl = mirror_mesh(&b, plane.origin, plane.normal);
+                    body = Some(mesh_union(&b, &refl));
                 }
             }
         }
@@ -6569,6 +6879,55 @@ fn chamfer_preview(
     }
     spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
     ui_state.chamfer_shown = Some(d);
+}
+
+/// Append a confirmed mirror to the timeline and trigger a rebuild.
+fn apply_mirror_feature(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+) {
+    let Some(which) = ui_state.mirror_request.take() else { return };
+    history.snapshot(&doc.0);
+    doc.0.add_feature(FeatureKind::Mirror { plane: standard_plane_ref(which) });
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// While the Mirror PropertyManager is open, show a live preview of the body unioned with
+/// its reflection across the chosen plane — recomputed only when the plane changes.
+fn mirror_preview(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ui_state: ResMut<UiState>,
+    part: Res<Part>,
+    existing: Query<Entity, With<SolidPart>>,
+) {
+    if ui_state.regen {
+        return;
+    }
+    let Some(which) = ui_state.pending_mirror else { return };
+    if ui_state.mirror_shown == Some(which) {
+        return;
+    }
+    let Some(base) = part.mesh.clone() else {
+        ui_state.mirror_shown = Some(which);
+        return;
+    };
+    let plane = standard_plane_ref(which);
+    let mirrored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let refl = mirror_mesh(&base, plane.origin, plane.normal);
+        mesh_union(&base, &refl)
+    }))
+    .unwrap_or_else(|_| base.clone());
+    let tess = mesh_tessellation(mirrored);
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+    ui_state.mirror_shown = Some(which);
 }
 
 /// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
@@ -7541,12 +7900,25 @@ fn draw_sketch(
                 }
             }
             // Angle dimension: an arc between the two lines, around their vertex.
-            hworks_sketch::Constraint::Angle { a, b, c, d, value, offset } => {
+            hworks_sketch::Constraint::Angle { a, b, c, d, offset, .. } => {
                 if let (Some(a2), Some(b2), Some(c2), Some(d2)) = (pt(*a), pt(*b), pt(*c), pt(*d)) {
                     let (vertex, _) = angle_dim_geometry(a2, b2, c2, d2, *offset as f32);
                     let r = *offset as f32;
-                    let start = (b2 - a2).to_angle(); // line (a→b) direction
-                    let sweep = *value as f32; // signed angle to line (c→d)
+                    // Rays away from the vertex along each line, so the arc spans the wedge
+                    // *between the two lines* — the short way, regardless of point order.
+                    let ray = |p: Vec2, q: Vec2| {
+                        let far = if (p - vertex).length() >= (q - vertex).length() { p } else { q };
+                        (far - vertex).normalize_or_zero()
+                    };
+                    let start = ray(a2, b2).to_angle();
+                    let mut sweep = ray(c2, d2).to_angle() - start;
+                    let tau = std::f32::consts::TAU;
+                    while sweep > std::f32::consts::PI {
+                        sweep -= tau;
+                    }
+                    while sweep <= -std::f32::consts::PI {
+                        sweep += tau;
+                    }
                     let steps = 24;
                     let mut prev = vertex + Vec2::from_angle(start) * r;
                     for s in 1..=steps {
@@ -7728,9 +8100,9 @@ fn draw_sketch(
                     prev = p;
                 }
             }
-            // Text commits on a single click (no rubber-band preview); Pattern repeats
-            // existing geometry rather than rubber-banding a new entity.
-            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text | Tool::Pattern => {}
+            // Text commits on a single click (no rubber-band preview); Pattern / Mirror act
+            // on existing geometry rather than rubber-banding a new entity.
+            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text | Tool::Pattern | Tool::Mirror => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col, ms);
     }
@@ -7757,6 +8129,20 @@ fn draw_sketch(
 
     // ---- Pattern preview: ghost copies of the selection at the instance transforms ----
     if session.tool == Tool::Pattern {
+        // Mark the circular-pattern centre so the chosen revolve point is visible.
+        if session.pattern_mode == PatternMode::Circular {
+            let c = if session.pat_center_set {
+                session.pat_circ_center
+            } else {
+                selection_centroid(&session.sketch, &pattern_seeds(&session))
+            };
+            let cw = ap.to_world(c);
+            let r = 0.18 * ms;
+            let col = Color::srgb(1.0, 0.55, 0.1);
+            gizmos.line(ap.to_world(c - Vec2::new(r, 0.0)), ap.to_world(c + Vec2::new(r, 0.0)), col);
+            gizmos.line(ap.to_world(c - Vec2::new(0.0, r)), ap.to_world(c + Vec2::new(0.0, r)), col);
+            gizmos.circle(Isometry3d::new(cw, plane_rot), r * 0.7, col);
+        }
         let seeds = pattern_seeds(&session);
         if let Ok(xfs) = pattern_instances(&session, &seeds) {
             let ghost = Color::srgba(0.35, 0.85, 1.0, 0.7);
@@ -7769,6 +8155,23 @@ fn draw_sketch(
                         for w in poly.windows(2) {
                             gizmos.line(ap.to_world(xf.apply(w[0])), ap.to_world(xf.apply(w[1])), ghost);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Mirror preview: ghost reflection of the selection across the axis line ----
+    if session.tool == Tool::Mirror {
+        if let Some((axis, a, b)) = mirror_axis(&session) {
+            // Emphasise the axis line.
+            gizmos.line(ap.to_world(a), ap.to_world(b), Color::srgba(0.9, 0.45, 0.95, 0.9));
+            let ghost = Color::srgba(0.35, 0.85, 1.0, 0.7);
+            for e in mirror_seeds(&session, axis) {
+                for poly in entity_preview_polylines(&session.sketch, e) {
+                    for w in poly.windows(2) {
+                        let (ra, rb) = (reflect_across(w[0], a, b), reflect_across(w[1], a, b));
+                        gizmos.line(ap.to_world(ra), ap.to_world(rb), ghost);
                     }
                 }
             }

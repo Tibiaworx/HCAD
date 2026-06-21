@@ -61,6 +61,9 @@ pub enum FeatureKind {
     Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
     /// Chamfer: flat-bevel the picked `edges` (world-space polylines) by `distance`.
     Chamfer { distance: f64, edges: Vec<Vec<[f64; 3]>> },
+    /// Mirror: reflect the whole body across `plane` and union it with the original
+    /// (a symmetric part). The plane is recorded so it survives regeneration.
+    Mirror { plane: PlaneRef },
     // Revolve / … arrive at M8+.
 }
 
@@ -146,6 +149,7 @@ impl Document {
                 FeatureKind::Chamfer { distance, edges } => {
                     format!("[chamfer] Chamfer  d={distance:.2} ({})", edges.len())
                 }
+                FeatureKind::Mirror { .. } => "[mirror] Mirror".to_string(),
             })
             .collect()
     }
