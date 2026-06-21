@@ -24,7 +24,7 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
+    bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
     extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, round_mesh,
     tessellate, threaded_hole, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
@@ -6998,16 +6998,36 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                     });
                 }
             }
-            // Round the body's (picked, or all) edges by the fillet radius.
+            // Round the body's (picked, or all) edges by the fillet radius. We try the
+            // mesh-surgery bevel first (no CSG → clean corners); it self-checks watertightness
+            // and returns None on cases it can't resolve, so we fall back to the CSG round.
             FeatureKind::Fillet { radius, edges } => {
                 if let Some(b) = body.take() {
-                    body = Some(round_mesh(&b, *radius, edges).unwrap_or(b));
+                    let seg = ((*radius * 6.0).round() as usize).clamp(3, 12);
+                    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bevel_mesh_selected(&b, *radius, seg, edges)
+                    }))
+                    .ok()
+                    .flatten();
+                    body = Some(match beveled {
+                        Some(m) => m,
+                        None => round_mesh(&b, *radius, edges).unwrap_or(b),
+                    });
                 }
             }
-            // Flat-bevel the picked edges by the chamfer distance.
+            // Flat-bevel the picked (or all) edges by the chamfer distance — same engine with a
+            // single (flat) profile segment; CSG chamfer fallback.
             FeatureKind::Chamfer { distance, edges } => {
                 if let Some(b) = body.take() {
-                    body = Some(chamfer_mesh(&b, *distance, edges).unwrap_or(b));
+                    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bevel_mesh_selected(&b, *distance, 1, edges)
+                    }))
+                    .ok()
+                    .flatten();
+                    body = Some(match beveled {
+                        Some(m) => m,
+                        None => chamfer_mesh(&b, *distance, edges).unwrap_or(b),
+                    });
                 }
             }
             // Reflect the body across the plane and union it with the original.
@@ -7199,10 +7219,14 @@ fn fillet_preview(
         return;
     };
     let edges = ui_state.fillet_edges.clone();
-    let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| round_mesh(&base, r as f64, &edges)))
-        .ok()
-        .flatten()
-        .unwrap_or(base);
+    let seg = ((r * 6.0).round() as usize).clamp(3, 12);
+    let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Mesh bevel first (clean corners); CSG round on anything it can't resolve.
+        bevel_mesh_selected(&base, r as f64, seg, &edges).or_else(|| round_mesh(&base, r as f64, &edges))
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(base);
     let tess = mesh_tessellation(rounded);
     for e in &existing {
         commands.entity(e).despawn();
@@ -7248,10 +7272,13 @@ fn chamfer_preview(
         return;
     };
     let edges = ui_state.fillet_edges.clone();
-    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chamfer_mesh(&base, d as f64, &edges)))
-        .ok()
-        .flatten()
-        .unwrap_or(base);
+    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Mesh bevel with a flat (1-segment) profile first; CSG chamfer fallback.
+        bevel_mesh_selected(&base, d as f64, 1, &edges).or_else(|| chamfer_mesh(&base, d as f64, &edges))
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(base);
     let tess = mesh_tessellation(beveled);
     for e in &existing {
         commands.entity(e).despawn();

@@ -274,7 +274,10 @@ pub fn edge_setback(na: V3, nb: V3, r: f64) -> Option<f64> {
 /// `s` into the face interior, and consecutive offset lines are intersected to place the new
 /// corner. The result is the flat remnant of the face after bevelling; its boundary is where
 /// the edge cylinders and corner patches will attach. Returns one 3D point per loop vertex.
-pub fn inset_loops(topo: &Topo, fi: usize, r: f64) -> Vec<Vec<V3>> {
+///
+/// `selected[ei]` gates which model edges actually round — a non-selected boundary edge keeps a
+/// zero setback, so the face stays put there (the edge remains sharp).
+pub fn inset_loops(topo: &Topo, fi: usize, r: f64, selected: &[bool]) -> Vec<Vec<V3>> {
     let f = &topo.faces[fi];
     let n = f.normal;
     let mut out = Vec::with_capacity(f.loops.len());
@@ -291,6 +294,9 @@ pub fn inset_loops(topo: &Topo, fi: usize, r: f64) -> Vec<Vec<V3>> {
             setback[i] = topo
                 .edge_between(lp[i], lp[(i + 1) % m])
                 .and_then(|ei| {
+                    if !selected[ei] {
+                        return Some(0.0); // sharp edge: face doesn't move here
+                    }
                     let fs = &topo.edges[ei].faces;
                     let other = fs.iter().copied().find(|&g| g != fi)?;
                     edge_setback(n, topo.faces[other].normal, r)
@@ -551,20 +557,53 @@ fn edge_end_ring(topo: &Topo, e: &TopoEdge, vi: usize, cpt: &dyn Fn(usize, usize
     Some(pts)
 }
 
-/// Prototype bevel: round **every** edge of a solid by `r` with `seg` arc segments, by mesh
-/// surgery instead of CSG. Flat faces inset by the rolling-ball setback (keeping their original
-/// triangulation, so non-convex faces and holes are fine); each edge becomes a cylinder strip
-/// that bulges outward (convex) or fills inward (concave); each corner is a patch stitched to
-/// the incident edge rings. No booleans, so corners carry no facets/dimples. Returns `None` on
-/// a body this prototype can't resolve (a degenerate edge, or a corner whose ring won't close).
+/// Squared distance from point `p` to segment `a`–`b`.
+fn pt_seg_dist2(p: V3, a: V3, b: V3) -> f64 {
+    let ab = sub(b, a);
+    let l2 = dot(ab, ab);
+    let t = if l2 > 1e-18 { (dot(sub(p, a), ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    let q = add(a, scale(ab, t));
+    let d = sub(p, q);
+    dot(d, d)
+}
+
+/// Does model edge `e` lie on one of the world-space `picked` edge polylines? Matched by its
+/// midpoint sitting on a polyline segment (model edges are sub-segments of the picked edges).
+fn edge_is_picked(topo: &Topo, e: &TopoEdge, picked: &[Vec<[f64; 3]>]) -> bool {
+    let mid = scale(add(topo.verts[e.a], topo.verts[e.b]), 0.5);
+    let tol2 = 1.0e-4; // 0.01 units
+    picked.iter().any(|poly| {
+        poly.windows(2).any(|w| pt_seg_dist2(mid, w[0], w[1]) < tol2)
+    })
+}
+
+/// Round **every** edge of a solid (the all-edges prototype). See [`bevel_mesh_selected`].
 pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
+    bevel_mesh_selected(mesh, r, seg, &[])
+}
+
+/// Bevel a solid by `r` with `seg` arc segments via mesh surgery (no CSG). `picked` is the set
+/// of world-space edge polylines to round; an **empty** list rounds every edge. Non-selected
+/// edges stay sharp, so corners where rounded and sharp edges meet are stitched with an end-cap
+/// patch. Flat faces inset by the rolling-ball setback (keeping their triangulation, so
+/// non-convex faces and holes work); each rounded edge becomes a convex/concave cylinder strip;
+/// corners become fanned patches. `seg = 1` gives a flat (chamfer) profile. Returns `None` if a
+/// corner ring can't be resolved.
+pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     let topo = build_topo(mesh);
 
-    // corner(v, f): where face f's boundary insets to at vertex v (rolling-ball setback). The
-    // single source of truth for flat faces, edge strips and corner patches → guaranteed shared.
+    // Which model edges actually round.
+    let all = picked.is_empty();
+    let selected: Vec<bool> = topo.edges.iter().map(|e| all || edge_is_picked(&topo, e, picked)).collect();
+    if !selected.iter().any(|&s| s) {
+        return None; // nothing matched → let the caller fall back
+    }
+
+    // corner(v, f): where face f's boundary insets to at vertex v (rolling-ball setback, zero on
+    // sharp edges). Single source of truth for flat faces, edge strips and corner patches.
     let mut corner: HashMap<(usize, usize), V3> = HashMap::new();
     for fi in 0..topo.faces.len() {
-        let rings = inset_loops(&topo, fi, r);
+        let rings = inset_loops(&topo, fi, r, &selected);
         for (li, lp) in topo.faces[fi].loops.iter().enumerate() {
             for (k, &vi) in lp.iter().enumerate() {
                 corner.insert((vi, fi), rings[li][k]);
@@ -576,8 +615,7 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
 
     let mut b = Build::new();
 
-    // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset corner
-    //    (interior vertices, if any, stay put). Robust for non-convex faces and faces with holes.
+    // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset corner.
     for fi in 0..topo.faces.len() {
         for &ti in &topo.faces[fi].tris {
             let t = topo.tris[ti];
@@ -588,13 +626,19 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
         }
     }
 
-    // 2) Edge strips: connect the edge's end ring at v0 to its end ring at v1.
-    for e in &topo.edges {
+    // 2) Edge strips: only for selected edges. Connect the end ring at v0 to the end ring at v1.
+    for (ei, e) in topo.edges.iter().enumerate() {
+        if !selected[ei] {
+            continue;
+        }
         let r0 = match edge_end_ring(&topo, e, e.a, &cpt, r, seg) {
             Some(p) => p,
-            None => continue, // flat edge: nothing to round
+            None => continue,
         };
-        let r1 = edge_end_ring(&topo, e, e.b, &cpt, r, seg)?;
+        let r1 = match edge_end_ring(&topo, e, e.b, &cpt, r, seg) {
+            Some(p) => p,
+            None => continue,
+        };
         let mut prev: Option<(usize, usize)> = None;
         for j in 0..=seg {
             let p0 = b.v(r0[j]);
@@ -607,21 +651,31 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
         }
     }
 
-    // 3) Corner patches: chain the incident edge rings into one boundary loop around v, fan it.
+    // 3) Corner patches: at any vertex touching ≥1 selected edge, chain ALL incident edges into
+    //    one boundary loop and fan it. A selected edge contributes its rounded arc; a sharp edge
+    //    contributes its two face corners joined through the original vertex (the end-cap).
     for vi in 0..topo.verts.len() {
         let inc = &topo.vert_edges[vi];
-        if inc.len() < 3 {
-            continue; // mid-edge or boundary vertex: the abutting strips already share the ring
+        if !inc.iter().any(|&ei| selected[ei]) {
+            continue; // wholly sharp vertex: untouched
         }
-        // Each incident bevelled edge gives an arc from its face-A corner to its face-B corner.
         let mut arcs: Vec<(usize, usize, Vec<V3>)> = Vec::new();
         for &ei in inc {
             let e = &topo.edges[ei];
-            if let Some(pts) = edge_end_ring(&topo, e, vi, &cpt, r, seg) {
-                arcs.push((e.faces[0], e.faces[1], pts));
-            }
+            let pts = if selected[ei] {
+                match edge_end_ring(&topo, e, vi, &cpt, r, seg) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            } else {
+                // Sharp edge: just its two face corners. Where the neighbouring rounded edges
+                // pulled both faces to the same point (a rim corner), these coincide and dedup
+                // away; where they differ (an isolated edge) the patch can't close and we bail.
+                vec![cpt(vi, e.faces[0]), cpt(vi, e.faces[1])]
+            };
+            arcs.push((e.faces[0], e.faces[1], pts));
         }
-        if arcs.len() < 3 {
+        if arcs.len() < 2 {
             continue;
         }
         // Walk arcs face-to-face to build the closed boundary ring of points.
@@ -631,7 +685,6 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
         let mut boundary: Vec<V3> = Vec::new();
         let mut ok = true;
         for _ in 0..arcs.len() {
-            // Find an unused arc touching cur_face.
             let found = arcs.iter().enumerate().position(|(i, (f0, f1, _))| !used[i] && (*f0 == cur_face || *f1 == cur_face));
             let ai = match found {
                 Some(ai) => ai,
@@ -642,23 +695,28 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
             };
             used[ai] = true;
             let (f0, f1, pts) = &arcs[ai];
-            // Orient the arc to start at cur_face.
             let (oriented, next_face): (Vec<V3>, usize) = if *f0 == cur_face {
                 (pts.clone(), *f1)
             } else {
                 (pts.iter().rev().cloned().collect(), *f0)
             };
-            // Append, skipping the shared first point (== boundary's last).
             let skip = if boundary.is_empty() { 0 } else { 1 };
             boundary.extend(oriented.into_iter().skip(skip));
             cur_face = next_face;
         }
-        if !ok || cur_face != start_face || boundary.len() < 3 {
+        if !ok || cur_face != start_face {
             continue;
         }
-        // Drop the closing duplicate (last == first), then fan from the centroid.
-        boundary.pop();
+        boundary.pop(); // closing duplicate
+        // Collapse consecutive duplicates (e.g. the shared original vertex from several sharp edges).
+        boundary.dedup_by(|a, b| dot(sub(*a, *b), sub(*a, *b)) < 1e-14);
+        if boundary.len() > 1 && dot(sub(boundary[0], boundary[boundary.len() - 1]), sub(boundary[0], boundary[boundary.len() - 1])) < 1e-14 {
+            boundary.pop();
+        }
         let n = boundary.len();
+        if n < 3 {
+            continue;
+        }
         let mut cen = [0.0; 3];
         for p in &boundary {
             cen = add(cen, *p);
@@ -670,7 +728,34 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
         }
     }
 
-    Some(b.finish())
+    let out = b.finish();
+    // Partial-bevel corners can leave a T-junction the prototype can't yet split (an isolated
+    // edge whose neighbour face doesn't move). Rather than emit a cracked mesh, self-check and
+    // bail so the caller falls back to CSG (which handles those simple cases fine).
+    if is_closed(&out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Every welded edge shared by exactly two triangles (closed, 2-manifold).
+fn is_closed(m: &TriMesh) -> bool {
+    let key = |i: u32| {
+        let p = m.positions[i as usize];
+        ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64)
+    };
+    let mut id: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut next = 0usize;
+    let mut vid = |i: u32| *id.entry(key(i)).or_insert_with(|| { next += 1; next - 1 });
+    let mut edges: HashMap<(usize, usize), i32> = HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        let v = [vid(t[0]), vid(t[1]), vid(t[2])];
+        for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+            *edges.entry(if a < b { (a, b) } else { (b, a) }).or_insert(0) += 1;
+        }
+    }
+    !edges.is_empty() && edges.values().all(|&c| c == 2)
 }
 
 #[cfg(test)]
@@ -771,6 +856,40 @@ mod tests {
     }
 
     #[test]
+    fn bevel_one_box_edge_closes_or_falls_back() {
+        // An isolated edge with sharp neighbours is the hard partial-vertex (T-junction) case.
+        // The engine must NOT emit a cracked mesh: either it closes, or it returns None so the
+        // caller can fall back to CSG (which handles a lone edge fine).
+        let sq = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        let cube = extrude_tool_mesh(&sq, &[], &xy(), 0.0, 4.0).unwrap();
+        let picked = vec![vec![[0.0, 0.0, 4.0], [4.0, 0.0, 4.0]]];
+        if let Some(m) = bevel_mesh_selected(&cube, 0.5, 4, &picked) {
+            assert!(is_watertight(&m), "if it returns a mesh, it must be closed");
+        }
+    }
+
+    #[test]
+    fn bevel_pocket_rim_loop_selective_is_watertight() {
+        // The realistic selective case: round just the rim loop of a blind pocket. Each rim
+        // corner is 2 rounded edges + 1 sharp vertical edge whose two walls move together, so
+        // there's no T-junction and the engine should close it.
+        let outer = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let block = extrude_tool_mesh(&outer, &[], &xy(), 0.0, 5.0).unwrap();
+        let pk = [[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]];
+        let tool = extrude_tool_mesh(&pk, &[], &xy(), 3.0, 5.0).unwrap();
+        let body = crate::mesh_difference(&block, &tool);
+        // The four rim edges at z=5 around the pocket opening.
+        let rim = vec![
+            vec![[3.0, 3.0, 5.0], [7.0, 3.0, 5.0]],
+            vec![[7.0, 3.0, 5.0], [7.0, 7.0, 5.0]],
+            vec![[7.0, 7.0, 5.0], [3.0, 7.0, 5.0]],
+            vec![[3.0, 7.0, 5.0], [3.0, 3.0, 5.0]],
+        ];
+        let rounded = bevel_mesh_selected(&body, 0.3, 3, &rim).expect("rim loop bevels");
+        assert!(is_watertight(&rounded), "selective rim-loop bevel must be closed");
+    }
+
+    #[test]
     fn bevel_csg_pocket_is_watertight() {
         // A real CSG body: a block with a blind rectangular pocket. Its rim corners are mixed
         // (2 convex + 1 concave) and its edges are subdivided by triangulation — the actual case
@@ -778,8 +897,8 @@ mod tests {
         let outer = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         let block = extrude_tool_mesh(&outer, &[], &xy(), 0.0, 5.0).unwrap();
         let pocket = [[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]];
-        let top = PlaneBasis { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
-        let tool = extrude_tool_mesh(&pocket, &[], &top, 0.0, 2.0).unwrap();
+        // Tool fills the pocket volume z∈[3,5] so the difference cuts a real blind pocket.
+        let tool = extrude_tool_mesh(&pocket, &[], &xy(), 3.0, 5.0).unwrap();
         let body = crate::mesh_difference(&block, &tool);
         let rounded = bevel_mesh(&body, 0.3, 3).expect("pocket bevels");
         assert!(is_watertight(&rounded), "bevelled CSG pocket must be a closed surface");
@@ -791,9 +910,10 @@ mod tests {
         let cube = extrude_tool_mesh(&sq, &[], &xy(), 0.0, 4.0).unwrap();
         let topo = build_topo(&cube);
         let r = 0.5;
+        let sel = vec![true; topo.edges.len()];
         // Every face is a [0,4]² square at 90° edges → its inset is the [0.5,3.5]² square.
         for fi in 0..topo.faces.len() {
-            let rings = inset_loops(&topo, fi, r);
+            let rings = inset_loops(&topo, fi, r, &sel);
             assert_eq!(rings.len(), 1);
             let ring = &rings[0];
             assert_eq!(ring.len(), 4);
