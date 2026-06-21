@@ -131,11 +131,14 @@ impl Uf {
 /// Rebuild the flat-face topology of a (watertight, flat-shaded) triangle mesh.
 pub fn build_topo(mesh: &TriMesh) -> Topo {
     let (verts, remap) = weld(mesh);
-    let tris: Vec<[usize; 3]> = mesh
+    let mut tris: Vec<[usize; 3]> = mesh
         .indices
         .chunks_exact(3)
         .map(|t| [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]])
+        .filter(|t| t[0] != t[1] && t[1] != t[2] && t[2] != t[0])
         .collect();
+    // Guarantee outward, consistent winding so face normals point out — `edge_sign` relies on it.
+    orient_consistently(&verts, &mut tris);
 
     // Per-triangle normal.
     let tnorm: Vec<V3> = tris
@@ -466,52 +469,133 @@ fn orient_consistently(verts: &[V3], tris: &mut [[usize; 3]]) {
     }
 }
 
-/// Prototype bevel: round **every** edge of a convex, 3-valent-cornered solid (e.g. a box) by
-/// `r`, with `seg` arc segments — flat faces inset, edges become cylinder strips, and corners
-/// become analytic spherical patches. No CSG, so the corners carry no facets. Returns `None`
-/// if the body has a corner this prototype can't yet handle (≠3 faces, or concave).
+/// Direction a model edge is traversed within face `fi`'s CCW boundary loop (so the face
+/// interior is on its left). `None` if the edge isn't on that face's boundary.
+fn loop_dir(topo: &Topo, fi: usize, a: usize, b: usize) -> Option<V3> {
+    for lp in &topo.faces[fi].loops {
+        let m = lp.len();
+        for i in 0..m {
+            let (x, y) = (lp[i], lp[(i + 1) % m]);
+            if (x, y) == (a, b) || (x, y) == (b, a) {
+                return Some(norm(sub(topo.verts[y], topo.verts[x])));
+            }
+        }
+    }
+    None
+}
+
+/// Convexity of a model edge: `-1` convex (a round bulges outward), `+1` concave (a round fills
+/// an inside corner), `0` flat/degenerate. Decided locally: walking the edge with face A's
+/// interior on the left, the edge is convex when face B folds *away* from that interior.
+pub fn edge_sign(topo: &Topo, e: &TopoEdge) -> i32 {
+    let (fa, fb) = (e.faces[0], e.faces[1]);
+    let na = topo.faces[fa].normal;
+    let nb = topo.faces[fb].normal;
+    let t = match loop_dir(topo, fa, e.a, e.b) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let inward = cross(na, t); // into face A
+    let d = dot(inward, nb);
+    if d < -1e-9 {
+        -1
+    } else if d > 1e-9 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The arc where edge `e`'s rolling-ball surface terminates at vertex `vi` — `seg+1` points
+/// from the face-A corner to the face-B corner, lying on the edge's fillet cylinder. Both the
+/// edge strip and the corner patch call this, so their shared boundary is bit-identical and
+/// welds without cracks. `None` if the edge is flat/degenerate at this vertex.
+fn edge_end_ring(topo: &Topo, e: &TopoEdge, vi: usize, cpt: &dyn Fn(usize, usize) -> V3, r: f64, seg: usize) -> Option<Vec<V3>> {
+    let (fa, fb) = (e.faces[0], e.faces[1]);
+    let (na, nb) = (topo.faces[fa].normal, topo.faces[fb].normal);
+    let sigma = edge_sign(topo, e) as f64;
+    if sigma == 0.0 {
+        return None;
+    }
+    let t = norm(sub(topo.verts[e.b], topo.verts[e.a]));
+    // Axis line of the fillet cylinder: at signed distance σ·r from both faces, parallel to t.
+    let off = solve3(na, nb, t, [sigma * r, sigma * r, 0.0])?;
+    let o = add(topo.verts[e.a], off);
+    // Radial direction + along-axis coordinate of each face's corner point at this vertex.
+    let radial = |p: V3| -> (V3, f64) {
+        let along = dot(sub(p, o), t);
+        let rp = sub(sub(p, o), scale(t, along));
+        (norm(rp), along)
+    };
+    let (ca, cb) = (cpt(vi, fa), cpt(vi, fb));
+    let (da, aa) = radial(ca);
+    let (db, ab) = radial(cb);
+    let mut pts = Vec::with_capacity(seg + 1);
+    for j in 0..=seg {
+        // Pin the two ends to the exact corner points so the flat-face seam can't crack; only
+        // interior arc points come from the cylinder formula (cylinder & patch share these).
+        if j == 0 {
+            pts.push(ca);
+        } else if j == seg {
+            pts.push(cb);
+        } else {
+            let p = j as f64 / seg as f64;
+            let along = aa + (ab - aa) * p;
+            let d = slerp(da, db, p);
+            pts.push(add(add(o, scale(t, along)), scale(d, r)));
+        }
+    }
+    Some(pts)
+}
+
+/// Prototype bevel: round **every** edge of a solid by `r` with `seg` arc segments, by mesh
+/// surgery instead of CSG. Flat faces inset by the rolling-ball setback (keeping their original
+/// triangulation, so non-convex faces and holes are fine); each edge becomes a cylinder strip
+/// that bulges outward (convex) or fills inward (concave); each corner is a patch stitched to
+/// the incident edge rings. No booleans, so corners carry no facets/dimples. Returns `None` on
+/// a body this prototype can't resolve (a degenerate edge, or a corner whose ring won't close).
 pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
     let topo = build_topo(mesh);
 
-    // Corner sphere centre per vertex (requires exactly 3 convex faces).
-    let mut centre = vec![None; topo.verts.len()];
-    for vi in 0..topo.verts.len() {
-        let fs = &topo.vert_faces[vi];
-        if fs.len() != 3 {
-            return None;
+    // corner(v, f): where face f's boundary insets to at vertex v (rolling-ball setback). The
+    // single source of truth for flat faces, edge strips and corner patches → guaranteed shared.
+    let mut corner: HashMap<(usize, usize), V3> = HashMap::new();
+    for fi in 0..topo.faces.len() {
+        let rings = inset_loops(&topo, fi, r);
+        for (li, lp) in topo.faces[fi].loops.iter().enumerate() {
+            for (k, &vi) in lp.iter().enumerate() {
+                corner.insert((vi, fi), rings[li][k]);
+            }
         }
-        let (na, nb, nc) = (topo.faces[fs[0]].normal, topo.faces[fs[1]].normal, topo.faces[fs[2]].normal);
-        centre[vi] = Some(corner_centre(topo.verts[vi], na, nb, nc, r)?);
     }
-
-    // corner(v, f) = the inset corner of face f at vertex v = sphere centre projected onto f.
-    let corner = |vi: usize, fi: usize| -> V3 {
-        let c = centre[vi].unwrap();
-        add(c, scale(topo.faces[fi].normal, r))
-    };
+    let verts = &topo.verts;
+    let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
 
     let mut b = Build::new();
 
-    // 1) Flat faces: the inset ring (corner points), fan-triangulated.
+    // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset corner
+    //    (interior vertices, if any, stay put). Robust for non-convex faces and faces with holes.
     for fi in 0..topo.faces.len() {
-        for lp in &topo.faces[fi].loops {
-            let ring: Vec<usize> = lp.iter().map(|&vi| b.v(corner(vi, fi))).collect();
-            b.fan(&ring);
+        for &ti in &topo.faces[fi].tris {
+            let t = topo.tris[ti];
+            let a = b.v(cpt(t[0], fi));
+            let c = b.v(cpt(t[1], fi));
+            let d = b.v(cpt(t[2], fi));
+            b.tri(a, c, d);
         }
     }
 
-    // 2) Edge cylinder strips: lengthwise c[v0]->c[v1], arc slerp(nA, nB) over `seg`.
+    // 2) Edge strips: connect the edge's end ring at v0 to its end ring at v1.
     for e in &topo.edges {
-        let (fa, fb) = (e.faces[0], e.faces[1]);
-        let (na, nb) = (topo.faces[fa].normal, topo.faces[fb].normal);
-        let (c0, c1) = (centre[e.a].unwrap(), centre[e.b].unwrap());
-        // Arc must sweep the *outward* way (start nA, end nB); slerp handles the short arc.
+        let r0 = match edge_end_ring(&topo, e, e.a, &cpt, r, seg) {
+            Some(p) => p,
+            None => continue, // flat edge: nothing to round
+        };
+        let r1 = edge_end_ring(&topo, e, e.b, &cpt, r, seg)?;
         let mut prev: Option<(usize, usize)> = None;
         for j in 0..=seg {
-            let t = j as f64 / seg as f64;
-            let d = slerp(na, nb, t);
-            let p0 = b.v(add(c0, scale(d, r)));
-            let p1 = b.v(add(c1, scale(d, r)));
+            let p0 = b.v(r0[j]);
+            let p1 = b.v(r1[j]);
             if let Some((q0, q1)) = prev {
                 b.tri(q0, p0, p1);
                 b.tri(q0, p1, q1);
@@ -520,45 +604,66 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
         }
     }
 
-    // 3) Corner sphere patches: double-slerp spherical triangle over the 3 face normals.
+    // 3) Corner patches: chain the incident edge rings into one boundary loop around v, fan it.
     for vi in 0..topo.verts.len() {
-        let c = centre[vi].unwrap();
-        let fs = &topo.vert_faces[vi];
-        let (na, nb, nc) = (topo.faces[fs[0]].normal, topo.faces[fs[1]].normal, topo.faces[fs[2]].normal);
-        // Grid: row i slerps na->nb and na->nc; columns slerp between those.
-        let mut rows: Vec<Vec<usize>> = Vec::with_capacity(seg + 1);
-        for i in 0..=seg {
-            let ti = i as f64 / seg as f64;
-            let pb = slerp(na, nb, ti);
-            let pc = slerp(na, nc, ti);
-            let cols = i.max(1);
-            let mut row = Vec::with_capacity(cols + 1);
-            for k in 0..=cols {
-                let tk = if i == 0 { 0.0 } else { k as f64 / cols as f64 };
-                let d = if i == 0 { na } else { slerp(pb, pc, tk) };
-                row.push(b.v(add(c, scale(d, r))));
-            }
-            rows.push(row);
+        let inc = &topo.vert_edges[vi];
+        if inc.len() < 3 {
+            continue; // mid-edge or boundary vertex: the abutting strips already share the ring
         }
-        // Stitch successive rows (row i has i+1 pts after row 0; row 0 is the apex).
-        for i in 1..=seg {
-            let (lo, hi) = (&rows[i - 1], &rows[i]);
-            // lo has `max(i-1,1)+1` pts, hi has `i+1` pts — stitch as a triangle strip.
-            let (mut a, mut bb) = (0usize, 0usize);
-            while a + 1 < lo.len() || bb + 1 < hi.len() {
-                if a + 1 >= lo.len() {
-                    b.tri(lo[a], hi[bb], hi[bb + 1]);
-                    bb += 1;
-                } else if bb + 1 >= hi.len() {
-                    b.tri(lo[a], hi[bb], lo[a + 1]);
-                    a += 1;
-                } else {
-                    b.tri(lo[a], hi[bb], hi[bb + 1]);
-                    b.tri(lo[a], hi[bb + 1], lo[a + 1]);
-                    a += 1;
-                    bb += 1;
-                }
+        // Each incident bevelled edge gives an arc from its face-A corner to its face-B corner.
+        let mut arcs: Vec<(usize, usize, Vec<V3>)> = Vec::new();
+        for &ei in inc {
+            let e = &topo.edges[ei];
+            if let Some(pts) = edge_end_ring(&topo, e, vi, &cpt, r, seg) {
+                arcs.push((e.faces[0], e.faces[1], pts));
             }
+        }
+        if arcs.len() < 3 {
+            continue;
+        }
+        // Walk arcs face-to-face to build the closed boundary ring of points.
+        let mut used = vec![false; arcs.len()];
+        let start_face = arcs[0].0;
+        let mut cur_face = arcs[0].0;
+        let mut boundary: Vec<V3> = Vec::new();
+        let mut ok = true;
+        for _ in 0..arcs.len() {
+            // Find an unused arc touching cur_face.
+            let found = arcs.iter().enumerate().position(|(i, (f0, f1, _))| !used[i] && (*f0 == cur_face || *f1 == cur_face));
+            let ai = match found {
+                Some(ai) => ai,
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            used[ai] = true;
+            let (f0, f1, pts) = &arcs[ai];
+            // Orient the arc to start at cur_face.
+            let (oriented, next_face): (Vec<V3>, usize) = if *f0 == cur_face {
+                (pts.clone(), *f1)
+            } else {
+                (pts.iter().rev().cloned().collect(), *f0)
+            };
+            // Append, skipping the shared first point (== boundary's last).
+            let skip = if boundary.is_empty() { 0 } else { 1 };
+            boundary.extend(oriented.into_iter().skip(skip));
+            cur_face = next_face;
+        }
+        if !ok || cur_face != start_face || boundary.len() < 3 {
+            continue;
+        }
+        // Drop the closing duplicate (last == first), then fan from the centroid.
+        boundary.pop();
+        let n = boundary.len();
+        let mut cen = [0.0; 3];
+        for p in &boundary {
+            cen = add(cen, *p);
+        }
+        let apex = b.v(scale(cen, 1.0 / n as f64));
+        let ring: Vec<usize> = boundary.iter().map(|&p| b.v(p)).collect();
+        for i in 0..n {
+            b.tri(ring[i], ring[(i + 1) % n], apex);
         }
     }
 
@@ -646,6 +751,20 @@ mod tests {
                 .fold(f64::INFINITY, f64::min);
             assert!(min_d > 0.2, "corner {corner:?} should be rounded away (min dist {min_d})");
         }
+    }
+
+    #[test]
+    fn bevel_l_prism_with_concave_edge_is_watertight() {
+        // An L-shaped prism: the reflex corner (2,2) gives one concave vertical edge whose two
+        // ends are mixed corners (1 concave + 2 convex) — the same difficulty as a pocket rim.
+        let l = [[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [2.0, 2.0], [2.0, 4.0], [0.0, 4.0]];
+        let prism = extrude_tool_mesh(&l, &[], &xy(), 0.0, 3.0).unwrap();
+        let topo = build_topo(&prism);
+        // The vertical edge at the reflex corner must be detected concave; the rest convex.
+        let concave = topo.edges.iter().filter(|e| edge_sign(&topo, e) > 0).count();
+        assert_eq!(concave, 1, "L-prism has exactly one concave (vertical) edge");
+        let rounded = bevel_mesh(&prism, 0.4, 4).expect("L-prism bevels");
+        assert!(is_watertight(&rounded), "bevelled L-prism must be a closed surface");
     }
 
     #[test]
