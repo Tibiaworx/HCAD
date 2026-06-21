@@ -24,9 +24,9 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap, extrude_tool_mesh,
-    mesh_difference, mesh_tessellation, mesh_union, round_mesh, tessellate, union_tol, KSolid,
-    PlaneBasis, Tessellation, TriMesh,
+    chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
+    extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, round_mesh, tessellate,
+    union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -54,6 +54,8 @@ mod text;
 const EXTRUDE_DISTANCE: f64 = 2.0;
 const PLANE_SIZE: f32 = 8.0;
 const SNAP: f32 = 0.18;
+/// Max entities held in the Select-tool selection (enough for an Equal across many lines).
+const MAX_SEL: usize = 32;
 /// How long (seconds) an edge's key points flash after it's selected.
 const FLASH_SECS: f32 = 1.2;
 /// Two adjacent edge segments merge into one chain while the turn between them
@@ -127,26 +129,32 @@ fn main() {
         .add_systems(
             Update,
             (
-                sketch_interaction,
-                handle_keys,
-                history_keys,
-                apply_history,
-                handle_file_io,
-                handle_edit_sketch,
-                handle_exit_sketch,
-                do_solid_op,
-                apply_fillet,
-                do_regenerate,
-                fillet_preview,
-                handle_new_part,
-                highlight_face,
-                update_plane_visibility,
-                orbit_camera,
-                draw_world_axes,
-                draw_body_edges,
-                draw_sketch,
-                tick_edge_flash,
-                draw_edge_selection,
+                (
+                    sketch_interaction,
+                    handle_keys,
+                    history_keys,
+                    apply_history,
+                    handle_file_io,
+                    handle_edit_sketch,
+                    handle_exit_sketch,
+                    do_solid_op,
+                    apply_fillet,
+                    apply_chamfer,
+                    do_regenerate,
+                    fillet_preview,
+                    chamfer_preview,
+                ),
+                (
+                    handle_new_part,
+                    highlight_face,
+                    update_plane_visibility,
+                    orbit_camera,
+                    draw_world_axes,
+                    draw_body_edges,
+                    draw_sketch,
+                    tick_edge_flash,
+                    draw_edge_selection,
+                ),
             ),
         )
         .run();
@@ -320,8 +328,12 @@ struct UiState {
     /// A confirmed fillet to append to the timeline; consumed by `apply_fillet`.
     fillet_request: Option<f64>,
     /// While the Fillet PM is open, the edges (world-space polylines) the user has picked
-    /// to round. Empty = round every edge.
+    /// to round. Empty = round every edge. (Shared by the chamfer tool too.)
     fillet_edges: Vec<Vec<[f64; 3]>>,
+    /// Chamfer tool: the bevel distance the PM is configuring (mirrors the fillet state).
+    pending_chamfer: Option<f32>,
+    chamfer_shown: Option<f32>,
+    chamfer_request: Option<f64>,
 }
 
 /// CommandManager tabs (SolidWorks-style), to declutter the toolbar.
@@ -416,6 +428,26 @@ struct SketchSession {
     /// Line-tool variant: when set, a line grows symmetrically from its first click
     /// (the click is the midpoint), with a Midpoint relation pinning the centre.
     line_midpoint: bool,
+    /// The most recently drawn construction *centre line* as `[a, mid, b]` point indices.
+    /// Its PropertyManager edits the two half-lengths and can equalise them. `mid` is the
+    /// pivot; the endpoints slide along the line's direction when a length changes, and
+    /// dragging `mid` with the Select tool translates the whole line.
+    center_line: Option<[usize; 3]>,
+    /// The last half-length the user typed for the centre line — "Make sides equal" sets
+    /// both halves to this number (rather than averaging).
+    center_line_len: Option<f32>,
+    /// An open on-canvas centre-line length editor: `(endpoint index, edit buffer)`.
+    center_line_edit: Option<(usize, f32)>,
+    /// A dimension (constraint index) selected on the canvas — highlighted, and removable
+    /// with Delete / the red ✕ in the panel.
+    selected_dim: Option<usize>,
+    /// Per-operation undo/redo *within* the sketch (so Ctrl+Z reverts the last line /
+    /// dimension / drag, not the whole sketch feature). `undo_baseline` holds the last
+    /// recorded stable state; `undo_fp` its fingerprint, so a change is detected cheaply.
+    undo_sketch: Vec<Sketch>,
+    redo_sketch: Vec<Sketch>,
+    undo_baseline: Option<Sketch>,
+    undo_fp: u64,
     /// Circle-tool variant: when set, the first click anchors a point on the rim and the
     /// circle grows to the cursor (the two clicks are opposite ends of a diameter).
     circle_perimeter: bool,
@@ -790,6 +822,73 @@ fn ui_system(
         ui_state.was_sketching = in_sketch;
     }
 
+    // ---- Menu bar (File / Edit / View / Insert / Tools) ----
+    // Placeholder menus for now; the entries are stubs wired to real actions where one
+    // already exists (New/Open/Save/Undo/Redo) and left inert otherwise so they can be
+    // populated later.
+    egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("New Part").clicked() {
+                    ui_state.new_part = true;
+                    ui.close();
+                }
+                if ui.button("Open…").clicked() {
+                    ui_state.open_request = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Save").clicked() {
+                    ui_state.save_request = true;
+                    ui.close();
+                }
+                let _ = ui.button("Save As…"); // TODO: distinct Save-As path
+                ui.separator();
+                let _ = ui.button("Exit"); // TODO: graceful shutdown
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).clicked() {
+                    ui_state.undo_request = true;
+                    ui.close();
+                }
+                if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).clicked() {
+                    ui_state.redo_request = true;
+                    ui.close();
+                }
+                ui.separator();
+                let _ = ui.button("Cut"); // TODO
+                let _ = ui.button("Copy"); // TODO
+                let _ = ui.button("Paste"); // TODO
+                let _ = ui.button("Delete"); // TODO
+            });
+            ui.menu_button("View", |ui| {
+                ui.checkbox(&mut ui_state.show_tangent_edges, "Tangent edges");
+                ui.checkbox(&mut ui_state.seamless, "Seamless");
+                ui.separator();
+                let _ = ui.button("Zoom to Fit"); // TODO
+                let _ = ui.button("Isometric"); // TODO
+                let _ = ui.button("Front"); // TODO
+                let _ = ui.button("Top"); // TODO
+                let _ = ui.button("Right"); // TODO
+            });
+            ui.menu_button("Insert", |ui| {
+                let _ = ui.button("Sketch"); // TODO: start a sketch
+                let _ = ui.button("Boss Extrude…"); // TODO
+                let _ = ui.button("Cut Extrude…"); // TODO
+                ui.separator();
+                let _ = ui.button("Fillet…"); // TODO
+                let _ = ui.button("Chamfer…"); // TODO
+                let _ = ui.button("Reference Plane…"); // TODO
+            });
+            ui.menu_button("Tools", |ui| {
+                let _ = ui.button("Measure…"); // TODO
+                let _ = ui.button("Mass Properties…"); // TODO
+                ui.separator();
+                let _ = ui.button("Options…"); // TODO
+            });
+        });
+    });
+
     // ---- Top toolbar (CommandManager) ----
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
         // Row 1: global actions + view controls.
@@ -886,9 +985,10 @@ fn ui_system(
                             session.tool = Tool::Line;
                             session.pending = None;
                         }
-                        let is_mid = session.line_midpoint;
-                        let is_con = session.construction && !is_mid;
-                        let is_plain = !session.construction && !is_mid;
+                        let is_ccl = session.construction && session.line_midpoint;
+                        let is_mid = session.line_midpoint && !session.construction;
+                        let is_con = session.construction && !session.line_midpoint;
+                        let is_plain = !session.construction && !session.line_midpoint;
                         egui::Popup::menu(&dropdown_arrow(ui, "Line variants")).show(|ui| {
                             if ui.selectable_label(line_on && is_plain, "Line").clicked() {
                                 session.tool = Tool::Line;
@@ -913,6 +1013,16 @@ fn ui_system(
                             {
                                 session.tool = Tool::Line;
                                 session.construction = false;
+                                session.line_midpoint = true;
+                                session.pending = None;
+                            }
+                            if ui
+                                .selectable_label(line_on && is_ccl, "Construction Center Line")
+                                .on_hover_text("A construction centre line — click the centre, then an end. Edit each half-length in the panel.")
+                                .clicked()
+                            {
+                                session.tool = Tool::Line;
+                                session.construction = true;
                                 session.line_midpoint = true;
                                 session.pending = None;
                             }
@@ -1107,16 +1217,26 @@ fn ui_system(
                         ui.label(egui::RichText::new("Select a sketch or draw a closed profile.").italics().weak());
                     }
                     ui.add_enabled_ui(part.mesh.is_some() && !in_sketch, |ui| {
+                        // Seed the edge set from a pre-selected edge (click an edge, then the tool).
+                        let seed = |ui_state: &mut UiState| {
+                            ui_state.fillet_edges.clear();
+                            if edge_sel.chain.len() >= 2 {
+                                ui_state.fillet_edges.push(
+                                    edge_sel.chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect(),
+                                );
+                            }
+                        };
                         if ui.button("Fillet").on_hover_text("Round picked edges by a radius — click edges on the body").clicked() {
                             ui_state.pending_fillet = Some(0.2);
                             ui_state.fillet_shown = None;
-                            ui_state.fillet_edges.clear();
-                            // Seed from a pre-selected edge, if any (click an edge, then Fillet).
-                            if edge_sel.chain.len() >= 2 {
-                                let poly: Vec<[f64; 3]> =
-                                    edge_sel.chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
-                                ui_state.fillet_edges.push(poly);
-                            }
+                            ui_state.pending_chamfer = None;
+                            seed(&mut ui_state);
+                        }
+                        if ui.button("Chamfer").on_hover_text("Flat-bevel picked edges by a distance — click edges on the body").clicked() {
+                            ui_state.pending_chamfer = Some(0.2);
+                            ui_state.chamfer_shown = None;
+                            ui_state.pending_fillet = None;
+                            seed(&mut ui_state);
                         }
                     });
                 }
@@ -1150,6 +1270,86 @@ fn ui_system(
                     .weak()
                     .small(),
             );
+            ui.separator();
+        }
+        // Construction centre-line parameters: the two half-lengths + an equalise button.
+        if session.tool == Tool::Line
+            && session.construction
+            && session.line_midpoint
+            && session.plane.is_some()
+        {
+            ui.heading("Centre Line");
+            ui.separator();
+            // Drop a stale reference if the line was removed (e.g. new sketch / undo).
+            if let Some([a, mid, b]) = session.center_line {
+                let n = session.sketch.points.len();
+                if a >= n || mid >= n || b >= n {
+                    session.center_line = None;
+                }
+            }
+            match session.center_line {
+                None => {
+                    ui.label(
+                        egui::RichText::new("Click the centre, then an end point. Each half-length\nappears here to edit; this line is construction geometry.")
+                            .weak()
+                            .small(),
+                    );
+                }
+                Some([a, mid, b]) => {
+                    let p = |i: usize| Vec2::new(session.sketch.points[i].x as f32, session.sketch.points[i].y as f32);
+                    let (pm, pa, pb) = (p(mid), p(a), p(b));
+                    let mut la = (pa - pm).length();
+                    let mut lb = (pb - pm).length();
+                    // Move an endpoint to a new half-length, sliding along its current
+                    // direction from the (fixed) centre. Falls back to +X if degenerate.
+                    let mut set_len = |sk: &mut Sketch, end: usize, len: f32| {
+                        let m = Vec2::new(sk.points[mid].x as f32, sk.points[mid].y as f32);
+                        let e = Vec2::new(sk.points[end].x as f32, sk.points[end].y as f32);
+                        let dir = (e - m).normalize_or_zero();
+                        let dir = if dir == Vec2::ZERO { Vec2::X } else { dir };
+                        let np = m + dir * len.max(0.001);
+                        sk.points[end].x = np.x as f64;
+                        sk.points[end].y = np.y as f64;
+                    };
+                    let mut changed = false;
+                    let mut entered: Option<f32> = None;
+                    ui.horizontal(|ui| {
+                        ui.label("Side A");
+                        if ui.add(egui::DragValue::new(&mut la).speed(0.05).range(0.001..=10_000.0).suffix(" mm")).changed() {
+                            set_len(&mut session.sketch, a, la);
+                            entered = Some(la);
+                            changed = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Side B");
+                        if ui.add(egui::DragValue::new(&mut lb).speed(0.05).range(0.001..=10_000.0).suffix(" mm")).changed() {
+                            set_len(&mut session.sketch, b, lb);
+                            entered = Some(lb);
+                            changed = true;
+                        }
+                    });
+                    if let Some(v) = entered {
+                        session.center_line_len = Some(v);
+                    }
+                    if ui
+                        .button("Make sides equal")
+                        .on_hover_text("Set both halves to the length you last entered (or their average)")
+                        .clicked()
+                    {
+                        // Use the number the user last typed; fall back to the average.
+                        let target = session.center_line_len.unwrap_or((la + lb) * 0.5);
+                        set_len(&mut session.sketch, a, target);
+                        set_len(&mut session.sketch, b, target);
+                        session.center_line_len = Some(target);
+                        changed = true;
+                    }
+                    if changed {
+                        session.dirty = true;
+                        session.needs_apply = true;
+                    }
+                }
+            }
             ui.separator();
         }
         // Text-tool parameters (also edit the selected text entity live).
@@ -1371,6 +1571,79 @@ fn ui_system(
                 ui_state.pending_fillet = Some(r.max(0.01));
             }
         }
+        // Chamfer PropertyManager: a single bevel distance + the same edge list.
+        if let Some(mut d) = ui_state.pending_chamfer {
+            if !d.is_finite() {
+                d = 0.2;
+            }
+            ui.heading("Chamfer");
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            let max_d = part
+                .mesh
+                .as_ref()
+                .map(|m| {
+                    let (lo, hi) = mesh_bbox(m);
+                    (((hi - lo).min_element()) * 0.45).max(0.02)
+                })
+                .unwrap_or(1000.0);
+            if d > max_d {
+                d = max_d;
+                ui_state.chamfer_shown = None;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Distance");
+                if ui.add(egui::DragValue::new(&mut d).range(0.01..=max_d as f64).speed(0.02).suffix(" mm")).changed() {
+                    ui_state.chamfer_shown = None;
+                }
+            });
+            let n_edges = ui_state.fillet_edges.len();
+            ui.horizontal(|ui| {
+                ui.strong(format!("Edges to chamfer  ({n_edges})"));
+                if n_edges > 0 && ui.small_button("Clear").clicked() {
+                    ui_state.fillet_edges.clear();
+                    ui_state.chamfer_shown = None;
+                }
+            });
+            let mut remove: Option<usize> = None;
+            egui::ScrollArea::vertical().id_salt("chamfer_edge_list").max_height(140.0).show(ui, |ui| {
+                for i in 0..n_edges {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").on_hover_text("Remove this edge").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.label(format!("Edge {}", i + 1));
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                ui_state.fillet_edges.remove(i);
+                ui_state.chamfer_shown = None;
+            }
+            ui.label(egui::RichText::new("Click edges on the body to bevel them.").weak().small());
+            ui.separator();
+            if commit {
+                ui_state.chamfer_request = Some(d as f64);
+                ui_state.pending_chamfer = None;
+                ui_state.chamfer_shown = None;
+            } else if cancel {
+                ui_state.pending_chamfer = None;
+                ui_state.chamfer_shown = None;
+                ui_state.fillet_edges.clear();
+                ui_state.regen = true;
+            } else {
+                ui_state.pending_chamfer = Some(d.max(0.01));
+            }
+        }
         if let Some(mut op) = ui_state.pending.clone() {
             // PropertyManager laid out like SolidWorks' Boss-Extrude.
             // Guard the depth: a non-finite value would crash egui's DragValue.
@@ -1559,12 +1832,23 @@ fn ui_system(
             });
             ui.separator();
 
+            // All driving dimensions (distance / radius / angle / point-line), each with a
+            // red ✕ to delete it.
             let dims: Vec<usize> = session
                 .sketch
                 .constraints
                 .iter()
                 .enumerate()
-                .filter_map(|(i, c)| matches!(c, Constraint::Distance { .. }).then_some(i))
+                .filter_map(|(i, c)| {
+                    matches!(
+                        c,
+                        Constraint::Distance { .. }
+                            | Constraint::Radius { .. }
+                            | Constraint::Angle { .. }
+                            | Constraint::PointLineDistance { .. }
+                    )
+                    .then_some(i)
+                })
                 .collect();
             if dims.is_empty() {
                 ui.label(
@@ -1575,23 +1859,63 @@ fn ui_system(
             } else {
                 ui.label(egui::RichText::new("Dimensions").strong());
                 let mut changed = false;
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                let mut delete_dim: Option<usize> = None;
+                let sel = session.selected_dim;
+                egui::ScrollArea::vertical().max_height(220.0).id_salt("dims").show(ui, |ui| {
                     for (k, i) in dims.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            ui.label(format!("D{}", k + 1));
-                            if let Some(Constraint::Distance { value, .. }) =
-                                session.sketch.constraints.get_mut(*i)
+                            if ui
+                                .small_button(egui::RichText::new("X").color(egui::Color32::from_rgb(220, 50, 50)).strong())
+                                .on_hover_text("Delete dimension")
+                                .clicked()
                             {
-                                if ui
-                                    .add(egui::DragValue::new(value).speed(0.05).range(0.01..=10_000.0).suffix(" mm"))
-                                    .changed()
-                                {
-                                    changed = true;
+                                delete_dim = Some(*i);
+                            }
+                            let tag = ui.selectable_label(sel == Some(*i), format!("D{}", k + 1));
+                            if tag.clicked() {
+                                session.selected_dim = if sel == Some(*i) { None } else { Some(*i) };
+                            }
+                            match session.sketch.constraints.get_mut(*i) {
+                                Some(Constraint::Distance { value, .. })
+                                | Some(Constraint::PointLineDistance { value, .. }) => {
+                                    if ui.add(egui::DragValue::new(value).speed(0.05).range(0.01..=10_000.0).suffix(" mm")).changed() {
+                                        changed = true;
+                                    }
                                 }
+                                Some(Constraint::Radius { value, diameter, .. }) => {
+                                    let dia = *diameter;
+                                    let mut shown = if dia { *value * 2.0 } else { *value };
+                                    let prefix = if dia { "Ø" } else { "R" };
+                                    if ui.add(egui::DragValue::new(&mut shown).speed(0.05).range(0.01..=10_000.0).prefix(prefix).suffix(" mm")).changed() {
+                                        if let Some(Constraint::Radius { value, .. }) = session.sketch.constraints.get_mut(*i) {
+                                            *value = if dia { shown * 0.5 } else { shown };
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                                Some(Constraint::Angle { value, .. }) => {
+                                    let mut deg = value.to_degrees();
+                                    if ui.add(egui::DragValue::new(&mut deg).speed(0.5).range(0.1..=359.9).suffix("°")).changed() {
+                                        if let Some(Constraint::Angle { value, .. }) = session.sketch.constraints.get_mut(*i) {
+                                            *value = deg.to_radians();
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                                _ => {}
                             }
                         });
                     }
                 });
+                if let Some(i) = delete_dim {
+                    if i < session.sketch.constraints.len() {
+                        session.sketch.constraints.remove(i);
+                    }
+                    // Constraint indices shift after a remove → drop any stale references.
+                    session.selected_dim = None;
+                    session.dim_edit = None;
+                    changed = true;
+                }
                 if changed {
                     session.needs_apply = true;
                 }
@@ -1632,7 +1956,8 @@ fn ui_system(
             let lines: Vec<(usize, usize)> = sel.iter().filter_map(|&i| entity_line(&session.sketch, i)).collect();
             let circles: Vec<(usize, f64)> = sel.iter().filter_map(|&i| entity_circle(&session.sketch, i)).collect();
             let two_lines = lines.len() == 2;
-            let two_circles = circles.len() == 2;
+            let many_lines = lines.len() >= 2;
+            let many_circles = circles.len() >= 2;
             let line_circle = lines.len() == 1 && circles.len() == 1;
             ui.label(egui::RichText::new(format!("Selected Entities — {}", sel.len())).strong());
             if sel.is_empty() {
@@ -1645,6 +1970,7 @@ fn ui_system(
             // ---- Add Relations ----
             let mut applied: Option<Constraint> = None;
             let mut dist_request = false;
+            let mut equal_request = false;
             // Entity indices of the selected lines (parallel to `lines`), so we can tell
             // which is a body-edge reference line when dimensioning.
             let line_entities: Vec<usize> =
@@ -1656,15 +1982,11 @@ fn ui_system(
                 if ui.add_enabled(two_lines, egui::Button::new("Perpendicular")).clicked() {
                     applied = Some(Constraint::Perpendicular(lines[0].0, lines[0].1, lines[1].0, lines[1].1));
                 }
-                if ui.add_enabled(two_lines || two_circles, egui::Button::new("Equal"))
-                    .on_hover_text("Equal line lengths, or equal circle radii")
+                if ui.add_enabled(many_lines || many_circles, egui::Button::new("Equal"))
+                    .on_hover_text("Make all selected lines equal length (or all circles equal radius). If one is already dimensioned, that size drives the rest.")
                     .clicked()
                 {
-                    applied = Some(if two_circles {
-                        Constraint::EqualRadius { a: circles[0].0, b: circles[1].0 }
-                    } else {
-                        Constraint::Equal(lines[0].0, lines[0].1, lines[1].0, lines[1].1)
-                    });
+                    equal_request = true;
                 }
                 if ui.add_enabled(line_circle, egui::Button::new("Tangent")).clicked() {
                     applied = Some(Constraint::Tangent {
@@ -1700,6 +2022,52 @@ fn ui_system(
                 open_dim_edit(&mut session, ci, None);
                 session.needs_apply = true;
             }
+            // Equal across the whole selection. Whichever item already carries a size
+            // dimension drives the rest through the chain; >2 sized items is ambiguous,
+            // so we refuse it rather than fight the solver.
+            if equal_request {
+                if many_circles {
+                    let defined = circles.iter().filter(|(c, _)| has_radius(&session.sketch, *c)).count();
+                    if defined > 2 {
+                        ui_state.last_error = Some(
+                            "Equal: more than two selected circles already have a radius — too many defined items. Remove a radius dimension and try again.".into(),
+                        );
+                    } else {
+                        let first = circles[0].0;
+                        for (c, _) in circles.iter().skip(1) {
+                            let dup = session.sketch.constraints.iter().any(|k| {
+                                matches!(k, Constraint::EqualRadius { a, b } if (*a == first && *b == *c) || (*a == *c && *b == first))
+                            });
+                            if !dup {
+                                session.sketch.constraints.push(Constraint::EqualRadius { a: first, b: *c });
+                            }
+                        }
+                        session.selected_entities.clear();
+                        session.needs_apply = true;
+                    }
+                } else if many_lines {
+                    let defined = lines.iter().filter(|(a, b)| has_distance(&session.sketch, *a, *b)).count();
+                    if defined > 2 {
+                        ui_state.last_error = Some(
+                            "Equal: more than two selected lines already have a length dimension — too many defined items. Remove a dimension and try again.".into(),
+                        );
+                    } else {
+                        let first = lines[0];
+                        for l in lines.iter().skip(1) {
+                            let dup = session.sketch.constraints.iter().any(|k| {
+                                matches!(k, Constraint::Equal(a, b, c, d)
+                                    if (*a == first.0 && *b == first.1 && *c == l.0 && *d == l.1)
+                                        || (*a == l.0 && *b == l.1 && *c == first.0 && *d == first.1))
+                            });
+                            if !dup {
+                                session.sketch.constraints.push(Constraint::Equal(first.0, first.1, l.0, l.1));
+                            }
+                        }
+                        session.selected_entities.clear();
+                        session.needs_apply = true;
+                    }
+                }
+            }
 
             // ---- Existing Relations on the selection (view + delete) ----
             let sel_points: std::collections::HashSet<usize> =
@@ -1722,7 +2090,8 @@ fn ui_system(
                 egui::ScrollArea::vertical().max_height(150.0).id_salt("relations").show(ui, |ui| {
                     for &ci in &related {
                         ui.horizontal(|ui| {
-                            if ui.small_button("✕").on_hover_text("Delete relation").clicked() {
+                            if ui.small_button(egui::RichText::new("X").color(egui::Color32::from_rgb(220, 50, 50)).strong())
+                                .on_hover_text("Delete relation").clicked() {
                                 delete = Some(ci);
                             }
                             ui.label(constraint_label(&session.sketch.constraints[ci]));
@@ -1856,6 +2225,19 @@ fn ui_system(
                         FeatureKind::Fillet { radius, edges } => {
                             let scope = if edges.is_empty() { "all edges".to_string() } else { format!("{} edge(s)", edges.len()) };
                             let resp = ui.selectable_label(selected, styled(format!("⬤ Fillet  (r {radius:.2}, {scope})")));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::Chamfer { distance, edges } => {
+                            let resp = ui.selectable_label(selected, styled(format!("⬤ Chamfer  (d {distance:.2}, {} edge(s))", edges.len())));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -2093,30 +2475,52 @@ fn ui_system(
     }
 
     // Dimension value labels floating at each dimension's midpoint in the viewport.
-    if let (Some(ap), Ok((camera, cam_gt))) = (session.plane.as_ref(), cam_read.single()) {
-        let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String| {
-            if let Ok(screen) = camera.world_to_viewport(cam_gt, world) {
-                egui::Area::new(id).fixed_pos(egui::pos2(screen.x, screen.y)).order(egui::Order::Foreground).show(
-                    ctx,
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(text).color(egui::Color32::from_rgb(150, 215, 255)).strong(),
-                        );
-                    },
-                );
+    // Clone the plane so the centre-line label code below can also mutate `session`.
+    if let (Some(ap), Ok((camera, cam_gt))) = (session.plane.clone(), cam_read.single()) {
+        // Every measurement label is interactive: single-click selects it (Delete or the
+        // panel ✕ removes it), double-click opens its Modify box. Returns the label's
+        // response so the caller can act on the click.
+        let sel_dim = session.selected_dim;
+        let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String, selected: bool| -> Option<egui::Response> {
+            camera.world_to_viewport(cam_gt, world).ok().map(|screen| {
+                let col = if selected {
+                    egui::Color32::from_rgb(255, 205, 90)
+                } else {
+                    egui::Color32::from_rgb(150, 215, 255)
+                };
+                egui::Area::new(id)
+                    .fixed_pos(egui::pos2(screen.x, screen.y))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(text).color(col).strong()).sense(egui::Sense::click()))
+                    })
+                    .inner
+            })
+        };
+        // Deferred click actions (the constraint loop holds an immutable borrow of session).
+        let mut dim_action: Option<(usize, bool)> = None; // (constraint index, double-clicked?)
+        let mut dia_action: Option<usize> = None; // circle centre to attach a Ø dim to
+        let mut act = |resp: Option<egui::Response>, ci: usize, slot: &mut Option<(usize, bool)>| {
+            if let Some(r) = resp {
+                if r.double_clicked() {
+                    *slot = Some((ci, true));
+                } else if r.clicked() {
+                    *slot = Some((ci, false));
+                }
             }
         };
         // Centres that carry a driving radius/diameter dimension (so the generic Ø
         // callout below can defer to the explicit dimension and avoid double labels).
         let mut dimensioned_centers: Vec<usize> = Vec::new();
         for (k, c) in session.sketch.constraints.iter().enumerate() {
+            let on = sel_dim == Some(k);
             match c {
                 Constraint::Distance { a, b, value, offset, axis } => {
                     if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, _, lab) = distance_dim_geometry(a2, b2, *offset as f32, *axis);
-                        label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), format!("{value:.2}"));
+                        act(label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
                     }
                 }
                 Constraint::Radius { center, value, diameter } => {
@@ -2126,7 +2530,7 @@ fn ui_system(
                         let r = *value as f32;
                         let edge = cu + Vec2::new(r * 0.707, r * 0.707);
                         let text = if *diameter { format!("Ø{:.2}", value * 2.0) } else { format!("R{value:.2}") };
-                        label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text);
+                        act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on), k, &mut dim_action);
                     }
                 }
                 Constraint::Angle { a, b, c, d, value, offset } => {
@@ -2142,7 +2546,7 @@ fn ui_system(
                         let c2 = Vec2::new(pc.x as f32, pc.y as f32);
                         let d2 = Vec2::new(pd.x as f32, pd.y as f32);
                         let (_, lab) = angle_dim_geometry(a2, b2, c2, d2, *offset as f32);
-                        label_at(ctx, egui::Id::new(("anglabel", k)), ap.to_world(lab), format!("{:.1}°", value.to_degrees()));
+                        act(label_at(ctx, egui::Id::new(("anglabel", k)), ap.to_world(lab), format!("{:.1}°", value.to_degrees()), on), k, &mut dim_action);
                     }
                 }
                 Constraint::PointLineDistance { p, a, b, value, .. } => {
@@ -2152,13 +2556,14 @@ fn ui_system(
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, lab) = point_line_geometry(p2, a2, b2);
-                        label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), format!("{value:.2}"));
+                        act(label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
                     }
                 }
                 _ => {}
             }
         }
-        // Diameter callout (Ø) for circles without an explicit radius dimension.
+        // Diameter callout (Ø) for circles without an explicit radius dimension. Double-
+        // click promotes it to a real (editable, deletable) diameter dimension.
         for (k, e) in session.sketch.entities.iter().enumerate() {
             if let SketchEntity::Circle { center, radius, .. } = e {
                 if dimensioned_centers.contains(center) {
@@ -2167,8 +2572,130 @@ fn ui_system(
                 if let Some(c) = session.sketch.points.get(*center) {
                     let cu = Vec2::new(c.x as f32, c.y as f32);
                     let edge = cu + Vec2::new(*radius as f32 * 0.707, *radius as f32 * 0.707);
-                    label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{:.2}", radius * 2.0));
+                    let resp = label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{:.2}", radius * 2.0), false);
+                    if resp.is_some_and(|r| r.double_clicked()) {
+                        dia_action = Some(*center);
+                    }
                 }
+            }
+        }
+        // Centre-line half-length callouts: each is an interactive label sat at the middle
+        // of its half. Double-click one to open a Modify box and type an exact length.
+        if let Some([a, mid, b]) = session.center_line {
+            let n = session.sketch.points.len();
+            if a < n && mid < n && b < n {
+                let pv = |i: usize| Vec2::new(session.sketch.points[i].x as f32, session.sketch.points[i].y as f32);
+                let (pm, pa, pb) = (pv(mid), pv(a), pv(b));
+                let mut open_edit: Option<(usize, f32)> = None;
+                let mut half = |end: usize, ep: Vec2| {
+                    let len = (ep - pm).length();
+                    let labpos = (pm + ep) * 0.5;
+                    if let Ok(screen) = camera.world_to_viewport(cam_gt, ap.to_world(labpos)) {
+                        egui::Area::new(egui::Id::new(("cllabel", end)))
+                            .fixed_pos(egui::pos2(screen.x, screen.y))
+                            .order(egui::Order::Foreground)
+                            .show(ctx, |ui| {
+                                let resp = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{len:.2}"))
+                                            .color(egui::Color32::from_rgb(210, 160, 245))
+                                            .strong(),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+                                if resp.double_clicked() {
+                                    open_edit = Some((end, len));
+                                }
+                            });
+                    }
+                };
+                half(a, pa);
+                half(b, pb);
+                if let Some(e) = open_edit {
+                    session.center_line_edit = Some(e);
+                }
+            } else {
+                session.center_line = None;
+                session.center_line_edit = None;
+            }
+        }
+        // The centre-line length Modify box (opened by double-clicking a half label).
+        if let Some((end, mut buf)) = session.center_line_edit {
+            if let Some([a, mid, b]) = session.center_line {
+                let valid = end == a || end == b;
+                let pv = |i: usize| Vec2::new(session.sketch.points[i].x as f32, session.sketch.points[i].y as f32);
+                let labpos = valid.then(|| (pv(mid) + pv(end)) * 0.5);
+                let screen = labpos.and_then(|uv| camera.world_to_viewport(cam_gt, ap.to_world(uv)).ok());
+                if let Some(s) = screen {
+                    let r = ctx.screen_rect();
+                    let pos = egui::pos2(
+                        s.x.clamp(r.left() + 8.0, (r.right() - 120.0).max(r.left() + 8.0)),
+                        s.y.clamp(r.top() + 96.0, (r.bottom() - 40.0).max(r.top() + 96.0)),
+                    );
+                    let mut close = false;
+                    egui::Area::new(egui::Id::new("cl_modify"))
+                        .fixed_pos(pos)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let resp = ui.add_sized(
+                                        egui::vec2(78.0, ui.spacing().interact_size.y),
+                                        egui::DragValue::new(&mut buf).speed(0.1).range(0.001..=1_000_000.0).max_decimals(2).suffix(" mm"),
+                                    );
+                                    resp.request_focus();
+                                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if ui.button("OK").clicked() || enter {
+                                        close = true;
+                                    }
+                                });
+                            });
+                        });
+                    // Slide the endpoint to the typed length along its current direction.
+                    let m = pv(mid);
+                    let e = pv(end);
+                    let dir = (e - m).normalize_or_zero();
+                    let dir = if dir == Vec2::ZERO { Vec2::X } else { dir };
+                    let np = m + dir * buf.max(0.001);
+                    session.sketch.points[end].x = np.x as f64;
+                    session.sketch.points[end].y = np.y as f64;
+                    session.center_line_len = Some(buf.max(0.001));
+                    session.dirty = true;
+                    session.center_line_edit = Some((end, buf));
+                    if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        session.center_line_edit = None;
+                        session.needs_apply = true;
+                    }
+                } else {
+                    session.center_line_edit = None;
+                }
+            } else {
+                session.center_line_edit = None;
+            }
+        }
+        // Apply the deferred measurement-label clicks now that the read borrows are gone.
+        if let Some((ci, double)) = dim_action {
+            if double {
+                session.selected_dim = Some(ci);
+                open_dim_edit(&mut session, ci, None);
+            } else {
+                // Toggle selection.
+                session.selected_dim = if session.selected_dim == Some(ci) { None } else { Some(ci) };
+            }
+        }
+        if let Some(center) = dia_action {
+            let radius = session
+                .sketch
+                .entities
+                .iter()
+                .find_map(|e| match e {
+                    SketchEntity::Circle { center: c, radius, .. } if *c == center => Some(*radius),
+                    _ => None,
+                })
+                .unwrap_or(1.0);
+            if let Some(ci) = add_radius_dim(&mut session.sketch, center, radius) {
+                session.selected_dim = Some(ci);
+                open_dim_edit(&mut session, ci, None);
             }
         }
     }
@@ -2460,6 +2987,77 @@ fn maybe_add_point_on_circle(sketch: &mut Sketch, p: usize, tol: f32) {
         if !exists {
             sketch.constraints.push(Constraint::PointOnCircle { p, center });
         }
+    }
+}
+
+/// Where point `p` landed on another sketch line, if anywhere within `tol`.
+enum LineHit {
+    /// On an endpoint (`point index`) — bind coincident so it stays put.
+    Endpoint(usize),
+    /// On the midpoint — bind with a Midpoint relation so it stays centred.
+    Midpoint(usize, usize),
+    /// On the span — pin with PointOnLine so it can still slide *along* the line.
+    Span(usize, usize),
+}
+
+/// If point `p` lands on another sketch line, give the connection a real relation so it
+/// survives later edits/moves. A span landing slides along the line (`PointOnLine`); a
+/// snap/end/mid landing is pinned (`Coincident` / `Midpoint`). `tol` ≈ a hair under snap.
+fn maybe_add_point_on_sketch_line(sketch: &mut Sketch, p: usize, tol: f32) {
+    let pp = Vec2::new(sketch.points[p].x as f32, sketch.points[p].y as f32);
+    let mut hit: Option<LineHit> = None;
+    for e in &sketch.entities {
+        if let SketchEntity::Line { a, b, reference: false, .. } = e {
+            if *a == p || *b == p {
+                continue; // p is an endpoint of this line — already structurally joined
+            }
+            let va = Vec2::new(sketch.points[*a].x as f32, sketch.points[*a].y as f32);
+            let vb = Vec2::new(sketch.points[*b].x as f32, sketch.points[*b].y as f32);
+            let len = (vb - va).length();
+            if len < 1e-6 || closest_on_segment(pp, va, vb).distance(pp) > tol {
+                continue;
+            }
+            // Parameter along the line (0 = a, 1 = b); classify the landing.
+            let t = ((pp - va).dot(vb - va) / (len * len)).clamp(0.0, 1.0);
+            let edge_t = (tol / len).min(0.25); // "near an end" window, in parameter units
+            hit = Some(if t <= edge_t {
+                LineHit::Endpoint(*a)
+            } else if t >= 1.0 - edge_t {
+                LineHit::Endpoint(*b)
+            } else if ((t - 0.5).abs() * len) <= tol {
+                LineHit::Midpoint(*a, *b)
+            } else {
+                LineHit::Span(*a, *b)
+            });
+            break;
+        }
+    }
+    match hit {
+        Some(LineHit::Endpoint(end)) => {
+            let dup = sketch.constraints.iter().any(|c| {
+                matches!(c, Constraint::Coincident(x, y) if (*x == p && *y == end) || (*x == end && *y == p))
+            });
+            if !dup {
+                sketch.constraints.push(Constraint::Coincident(p, end));
+            }
+        }
+        Some(LineHit::Midpoint(a, b)) => {
+            let dup = sketch.constraints.iter().any(|c| {
+                matches!(c, Constraint::Midpoint { mid, a: x, b: y } if *mid == p && *x == a && *y == b)
+            });
+            if !dup {
+                sketch.constraints.push(Constraint::Midpoint { mid: p, a, b });
+            }
+        }
+        Some(LineHit::Span(a, b)) => {
+            let dup = sketch.constraints.iter().any(
+                |c| matches!(c, Constraint::PointOnLine { p: q, a: x, b: y } if *q == p && *x == a && *y == b),
+            );
+            if !dup {
+                sketch.constraints.push(Constraint::PointOnLine { p, a, b });
+            }
+        }
+        None => {}
     }
 }
 
@@ -2765,6 +3363,36 @@ fn constraint_label(c: &Constraint) -> String {
     }
 }
 
+/// A cheap fingerprint of a sketch's editable state (point positions, entity/constraint
+/// counts, and dimension values) — used to notice when an operation changed the sketch so
+/// a per-operation undo step can be recorded. Quantised so float jitter doesn't churn it.
+fn sketch_fingerprint(s: &Sketch) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    mix(s.points.len() as u64);
+    mix(s.entities.len() as u64);
+    mix(s.constraints.len() as u64);
+    for p in &s.points {
+        mix((p.x * 1.0e4).round() as i64 as u64);
+        mix((p.y * 1.0e4).round() as i64 as u64);
+        mix(p.fixed as u64);
+    }
+    for c in &s.constraints {
+        let v = match c {
+            Constraint::Distance { value, .. }
+            | Constraint::PointLineDistance { value, .. }
+            | Constraint::Radius { value, .. }
+            | Constraint::Angle { value, .. } => *value,
+            _ => 0.0,
+        };
+        mix((v * 1.0e4).round() as i64 as u64);
+    }
+    h
+}
+
 /// Index of the sketch region whose interior (inside the outer loop, outside any
 /// hole) contains `uv`.
 fn region_at(sketch: &Sketch, uv: Vec2) -> Option<usize> {
@@ -3006,11 +3634,13 @@ fn sketch_interaction(
     let Ok((camera, cam_gt, mut cam_tf, mut orbit)) = cam_q.single_mut() else { return };
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
 
-    // Fillet edge picking runs *before* the egui pointer-block: while the Fillet panel is
+    // Fillet/chamfer edge picking runs *before* the egui pointer-block: while the panel is
     // open, a focused widget makes egui greedy for the pointer, which would otherwise eat
     // the click. Gating on an actual body-edge hit keeps it safe — a hit means the cursor
     // is on the body, not the panel.
-    if ui_state.pending_fillet.is_some() && buttons.just_pressed(MouseButton::Left) {
+    if (ui_state.pending_fillet.is_some() || ui_state.pending_chamfer.is_some())
+        && buttons.just_pressed(MouseButton::Left)
+    {
         if let Some(cursor) = window.cursor_position() {
             if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
                 let (chain, closed) = edge_chain(&part.edges, si);
@@ -3121,10 +3751,6 @@ fn sketch_interaction(
     // The working cursor snaps to an inference point, a reference point, or onto the
     // boundary of a sketch circle near it — so lines drawn to a circle actually
     // connect (land on the rim) instead of stopping a hair short.
-    // True when the cursor has locked onto a precise geometric target (an existing
-    // point, an inference/reference point, or a circle rim) — used to suppress the
-    // looser 90° square-snap so it can't pull an endpoint back off the target.
-    let mut cursor_locked = false;
     if session.plane.is_some() {
         let mut snaps = session.inference_points.clone();
         snaps.extend_from_slice(&session.reference_points);
@@ -3208,8 +3834,6 @@ fn sketch_interaction(
         }
         session.cursor_uv = active_uv.map(|uv| snap_to_inference(uv, &snaps, snap));
         session.cursor_raw_uv = active_uv;
-        // Did we actually land on a snap target (vs. just free space)?
-        cursor_locked = active_uv.is_some_and(|uv| snaps.iter().any(|p| p.distance(uv) <= snap));
         // Is the (snapped) cursor sitting on the hovered edge? If so, placing a point
         // here will add a point-on-edge relation.
         session.cursor_edge = match (session.cursor_uv, session.hover_edge) {
@@ -3221,24 +3845,59 @@ fn sketch_interaction(
         session.cursor_edge = None;
     }
 
-    // Line tool (and the slot's centre line) — when the in-progress segment is near
-    // horizontal/vertical (a 90° step), snap it square so things stay axis-aligned —
-    // unless the cursor already locked onto an exact target (a point or a circle rim),
-    // in which case the exact target must win so the line closes on it.
+    // Line tool (and the slot's centre line) — snap the in-progress segment to a 90° step
+    // off the world axes *and* off any line the start point is joined to (so it stays
+    // square / perpendicular to what it connects to, at any length). This yields to a
+    // genuine point / corner / circle-rim target so the line can still close on one.
     let square_tool =
         session.tool == Tool::Line || (session.tool == Tool::Slot && session.pending_b.is_none());
-    if square_tool && !cursor_locked {
+    if square_tool {
         if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
-            let on_point = nearest_point(&session.sketch, cur, snap).is_some();
+            // Strong targets win over the square snap so connections aren't pulled off.
+            let near = |p: Vec2, t: f32| p.distance(cur) <= t;
+            let strong = snap * 0.6;
+            let on_strong = nearest_point(&session.sketch, cur, strong).is_some()
+                || session.reference_points.iter().any(|r| near(*r, strong))
+                || session.inference_points.iter().any(|r| near(*r, strong))
+                || session.reference_circles.iter().any(|(c, r)| (cur.distance(*c) - *r).abs() <= strong)
+                || session.sketch.entities.iter().any(|e| matches!(e, SketchEntity::Circle { center, radius, .. }
+                    if session.sketch.points.get(*center).is_some_and(|c| (cur.distance(Vec2::new(c.x as f32, c.y as f32)) - *radius as f32).abs() <= strong)));
             let v = cur - start;
-            if !on_point && v.length() > 1e-4 {
+            if !on_strong && v.length() > 1e-4 {
+                // Reference directions: the world axes, plus the direction of any sketch
+                // line the start point belongs to (its perpendicular/parallel snaps too).
+                let mut dirs: Vec<Vec2> = vec![Vec2::X, Vec2::Y];
+                if let Some(pi) = nearest_point(&session.sketch, start, snap * 0.5) {
+                    for e in &session.sketch.entities {
+                        if let SketchEntity::Line { a, b, reference: false, .. } = e {
+                            if *a == pi || *b == pi {
+                                let pa = session.sketch.points[*a];
+                                let pb = session.sketch.points[*b];
+                                let d = (Vec2::new(pb.x as f32, pb.y as f32) - Vec2::new(pa.x as f32, pa.y as f32)).normalize_or_zero();
+                                if d != Vec2::ZERO {
+                                    dirs.push(d);
+                                }
+                            }
+                        }
+                    }
+                }
                 let step = std::f32::consts::FRAC_PI_2; // 90°
                 let ang = v.y.atan2(v.x);
-                let snapped = (ang / step).round() * step;
-                if (ang - snapped).abs() < 5.0_f32.to_radians() {
-                    // Project the cursor onto the square axis (length follows the cursor).
-                    let dir = Vec2::new(snapped.cos(), snapped.sin());
-                    session.cursor_uv = Some(start + dir * v.dot(dir));
+                let mut best: Option<(f32, Vec2)> = None; // (angle error, snapped direction)
+                for d in &dirs {
+                    let base = d.y.atan2(d.x);
+                    let snapped = base + ((ang - base) / step).round() * step;
+                    let mut err = (ang - snapped).abs();
+                    err = err.min(std::f32::consts::TAU - err);
+                    if best.map_or(true, |(be, _)| err < be) {
+                        best = Some((err, Vec2::new(snapped.cos(), snapped.sin())));
+                    }
+                }
+                if let Some((err, dir)) = best {
+                    if err < 5.0_f32.to_radians() {
+                        // Project the cursor onto the chosen axis (length follows the cursor).
+                        session.cursor_uv = Some(start + dir * v.dot(dir));
+                    }
                 }
             }
         }
@@ -3356,6 +4015,10 @@ fn sketch_interaction(
                 session.selected_contours.clear();
                 session.selected_entities.clear();
                 session.needs_apply = false;
+                session.undo_sketch.clear();
+                session.redo_sketch.clear();
+                session.undo_baseline = Some(session.sketch.clone());
+                session.undo_fp = sketch_fingerprint(&session.sketch);
                 info!("Sketching on the {} plane.", ap.name);
                 session.plane = Some(ap);
             } else {
@@ -3474,12 +4137,14 @@ fn sketch_interaction(
                         let region = region_at(&session.sketch, uv);
                         let near_entity = nearest_entity(&session.sketch, uv, snap * 1.5);
                         if let Some(e) = on_entity.or(region.is_none().then_some(()).and(near_entity)) {
-                            // (de)select the entity for a constraint (keep ≤2).
+                            // (de)select the entity for a constraint. Many can be selected
+                            // (e.g. Equal across several lines); pairwise relations just
+                            // stay disabled unless exactly two are chosen.
                             if let Some(pos) = session.selected_entities.iter().position(|&x| x == e) {
                                 session.selected_entities.remove(pos);
                             } else {
                                 session.selected_entities.push(e);
-                                while session.selected_entities.len() > 2 {
+                                while session.selected_entities.len() > MAX_SEL {
                                     session.selected_entities.remove(0);
                                 }
                             }
@@ -3513,7 +4178,7 @@ fn sketch_interaction(
                                 if let Some(e) = add_or_get_reference_line(&mut session, a2, b2) {
                                     if !session.selected_entities.contains(&e) {
                                         session.selected_entities.push(e);
-                                        while session.selected_entities.len() > 2 {
+                                        while session.selected_entities.len() > MAX_SEL {
                                             session.selected_entities.remove(0);
                                         }
                                     }
@@ -3544,14 +4209,52 @@ fn sketch_interaction(
                     if let Some(uv) = active_uv {
                         // Snap the dragged endpoint onto a nearby *other* point / corner.
                         let target = snap_drag_target(&session, i, uv);
-                        if let Some(p) = session.sketch.points.get_mut(i) {
-                            p.x = target.x as f64;
-                            p.y = target.y as f64;
+                        // Grabbing a centre line by its midpoint translates the whole line
+                        // (both ends ride along) so it can be repositioned and snapped.
+                        let cl_mid = session.center_line.filter(|[_, mid, _]| *mid == i);
+                        if let Some([a, mid, b]) = cl_mid {
+                            let old = Vec2::new(session.sketch.points[mid].x as f32, session.sketch.points[mid].y as f32);
+                            let d = target - old;
+                            for p in [a, mid, b] {
+                                if let Some(q) = session.sketch.points.get_mut(p) {
+                                    q.x += d.x as f64;
+                                    q.y += d.y as f64;
+                                }
+                            }
+                            session.dirty = true;
+                        } else {
+                            if let Some(p) = session.sketch.points.get_mut(i) {
+                                p.x = target.x as f64;
+                                p.y = target.y as f64;
+                            }
+                            session.sketch.solve_with_fixed(&[i]);
                         }
-                        session.sketch.solve_with_fixed(&[i]);
                     }
                 }
                 if just_released {
+                    // If we dropped this point onto another, bind them coincident so the
+                    // snap *survives* later edits/moves (not just a one-frame overlap).
+                    // Skip the centre line's own three points (mid carries its ends).
+                    let is_cl = session.center_line.is_some_and(|t| t.contains(&i));
+                    if !is_cl {
+                        let pi = session.sketch.points.get(i).map(|p| Vec2::new(p.x as f32, p.y as f32));
+                        if let Some(pi) = pi {
+                            let tol = session.snap_dist.max(1e-3);
+                            let target = session.sketch.points.iter().enumerate().find(|(j, p)| {
+                                *j != i && Vec2::new(p.x as f32, p.y as f32).distance(pi) <= tol
+                            }).map(|(j, _)| j);
+                            if let Some(j) = target {
+                                let exists = session.sketch.constraints.iter().any(|c| {
+                                    matches!(c, Constraint::Coincident(x, y) if (*x == i && *y == j) || (*x == j && *y == i))
+                                });
+                                if !exists {
+                                    session.sketch.constraints.push(Constraint::Coincident(i, j));
+                                    session.sketch.solve();
+                                    session.dirty = true;
+                                }
+                            }
+                        }
+                    }
                     session.drag = None;
                 }
             }
@@ -3659,6 +4362,39 @@ fn sketch_interaction(
         session.sketch.solve();
         session.dirty = false;
     }
+
+    // ---- Per-operation sketch undo: snapshot a *settled* change ----
+    // Only record between gestures (nothing in-progress), so one click / drag / dimension
+    // edit is one undo step. The state is already solved here, so no jitter step is logged.
+    if session.plane.is_some() {
+        let settled = !buttons.pressed(MouseButton::Left)
+            && session.pending.is_none()
+            && session.pending_b.is_none()
+            && session.pending_c.is_none()
+            && session.drag.is_none()
+            && session.text_handle.is_none()
+            && session.dim_drag.is_none()
+            && session.dim_edit.is_none()
+            && session.spline_pts.is_empty()
+            && session.box_select.is_none();
+        if settled {
+            let fp = sketch_fingerprint(&session.sketch);
+            if session.undo_baseline.is_none() {
+                session.undo_baseline = Some(session.sketch.clone());
+                session.undo_fp = fp;
+            } else if fp != session.undo_fp {
+                let snapshot = session.sketch.clone();
+                if let Some(prev) = session.undo_baseline.replace(snapshot) {
+                    session.undo_sketch.push(prev);
+                    if session.undo_sketch.len() > 200 {
+                        session.undo_sketch.remove(0);
+                    }
+                }
+                session.redo_sketch.clear();
+                session.undo_fp = fp;
+            }
+        }
+    }
 }
 
 /// Commit the in-progress line at an exact `length` (toward the current cursor),
@@ -3714,6 +4450,14 @@ fn has_distance(sketch: &Sketch, a: usize, b: usize) -> bool {
     sketch.constraints.iter().any(|c| {
         matches!(c, Constraint::Distance { a: x, b: y, .. } if (*x == a && *y == b) || (*x == b && *y == a))
     })
+}
+
+/// True if the circle centred at point `center` already carries a driving radius dimension.
+fn has_radius(sketch: &Sketch, center: usize) -> bool {
+    sketch
+        .constraints
+        .iter()
+        .any(|c| matches!(c, Constraint::Radius { center: x, .. } if *x == center))
 }
 
 /// Add a distance dimension between two points at their current distance (or return
@@ -3938,6 +4682,86 @@ fn angle_dim_geometry(a2: Vec2, b2: Vec2, c2: Vec2, d2: Vec2, offset: f32) -> (V
     (vertex, vertex + bisect * offset)
 }
 
+/// After a line `a→b` is committed, lock in the relation the user clearly intended so later
+/// edits keep the sketch square:
+///   * a near-axis line gets a `Horizontal` / `Vertical` constraint;
+///   * otherwise a line meeting an existing line at ~90° (sharing an endpoint *or* touching
+///     it at a corner / T-junction / crossing) gets a `Perpendicular` constraint.
+/// The point *connection* itself is already preserved — snapped endpoints share one point
+/// index — so this only adds the angular relation. Tolerances are tight (≈2°): the 90°
+/// preview snap already projects an intended-square line exactly onto its axis, so this
+/// fires for those and leaves a deliberately diagonal line alone.
+fn add_square_relations(sketch: &mut Sketch, a: usize, b: usize) {
+    let p = |i: usize| Vec2::new(sketch.points[i].x as f32, sketch.points[i].y as f32);
+    let v = p(b) - p(a);
+    let len = v.length();
+    if len < 1e-5 {
+        return;
+    }
+    let sin_tol = 2.0_f32.to_radians().sin();
+    let axis_tol = len * sin_tol; // perpendicular gap from the axis at this length
+    // Horizontal / vertical — these also make two square lines implicitly perpendicular.
+    if v.y.abs() <= axis_tol {
+        if !sketch.constraints.iter().any(|c| matches!(c, Constraint::Horizontal(x, y) if (*x == a && *y == b) || (*x == b && *y == a))) {
+            sketch.constraints.push(Constraint::Horizontal(a, b));
+        }
+        return;
+    }
+    if v.x.abs() <= axis_tol {
+        if !sketch.constraints.iter().any(|c| matches!(c, Constraint::Vertical(x, y) if (*x == a && *y == b) || (*x == b && *y == a))) {
+            sketch.constraints.push(Constraint::Vertical(a, b));
+        }
+        return;
+    }
+    // Otherwise: perpendicular to a *connected* non-reference sketch line. "Connected"
+    // means sharing an endpoint OR touching geometrically — either line's endpoint landing
+    // on the other (an L-corner, a T-junction, or a crossing). This is what keeps a 90°
+    // joint square when the sketch is later dragged around, instead of going free.
+    let dirn = v / len;
+    let touch_tol = (len * 0.02).clamp(1e-3, 0.1); // small absolute proximity for a touch
+    let lines: Vec<(usize, usize)> = sketch
+        .entities
+        .iter()
+        .filter_map(|e| match e {
+            SketchEntity::Line { a: c, b: d, reference: false, .. }
+                if !((*c == a && *d == b) || (*c == b && *d == a)) =>
+            {
+                Some((*c, *d))
+            }
+            _ => None,
+        })
+        .collect();
+    let (pa, pb) = (p(a), p(b));
+    for (c, d) in lines {
+        let w = p(d) - p(c);
+        let wl = w.length();
+        if wl < 1e-5 {
+            continue;
+        }
+        // Connected if they share a point, or an endpoint of one lands on the other.
+        let shares = c == a || c == b || d == a || d == b;
+        let touches = shares
+            || closest_on_segment(pa, p(c), p(d)).distance(pa) <= touch_tol
+            || closest_on_segment(pb, p(c), p(d)).distance(pb) <= touch_tol
+            || closest_on_segment(p(c), pa, pb).distance(p(c)) <= touch_tol
+            || closest_on_segment(p(d), pa, pb).distance(p(d)) <= touch_tol;
+        if !touches {
+            continue;
+        }
+        if (dirn.dot(w / wl)).abs() <= sin_tol {
+            let dup = sketch.constraints.iter().any(|k| {
+                matches!(k, Constraint::Perpendicular(a1, b1, c1, d1)
+                    if (*a1 == a && *b1 == b && *c1 == c && *d1 == d)
+                        || (*a1 == c && *b1 == d && *c1 == a && *d1 == b))
+            });
+            if !dup {
+                sketch.constraints.push(Constraint::Perpendicular(a, b, c, d));
+            }
+            return;
+        }
+    }
+}
+
 fn place_point(session: &mut SketchSession, uv: Vec2) {
     let snap = session.snap_dist;
     match session.tool {
@@ -3949,7 +4773,14 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 let b = get_or_add_point_ref(session, uv, snap);
                 let mid = get_or_add_point(&mut session.sketch, center, snap);
                 session.sketch.add_line(a, b, session.construction);
-                session.sketch.constraints.push(Constraint::Midpoint { mid, a, b });
+                if session.construction {
+                    // Construction centre line: leave the two halves free (no Midpoint
+                    // constraint) so the PropertyManager can dimension each side and
+                    // equalise them by sliding the endpoints along the line.
+                    session.center_line = Some([a, mid, b]);
+                } else {
+                    session.sketch.constraints.push(Constraint::Midpoint { mid, a, b });
+                }
                 session.dirty = true;
             } else {
                 session.pending = Some(uv);
@@ -3961,10 +4792,17 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 let a = get_or_add_point_ref(session, start, snap);
                 let b = get_or_add_point_ref(session, uv, snap);
                 session.sketch.add_line(a, b, session.construction);
+                // Persist the square/perpendicular relation the 90° snap implied, so resizing
+                // keeps the sketch square (the shared point already keeps lines connected).
+                add_square_relations(&mut session.sketch, a, b);
                 // If either endpoint landed on a circle rim, link it parametrically.
                 let tol = (snap * 0.6).max(1e-3);
                 maybe_add_point_on_circle(&mut session.sketch, a, tol);
                 maybe_add_point_on_circle(&mut session.sketch, b, tol);
+                // If either endpoint landed on the span of another sketch line, pin it
+                // there so the snap is a real relation that survives later moves.
+                maybe_add_point_on_sketch_line(&mut session.sketch, a, tol);
+                maybe_add_point_on_sketch_line(&mut session.sketch, b, tol);
                 // If either endpoint landed on a body edge, add a point-on-edge relation
                 // (two on one line make it collinear with — snapped along — the edge).
                 let start_edge = session.pending_edge.take();
@@ -4141,7 +4979,8 @@ fn toggle_fillet_edge(ui_state: &mut UiState, chain: &[Vec3]) {
     if ui_state.fillet_edges.len() == before {
         ui_state.fillet_edges.push(poly); // wasn't present → add it
     }
-    ui_state.fillet_shown = None; // recompute the preview
+    ui_state.fillet_shown = None; // recompute the fillet/chamfer preview
+    ui_state.chamfer_shown = None;
 }
 
 /// Fill in sensible Text-tool defaults the first time it's opened (the system default
@@ -4477,9 +5316,16 @@ fn handle_keys(
     if keys.just_pressed(KeyCode::KeyD) {
         session.op_request = Some(SolidOp::Cut(EXTRUDE_DISTANCE));
     }
-    // Delete (or Backspace) removes the selected sketch entities.
+    // Delete (or Backspace) removes a selected dimension first, else selected entities.
     if keys.just_pressed(KeyCode::Delete) || keys.just_pressed(KeyCode::Backspace) {
-        if !session.selected_entities.is_empty() {
+        if let Some(ci) = session.selected_dim.take() {
+            if ci < session.sketch.constraints.len() {
+                session.sketch.constraints.remove(ci);
+            }
+            session.dim_edit = None;
+            session.dirty = true;
+            session.needs_apply = true;
+        } else if !session.selected_entities.is_empty() {
             let mut idx = session.selected_entities.clone();
             idx.sort_unstable();
             idx.dedup();
@@ -4595,11 +5441,29 @@ fn handle_file_io(
     }
 }
 
-/// Apply a requested undo/redo by swapping the whole document snapshot.
-fn apply_history(mut history: ResMut<History>, mut doc: ResMut<DocRes>, mut ui_state: ResMut<UiState>) {
+/// Apply a requested undo/redo. While a sketch is open, undo/redo steps through the
+/// per-operation sketch history first (so it reverts the last line / dimension / drag, not
+/// the whole sketch feature); only once that's exhausted does it fall back to the
+/// document-level (feature timeline) history.
+fn apply_history(
+    mut history: ResMut<History>,
+    mut doc: ResMut<DocRes>,
+    mut ui_state: ResMut<UiState>,
+    mut session: ResMut<SketchSession>,
+) {
     if ui_state.undo_request {
         ui_state.undo_request = false;
-        if let Some(prev) = history.undo.pop() {
+        if session.plane.is_some() && !session.undo_sketch.is_empty() {
+            let prev = session.undo_sketch.pop().unwrap();
+            let cur = std::mem::replace(&mut session.sketch, prev);
+            session.redo_sketch.push(cur);
+            session.sketch.solve();
+            session.dirty = true;
+            session.undo_baseline = Some(session.sketch.clone());
+            session.undo_fp = sketch_fingerprint(&session.sketch);
+            session.selected_entities.clear();
+            session.selected_dim = None;
+        } else if let Some(prev) = history.undo.pop() {
             history.redo.push(doc.0.clone());
             doc.0 = prev;
             ui_state.regen = true;
@@ -4608,7 +5472,17 @@ fn apply_history(mut history: ResMut<History>, mut doc: ResMut<DocRes>, mut ui_s
     }
     if ui_state.redo_request {
         ui_state.redo_request = false;
-        if let Some(next) = history.redo.pop() {
+        if session.plane.is_some() && !session.redo_sketch.is_empty() {
+            let next = session.redo_sketch.pop().unwrap();
+            let cur = std::mem::replace(&mut session.sketch, next);
+            session.undo_sketch.push(cur);
+            session.sketch.solve();
+            session.dirty = true;
+            session.undo_baseline = Some(session.sketch.clone());
+            session.undo_fp = sketch_fingerprint(&session.sketch);
+            session.selected_entities.clear();
+            session.selected_dim = None;
+        } else if let Some(next) = history.redo.pop() {
             history.undo.push(doc.0.clone());
             doc.0 = next;
             ui_state.regen = true;
@@ -4696,7 +5570,7 @@ fn handle_edit_sketch(
         | FeatureKind::Cut { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } => return,
     };
     let ap = active_plane_from_ref(&plane, "Face");
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -4714,6 +5588,10 @@ fn handle_edit_sketch(
     session.drag = None;
     session.cursor_uv = None;
     session.needs_apply = false;
+    session.undo_sketch.clear();
+    session.redo_sketch.clear();
+    session.undo_baseline = Some(session.sketch.clone());
+    session.undo_fp = sketch_fingerprint(&session.sketch);
     // Roll back to just before this feature so you sketch on its input geometry
     // (the body without this feature); committing rolls forward again.
     doc.0.rollback = i;
@@ -4768,7 +5646,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -4818,7 +5696,9 @@ fn doc_has_text(doc: &Document) -> bool {
 
 /// True if the model has a fillet feature — those are mesh-only (truck can't fillet).
 fn doc_has_fillet(doc: &Document) -> bool {
-    doc.features.iter().any(|f| matches!(f.kind, FeatureKind::Fillet { .. }))
+    doc.features
+        .iter()
+        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. }))
 }
 
 /// failed to build, so the UI can tell the user which operation didn't apply.
@@ -4883,10 +5763,10 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            // A fillet rounds the mesh, so a model containing one always builds via the
-            // mesh path — this exact-kernel path never actually runs with a fillet present.
-            FeatureKind::Fillet { .. } => {
-                failures.push("Fillet needs the mesh kernel.".into());
+            // A fillet/chamfer reshapes the mesh, so a model with one always builds via the
+            // mesh path — this exact-kernel path never actually runs with one present.
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } => {
+                failures.push("Fillet/chamfer needs the mesh kernel.".into());
             }
         }
     }
@@ -4967,6 +5847,12 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
             FeatureKind::Fillet { radius, edges } => {
                 if let Some(b) = body.take() {
                     body = Some(round_mesh(&b, *radius, edges).unwrap_or(b));
+                }
+            }
+            // Flat-bevel the picked edges by the chamfer distance.
+            FeatureKind::Chamfer { distance, edges } => {
+                if let Some(b) = body.take() {
+                    body = Some(chamfer_mesh(&b, *distance, edges).unwrap_or(b));
                 }
             }
         }
@@ -5155,6 +6041,55 @@ fn fillet_preview(
     }
     spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
     ui_state.fillet_shown = Some(r);
+}
+
+/// Append a confirmed chamfer to the timeline and trigger a rebuild.
+fn apply_chamfer(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+) {
+    let Some(distance) = ui_state.chamfer_request.take() else { return };
+    let edges = std::mem::take(&mut ui_state.fillet_edges);
+    history.snapshot(&doc.0);
+    doc.0.add_feature(FeatureKind::Chamfer { distance, edges });
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// While the Chamfer PropertyManager is open, show a live beveled preview of the current
+/// body — recomputed only when the distance changes (the boolean is expensive).
+fn chamfer_preview(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ui_state: ResMut<UiState>,
+    part: Res<Part>,
+    existing: Query<Entity, With<SolidPart>>,
+) {
+    if ui_state.regen {
+        return; // a full rebuild this frame supersedes the preview
+    }
+    let Some(d) = ui_state.pending_chamfer else { return };
+    if ui_state.chamfer_shown == Some(d) {
+        return; // already showing this distance
+    }
+    let Some(base) = part.mesh.clone() else {
+        ui_state.chamfer_shown = Some(d);
+        return;
+    };
+    let edges = ui_state.fillet_edges.clone();
+    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chamfer_mesh(&base, d as f64, &edges)))
+        .ok()
+        .flatten()
+        .unwrap_or(base);
+    let tess = mesh_tessellation(beveled);
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+    ui_state.chamfer_shown = Some(d);
 }
 
 /// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
@@ -5979,7 +6914,9 @@ fn draw_sketch(
     if !regions.is_empty() {
         let picked: Vec<usize> =
             session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
-        let hatch = (spacing * 0.5).max(1e-3);
+        // Dense, zoom-relative scanlines so the region reads as a *solid* translucent fill
+        // rather than visible hatch (gizmos can't fill polygons, so we pack the lines).
+        let hatch = (radius * 0.0022).max(1e-4);
         let draw_loop = |gizmos: &mut Gizmos, loop_pts: &[[f64; 2]], col: Color| {
             let m = loop_pts.len();
             for k in 0..m {
@@ -5994,9 +6931,9 @@ fn draw_sketch(
         for (i, r) in regions.iter().enumerate() {
             let sel = picked.contains(&i);
             let (line_col, fill) = if sel {
-                (Color::srgb(0.45, 0.85, 1.0), Color::srgba(0.45, 0.85, 1.0, 0.22))
+                (Color::srgb(0.45, 0.85, 1.0), Color::srgba(0.4, 0.8, 1.0, 0.32))
             } else {
-                (Color::srgba(0.2, 1.0, 0.45, 0.5), Color::srgba(0.2, 1.0, 0.45, 0.08))
+                (Color::srgba(0.2, 1.0, 0.45, 0.5), Color::srgba(0.2, 1.0, 0.45, 0.12))
             };
             hatch_region(&mut gizmos, ap, &r.outer, &r.holes, fill, hatch);
             draw_loop(&mut gizmos, &r.outer, line_col);
@@ -6757,8 +7694,8 @@ fn draw_edge_selection(
     const TOWARD_CAM: f32 = 0.004;
     let nudge = |p: Vec3| p + (cam_pos - p) * TOWARD_CAM;
 
-    // While the Fillet PM is open, highlight every edge picked to round (bright yellow).
-    if ui_state.pending_fillet.is_some() {
+    // While the Fillet/Chamfer PM is open, highlight every picked edge (bright yellow).
+    if ui_state.pending_fillet.is_some() || ui_state.pending_chamfer.is_some() {
         let fcol = Color::srgb(1.0, 0.95, 0.2);
         for edge in &ui_state.fillet_edges {
             for w in edge.windows(2) {

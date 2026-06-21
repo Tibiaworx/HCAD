@@ -502,12 +502,44 @@ impl Sketch {
                 SketchEntity::Circle { center, radius, construction: false } => {
                     if let Some(c) = self.points.get(*center) {
                         const SEG: usize = 64;
-                        let mut prev = [c.x + radius, c.y];
-                        for k in 1..=SEG {
-                            let ang = std::f64::consts::TAU * k as f64 / SEG as f64;
-                            let p = [c.x + radius * ang.cos(), c.y + radius * ang.sin()];
-                            segs.push((prev, p));
-                            prev = p;
+                        let tau = std::f64::consts::TAU;
+                        let step = tau / SEG as f64;
+                        // Any sketch point sitting on this rim (a line/arc endpoint snapped
+                        // to it) must become a vertex of the tessellation — otherwise the
+                        // connecting edge dangles against a chord and the area never closes.
+                        // Using the point's *exact* coordinates makes the arrangement share
+                        // the node, so the enclosed region traces cleanly and can extrude.
+                        let on_tol = (radius * 5.0e-3).max(1.0e-4);
+                        let mut samples: Vec<(f64, [f64; 2])> = Vec::new();
+                        for (pi, p) in self.points.iter().enumerate() {
+                            if pi == *center {
+                                continue;
+                            }
+                            let (dx, dy) = (p.x - c.x, p.y - c.y);
+                            let d = (dx * dx + dy * dy).sqrt();
+                            if d > 1.0e-9 && (d - radius).abs() <= on_tol {
+                                samples.push((dy.atan2(dx).rem_euclid(tau), [p.x, p.y]));
+                            }
+                        }
+                        // Fill the rest of the circle with even samples, skipping any that
+                        // land almost on a connection vertex (avoids zero-length slivers).
+                        for k in 0..SEG {
+                            let a = step * k as f64;
+                            let near = samples.iter().any(|(ta, _)| {
+                                let d = (a - ta).abs();
+                                d.min(tau - d) < step * 0.4
+                            });
+                            if !near {
+                                samples.push((a, [c.x + radius * a.cos(), c.y + radius * a.sin()]));
+                            }
+                        }
+                        samples.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+                        let ring: Vec<[f64; 2]> = samples.iter().map(|(_, p)| *p).collect();
+                        for w in ring.windows(2) {
+                            segs.push((w[0], w[1]));
+                        }
+                        if ring.len() >= 2 {
+                            segs.push((ring[ring.len() - 1], ring[0]));
                         }
                     }
                 }

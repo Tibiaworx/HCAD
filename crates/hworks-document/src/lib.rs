@@ -59,6 +59,8 @@ pub enum FeatureKind {
     /// Fillet: round body edges by `radius` (a mesh round). `edges` are the picked edge
     /// polylines (world space) to round; empty means "round every edge".
     Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
+    /// Chamfer: flat-bevel the picked `edges` (world-space polylines) by `distance`.
+    Chamfer { distance: f64, edges: Vec<Vec<[f64; 3]>> },
     // Revolve / … arrive at M8+.
 }
 
@@ -140,6 +142,9 @@ impl Document {
                 FeatureKind::Fillet { radius, edges } => {
                     let scope = if edges.is_empty() { "all".to_string() } else { format!("{}", edges.len()) };
                     format!("[fillet] Fillet  r={radius:.2} ({scope})")
+                }
+                FeatureKind::Chamfer { distance, edges } => {
+                    format!("[chamfer] Chamfer  d={distance:.2} ({})", edges.len())
                 }
             })
             .collect()

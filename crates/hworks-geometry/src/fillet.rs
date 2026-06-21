@@ -1139,6 +1139,190 @@ pub fn round_mesh(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
     }
 }
 
+/// Chamfer (flat bevel) on the picked `edges` by `dist`. Same edge classification and
+/// boolean machinery as the fillet, but the cross-section is a straight cut instead of an
+/// arc: a straight edge loses a triangular wedge; a circular rim loses a cone frustum.
+/// Convex edges only (a chamfer adds no material). `None` if nothing was beveled.
+pub fn chamfer_mesh(mesh: &TriMesh, dist: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
+    if dist <= 1e-6 || mesh.indices.len() < 3 || edges.is_empty() {
+        return None;
+    }
+    let tris: Vec<[V3; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let g = |i: u32| {
+                let p = mesh.positions[i as usize];
+                [p[0] as f64, p[1] as f64, p[2] as f64]
+            };
+            [g(t[0]), g(t[1]), g(t[2])]
+        })
+        .collect();
+    // Clamp to under half the smallest body dimension (same guard as the fillet).
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for t in &tris {
+        for v in t {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+    }
+    let min_ext = (hi[0] - lo[0]).min(hi[1] - lo[1]).min(hi[2] - lo[2]).max(1e-6);
+    let dist = dist.min(0.49 * min_ext);
+    let diag = len(sub(hi, lo)).max(1.0);
+    let tol = diag * 1e-4;
+
+    let mut body = mesh.clone();
+    let mut any = false;
+    // Collect the straight segments to bevel (a chain itself, or its straight runs).
+    for chain in edges {
+        if fit_circle(chain).is_some() {
+            if let Some(tool) = chamfer_circular(&tris, dist, chain) {
+                if tool.indices.len() >= 3 {
+                    body = crate::mesh_difference(&body, &tool);
+                    any = true;
+                }
+            }
+            continue;
+        }
+        let runs: Vec<Vec<[f64; 3]>> = if is_straight_edge(chain) {
+            vec![chain.clone()]
+        } else if is_piecewise_straight(chain) {
+            split_straight_runs(chain)
+        } else {
+            continue; // curved/slot chamfer not handled in v1
+        };
+        for run in &runs {
+            for w in run.windows(2) {
+                if let Some(tool) = chamfer_straight_seg(&tris, dist, w[0], w[1], tol) {
+                    if tool.indices.len() >= 3 {
+                        body = crate::mesh_difference(&body, &tool);
+                        any = true;
+                    }
+                }
+            }
+        }
+    }
+    if any {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+/// Wedge tool for a straight convex edge `a`–`b`: the triangle (edge, contact-on-face-1,
+/// contact-on-face-2) extruded along the edge. Subtracting it leaves the flat bevel.
+fn chamfer_straight_seg(tris: &[[V3; 3]], dist: f64, a: V3, b: V3, tol: f64) -> Option<TriMesh> {
+    let d = sub(b, a);
+    let l = len(d);
+    if l < tol {
+        return None;
+    }
+    let axis = norm(d);
+    let (n1, n2) = adjacent_normals(tris, a, b, tol.max(1e-3))?;
+    // Convex only: one solid quadrant around the edge midpoint.
+    let inside = |p: V3| {
+        let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+        (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+    };
+    let m = scale(add(a, b), 0.5);
+    let e = dist * 0.4;
+    let mut solid = 0;
+    for s1 in [-1.0_f64, 1.0] {
+        for s2 in [-1.0_f64, 1.0] {
+            if inside(add(m, add(scale(n1, s1 * e), scale(n2, s2 * e)))) {
+                solid += 1;
+            }
+        }
+    }
+    if solid != 1 {
+        return None;
+    }
+    // In-plane directions along each face, away from the edge into the material (the
+    // inward bisector projected onto each face).
+    let inward = norm(scale(add(n1, n2), -1.0));
+    let f1 = norm(sub(inward, scale(n1, dot(inward, n1))));
+    let f2 = norm(sub(inward, scale(n2, dot(inward, n2))));
+    let p1 = add(a, scale(f1, dist));
+    let p2 = add(a, scale(f2, dist));
+    let margin = dist * 0.5;
+    let shift = scale(axis, -margin);
+    let cross = [add(a, shift), add(p1, shift), add(p2, shift)];
+    Some(extrude_prism(&cross, axis, l + 2.0 * margin))
+}
+
+/// Cone-frustum tool for a circular convex rim: revolve the straight chamfer cross-section
+/// (cap contact → wall contact) around the axis.
+fn chamfer_circular(tris: &[[V3; 3]], dist: f64, loop_pts: &[[f64; 3]]) -> Option<TriMesh> {
+    let (center, axis0, big_r) = fit_circle(loop_pts)?;
+    if big_r <= dist * 1.05 {
+        return None;
+    }
+    let radial0 = {
+        let r = sub(loop_pts[0], center);
+        norm(sub(r, scale(axis0, dot(r, axis0))))
+    };
+    let inside = |p: V3| {
+        let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+        (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+    };
+    let e = dist * 0.4;
+    let rim0 = loop_pts[0];
+    let signs = [-1.0_f64, 1.0];
+    let mut q = [[false; 2]; 2];
+    let mut solid = 0;
+    for (i, &sc) in signs.iter().enumerate() {
+        for (j, &sw) in signs.iter().enumerate() {
+            let p = add(rim0, add(scale(axis0, sc * e), scale(radial0, sw * e)));
+            q[i][j] = inside(p);
+            if q[i][j] {
+                solid += 1;
+            }
+        }
+    }
+    if solid != 1 {
+        return None; // convex rims only
+    }
+    let (mut sc0, mut sw0) = (1.0, 1.0);
+    for (i, &sc) in signs.iter().enumerate() {
+        for (j, &sw) in signs.iter().enumerate() {
+            if q[i][j] {
+                sc0 = sc;
+                sw0 = sw;
+            }
+        }
+    }
+    let axis = scale(axis0, -sc0);
+    let sign_w = -sw0;
+    let tangent = cross(axis, radial0);
+    // Align the revolve to the mesh rim vertices (no step).
+    let mut ring: Vec<(f64, [i64; 3])> = Vec::new();
+    let plane_tol = big_r * 0.03;
+    for t in tris {
+        for &v in t {
+            let dd = sub(v, center);
+            let axial = dot(dd, axis);
+            let radial = len(sub(dd, scale(axis, axial)));
+            if axial.abs() < plane_tol && (radial - big_r).abs() < plane_tol {
+                ring.push((dot(dd, tangent).atan2(dot(dd, radial0)), [(v[0] * 1e3) as i64, (v[1] * 1e3) as i64, (v[2] * 1e3) as i64]));
+            }
+        }
+    }
+    ring.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    ring.dedup_by_key(|r| r.1);
+    let angles: Vec<f64> = if ring.len() >= 8 {
+        ring.iter().map(|r| r.0).collect()
+    } else {
+        loop_pts.iter().map(|p| { let dd = sub(*p, center); dot(dd, tangent).atan2(dot(dd, radial0)) }).collect()
+    };
+    let pad = dist;
+    let sz = |u: f64, v: f64| -> (f64, f64) { (big_r + sign_w * u, v) };
+    // Straight bevel: cap contact (−d, 0) → wall contact (0, −d); outer edges into air.
+    let profile = vec![sz(-dist, 0.0), sz(0.0, -dist), sz(pad, -dist), sz(pad, pad), sz(-dist, pad)];
+    Some(revolve(&profile, center, axis, radial0, &angles))
+}
+
 /// SDF rolling-ball round: sample the signed-distance field on a voxel grid, blur it by the
 /// radius, re-extract with surface nets. If `edges` is non-empty, the round is masked to
 /// the body within ≈radius of those polylines; otherwise every edge rounds.
