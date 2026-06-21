@@ -26,7 +26,7 @@ use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
     chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
     extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, round_mesh,
-    tessellate, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
+    tessellate, threaded_hole, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -143,10 +143,12 @@ fn main() {
                     apply_fillet,
                     apply_chamfer,
                     apply_mirror_feature,
+                    apply_thread,
                     do_regenerate,
                     fillet_preview,
                     chamfer_preview,
                     mirror_preview,
+                    thread_ghost,
                 ),
                 (
                     handle_new_part,
@@ -359,6 +361,62 @@ struct UiState {
     pending_mirror: Option<u8>,
     mirror_shown: Option<u8>,
     mirror_request: Option<u8>,
+    /// Hole Genie (threads): the spec being configured, and a confirmed thread to append.
+    pending_thread: Option<ThreadSpec>,
+    thread_request: Option<ThreadSpec>,
+    /// The snapped placement point under the cursor while the Hole Genie PM is open
+    /// (`(origin, axis)`), for the hover marker and to anchor on click.
+    thread_hover: Option<(Vec3, Vec3)>,
+}
+
+/// A standard thread: display name, major diameter (mm), coarse pitch (mm).
+const METRIC_THREADS: &[(&str, f32, f32)] = &[
+    ("M3", 3.0, 0.5), ("M4", 4.0, 0.7), ("M5", 5.0, 0.8), ("M6", 6.0, 1.0),
+    ("M8", 8.0, 1.25), ("M10", 10.0, 1.5), ("M12", 12.0, 1.75), ("M16", 16.0, 2.0),
+];
+const IMPERIAL_THREADS: &[(&str, f32, f32)] = &[
+    ("#6-32", 3.51, 0.794), ("#8-32", 4.17, 0.794), ("#10-24", 4.83, 1.058),
+    ("1/4-20", 6.35, 1.27), ("5/16-18", 7.94, 1.411), ("3/8-16", 9.53, 1.5875),
+    ("1/2-13", 12.7, 1.954),
+];
+
+/// Hole Genie thread state (a threaded hole or an external thread).
+#[derive(Clone, PartialEq)]
+struct ThreadSpec {
+    placed: bool,    // has the user clicked a face to anchor it?
+    origin: Vec3,    // hole centre on the face
+    axis: Vec3,      // outward face normal (thread runs −axis into the body)
+    metric: bool,    // metric vs imperial size table
+    size: usize,     // index into the table
+    pitch: f32,
+    depth: f32,
+    internal: bool,  // tap a hole (true) vs thread an existing boss (false)
+    rh: bool,        // right-handed
+}
+
+impl Default for ThreadSpec {
+    fn default() -> Self {
+        ThreadSpec {
+            placed: false,
+            origin: Vec3::ZERO,
+            axis: Vec3::Z,
+            metric: true,
+            size: 3, // M6
+            pitch: 1.0,
+            depth: 6.0,
+            internal: true,
+            rh: true,
+        }
+    }
+}
+
+impl ThreadSpec {
+    fn table(&self) -> &'static [(&'static str, f32, f32)] {
+        if self.metric { METRIC_THREADS } else { IMPERIAL_THREADS }
+    }
+    fn major_d(&self) -> f32 {
+        self.table().get(self.size).map(|t| t.1).unwrap_or(6.0)
+    }
 }
 
 /// A `PlaneRef` for one of the three standard reference planes (0=Front, 1=Top, 2=Right),
@@ -1335,6 +1393,12 @@ fn ui_system(
                             ui_state.pending_fillet = None;
                             ui_state.pending_chamfer = None;
                         }
+                        if ui.button("Hole Genie").on_hover_text("Threaded holes: click a face to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
+                            ui_state.pending_thread = Some(ThreadSpec::default());
+                            ui_state.pending_fillet = None;
+                            ui_state.pending_chamfer = None;
+                            ui_state.pending_mirror = None;
+                        }
                     });
                 }
             }
@@ -1957,6 +2021,86 @@ fn ui_system(
                 ui_state.pending_mirror = Some(which);
             }
         }
+        if let Some(mut spec) = ui_state.pending_thread.clone() {
+            ui.heading("Hole Genie");
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            // Mode.
+            ui.horizontal(|ui| {
+                if ui.radio(spec.internal, "Tap hole").clicked() {
+                    spec.internal = true;
+                }
+                if ui.radio(!spec.internal, "Thread boss").clicked() {
+                    spec.internal = false;
+                }
+            });
+            // Placement status.
+            if spec.placed {
+                ui.label(egui::RichText::new("Location: placed ✓").color(egui::Color32::from_rgb(90, 200, 120)));
+            } else {
+                ui.label(egui::RichText::new("Click a face on the body to place it.").color(egui::Color32::from_rgb(230, 170, 60)));
+            }
+            ui.separator();
+            // Standard table (metric / imperial).
+            ui.horizontal(|ui| {
+                if ui.radio(spec.metric, "Metric").clicked() && !spec.metric {
+                    spec.metric = true;
+                    spec.size = spec.size.min(METRIC_THREADS.len() - 1);
+                    spec.pitch = spec.table()[spec.size].2;
+                }
+                if ui.radio(!spec.metric, "Imperial").clicked() && spec.metric {
+                    spec.metric = false;
+                    spec.size = spec.size.min(IMPERIAL_THREADS.len() - 1);
+                    spec.pitch = spec.table()[spec.size].2;
+                }
+            });
+            let cur = spec.table()[spec.size.min(spec.table().len() - 1)].0;
+            egui::ComboBox::from_label("Size").selected_text(cur).show_ui(ui, |ui| {
+                for (i, (name, _, pitch)) in spec.table().iter().enumerate() {
+                    if ui.selectable_label(spec.size == i, *name).clicked() {
+                        spec.size = i;
+                        spec.pitch = *pitch;
+                    }
+                }
+            });
+            egui::Grid::new("thread_params").num_columns(2).show(ui, |ui| {
+                ui.label("Pitch");
+                if ui.add(egui::DragValue::new(&mut spec.pitch).range(0.1..=10.0).speed(0.01).suffix(" mm")).changed() {
+                }
+                ui.end_row();
+                ui.label("Depth");
+                if ui.add(egui::DragValue::new(&mut spec.depth).range(0.5..=1000.0).speed(0.1).suffix(" mm")).changed() {
+                }
+                ui.end_row();
+            });
+            if ui.checkbox(&mut spec.rh, "Right-handed").changed() {
+            }
+            ui.label(egui::RichText::new(format!("Major Ø {:.2} mm", spec.major_d())).weak().small());
+            ui.separator();
+            if commit {
+                if spec.placed {
+                    ui_state.thread_request = Some(spec);
+                    ui_state.pending_thread = None;
+                } else {
+                    ui_state.last_error = Some("Hole Genie: click a face to place the thread first.".into());
+                    ui_state.pending_thread = Some(spec);
+                }
+            } else if cancel {
+                ui_state.pending_thread = None;
+                ui_state.regen = true;
+            } else {
+                ui_state.pending_thread = Some(spec);
+            }
+        }
         if let Some(mut op) = ui_state.pending.clone() {
             // PropertyManager laid out like SolidWorks' Boss-Extrude.
             // Guard the depth: a non-finite value would crash egui's DragValue.
@@ -2573,6 +2717,20 @@ fn ui_system(
                         }
                         FeatureKind::Mirror { .. } => {
                             let resp = ui.selectable_label(selected, styled("◧ Mirror".to_string()));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::Thread { major_d, pitch, internal, .. } => {
+                            let kind = if *internal { "tap" } else { "ext" };
+                            let resp = ui.selectable_label(selected, styled(format!("⛁ Thread {kind}  M{major_d:.1}×{pitch:.2}")));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -4050,6 +4208,32 @@ fn sketch_interaction(
             }
         }
         return;
+    }
+
+    // Hole Genie: while its PM is open, hover the body and snap to the nearest feature point
+    // (vertex / edge midpoint / circle centre) so the hole drops onto a precise location
+    // without fiddly aiming. A click anchors it there (hit = centre, face normal = axis).
+    ui_state.thread_hover = None;
+    if ui_state.pending_thread.is_some() && !blocking.0 {
+        if let (Some(cursor), Some(mesh)) = (window.cursor_position(), part.mesh.as_ref()) {
+            if let Some((hit, normal)) = pick_face_point(mesh, camera, cam_gt, cursor) {
+                // Snap the raw hit to the nearest body feature point in screen space.
+                let origin = snap_place_point(&part, camera, cam_gt, cursor, hit);
+                ui_state.thread_hover = Some((origin, normal));
+                if buttons.just_pressed(MouseButton::Left) {
+                    if let Some(spec) = ui_state.pending_thread.clone() {
+                        let mut s = spec;
+                        s.origin = origin;
+                        s.axis = normal;
+                        s.placed = true;
+                        ui_state.pending_thread = Some(s);
+                    }
+                }
+            }
+        }
+        if buttons.just_pressed(MouseButton::Left) {
+            return; // consume the placement click
+        }
     }
 
     if blocking.0 {
@@ -6533,7 +6717,7 @@ fn handle_edit_sketch(
         | FeatureKind::Cut { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => return,
     };
     let ap = active_plane_from_ref(&plane, "Face");
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -6609,7 +6793,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -6661,7 +6845,7 @@ fn doc_has_text(doc: &Document) -> bool {
 fn doc_has_fillet(doc: &Document) -> bool {
     doc.features
         .iter()
-        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. }))
+        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. }))
 }
 
 /// failed to build, so the UI can tell the user which operation didn't apply.
@@ -6726,10 +6910,10 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            // A fillet/chamfer/mirror reshapes the mesh, so a model with one always builds
-            // via the mesh path — this exact-kernel path never runs with one present.
-            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } => {
-                failures.push("Fillet/chamfer/mirror needs the mesh kernel.".into());
+            // These reshape the mesh, so a model with one always builds via the mesh path —
+            // this exact-kernel path never runs with one present.
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => {
+                failures.push("Fillet/chamfer/mirror/thread needs the mesh kernel.".into());
             }
         }
     }
@@ -6831,6 +7015,12 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                 if let Some(b) = body.take() {
                     let refl = mirror_mesh(&b, plane.origin, plane.normal);
                     body = Some(mesh_union(&b, &refl));
+                }
+            }
+            // Tap a threaded hole / thread a boss.
+            FeatureKind::Thread { origin, axis, major_d, pitch, depth, internal, rh } => {
+                if let Some(b) = body.take() {
+                    body = Some(threaded_hole(&b, *origin, *axis, *major_d, *pitch, *depth, *internal, *rh).unwrap_or(b));
                 }
             }
         }
@@ -7117,6 +7307,94 @@ fn mirror_preview(
     }
     spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
     ui_state.mirror_shown = Some(which);
+}
+
+/// Build the `FeatureKind::Thread` from a placed spec.
+fn thread_feature(spec: &ThreadSpec) -> FeatureKind {
+    FeatureKind::Thread {
+        origin: [spec.origin.x as f64, spec.origin.y as f64, spec.origin.z as f64],
+        axis: [spec.axis.x as f64, spec.axis.y as f64, spec.axis.z as f64],
+        major_d: spec.major_d() as f64,
+        pitch: spec.pitch as f64,
+        depth: spec.depth as f64,
+        internal: spec.internal,
+        rh: spec.rh,
+    }
+}
+
+/// Append a confirmed thread to the timeline and trigger a rebuild.
+fn apply_thread(mut ui_state: ResMut<UiState>, mut doc: ResMut<DocRes>, mut history: ResMut<History>) {
+    let Some(spec) = ui_state.thread_request.take() else { return };
+    history.snapshot(&doc.0);
+    doc.0.add_feature(thread_feature(&spec));
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// While the Hole Genie PM is open, draw a see-through ghost of the hole/thread on the
+/// overlay group (so it shows *through* the model, like the cut-extrude preview): a hover
+/// snap marker before it's placed, then the bore rings + helix going into the body.
+fn thread_ghost(mut overlay: Gizmos<OverlayGizmos>, ui_state: Res<UiState>) {
+    let Some(spec) = &ui_state.pending_thread else { return };
+    // Hover marker at the snapped placement point (before it's anchored).
+    if !spec.placed {
+        if let Some((o, a)) = ui_state.thread_hover {
+            let r = (spec.major_d() * 0.5).max(0.3);
+            ring(&mut overlay, o, a.normalize_or_zero(), r, Color::srgb(0.2, 1.0, 0.45));
+            let u = a.normalize_or_zero().any_orthonormal_vector() * (r * 0.4);
+            overlay.line(o - u, o + u, Color::srgb(0.2, 1.0, 0.45));
+            let w = a.normalize_or_zero().cross(u.normalize_or_zero()) * (r * 0.4);
+            overlay.line(o - w, o + w, Color::srgb(0.2, 1.0, 0.45));
+        }
+        return;
+    }
+    let a = spec.axis.normalize_or_zero();
+    let r = (spec.major_d() * 0.5).max(0.1);
+    let depth = spec.depth.max(0.1);
+    let o = spec.origin;
+    let bore = Color::srgba(1.0, 0.4, 0.35, 0.9); // reddish, like a cut
+    let depth_col = Color::srgb(1.0, 0.75, 0.2); // bright depth ring
+    // Top and bottom (depth) rings.
+    ring(&mut overlay, o, a, r, bore);
+    ring(&mut overlay, o - a * depth, a, r, depth_col);
+    // Four risers down the bore.
+    let u = a.any_orthonormal_vector();
+    let v = a.cross(u);
+    for k in 0..4 {
+        let ang = std::f32::consts::TAU * k as f32 / 4.0;
+        let p = o + (u * ang.cos() + v * ang.sin()) * r;
+        overlay.line(p, p - a * depth, bore);
+    }
+    // Helical thread line, suggesting the pitch.
+    let pitch = spec.pitch.max(0.1);
+    let turns = (depth / pitch).clamp(0.5, 200.0);
+    let n = (turns * 24.0).ceil() as usize;
+    let sign = if spec.rh { 1.0 } else { -1.0 };
+    let mut prev = o + u * r;
+    for i in 1..=n {
+        let t = i as f32 / n as f32;
+        let ang = sign * std::f32::consts::TAU * turns * t;
+        let p = o - a * (depth * t) + (u * ang.cos() + v * ang.sin()) * r;
+        overlay.line(prev, p, Color::srgba(1.0, 0.6, 0.2, 0.8));
+        prev = p;
+    }
+    overlay.line(o, o - a * depth, depth_col); // axis
+}
+
+/// Draw a ring (circle) of `radius` centred at `c` in the plane with normal `n`.
+fn ring(overlay: &mut Gizmos<OverlayGizmos>, c: Vec3, n: Vec3, radius: f32, color: Color) {
+    let n = n.normalize_or_zero();
+    let u = n.any_orthonormal_vector();
+    let v = n.cross(u);
+    const SEG: usize = 48;
+    let mut prev = c + u * radius;
+    for k in 1..=SEG {
+        let a = std::f32::consts::TAU * k as f32 / SEG as f32;
+        let p = c + (u * a.cos() + v * a.sin()) * radius;
+        overlay.line(prev, p, color);
+        prev = p;
+    }
 }
 
 /// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
@@ -8699,6 +8977,70 @@ fn extrude_arrow_drag(
 
 /// Index of the body edge segment nearest the cursor in screen space, within
 /// `thresh` pixels.
+/// Snap a raw face-hit to the nearest body feature point in screen space (within ~14 px):
+/// an edge endpoint, an edge midpoint, or a circular-edge centre — so a hole drops precisely
+/// onto a vertex / hole centre. Falls back to the raw `hit` when nothing is close.
+fn snap_place_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform, cursor: Vec2, hit: Vec3) -> Vec3 {
+    let mut cands: Vec<Vec3> = Vec::new();
+    for e in &part.edges {
+        let a = Vec3::from_array(e[0]);
+        let b = Vec3::from_array(e[1]);
+        cands.push(a);
+        cands.push(b);
+        cands.push((a + b) * 0.5);
+    }
+    // Circular-edge centres (concentric holes/bosses): the centroid of a closed edge loop.
+    let mut seen = vec![false; part.edges.len()];
+    for i in 0..part.edges.len() {
+        if seen[i] {
+            continue;
+        }
+        let (chain, closed) = edge_chain(&part.edges, i);
+        for (j, e) in part.edges.iter().enumerate() {
+            if chain.iter().any(|p| p.distance(Vec3::from_array(e[0])) < 1e-4) {
+                seen[j] = true; // don't re-walk this loop
+            }
+        }
+        if closed && chain.len() >= 8 {
+            cands.push(chain.iter().fold(Vec3::ZERO, |s, p| s + *p) / chain.len() as f32);
+        }
+    }
+    let mut best: Option<(Vec3, f32)> = None;
+    for c in cands {
+        if let Ok(s) = camera.world_to_viewport(cam_gt, c) {
+            let d = s.distance(cursor);
+            if d <= 14.0 && best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((c, d));
+            }
+        }
+    }
+    best.map(|(c, _)| c).unwrap_or(hit)
+}
+
+/// Raycast the cursor onto the body mesh: the nearest triangle hit, returning the world hit
+/// point and that face's normal (oriented toward the camera). Used to place a threaded hole.
+fn pick_face_point(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cursor: Vec2) -> Option<(Vec3, Vec3)> {
+    let ray = camera.viewport_to_world(cam_gt, cursor).ok()?;
+    let (orig, dir) = (ray.origin, *ray.direction);
+    let mut best: Option<(f32, Vec3)> = None; // (t, normal)
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = Vec3::from_array(mesh.positions[tri[0] as usize]);
+        let b = Vec3::from_array(mesh.positions[tri[1] as usize]);
+        let c = Vec3::from_array(mesh.positions[tri[2] as usize]);
+        if let Some(t) = ray_triangle(orig, dir, a, b, c) {
+            if best.map_or(true, |(bt, _)| t < bt) {
+                best = Some((t, (b - a).cross(c - a).normalize_or_zero()));
+            }
+        }
+    }
+    best.map(|(t, mut n)| {
+        if n.dot(dir) > 0.0 {
+            n = -n; // face toward the camera (outward)
+        }
+        (orig + dir * t, n)
+    })
+}
+
 fn pick_edge(
     edges: &[[[f32; 3]; 2]],
     camera: &Camera,

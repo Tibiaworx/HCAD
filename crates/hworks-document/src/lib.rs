@@ -64,6 +64,10 @@ pub enum FeatureKind {
     /// Mirror: reflect the whole body across `plane` and union it with the original
     /// (a symmetric part). The plane is recorded so it survives regeneration.
     Mirror { plane: PlaneRef },
+    /// Threaded hole / thread (the "Hole Genie"): at `origin` on a face with outward normal
+    /// `axis`, a thread of `major_d` × `pitch` over `depth`. `internal` taps a hole; false
+    /// threads an existing boss. `rh` = right-handed.
+    Thread { origin: [f64; 3], axis: [f64; 3], major_d: f64, pitch: f64, depth: f64, internal: bool, rh: bool },
     // Revolve / … arrive at M8+.
 }
 
@@ -150,6 +154,10 @@ impl Document {
                     format!("[chamfer] Chamfer  d={distance:.2} ({})", edges.len())
                 }
                 FeatureKind::Mirror { .. } => "[mirror] Mirror".to_string(),
+                FeatureKind::Thread { major_d, pitch, internal, .. } => {
+                    let kind = if *internal { "tap" } else { "ext" };
+                    format!("[thread] Thread {kind}  M{major_d:.1}×{pitch:.2}")
+                }
             })
             .collect()
     }

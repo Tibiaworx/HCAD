@@ -11,10 +11,11 @@
 use truck_meshalgo::prelude::*;
 use truck_modeling::{builder, Point3, Vector3};
 
+mod bevel;
 mod csg;
 mod fillet;
 mod mesh_bool;
-pub use fillet::{chamfer_mesh, round_mesh};
+pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
 pub use mesh_bool::{mesh_difference, mesh_intersection, mesh_union, mirror_mesh};
 
 /// A tessellated triangle mesh handed up to the renderer.

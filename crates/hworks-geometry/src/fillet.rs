@@ -1640,3 +1640,171 @@ fn sdf_round(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<Tri
     }
     Some(TriMesh { positions, normals, indices })
 }
+
+// ---------------------------------------------------------------------------
+// Threads — the "Hole Genie": tap a threaded hole, or add a thread to a hole/boss.
+// A thread is a helical triangular ridge (a coil) swept around the axis and booleaned in:
+// internal threads (tapped hole) union ridges into a clearance hole; external threads on a
+// boss subtract a helical V-groove. Pitch sets the helix advance per turn; the 60° ISO V is
+// approximated by a triangular tooth (pointed crest/root) — fine for a visual model.
+// ---------------------------------------------------------------------------
+
+/// A unit vector perpendicular to `a`.
+fn any_perp(a: V3) -> V3 {
+    let t = if a[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    norm(cross(a, t))
+}
+
+/// A helical triangular coil around `axis` through `o`, advancing `pitch` per turn over
+/// `length`. Each cross-section is a tooth: two outer vertices at `r_out` (± half-width along
+/// the axis) and an apex at `r_in`. `rh` = right-handed. Used as a boolean tool.
+fn thread_coil(o: V3, axis: V3, r_out: f64, r_in: f64, pitch: f64, length: f64, rh: bool) -> TriMesh {
+    let a = norm(axis);
+    let u = any_perp(a);
+    let v = cross(a, u);
+    let hw = pitch * 0.25; // tooth half-width along the axis
+    let spt = 32usize; // angular steps per turn
+    let turns = (length / pitch).max(0.0);
+    let n = ((turns * spt as f64).ceil() as usize).max(2);
+    let sign = if rh { 1.0 } else { -1.0 };
+    // Start a hair below the face so the first tooth doesn't poke above it.
+    let z0 = -hw;
+    // Run-out: over the first/last half-turn fade the tooth apex back out to the wall
+    // (`r_out`), so the coil's flat end caps collapse onto the wall — no tab at the top, no
+    // stray geometry at the bottom of the bore.
+    let ramp = (spt / 2).max(1);
+    let cs = |k: usize| -> [V3; 3] {
+        let theta = std::f64::consts::TAU * k as f64 / spt as f64;
+        let z = z0 - pitch * theta / std::f64::consts::TAU; // spiral into the material (−axis)
+        let rad = add(scale(u, (sign * theta).cos()), scale(v, (sign * theta).sin()));
+        let base = add(o, scale(a, z));
+        let taper = (k as f64 / ramp as f64).min((n - k) as f64 / ramp as f64).clamp(0.0, 1.0);
+        let r_apex = r_out + (r_in - r_out) * taper; // r_out at the ends, r_in in the middle
+        let outer = |dz: f64| add(add(base, scale(a, dz)), scale(rad, r_out));
+        [outer(-hw), outer(hw), add(base, scale(rad, r_apex))]
+    };
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity((n + 1) * 3);
+    for k in 0..=n {
+        for p in cs(k) {
+            positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+        }
+    }
+    let vi = |k: usize, j: usize| (k * 3 + j) as u32;
+    let mut indices: Vec<u32> = Vec::new();
+    for k in 0..n {
+        for e in 0..3 {
+            let (j0, j1) = (e, (e + 1) % 3);
+            let (a0, a1, b1, b0) = (vi(k, j0), vi(k, j1), vi(k + 1, j1), vi(k + 1, j0));
+            indices.extend_from_slice(&[a0, a1, b1, a0, b1, b0]);
+        }
+    }
+    indices.extend_from_slice(&[vi(0, 0), vi(0, 1), vi(0, 2)]); // start cap
+    indices.extend_from_slice(&[vi(n, 2), vi(n, 1), vi(n, 0)]); // end cap
+    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    orient_outward(&mut m);
+    fill_normals(&mut m);
+    m
+}
+
+/// Tap a threaded hole: drill a clearance hole of `major_d` from the face at `origin` (with
+/// outward normal `axis`) down `depth`, then union the internal thread ridges (crests at the
+/// minor diameter). `internal` true taps a hole; false threads an existing boss of `major_d`
+/// (subtract a helical V-groove instead). Returns the modified body.
+pub fn threaded_hole(
+    body: &TriMesh,
+    origin: V3,
+    axis: V3,
+    major_d: f64,
+    pitch: f64,
+    depth: f64,
+    internal: bool,
+    rh: bool,
+) -> Option<TriMesh> {
+    if major_d <= 1e-4 || pitch <= 1e-4 || depth <= 1e-4 || body.indices.len() < 3 {
+        return None;
+    }
+    let a = norm(axis);
+    let u = any_perp(a);
+    let w = cross(a, u);
+    let minor_d = (major_d - 1.0825 * pitch).max(major_d * 0.55);
+    let hw = 0.25 * pitch;
+    // Clamp the thread depth to the material actually behind the hole: cast a ray from the
+    // face along −axis and find where it exits the solid (the back face). The thread can't be
+    // built deeper than that, so an over-specified depth never spawns geometry past the body.
+    let tris: Vec<[V3; 3]> = body
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let g = |i: u32| {
+                let p = body.positions[i as usize];
+                [p[0] as f64, p[1] as f64, p[2] as f64]
+            };
+            [g(t[0]), g(t[1]), g(t[2])]
+        })
+        .collect();
+    let avail = axis_exit(&tris, origin, scale(a, -1.0)).unwrap_or(depth + 1.0);
+    // The bottom tooth's outer base reaches ~hw below the last helix point (which itself sits
+    // hw below the face), so leave ~2.5·hw of clearance to keep the whole tooth inside.
+    let depth = depth.min((avail - 2.5 * hw).max(0.5));
+    let mut out = body.clone();
+    if internal {
+        // Drill the clearance hole (major), starting just above the face going inward. It runs
+        // a bit past the thread so the bore floor (or the through-exit) sits below the run-out.
+        let start = add(origin, scale(a, 0.2));
+        let hole = make_cylinder(start, scale(a, -1.0), u, w, major_d * 0.5, depth + 0.5 * pitch + 0.4, 48);
+        out = crate::mesh_difference(&out, &hole);
+        // Union the thread ridges (apex at minor, base buried a hair in the wall).
+        let r_out = major_d * 0.5 + 0.1 * pitch;
+        let coil = thread_coil(origin, a, r_out, minor_d * 0.5, pitch, depth, rh);
+        if coil.indices.len() >= 3 {
+            out = crate::mesh_union(&out, &coil);
+        }
+    } else {
+        // External: cut a helical V-groove into the boss (crest stays at major, root at minor).
+        let r_out = major_d * 0.5 + 0.1 * pitch; // base outside the surface
+        let groove = thread_coil(origin, a, r_out, minor_d * 0.5, pitch, depth, rh);
+        if groove.indices.len() >= 3 {
+            out = crate::mesh_difference(&out, &groove);
+        }
+    }
+    (out.indices.len() >= 3).then_some(out)
+}
+
+/// Distance from `o` along unit `dir` to where the ray exits the solid `tris` (the first
+/// front/back surface it crosses after stepping just inside). `None` if it never exits.
+fn axis_exit(tris: &[[V3; 3]], o: V3, dir: V3) -> Option<f64> {
+    let oo = add(o, scale(dir, 1e-3)); // step just inside so the entry face is skipped
+    let mut best: Option<f64> = None;
+    for t in tris {
+        if let Some(td) = ray_tri(oo, dir, t[0], t[1], t[2]) {
+            if td > 1e-3 {
+                best = Some(best.map_or(td, |b: f64| b.min(td)));
+            }
+        }
+    }
+    best.map(|t| t + 1e-3)
+}
+
+/// Möller–Trumbore ray/triangle: distance `t > 0` along `dir` from `o` to triangle `abc`.
+fn ray_tri(o: V3, dir: V3, a: V3, b: V3, c: V3) -> Option<f64> {
+    let e1 = sub(b, a);
+    let e2 = sub(c, a);
+    let p = cross(dir, e2);
+    let det = dot(e1, p);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tv = sub(o, a);
+    let uu = dot(tv, p) * inv;
+    if !(-1e-7..=1.0 + 1e-7).contains(&uu) {
+        return None;
+    }
+    let q = cross(tv, e1);
+    let vv = dot(dir, q) * inv;
+    if vv < -1e-7 || uu + vv > 1.0 + 1e-7 {
+        return None;
+    }
+    let t = dot(e2, q) * inv;
+    (t > 0.0).then_some(t)
+}
