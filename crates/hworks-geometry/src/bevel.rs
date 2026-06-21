@@ -306,7 +306,10 @@ pub fn inset_loops(topo: &Topo, fi: usize, r: f64) -> Vec<Vec<V3>> {
             let w_out = norm(cross(n, dir[i]));
             let p_in = add(v, scale(w_in, setback[prev])); // a point on the incoming offset line
             let p_out = add(v, scale(w_out, setback[i]));
-            ring.push(line_intersect(p_in, dir[prev], p_out, dir[i], n).unwrap_or(v));
+            // When the two boundary edges are collinear (a mid-edge vertex left by triangulation)
+            // the offset lines are parallel — there's no intersection, so just step perpendicular.
+            let pt = line_intersect(p_in, dir[prev], p_out, dir[i], n).unwrap_or(p_out);
+            ring.push(pt);
         }
         out.push(ring);
     }
@@ -765,6 +768,21 @@ mod tests {
         assert_eq!(concave, 1, "L-prism has exactly one concave (vertical) edge");
         let rounded = bevel_mesh(&prism, 0.4, 4).expect("L-prism bevels");
         assert!(is_watertight(&rounded), "bevelled L-prism must be a closed surface");
+    }
+
+    #[test]
+    fn bevel_csg_pocket_is_watertight() {
+        // A real CSG body: a block with a blind rectangular pocket. Its rim corners are mixed
+        // (2 convex + 1 concave) and its edges are subdivided by triangulation — the actual case
+        // the CSG fillet notched. This is the end-to-end target.
+        let outer = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let block = extrude_tool_mesh(&outer, &[], &xy(), 0.0, 5.0).unwrap();
+        let pocket = [[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]];
+        let top = PlaneBasis { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let tool = extrude_tool_mesh(&pocket, &[], &top, 0.0, 2.0).unwrap();
+        let body = crate::mesh_difference(&block, &tool);
+        let rounded = bevel_mesh(&body, 0.3, 3).expect("pocket bevels");
+        assert!(is_watertight(&rounded), "bevelled CSG pocket must be a closed surface");
     }
 
     #[test]
