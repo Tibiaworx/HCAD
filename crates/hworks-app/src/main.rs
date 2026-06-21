@@ -541,6 +541,9 @@ struct SketchSession {
     /// If the open Modify box dimensions a single line (entity index), clicking a
     /// second line converts it into an angle dimension between the two lines.
     dim_line: Option<usize>,
+    /// Like `dim_line` but for a slot whose width box is open: clicking a line / edge next
+    /// converts it into a distance from that line to the slot's centre line.
+    dim_slot: Option<usize>,
     /// A dimension whose offset is being dragged with the Select tool (constraint index).
     dim_drag: Option<usize>,
     /// Timestamp of the last Select-tool click, for double-click-to-edit detection.
@@ -2154,6 +2157,7 @@ fn ui_system(
                             | Constraint::Radius { .. }
                             | Constraint::Angle { .. }
                             | Constraint::PointLineDistance { .. }
+                            | Constraint::SlotWidth { .. }
                     )
                     .then_some(i)
                 })
@@ -2185,7 +2189,8 @@ fn ui_system(
                             }
                             match session.sketch.constraints.get_mut(*i) {
                                 Some(Constraint::Distance { value, .. })
-                                | Some(Constraint::PointLineDistance { value, .. }) => {
+                                | Some(Constraint::PointLineDistance { value, .. })
+                                | Some(Constraint::SlotWidth { value, .. }) => {
                                     if ui.add(egui::DragValue::new(value).speed(0.05).range(0.01..=10_000.0).suffix(" mm")).changed() {
                                         changed = true;
                                     }
@@ -2331,21 +2336,11 @@ fn ui_system(
             // Distance dimension between the two selected lines (point-to-line). The body
             // edge (a reference line) is the base; an endpoint of the other line is driven.
             if dist_request && two_lines {
-                let is_ref = |i: usize| matches!(session.sketch.entities.get(i), Some(SketchEntity::Line { reference: true, .. }));
-                let base_i = if is_ref(line_entities[0]) { 0 } else if is_ref(line_entities[1]) { 1 } else { 0 };
-                let other_i = 1 - base_i;
-                let (ba, bb) = lines[base_i];
-                let pp = lines[other_i].0;
-                let a2 = Vec2::new(session.sketch.points[ba].x as f32, session.sketch.points[ba].y as f32);
-                let b2 = Vec2::new(session.sketch.points[bb].x as f32, session.sketch.points[bb].y as f32);
-                let p2 = Vec2::new(session.sketch.points[pp].x as f32, session.sketch.points[pp].y as f32);
-                let (foot, _) = point_line_geometry(p2, a2, b2);
-                let value = (p2 - foot).length().max(0.001) as f64;
-                let ci = session.sketch.constraints.len();
-                session.sketch.constraints.push(Constraint::PointLineDistance { p: pp, a: ba, b: bb, value, offset: 0.0 });
-                session.selected_entities.clear();
-                open_dim_edit(&mut session, ci, None);
-                session.needs_apply = true;
+                if let Some(ci) = add_point_line_distance(&mut session.sketch, line_entities[0], line_entities[1]) {
+                    session.selected_entities.clear();
+                    open_dim_edit(&mut session, ci, None);
+                    session.needs_apply = true;
+                }
             }
             // Equal across the whole selection. Whichever item already carries a size
             // dimension drives the rest through the chain; >2 sized items is ambiguous,
@@ -2904,6 +2899,14 @@ fn ui_system(
                         act(label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
                     }
                 }
+                Constraint::SlotWidth { a, b, value, .. } => {
+                    if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
+                        let a2 = Vec2::new(pa.x as f32, pa.y as f32);
+                        let b2 = Vec2::new(pb.x as f32, pb.y as f32);
+                        let (_, _, lab) = slot_width_geometry(a2, b2, (*value * 0.5) as f32);
+                        act(label_at(ctx, egui::Id::new(("slotlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
+                    }
+                }
                 _ => {}
             }
         }
@@ -3060,7 +3063,8 @@ fn ui_system(
             Some(Constraint::Distance { axis, .. }) => Some(DimKind::Distance(*axis)),
             Some(Constraint::Radius { diameter, .. }) => Some(DimKind::Radius(*diameter)),
             Some(Constraint::Angle { .. }) => Some(DimKind::Angle),
-            Some(Constraint::PointLineDistance { .. }) => Some(DimKind::PointLine),
+            // Slot width edits like a plain mm distance (no axis/diameter toggle).
+            Some(Constraint::PointLineDistance { .. }) | Some(Constraint::SlotWidth { .. }) => Some(DimKind::PointLine),
             _ => None,
         };
         // Label/box anchor in plane uv, computed from the constraint's points.
@@ -3084,6 +3088,10 @@ fn ui_system(
             }
             Some(Constraint::PointLineDistance { p, a, b, .. }) => match (pt(*p), pt(*a), pt(*b)) {
                 (Some(pp), Some(a2), Some(b2)) => Some(point_line_geometry(pp, a2, b2).1),
+                _ => None,
+            },
+            Some(Constraint::SlotWidth { a, b, value, .. }) => match (pt(*a), pt(*b)) {
+                (Some(a2), Some(b2)) => Some(slot_width_geometry(a2, b2, (*value * 0.5) as f32).2),
                 _ => None,
             },
             _ => None,
@@ -3149,6 +3157,7 @@ fn ui_system(
                                         angle_ref = Some([*a, *b]);
                                     }
                                     Some(Constraint::PointLineDistance { value, .. }) => *value = v,
+                                    Some(Constraint::SlotWidth { value, .. }) => *value = v,
                                     _ => {}
                                 }
                                 match angle_ref {
@@ -3612,11 +3621,6 @@ fn inference_points(sketch: &Sketch, i: usize) -> Vec<Vec2> {
     }
 }
 
-/// Snap `uv` to the nearest inference point within `thresh`, else return it.
-fn snap_to_inference(uv: Vec2, points: &[Vec2], thresh: f32) -> Vec2 {
-    nearest_within(uv, points, thresh).unwrap_or(uv)
-}
-
 /// The nearest of `points` to `uv` within `thresh`, if any.
 fn nearest_within(uv: Vec2, points: &[Vec2], thresh: f32) -> Option<Vec2> {
     points
@@ -3653,6 +3657,39 @@ fn entity_circle(sketch: &Sketch, i: usize) -> Option<(usize, f64)> {
     }
 }
 
+/// The (centre-line endpoints, half-width) of a slot entity, if `i` is a slot.
+fn entity_slot(sketch: &Sketch, i: usize) -> Option<(usize, usize, f64)> {
+    match sketch.entities.get(i) {
+        Some(SketchEntity::Slot { a, b, radius, .. }) => Some((*a, *b, *radius)),
+        _ => None,
+    }
+}
+
+/// The two side points (across the width) and the label anchor of a slot-width dimension:
+/// the perpendicular through the centre line's midpoint, ±`half` to each side.
+fn slot_width_geometry(a2: Vec2, b2: Vec2, half: f32) -> (Vec2, Vec2, Vec2) {
+    let center = (a2 + b2) * 0.5;
+    let mut dir = (b2 - a2).normalize_or_zero();
+    if dir == Vec2::ZERO {
+        dir = Vec2::X;
+    }
+    let perp = Vec2::new(-dir.y, dir.x);
+    (center + perp * half, center - perp * half, center)
+}
+
+/// Add a slot-width dimension (or return the existing one) driving the slot's half-width.
+fn add_slot_width_dim(sketch: &mut Sketch, slot_entity: usize) -> Option<usize> {
+    let (a, b, radius) = entity_slot(sketch, slot_entity)?;
+    if let Some(i) = sketch.constraints.iter().position(|c| {
+        matches!(c, Constraint::SlotWidth { a: x, b: y, .. } if (*x == a && *y == b) || (*x == b && *y == a))
+    }) {
+        return Some(i);
+    }
+    let value = (radius * 2.0).max(0.001);
+    sketch.constraints.push(Constraint::SlotWidth { a, b, value, offset: 0.0 });
+    Some(sketch.constraints.len() - 1)
+}
+
 /// The point indices an entity is built on (a line's ends, a circle's centre).
 fn entity_points(sketch: &Sketch, i: usize) -> Vec<usize> {
     match sketch.entities.get(i) {
@@ -3686,6 +3723,7 @@ fn constraint_points(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnCircle { p, center } => vec![*p, *center],
         Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
         Constraint::PointOnArc { p, .. } => vec![*p],
+        Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
     }
 }
 
@@ -3718,6 +3756,7 @@ fn constraint_label(c: &Constraint) -> String {
         Constraint::PointOnCircle { .. } => "On circle".into(),
         Constraint::PointOnLine { .. } => "On edge".into(),
         Constraint::PointOnArc { .. } => "On arc".into(),
+        Constraint::SlotWidth { value, .. } => format!("Slot width  {value:.2}"),
     }
 }
 
@@ -4324,14 +4363,19 @@ fn sketch_interaction(
     // line is clicked, it becomes an angle dimension.
     if let Some(ci) = session.dim_edit {
         if just_pressed {
-            // Angle conversion: open dim is a line length and a different line is clicked.
-            // Pick the nearest *line* under the cursor (a sketch line in preference to a
-            // body-edge reference line) so the angle is between the lines you actually click.
-            let convert = session.dim_line.and_then(|l1| {
-                let uv = active_uv?;
-                let mut best: Option<(usize, bool, f32)> = None; // (entity, is_ref, dist)
+            // The Modify box is open on a line's length; clicking a *second* line (or a body
+            // edge) turns it into a line-to-line dimension. Pick the nearest sketch line
+            // under the cursor (preferring a real sketch line over a reference line); if
+            // there's none, fall back to a body edge under the cursor and project it.
+            let first_line = session.dim_line;
+            let first_slot = session.dim_slot;
+            let mut second_line: Option<usize> = None;
+            let mut second_slot: Option<usize> = None;
+            if let Some(uv) = active_uv {
+                // Nearest sketch line (preferring a real line over a reference line).
+                let mut best: Option<(usize, bool, f32)> = None;
                 for (i, e) in session.sketch.entities.iter().enumerate() {
-                    if i == l1 {
+                    if Some(i) == first_line {
                         continue;
                     }
                     if let SketchEntity::Line { a, b, reference, .. } = e {
@@ -4340,7 +4384,6 @@ fn sketch_interaction(
                             let vb = Vec2::new(pb.x as f32, pb.y as f32);
                             let d = closest_on_segment(uv, va, vb).distance(uv);
                             if d <= snap * 2.0 {
-                                // Prefer a non-reference line; among equals, the nearer one.
                                 let better = best.map_or(true, |(_, bref, bd)| {
                                     (*reference, d) < (bref, bd) || (*reference == bref && d < bd)
                                 });
@@ -4351,23 +4394,74 @@ fn sketch_interaction(
                         }
                     }
                 }
-                best.map(|(i, _, _)| (l1, i))
-            });
-            if let Some((l1, l2)) = convert {
-                if let Some(ci2) = convert_length_to_angle(&mut session, ci, l1, l2) {
+                second_line = best.map(|(i, _, _)| i);
+                // A slot under the cursor (its centre line can be dimensioned to a line).
+                if let Some(e) = nearest_entity(&session.sketch, uv, snap * 2.0) {
+                    if Some(e) != first_slot && entity_slot(&session.sketch, e).is_some() {
+                        second_slot = Some(e);
+                    }
+                }
+                // Otherwise a body edge → project it as a locked reference line.
+                if second_line.is_none() && second_slot.is_none() {
+                    if let (Some(cursor), Some(ap)) = (window.cursor_position(), session.plane.clone()) {
+                        if let Some(ei) = pick_edge(&part.edges, camera, cam_gt, cursor, 10.0) {
+                            let seg = part.edges[ei];
+                            let to_uv = |w: Vec3| {
+                                let d = w - ap.origin;
+                                Vec2::new(d.dot(ap.u), d.dot(ap.v))
+                            };
+                            let a2 = to_uv(Vec3::from_array(seg[0]));
+                            let b2 = to_uv(Vec3::from_array(seg[1]));
+                            second_line = add_or_get_reference_line(&mut session, a2, b2);
+                        }
+                    }
+                }
+            }
+            // Decide the new dimension: slot↔line distance, or line↔line distance/angle.
+            enum Act {
+                SlotLine(usize, usize), // (slot entity, line entity)
+                LineLine(usize, usize),
+            }
+            let act = if let (Some(sl), Some(ln)) = (first_slot, second_line) {
+                Some(Act::SlotLine(sl, ln))
+            } else if let (Some(ln), Some(sl)) = (first_line, second_slot) {
+                Some(Act::SlotLine(sl, ln))
+            } else if let (Some(l1), Some(l2)) = (first_line, second_line) {
+                (l2 != l1).then_some(Act::LineLine(l1, l2))
+            } else {
+                None
+            };
+            if let Some(act) = act {
+                // Drop the length/width dim we just made; replace it with the pair dim.
+                if ci + 1 == session.sketch.constraints.len() {
+                    session.sketch.constraints.pop();
+                }
+                let new_ci = match act {
+                    Act::SlotLine(sl, ln) => add_slot_line_distance(&mut session.sketch, sl, ln),
+                    Act::LineLine(l1, l2) => {
+                        if lines_parallel(&session.sketch, l1, l2) {
+                            add_point_line_distance(&mut session.sketch, l1, l2)
+                        } else {
+                            add_angle_dim(&mut session.sketch, l1, l2)
+                        }
+                    }
+                };
+                if let Some(ci2) = new_ci {
                     session.dim_edit = Some(ci2);
                     session.dim_line = None;
-                    let deg = match session.sketch.constraints.get(ci2) {
+                    session.dim_slot = None;
+                    session.dim_buf = match session.sketch.constraints.get(ci2) {
                         Some(Constraint::Angle { value, .. }) => value.to_degrees(),
+                        Some(Constraint::PointLineDistance { value, .. }) => *value,
                         _ => 0.0,
                     };
-                    session.dim_buf = deg;
                     session.dim_edit_focus = true;
                     return;
                 }
             }
             session.dim_edit = None;
             session.dim_line = None;
+            session.dim_slot = None;
         }
         return;
     }
@@ -4455,6 +4549,7 @@ fn sketch_interaction(
     if session.tool != Tool::Dimension {
         session.dim_first = None;
         session.dim_line = None;
+        session.dim_slot = None;
     }
     if session.tool != Tool::Spline && !session.spline_pts.is_empty() {
         session.spline_pts.clear(); // leaving the spline tool drops the in-progress curve
@@ -4748,6 +4843,7 @@ fn sketch_interaction(
                     // line); a circle dimensions its radius/diameter. A new dimension
                     // opens the Modify box so the exact value can be typed straight away.
                     let mut line_ctx = None;
+                    let mut slot_ctx = None;
                     let created = if let Some(p) = nearest_point(&session.sketch, uv, snap * 1.5) {
                         match session.dim_first.take() {
                             Some(first) if first != p => add_distance_dim(&mut session.sketch, first, p),
@@ -4763,6 +4859,12 @@ fn sketch_interaction(
                             add_distance_dim(&mut session.sketch, a, b)
                         } else if let Some((center, radius)) = entity_circle(&session.sketch, e) {
                             add_radius_dim(&mut session.sketch, center, radius)
+                        } else if entity_slot(&session.sketch, e).is_some() {
+                            // A slot is one entity — clicking it dimensions its width; but
+                            // remember it so a follow-up click on a line/edge instead makes
+                            // a distance from that line to the slot's centre line.
+                            slot_ctx = Some(e);
+                            add_slot_width_dim(&mut session.sketch, e)
                         } else {
                             None
                         }
@@ -4771,6 +4873,7 @@ fn sketch_interaction(
                     };
                     if let Some(ci) = created {
                         open_dim_edit(&mut session, ci, line_ctx);
+                        session.dim_slot = slot_ctx;
                     }
                 }
             }
@@ -5243,6 +5346,10 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
                 (Some(pp), Some(a2), Some(b2)) => Some(point_line_geometry(pp, a2, b2).1),
                 _ => None,
             },
+            Constraint::SlotWidth { a, b, value, .. } => match (pt(*a), pt(*b)) {
+                (Some(a2), Some(b2)) => Some(slot_width_geometry(a2, b2, (*value * 0.5) as f32).2),
+                _ => None,
+            },
             _ => None,
         };
         anchor.filter(|p| (*p - uv).length() <= tol).map(|_| i)
@@ -5264,6 +5371,7 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
         }
         Some(Constraint::Angle { value, .. }) => value.to_degrees(),
         Some(Constraint::PointLineDistance { value, .. }) => *value,
+        Some(Constraint::SlotWidth { value, .. }) => *value,
         _ => return,
     };
     session.dim_edit = Some(ci);
@@ -5274,6 +5382,57 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
 
 /// Replace a freshly-placed line-length dimension (`ci`) with an angle dimension
 /// between lines `l1` and `l2`. Returns the new constraint index.
+/// Add a perpendicular distance dimension between two line entities (e.g. the two parallel
+/// sides of a slot, or a line and a body-edge reference line). A reference line is used as
+/// the base; an endpoint of the other line is the driven point. Returns the constraint idx.
+fn add_point_line_distance(sketch: &mut Sketch, l1: usize, l2: usize) -> Option<usize> {
+    let _ = entity_line(sketch, l1)?;
+    let _ = entity_line(sketch, l2)?;
+    let is_ref = |i: usize| matches!(sketch.entities.get(i), Some(SketchEntity::Line { reference: true, .. }));
+    // Prefer a reference (body-edge) line as the fixed base.
+    let (base, other) = if is_ref(l2) && !is_ref(l1) { (l2, l1) } else { (l1, l2) };
+    let (ba, bb) = entity_line(sketch, base)?;
+    let (pp, _) = entity_line(sketch, other)?;
+    if let Some(i) = sketch.constraints.iter().position(|c| {
+        matches!(c, Constraint::PointLineDistance { p, a, b, .. } if *p == pp && *a == ba && *b == bb)
+    }) {
+        return Some(i);
+    }
+    let v = |i: usize| {
+        let q = sketch.points[i];
+        Vec2::new(q.x as f32, q.y as f32)
+    };
+    let (foot, _) = point_line_geometry(v(pp), v(ba), v(bb));
+    let value = (v(pp) - foot).length().max(0.001) as f64;
+    sketch.constraints.push(Constraint::PointLineDistance { p: pp, a: ba, b: bb, value, offset: 0.0 });
+    Some(sketch.constraints.len() - 1)
+}
+
+/// Add a distance dimension between a slot and a line/edge: the perpendicular distance from
+/// the slot's centre line (its nearer endpoint) to the line. Editing it slides the slot.
+fn add_slot_line_distance(sketch: &mut Sketch, slot_entity: usize, line_entity: usize) -> Option<usize> {
+    let (sa, sb, _) = entity_slot(sketch, slot_entity)?;
+    let (la, lb) = entity_line(sketch, line_entity)?;
+    let v = |i: usize| {
+        let q = sketch.points[i];
+        Vec2::new(q.x as f32, q.y as f32)
+    };
+    let perp = |p: usize| {
+        let (foot, _) = point_line_geometry(v(p), v(la), v(lb));
+        (v(p) - foot).length()
+    };
+    // Drive whichever centre-line endpoint is nearer the line (so the slot slides square).
+    let pp = if perp(sa) <= perp(sb) { sa } else { sb };
+    if let Some(i) = sketch.constraints.iter().position(|c| {
+        matches!(c, Constraint::PointLineDistance { p, a, b, .. } if *p == pp && *a == la && *b == lb)
+    }) {
+        return Some(i);
+    }
+    let value = perp(pp).max(0.001) as f64;
+    sketch.constraints.push(Constraint::PointLineDistance { p: pp, a: la, b: lb, value, offset: 0.0 });
+    Some(sketch.constraints.len() - 1)
+}
+
 /// Add an angle dimension between two line entities (or return the existing one). The
 /// stored angle is kept positive by ordering the lines so the directed angle is ≥ 0; the
 /// first line in that order is the reference that stays put when the dimension is edited.
@@ -5310,14 +5469,20 @@ fn add_angle_dim(sketch: &mut Sketch, l1: usize, l2: usize) -> Option<usize> {
     Some(sketch.constraints.len() - 1)
 }
 
-fn convert_length_to_angle(session: &mut SketchSession, ci: usize, l1: usize, l2: usize) -> Option<usize> {
-    // Drop the length dim we just made (it's the last one) so the angle replaces it.
-    if ci + 1 == session.sketch.constraints.len() {
-        session.sketch.constraints.pop();
+/// Whether two line entities are (near) parallel — used to decide between a perpendicular
+/// distance dimension (parallel) and an angle dimension (not).
+fn lines_parallel(sketch: &Sketch, l1: usize, l2: usize) -> bool {
+    let dir = |l: usize| {
+        entity_line(sketch, l).and_then(|(a, b)| {
+            let va = Vec2::new(sketch.points[a].x as f32, sketch.points[a].y as f32);
+            let vb = Vec2::new(sketch.points[b].x as f32, sketch.points[b].y as f32);
+            (vb - va).try_normalize()
+        })
+    };
+    match (dir(l1), dir(l2)) {
+        (Some(d1), Some(d2)) => (d1.x * d2.y - d1.y * d2.x).abs() < 0.08, // ~4.5°
+        _ => false,
     }
-    // Reuse the shared builder so the click-convert and the relations-panel "Angle" button
-    // produce identical (vertex-first, positive-wedge) angle dimensions.
-    add_angle_dim(&mut session.sketch, l1, l2)
 }
 
 /// The two endpoints of a linear dimension's offset line plus its label anchor, all
@@ -6572,7 +6737,13 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
             FeatureKind::Plane(_) | FeatureKind::Sketch { .. } => {}
             FeatureKind::Extrude { sketch, regions, plane, distance } => {
                 let all = sketch.regions();
-                let basis = basis_from_ref(plane);
+                // Reproject onto the live body's matching face (like the exact path), so a
+                // boss stacks on the *current* top rather than the stale stored plane.
+                let plane = match &body {
+                    Some(b) => reproject_plane_on_mesh(plane, b),
+                    None => plane.clone(),
+                };
+                let basis = basis_from_ref(&plane);
                 for r in &merge_regions(&chosen_regions(&all, regions)) {
                     body = match body.take() {
                         // Boss: dip the prism *substantially* into the body so the join ring
@@ -6608,11 +6779,13 @@ fn regenerate_mesh(doc: &Document) -> Option<TriMesh> {
                 }
             }
             FeatureKind::Cut { sketch, regions, plane, distance } => {
-                if body.is_none() {
-                    continue;
-                }
+                let Some(cur0) = &body else { continue };
                 let all = sketch.regions();
-                let basis = basis_from_ref(plane);
+                // Reproject onto the live body's top face (like the exact path) so the cut
+                // starts at the real surface — otherwise a chamfered body (forced onto this
+                // mesh path) cuts from the stale stored plane and comes out shallow.
+                let plane = reproject_plane_on_mesh(plane, cur0);
+                let basis = basis_from_ref(&plane);
                 let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
                 let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
                 for r in &merge_regions(&chosen_regions(&all, regions)) {
@@ -6945,11 +7118,17 @@ fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
 /// feature sketched on a recessed/stepped face of the same orientation can resolve
 /// to the wrong one. Robust topological naming (DESIGN.md §4.3) is the eventual fix.
 fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
+    reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh)
+}
+
+/// Same as [`reproject_plane`] but driven by a triangle mesh directly — so the mesh-kernel
+/// path (forced by a fillet/chamfer/mirror) can reproject a feature's plane onto the live
+/// body too, instead of using the stale stored plane (which made cuts land shallow).
+fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh) -> PlaneRef {
     let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
     let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
     let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
     let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
-    let mesh = tessellate(body, 0.2).mesh;
     if mesh.indices.len() < 3 {
         return plane.clone();
     }
@@ -7936,6 +8115,13 @@ fn draw_sketch(
                     gizmos.line(ap.to_world(p2), ap.to_world(foot), dim_col);
                 }
             }
+            // Slot width: a witness line straight across the slot (side to side).
+            hworks_sketch::Constraint::SlotWidth { a, b, value, .. } => {
+                if let (Some(a2), Some(b2)) = (pt(*a), pt(*b)) {
+                    let (s1, s2, _) = slot_width_geometry(a2, b2, (*value * 0.5) as f32);
+                    gizmos.line(ap.to_world(s1), ap.to_world(s2), dim_col);
+                }
+            }
             _ => {}
         }
     }
@@ -7945,6 +8131,34 @@ fn draw_sketch(
         if let Some(p) = session.sketch.points.get(i) {
             let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
             gizmos.circle(iso, 0.18 * ms, dim_col);
+        }
+    }
+    // Indicator that the Dimension tool has a first line picked (for a line-to-line / angle
+    // dimension): glow it and ring its endpoints, so it's clear what the next click pairs to.
+    if session.tool == Tool::Dimension {
+        if let Some((a, b)) = session.dim_line.and_then(|li| entity_line(&session.sketch, li)) {
+            if let (Some(pa), Some(pb)) = (session.sketch.points.get(a), session.sketch.points.get(b)) {
+                let (va, vb) = (Vec2::new(pa.x as f32, pa.y as f32), Vec2::new(pb.x as f32, pb.y as f32));
+                let (wa, wb) = (ap.to_world(va), ap.to_world(vb));
+                let off = ap.n.cross((wb - wa).normalize_or_zero()).normalize_or_zero() * 0.03;
+                let hl = Color::srgb(1.0, 0.7, 0.1);
+                gizmos.line(wa + off, wb + off, hl);
+                gizmos.line(wa - off, wb - off, hl);
+                for v in [va, vb] {
+                    gizmos.circle(Isometry3d::new(ap.to_world(v), plane_rot), 0.12 * ms, hl);
+                }
+            }
+        }
+        // Same indicator for a first-picked slot: glow its centre line + ring its ends.
+        if let Some((a, b, _)) = session.dim_slot.and_then(|si| entity_slot(&session.sketch, si)) {
+            if let (Some(pa), Some(pb)) = (session.sketch.points.get(a), session.sketch.points.get(b)) {
+                let (va, vb) = (Vec2::new(pa.x as f32, pa.y as f32), Vec2::new(pb.x as f32, pb.y as f32));
+                let hl = Color::srgb(1.0, 0.7, 0.1);
+                gizmos.line(ap.to_world(va), ap.to_world(vb), hl);
+                for v in [va, vb] {
+                    gizmos.circle(Isometry3d::new(ap.to_world(v), plane_rot), 0.12 * ms, hl);
+                }
+            }
         }
     }
 

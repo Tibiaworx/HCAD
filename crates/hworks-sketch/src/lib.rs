@@ -189,6 +189,11 @@ pub enum Constraint {
     /// and radius are baked (projected reference geometry), so this snaps a sketch point
     /// onto a rounded body edge without needing a sketch circle entity.
     PointOnArc { p: usize, cx: f64, cy: f64, radius: f64 },
+    /// Driving width dimension for the slot whose centre line runs `a`→`b`: the distance
+    /// across its parallel sides equals `value` (so its half-width = value/2). Enforced
+    /// after the solve (the slot's radius isn't a point variable). `offset` is the display
+    /// offset of the dimension line.
+    SlotWidth { a: usize, b: usize, value: f64, offset: f64 },
 }
 
 /// Which span a [`Constraint::Distance`] measures: the true point-to-point distance
@@ -978,6 +983,7 @@ fn constraint_point_indices(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnCircle { p, center } => vec![*p, *center],
         Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
         Constraint::PointOnArc { p, .. } => vec![*p],
+        Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
     }
 }
 
@@ -1057,6 +1063,10 @@ fn remap_constraint(c: &mut Constraint, m: &[usize]) {
             *b = m[*b];
         }
         Constraint::PointOnArc { p, .. } => *p = m[*p],
+        Constraint::SlotWidth { a, b, .. } => {
+            *a = m[*a];
+            *b = m[*b];
+        }
     }
 }
 
@@ -1235,6 +1245,24 @@ impl Sketch {
                 }
             }
         }
+        // Slot-width dimensions: drive the slot's half-width (radius = width/2).
+        let widths: Vec<(usize, usize, f64)> = self
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::SlotWidth { a, b, value, .. } => Some((*a, *b, *value)),
+                _ => None,
+            })
+            .collect();
+        for (sa, sb, value) in widths {
+            for e in self.entities.iter_mut() {
+                if let SketchEntity::Slot { a, b, radius, .. } = e {
+                    if (*a == sa && *b == sb) || (*a == sb && *b == sa) {
+                        *radius = (value * 0.5).max(1e-4);
+                    }
+                }
+            }
+        }
     }
 
     /// Total number of scalar residual equations across all constraints.
@@ -1256,8 +1284,8 @@ impl Sketch {
                 | Constraint::PointOnCircle { .. }
                 | Constraint::PointOnLine { .. }
                 | Constraint::PointOnArc { .. } => 1,
-                // Enforced after the solve (radius isn't a point variable).
-                Constraint::EqualRadius { .. } | Constraint::Radius { .. } => 0,
+                // Enforced after the solve (radius / slot width aren't point variables).
+                Constraint::EqualRadius { .. } | Constraint::Radius { .. } | Constraint::SlotWidth { .. } => 0,
             })
             .sum()
     }
@@ -1382,7 +1410,7 @@ impl Sketch {
                     k += 1;
                 }
                 // Not point residuals — enforced separately after the solve.
-                Constraint::EqualRadius { .. } | Constraint::Radius { .. } => {}
+                Constraint::EqualRadius { .. } | Constraint::Radius { .. } | Constraint::SlotWidth { .. } => {}
             }
         }
         r
