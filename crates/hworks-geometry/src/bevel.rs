@@ -799,6 +799,16 @@ mod tests {
         assert_eq!(annuli, 2, "top and bottom of a square tube are 2-loop annuli");
     }
 
+    /// Signed volume (divergence theorem) — sane only for a consistently-wound closed mesh.
+    fn mesh_volume(m: &TriMesh) -> f64 {
+        let mut v = 0.0;
+        for t in m.indices.chunks_exact(3) {
+            let p: Vec<[f64; 3]> = t.iter().map(|&i| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] }).collect();
+            v += p[0][0] * (p[1][1] * p[2][2] - p[1][2] * p[2][1]) - p[0][1] * (p[1][0] * p[2][2] - p[1][2] * p[2][0]) + p[0][2] * (p[1][0] * p[2][1] - p[1][1] * p[2][0]);
+        }
+        (v / 6.0).abs()
+    }
+
     /// Weld output positions and confirm every edge is shared by exactly two triangles.
     fn is_watertight(m: &TriMesh) -> bool {
         let key = |i: u32| {
@@ -887,6 +897,102 @@ mod tests {
         ];
         let rounded = bevel_mesh_selected(&body, 0.3, 3, &rim).expect("rim loop bevels");
         assert!(is_watertight(&rounded), "selective rim-loop bevel must be closed");
+    }
+
+    /// Replica of the app's reproject_plane_on_mesh: snap a +z sketch plane at `o` onto the
+    /// nearest parallel body face under the origin. Returns the snapped z (or o.z if none).
+    fn reproject_z(mesh: &TriMesh, o: [f64; 3]) -> f64 {
+        let n = [0.0, 0.0, 1.0];
+        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let o_n = dot(o, n);
+        let p = |i: u32| { let q = mesh.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+        let in_tri = |ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64| {
+            let s = |px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64| (rx - qx) * (py - qy) - (ry - qy) * (px - qx);
+            let d1 = s(0.0, 0.0, ax, ay, bx, by);
+            let d2 = s(0.0, 0.0, bx, by, cx, cy);
+            let d3 = s(0.0, 0.0, cx, cy, ax, ay);
+            !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+        };
+        let mut best: Option<f64> = None;
+        for t in mesh.indices.chunks_exact(3) {
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let tn = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+            let l = dot(tn, tn).sqrt();
+            if l < 1e-12 || (tn[2] / l).abs() < 0.9 {
+                continue;
+            }
+            let to2 = |q: [f64; 3]| (q[0] - o[0], q[1] - o[1]);
+            let (a2, b2, c2) = (to2(a), to2(b), to2(c));
+            if !in_tri(a2.0, a2.1, b2.0, b2.1, c2.0, c2.1) {
+                continue;
+            }
+            let off = a[2];
+            if best.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs()) {
+                best = Some(off);
+            }
+        }
+        best.unwrap_or(o_n)
+    }
+
+    #[test]
+    fn reproject_finds_top_face_on_bevelled_body() {
+        // Block 12×12×6 with a pocket [2,6] cut from the top, rim filleted (the user's body).
+        let outer = [[0.0, 0.0], [12.0, 0.0], [12.0, 12.0], [0.0, 12.0]];
+        let block = extrude_tool_mesh(&outer, &[], &xy(), 0.0, 6.0).unwrap();
+        let pk = [[2.0, 2.0], [6.0, 2.0], [6.0, 6.0], [2.0, 6.0]];
+        let tool1 = extrude_tool_mesh(&pk, &[], &xy(), 3.0, 6.5).unwrap();
+        let pocketed = crate::mesh_difference(&block, &tool1);
+        let rim = vec![
+            vec![[2.0, 2.0, 6.0], [6.0, 2.0, 6.0]], vec![[6.0, 2.0, 6.0], [6.0, 6.0, 6.0]],
+            vec![[6.0, 6.0, 6.0], [2.0, 6.0, 6.0]], vec![[2.0, 6.0, 6.0], [2.0, 2.0, 6.0]],
+        ];
+        let body = bevel_mesh_selected(&pocketed, 0.4, 3, &rim).expect("rim fillets");
+        // A second cut sketched on the top frame (origin at (9,9,6)) must reproject to z=6.
+        let z = reproject_z(&body, [9.0, 9.0, 6.0]);
+        assert!((z - 6.0).abs() < 0.01, "reproject snapped cut plane to z={z}, not the top (6)");
+    }
+
+    #[test]
+    fn cut_after_bevel_reaches_full_depth() {
+        // Reproduce the "shallow cut after chamfer" report: bevel a block, then difference a
+        // pocket tool from its top. The cut must reach the intended floor — i.e. the result has
+        // geometry down at the pocket floor z≈2, not just a shallow nick near the top.
+        let sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let block = extrude_tool_mesh(&sq, &[], &xy(), 0.0, 6.0).unwrap();
+        let beveled = bevel_mesh(&block, 0.4, 2).expect("block bevels");
+        // Pocket tool z∈[2,6.5] over [3,7]² (overlap above the top).
+        let pk = [[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]];
+        let tool = extrude_tool_mesh(&pk, &[], &xy(), 2.0, 6.5).unwrap();
+        let cut = crate::mesh_difference(&beveled, &tool);
+        // Full-depth cut removes the 4×4×4 = 64 pocket: 597.1 − 64 ≈ 533.
+        assert!((mesh_volume(&cut) - 533.0).abs() < 5.0, "cut after bevel went shallow: vol {}", mesh_volume(&cut));
+    }
+
+    #[test]
+    fn cut_after_selective_rim_fillet_full_depth() {
+        // The user's path: block with a pocket, fillet the pocket rim, then make another cut.
+        // The rim-filleted body (concave + selective bevel) must still cut to full depth.
+        let outer = [[0.0, 0.0], [12.0, 0.0], [12.0, 12.0], [0.0, 12.0]];
+        let block = extrude_tool_mesh(&outer, &[], &xy(), 0.0, 6.0).unwrap();
+        let pk = [[2.0, 2.0], [6.0, 2.0], [6.0, 6.0], [2.0, 6.0]];
+        let tool1 = extrude_tool_mesh(&pk, &[], &xy(), 3.0, 6.5).unwrap();
+        let pocketed = crate::mesh_difference(&block, &tool1);
+        let rim = vec![
+            vec![[2.0, 2.0, 6.0], [6.0, 2.0, 6.0]],
+            vec![[6.0, 2.0, 6.0], [6.0, 6.0, 6.0]],
+            vec![[6.0, 6.0, 6.0], [2.0, 6.0, 6.0]],
+            vec![[2.0, 6.0, 6.0], [2.0, 2.0, 6.0]],
+        ];
+        let filleted = bevel_mesh_selected(&pocketed, 0.4, 3, &rim).expect("rim fillets");
+        // A second pocket on the far side, full through-ish: z 2..6.5 over [8,11]².
+        let pk2 = [[8.0, 8.0], [11.0, 8.0], [11.0, 11.0], [8.0, 11.0]];
+        let tool2 = extrude_tool_mesh(&pk2, &[], &xy(), 2.0, 6.5).unwrap();
+        let cut2 = crate::mesh_difference(&filleted, &tool2);
+        // Second pocket removes 3×3×4 = 36 from the rim-filleted body.
+        let expect = mesh_volume(&filleted) - 36.0;
+        assert!((mesh_volume(&cut2) - expect).abs() < 6.0, "second cut went shallow: vol {} want {expect}", mesh_volume(&cut2));
     }
 
     #[test]
