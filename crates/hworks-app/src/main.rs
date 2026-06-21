@@ -119,7 +119,9 @@ fn main() {
         .insert_resource(DocRes(Document::with_default_planes()))
         .init_resource::<SketchSession>()
         .init_resource::<Part>()
-        .init_resource::<UiState>()
+        // Seamless on by default — build with the robust mesh kernel so shared/coincident
+        // walls fuse without a seam. Toggle off in the toolbar for exact B-rep faces.
+        .insert_resource(UiState { seamless: true, ..Default::default() })
         .init_resource::<UiBlocking>()
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
@@ -4078,6 +4080,18 @@ fn sketch_interaction(
             let d = w - ap.origin;
             Vec2::new(d.dot(ap.u), d.dot(ap.v))
         };
+        // Exact circles from the timeline's source sketch circles in this plane — used to
+        // replace each tessellation-fit (centre, radius) with the true value so concentric
+        // bosses snap exactly. A fit circle is refined to the nearest matching exact one.
+        let exact = exact_plane_circles(&doc.0, &ap);
+        let refine = |c: Vec2, r: f32| -> (Vec2, f32) {
+            exact
+                .iter()
+                .copied()
+                .filter(|(ec, _)| ec.distance(c) <= (r * 0.05).max(0.1))
+                .min_by(|a, b| a.0.distance(c).total_cmp(&b.0.distance(c)))
+                .unwrap_or((c, r))
+        };
         // Vertices already accounted for by a detected circular edge (full circle or
         // arc), so its many tessellation segments aren't each emitted as straight points.
         let mut circle_verts: Vec<Vec3> = Vec::new();
@@ -4103,6 +4117,7 @@ fn sketch_interaction(
                 None
             };
             if let Some((c, r)) = whole_circle {
+                let (c, r) = refine(c, r); // use the exact source radius/centre when known
                 session.reference_circles.push((c, r));
                 session.reference_points.push(c);
                 session.reference_points.push(c + Vec2::new(r, 0.0));
@@ -4118,8 +4133,9 @@ fn sketch_interaction(
                 for (s, e, fit) in &segs {
                     match fit {
                         Some((c, r)) => {
-                            session.reference_circles.push((*c, *r));
-                            session.reference_points.push(*c);
+                            let (c, r) = refine(*c, *r); // exact source radius/centre if known
+                            session.reference_circles.push((c, r));
+                            session.reference_points.push(c);
                             session.reference_points.push(uvs[*s]);
                             session.reference_points.push(uvs[*e]);
                             session.reference_points.push(uvs[(*s + *e) / 2]);
@@ -7119,6 +7135,47 @@ fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
 /// to the wrong one. Robust topological naming (DESIGN.md §4.3) is the eventual fix.
 fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
     reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh)
+}
+
+/// Exact `(centre_uv, radius)` of every body circular edge lying in the sketch plane `ap`,
+/// read from the *source* sketch circles in the timeline. The B-rep tessellates circles to
+/// polygons, so a tessellation fit only approximates the radius (~sagitta); this recovers
+/// the true value so a concentric boss snaps exactly and joins without a micro-step.
+fn exact_plane_circles(doc: &Document, ap: &ActivePlane) -> Vec<(Vec2, f32)> {
+    let mut out = Vec::new();
+    let n_unit = ap.n.normalize_or_zero();
+    let end = doc.rollback.min(doc.features.len());
+    for f in &doc.features[..end] {
+        let (sketch, plane, dist) = match &f.kind {
+            FeatureKind::Extrude { sketch, plane, distance, .. } => (sketch, plane, *distance as f32),
+            FeatureKind::Cut { sketch, plane, distance, .. } => (sketch, plane, *distance as f32),
+            _ => continue,
+        };
+        let fo = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let fu = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let fv = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let fnormal = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32).normalize_or_zero();
+        // The circle's plane must be parallel to the sketch plane to project to a circle.
+        if fnormal.dot(n_unit).abs() < 0.999 {
+            continue;
+        }
+        for ent in &sketch.entities {
+            if let SketchEntity::Circle { center, radius, construction: false } = ent {
+                if let Some(cp) = sketch.points.get(*center) {
+                    let cbase = fo + fu * cp.x as f32 + fv * cp.y as f32;
+                    // Circular edges live at both ends of the prism (boss/cut).
+                    for off in [0.0_f32, dist, -dist] {
+                        let c3 = cbase + fnormal * off;
+                        if (c3 - ap.origin).dot(ap.n).abs() < 0.02 {
+                            let d = c3 - ap.origin;
+                            out.push((Vec2::new(d.dot(ap.u), d.dot(ap.v)), *radius as f32));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Same as [`reproject_plane`] but driven by a triangle mesh directly — so the mesh-kernel
