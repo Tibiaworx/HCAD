@@ -45,6 +45,18 @@ pub enum SketchEntity {
         #[serde(default)]
         construction: bool,
     },
+    /// A circular arc centred at `center`, sweeping from endpoint `a` to endpoint `b` (both on
+    /// the rim, radius = |center→a|). `ccw` chooses the sweep direction so major/minor is
+    /// unambiguous. Endpoints are real sketch points, so lines snap to them to close a profile.
+    Arc {
+        center: usize,
+        a: usize,
+        b: usize,
+        #[serde(default)]
+        ccw: bool,
+        #[serde(default)]
+        construction: bool,
+    },
     Point { at: usize },
     /// A smooth spline through (or guided by) its `points`. `control == false` ⇒ the
     /// curve passes *through* the points (interpolating Catmull-Rom); `control == true`
@@ -264,6 +276,12 @@ impl Sketch {
     /// Returns its entity index so callers can constrain points onto its rim.
     pub fn add_construction_circle(&mut self, center: usize, radius: f64) -> usize {
         self.entities.push(SketchEntity::Circle { center, radius, construction: true });
+        self.entities.len() - 1
+    }
+
+    /// Add an arc about `center` from endpoint `a` to `b` (sweep `ccw`). Returns its index.
+    pub fn add_arc(&mut self, center: usize, a: usize, b: usize, ccw: bool, construction: bool) -> usize {
+        self.entities.push(SketchEntity::Arc { center, a, b, ccw, construction });
         self.entities.len() - 1
     }
 
@@ -561,6 +579,16 @@ impl Sketch {
                         }
                     }
                 }
+                SketchEntity::Arc { center, a, b, ccw, construction: false } => {
+                    if let (Some(c), Some(pa), Some(pb)) =
+                        (self.points.get(*center), self.points.get(*a), self.points.get(*b))
+                    {
+                        let poly = tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
+                        for w in poly.windows(2) {
+                            segs.push((w[0], w[1])); // open arc — no closing chord
+                        }
+                    }
+                }
                 SketchEntity::Slot { a, b, radius, construction: false, mid } => {
                     let pm = mid.and_then(|m| self.points.get(m)).map(|p| [p.x, p.y]);
                     if let (Some(pa), Some(pb)) = (self.points.get(*a), self.points.get(*b)) {
@@ -590,6 +618,7 @@ impl Sketch {
                 }
                 SketchEntity::Line { .. }
                 | SketchEntity::Circle { .. }
+                | SketchEntity::Arc { .. }
                 | SketchEntity::Point { .. }
                 | SketchEntity::Spline { .. }
                 | SketchEntity::Slot { .. } => {}
@@ -662,6 +691,32 @@ pub fn tessellate_slot(a: [f64; 2], b: [f64; 2], r: f64) -> Vec<[f64; 2]> {
 /// (falling back to a straight slot if those three points are collinear).
 pub fn tessellate_arc_slot(a: [f64; 2], p: [f64; 2], b: [f64; 2], r: f64) -> Vec<[f64; 2]> {
     slot_outline(&arc_through(a, p, b, 40), r)
+}
+
+/// Tessellate a circular arc about `center` from endpoint `a` to endpoint `b`, sweeping `ccw`
+/// (else CW). The polyline starts exactly at `a` and ends exactly at `b` so connecting edges
+/// share those nodes.
+pub fn tessellate_arc(center: [f64; 2], a: [f64; 2], b: [f64; 2], ccw: bool) -> Vec<[f64; 2]> {
+    let r = ((a[0] - center[0]).powi(2) + (a[1] - center[1]).powi(2)).sqrt();
+    if r < 1e-9 {
+        return vec![a, b];
+    }
+    let tau = std::f64::consts::TAU;
+    let ta = (a[1] - center[1]).atan2(a[0] - center[0]);
+    let tb = (b[1] - center[1]).atan2(b[0] - center[0]);
+    let mut span = if ccw { (tb - ta).rem_euclid(tau) } else { -((ta - tb).rem_euclid(tau)) };
+    if span.abs() < 1e-9 {
+        span = if ccw { tau } else { -tau }; // coincident endpoints ⇒ full circle
+    }
+    let n = ((span.abs() / tau * 64.0).ceil() as usize).max(2);
+    let mut out = Vec::with_capacity(n + 1);
+    for k in 0..=n {
+        let t = ta + span * (k as f64 / n as f64);
+        out.push([center[0] + r * t.cos(), center[1] + r * t.sin()]);
+    }
+    out[0] = a;
+    *out.last_mut().unwrap() = b;
+    out
 }
 
 /// Tessellate the circular arc through `a`, `p`, `b` (in order) into `steps`+1 points.
@@ -953,6 +1008,7 @@ fn entity_point_indices(e: &SketchEntity) -> Vec<usize> {
     match e {
         SketchEntity::Line { a, b, .. } => vec![*a, *b],
         SketchEntity::Circle { center, .. } => vec![*center],
+        SketchEntity::Arc { center, a, b, .. } => vec![*center, *a, *b],
         SketchEntity::Point { at } => vec![*at],
         SketchEntity::Spline { points, .. } => points.clone(),
         SketchEntity::Slot { a, b, mid, .. } => {
@@ -995,6 +1051,11 @@ fn remap_entity(e: &mut SketchEntity, m: &[usize]) {
             *b = m[*b];
         }
         SketchEntity::Circle { center, .. } => *center = m[*center],
+        SketchEntity::Arc { center, a, b, .. } => {
+            *center = m[*center];
+            *a = m[*a];
+            *b = m[*b];
+        }
         SketchEntity::Point { at } => *at = m[*at],
         SketchEntity::Spline { points, .. } => {
             for p in points.iter_mut() {

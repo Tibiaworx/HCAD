@@ -44,8 +44,8 @@ struct ProfileGizmos;
 /// while big enough to keep the union robust paired with the tight tolerance.
 const BOSS_OVERLAP: f64 = 0.01;
 use hworks_sketch::{
-    point_in_poly, tessellate_arc_slot, tessellate_slot, tessellate_spline, text_contours, Constraint,
-    DimAxis, Sketch, SketchEntity,
+    point_in_poly, tessellate_arc, tessellate_arc_slot, tessellate_slot, tessellate_spline, text_contours,
+    Constraint, DimAxis, Sketch, SketchEntity,
 };
 
 mod text;
@@ -3779,6 +3779,23 @@ fn nearest_entity(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
             SketchEntity::Circle { center, radius, .. } => {
                 ((uv - p(*center)).length() - *radius as f32).abs()
             }
+            SketchEntity::Arc { center, a, b, ccw, .. } => {
+                match (sketch.points.get(*center), sketch.points.get(*a), sketch.points.get(*b)) {
+                    (Some(c), Some(pa), Some(pb)) => {
+                        let poly = tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
+                        let mut dmin = f32::MAX;
+                        for w in poly.windows(2) {
+                            let a2 = Vec2::new(w[0][0] as f32, w[0][1] as f32);
+                            let b2 = Vec2::new(w[1][0] as f32, w[1][1] as f32);
+                            let ab = b2 - a2;
+                            let t = if ab.length_squared() > 1e-9 { ((uv - a2).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+                            dmin = dmin.min((uv - (a2 + ab * t)).length());
+                        }
+                        dmin
+                    }
+                    _ => continue,
+                }
+            }
             SketchEntity::Spline { points, closed, control, .. } => {
                 let pts: Vec<[f64; 2]> =
                     points.iter().filter_map(|&i| sketch.points.get(i)).map(|q| [q.x, q.y]).collect();
@@ -3949,6 +3966,7 @@ fn entity_points(sketch: &Sketch, i: usize) -> Vec<usize> {
     match sketch.entities.get(i) {
         Some(SketchEntity::Line { a, b, .. }) => vec![*a, *b],
         Some(SketchEntity::Circle { center, .. }) => vec![*center],
+        Some(SketchEntity::Arc { center, a, b, .. }) => vec![*center, *a, *b],
         Some(SketchEntity::Point { at }) => vec![*at],
         Some(SketchEntity::Spline { points, .. }) => points.clone(),
         Some(SketchEntity::Slot { a, b, .. }) => vec![*a, *b],
@@ -6004,15 +6022,161 @@ fn trim_bracket(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<(usize, f32, f
     Some((li, t_lo, t_hi))
 }
 
-/// Perform a trim-to-closest at `uv`: drop the bracketed sub-segment of the nearest line,
-/// replacing it with the surviving piece(s). Returns true if anything changed.
+/// Intersection points of two circles (0, 1, or 2).
+fn circle_circle_pts(c1: Vec2, r1: f32, c2: Vec2, r2: f32) -> Vec<Vec2> {
+    let d = c1.distance(c2);
+    if d < 1e-6 || d > r1 + r2 + 1e-4 || d < (r1 - r2).abs() - 1e-4 {
+        return vec![];
+    }
+    let a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d);
+    let h2 = r1 * r1 - a * a;
+    let mid = c1 + (c2 - c1) * (a / d);
+    if h2 <= 1e-9 {
+        return vec![mid];
+    }
+    let h = h2.sqrt();
+    let perp = Vec2::new(-(c2.y - c1.y), c2.x - c1.x) / d;
+    vec![mid + perp * h, mid - perp * h]
+}
+
+/// The angles (about the circle's centre) where every *other* entity crosses circle `ci`'s rim.
+fn circle_cut_angles(sketch: &Sketch, ci: usize) -> Vec<f32> {
+    let (center, r) = match &sketch.entities[ci] {
+        SketchEntity::Circle { center, radius, .. } => (pt2(sketch, *center), *radius as f32),
+        _ => return vec![],
+    };
+    let ang = |p: Vec2| (p.y - center.y).atan2(p.x - center.x).rem_euclid(std::f32::consts::TAU);
+    let on_tol = (r * 5.0e-3).max(1.0e-3); // a point "on the rim" (an endpoint snapped to it)
+    let on_rim = |p: Vec2| ((p - center).length() - r).abs() <= on_tol;
+    let mut out = Vec::new();
+    for (j, e) in sketch.entities.iter().enumerate() {
+        if j == ci {
+            continue;
+        }
+        match e {
+            SketchEntity::Line { a, b, reference: false, .. } => {
+                let (pa, pb) = (pt2(sketch, *a), pt2(sketch, *b));
+                for t in seg_circle_t(pa, pb, center, r) {
+                    out.push(ang(pa + (pb - pa) * t));
+                }
+                // An endpoint lying on the rim (e.g. a chord whose end was trimmed to the circle)
+                // is itself a cut — seg_circle_t excludes segment ends, so add them here.
+                for p in [pa, pb] {
+                    if on_rim(p) {
+                        out.push(ang(p));
+                    }
+                }
+            }
+            SketchEntity::Circle { center: c2, radius: r2, .. } => {
+                for p in circle_circle_pts(center, r, pt2(sketch, *c2), *r2 as f32) {
+                    out.push(ang(p));
+                }
+            }
+            SketchEntity::Arc { center: c2, a, b, ccw, .. } => {
+                if let (Some(cc), Some(pa), Some(pb)) = (sketch.points.get(*c2), sketch.points.get(*a), sketch.points.get(*b)) {
+                    let poly = tessellate_arc([cc.x, cc.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
+                    for w in poly.windows(2) {
+                        let (w0, w1) = (Vec2::new(w[0][0] as f32, w[0][1] as f32), Vec2::new(w[1][0] as f32, w[1][1] as f32));
+                        for t in seg_circle_t(w0, w1, center, r) {
+                            out.push(ang(w0 + (w1 - w0) * t));
+                        }
+                    }
+                    for p in [pt2(sketch, *a), pt2(sketch, *b)] {
+                        if on_rim(p) {
+                            out.push(ang(p));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Nearest circle (by rim distance) within `thresh`.
+fn nearest_circle(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, e) in sketch.entities.iter().enumerate() {
+        if let SketchEntity::Circle { center, radius, .. } = e {
+            let d = ((uv - pt2(sketch, *center)).length() - *radius as f32).abs();
+            if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// The removed angular interval `(lo, hi)` (CCW, containing the click) for trimming circle `ci`,
+/// or `None` if it has fewer than two cuts (then the whole circle would be deleted).
+fn circle_trim_interval(sketch: &Sketch, ci: usize, uv: Vec2) -> Option<(f32, f32)> {
+    let center = match &sketch.entities[ci] {
+        SketchEntity::Circle { center, .. } => pt2(sketch, *center),
+        _ => return None,
+    };
+    let mut angs = circle_cut_angles(sketch, ci);
+    if angs.len() < 2 {
+        return None;
+    }
+    angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    angs.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    let tau = std::f32::consts::TAU;
+    let click = (uv.y - center.y).atan2(uv.x - center.x).rem_euclid(tau);
+    // Find the consecutive pair (CCW) bracketing the click.
+    for i in 0..angs.len() {
+        let lo = angs[i];
+        let hi = if i + 1 < angs.len() { angs[i + 1] } else { angs[0] + tau };
+        let c = if click < lo { click + tau } else { click };
+        if c >= lo && c <= hi {
+            return Some((lo, hi)); // hi may exceed τ (the wrap interval); cos/sin handle it
+        }
+    }
+    None
+}
+
+/// Perform a trim-to-closest at `uv`: pick the nearest line *or* circle and drop the piece the
+/// click is on, leaving the survivor(s) (a trimmed line, or a circle → arc). Returns true if
+/// anything changed.
 fn apply_trim(session: &mut SketchSession, uv: Vec2, thresh: f32) -> bool {
-    let Some((li, t_lo, t_hi)) = trim_bracket(&session.sketch, uv, thresh) else { return false };
-    let Some((ia, ib)) = entity_line(&session.sketch, li) else { return false };
+    let line = nearest_line(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
+    let circ = nearest_circle(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
+    // Prefer whichever rim/segment the cursor is closest to.
+    let pick = [line, circ].into_iter().flatten().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let Some((ei, _)) = pick else { return false };
+
+    if let SketchEntity::Circle { .. } = session.sketch.entities[ei] {
+        // Circle → arc (keep the complement of the clicked interval), or delete if <2 cuts.
+        let center = match &session.sketch.entities[ei] { SketchEntity::Circle { center, .. } => *center, _ => return false };
+        let r = match &session.sketch.entities[ei] { SketchEntity::Circle { radius, .. } => *radius, _ => return false };
+        let construction = matches!(&session.sketch.entities[ei], SketchEntity::Circle { construction: true, .. });
+        let snap = session.snap_dist;
+        match circle_trim_interval(&session.sketch, ei, uv) {
+            Some((lo, hi)) => {
+                let c = pt2(&session.sketch, center);
+                let at = |ang: f32| c + Vec2::new(ang.cos(), ang.sin()) * r as f32;
+                session.sketch.entities.remove(ei);
+                let p_hi = get_or_add_point(&mut session.sketch, at(hi), snap);
+                let p_lo = get_or_add_point(&mut session.sketch, at(lo), snap);
+                // Kept arc = from hi CCW round to lo (the part NOT under the click).
+                session.sketch.add_arc(center, p_hi, p_lo, true, construction);
+            }
+            None => {
+                session.sketch.entities.remove(ei); // no bracketing cuts → remove the whole circle
+            }
+        }
+        session.sketch.remove_unused_points();
+        session.dirty = true;
+        return true;
+    }
+
+    // Line trim (the original behaviour).
+    let Some((_, t_lo, t_hi)) = trim_bracket(&session.sketch, uv, thresh) else { return false };
+    let Some((ia, ib)) = entity_line(&session.sketch, ei) else { return false };
     let (a, b) = (pt2(&session.sketch, ia), pt2(&session.sketch, ib));
-    let construction = matches!(&session.sketch.entities[li], SketchEntity::Line { construction: true, .. });
+    let construction = matches!(&session.sketch.entities[ei], SketchEntity::Line { construction: true, .. });
     let snap = session.snap_dist;
-    session.sketch.entities.remove(li); // drop the original; re-add the survivors
+    session.sketch.entities.remove(ei);
     if t_lo > 1e-3 {
         let p = get_or_add_point(&mut session.sketch, a + (b - a) * t_lo, snap);
         session.sketch.add_line(ia, p, construction);
@@ -6024,6 +6188,20 @@ fn apply_trim(session: &mut SketchSession, uv: Vec2, thresh: f32) -> bool {
     session.sketch.remove_unused_points();
     session.dirty = true;
     true
+}
+
+/// Distance from `uv` to entity `i` (line segment or circle rim); `MAX` for others.
+fn dist_to_entity(sketch: &Sketch, i: usize, uv: Vec2) -> f32 {
+    match &sketch.entities[i] {
+        SketchEntity::Line { a, b, .. } => {
+            let (pa, pb) = (pt2(sketch, *a), pt2(sketch, *b));
+            let ab = pb - pa;
+            let t = if ab.length_squared() > 1e-9 { ((uv - pa).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+            uv.distance(pa + ab * t)
+        }
+        SketchEntity::Circle { center, radius, .. } => ((uv - pt2(sketch, *center)).length() - *radius as f32).abs(),
+        _ => f32::MAX,
+    }
 }
 
 /// The vertex and label anchor of an angle dimension between lines (a→b) and (c→d).
@@ -8599,6 +8777,24 @@ fn draw_sketch(
                     gizmos.line(ap.to_world(cu - d), ap.to_world(cu + d), dcol);
                 }
             }
+            SketchEntity::Arc { center, a, b, ccw, construction: is_con } => {
+                if let (Some(c), Some(pa), Some(pb)) =
+                    (session.sketch.points.get(*center), session.sketch.points.get(*a), session.sketch.points.get(*b))
+                {
+                    let poly = tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
+                    for w in poly.windows(2) {
+                        let (wa, wb) = (
+                            ap.to_world(Vec2::new(w[0][0] as f32, w[0][1] as f32)),
+                            ap.to_world(Vec2::new(w[1][0] as f32, w[1][1] as f32)),
+                        );
+                        if *is_con {
+                            gizmos.line(wa, wb, construction);
+                        } else {
+                            profile.line(wa, wb, circle_col);
+                        }
+                    }
+                }
+            }
             SketchEntity::Point { .. } => {}
             SketchEntity::Spline { points, closed, construction: is_con, control } => {
                 let pts: Vec<[f64; 2]> = points
@@ -9079,15 +9275,40 @@ fn draw_sketch(
         draw_marker(&mut gizmos, ap, start, point_col, ms);
     }
 
-    // Trim-to-closest hover preview: the sub-segment that a click would delete, in red.
+    // Trim-to-closest hover preview: the piece that a click would delete, in red.
     if session.tool == Tool::Trim {
         if let Some(uv) = session.cursor_uv {
-            if let Some((li, t_lo, t_hi)) = trim_bracket(&session.sketch, uv, ms * 0.04 + 0.25) {
-                if let Some((ia, ib)) = entity_line(&session.sketch, li) {
-                    let (a, b) = (pt2(&session.sketch, ia), pt2(&session.sketch, ib));
-                    let p0 = a + (b - a) * t_lo;
-                    let p1 = a + (b - a) * t_hi;
-                    gizmos.line(ap.to_world(p0), ap.to_world(p1), Color::srgb(1.0, 0.3, 0.3));
+            let red = Color::srgb(1.0, 0.3, 0.3);
+            let thresh = ms * 0.04 + 0.25;
+            let line = nearest_line(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
+            let circ = nearest_circle(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
+            if let Some((ei, _)) = [line, circ].into_iter().flatten().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+                match &session.sketch.entities[ei] {
+                    SketchEntity::Circle { center, radius, .. } => {
+                        let (c, r) = (pt2(&session.sketch, *center), *radius as f32);
+                        if let Some((lo, hi)) = circle_trim_interval(&session.sketch, ei, uv) {
+                            // The removed arc lo→hi (the side the cursor is on).
+                            let span = hi - lo;
+                            let n = ((span.abs() / std::f32::consts::TAU * 64.0).ceil() as usize).max(2);
+                            for k in 0..n {
+                                let a0 = lo + span * (k as f32 / n as f32);
+                                let a1 = lo + span * ((k + 1) as f32 / n as f32);
+                                gizmos.line(
+                                    ap.to_world(c + Vec2::new(a0.cos(), a0.sin()) * r),
+                                    ap.to_world(c + Vec2::new(a1.cos(), a1.sin()) * r),
+                                    red,
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some((li, t_lo, t_hi)) = trim_bracket(&session.sketch, uv, thresh) {
+                            if let Some((ia, ib)) = entity_line(&session.sketch, li) {
+                                let (a, b) = (pt2(&session.sketch, ia), pt2(&session.sketch, ib));
+                                gizmos.line(ap.to_world(a + (b - a) * t_lo), ap.to_world(a + (b - a) * t_hi), red);
+                            }
+                        }
+                    }
                 }
             }
         }
