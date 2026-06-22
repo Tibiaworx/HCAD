@@ -1071,6 +1071,45 @@ mod tests {
     }
 
     #[test]
+    fn bevel_is_deterministic() {
+        // Rust seeds each HashMap randomly, so build_topo iterates edges/verts differently every
+        // run. If any geometry decision depends on that order, the watertight outcome flips —
+        // exactly the "sometimes takes, sometimes falls back" the user sees. Run the same bevel
+        // many times; the result (and watertightness) must be identical every time.
+        let base = extrude_tool_mesh(&[[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], &[], &xy(), 0.0, 5.0).unwrap();
+        let n = 32;
+        let circ: Vec<[f64; 2]> = (0..n)
+            .map(|i| { let a = std::f64::consts::TAU * i as f64 / n as f64; [10.0 + 4.0 * a.cos(), 10.0 + 4.0 * a.sin()] })
+            .collect();
+        let boss = extrude_tool_mesh(&circ, &[], &xy(), 4.5, 7.5).unwrap();
+        let body = crate::mesh_union(&base, &boss);
+        let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], 12.0]).collect();
+        rim.push(rim[0]);
+        let picked = vec![rim];
+        let first = bevel_mesh_selected(&body, 0.7, 3, &picked);
+        let (some0, tris0) = (first.is_some(), first.as_ref().map(|m| m.indices.len()).unwrap_or(0));
+        for _ in 0..40 {
+            let r = bevel_mesh_selected(&body, 0.7, 3, &picked);
+            assert_eq!(r.is_some(), some0, "bevel success flipped between identical runs (non-deterministic)");
+            assert_eq!(r.map(|m| m.indices.len()).unwrap_or(0), tris0, "bevel output size varies between identical runs");
+        }
+    }
+
+    #[test]
+    fn mesh_union_is_deterministic() {
+        // If Manifold's rebuild varies run-to-run, the bevel sees a different body each regen and
+        // its watertight outcome can flip. Confirm the union is stable.
+        let base = extrude_tool_mesh(&[[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], &[], &xy(), 0.0, 5.0).unwrap();
+        let circ: Vec<[f64; 2]> = (0..32).map(|i| { let a = std::f64::consts::TAU * i as f64 / 32.0; [10.0 + 4.0 * a.cos(), 10.0 + 4.0 * a.sin()] }).collect();
+        let boss = extrude_tool_mesh(&circ, &[], &xy(), 4.5, 7.5).unwrap();
+        let base0 = crate::mesh_union(&base, &boss);
+        for _ in 0..20 {
+            let u = crate::mesh_union(&base, &boss);
+            assert_eq!(u.indices.len(), base0.indices.len(), "mesh_union triangle count varies run-to-run");
+        }
+    }
+
+    #[test]
     fn cut_after_bevel_reaches_full_depth() {
         // Reproduce the "shallow cut after chamfer" report: bevel a block, then difference a
         // pocket tool from its top. The cut must reach the intended floor — i.e. the result has

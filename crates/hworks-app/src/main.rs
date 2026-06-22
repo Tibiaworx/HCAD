@@ -1893,7 +1893,7 @@ fn ui_system(
             }
             ui.label(
                 egui::RichText::new(if n_edges == 0 {
-                    "Click edges on the body to pick which to round.\n(No edges picked = round every edge.)"
+                    "Click one or more edges on the body to pick which to round."
                 } else {
                     "Click more edges to add, or a picked edge again to remove."
                 })
@@ -7223,6 +7223,12 @@ fn apply_fillet(
 ) {
     let Some(radius) = ui_state.fillet_request.take() else { return };
     let edges = std::mem::take(&mut ui_state.fillet_edges);
+    // Guard the round-everything footgun: an empty selection (e.g. cleared by a sketch edit)
+    // used to silently round every edge. Require at least one picked edge.
+    if edges.is_empty() {
+        ui_state.last_error = Some("Select one or more edges to fillet (click them on the body).".into());
+        return;
+    }
     history.snapshot(&doc.0);
     doc.0.add_feature(FeatureKind::Fillet { radius, edges });
     doc.0.rollback = doc.0.features.len();
@@ -7276,6 +7282,10 @@ fn apply_chamfer(
 ) {
     let Some(distance) = ui_state.chamfer_request.take() else { return };
     let edges = std::mem::take(&mut ui_state.fillet_edges);
+    if edges.is_empty() {
+        ui_state.last_error = Some("Select one or more edges to chamfer (click them on the body).".into());
+        return;
+    }
     history.snapshot(&doc.0);
     doc.0.add_feature(FeatureKind::Chamfer { distance, edges });
     doc.0.rollback = doc.0.features.len();
