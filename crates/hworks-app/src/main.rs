@@ -6940,7 +6940,8 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
         match &feature.kind {
             FeatureKind::Plane(_) | FeatureKind::Sketch { .. } => {}
             FeatureKind::Extrude { sketch, regions, plane, distance } => {
-                bevel_edges.clear();
+                // A boss adds material elsewhere; it doesn't invalidate edges from an earlier
+                // fillet/chamfer, so keep them (don't clear here).
                 let all = sketch.regions();
                 // Reproject onto the live body's matching face (like the exact path), so a
                 // boss stacks on the *current* top rather than the stale stored plane.
@@ -7015,20 +7016,16 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                     }))
                     .ok()
                     .flatten();
-                    body = Some(match beveled {
-                        // Bevel engine succeeded → record its tangent edges as selectable.
-                        Some(m) => {
-                            bevel_edges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                bevel_feature_edges(&b, *radius, edges)
-                            }))
-                            .unwrap_or_default();
-                            m
-                        }
-                        None => {
-                            bevel_edges.clear();
-                            round_mesh(&b, *radius, edges).unwrap_or(b)
-                        }
-                    });
+                    // Emit the tangent edges from topology *regardless* of whether the surgery
+                    // succeeded or fell back to CSG — they sit at the same contact lines either
+                    // way, so the rounded edges stay selectable even on the CSG path. Several
+                    // fillets can stack with no body op between (a cylinder's top + bottom).
+                    let fe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bevel_feature_edges(&b, *radius, edges)
+                    }))
+                    .unwrap_or_default();
+                    bevel_edges.extend(fe);
+                    body = Some(beveled.unwrap_or_else(|| round_mesh(&b, *radius, edges).unwrap_or(b)));
                 }
             }
             // Flat-bevel the picked (or all) edges by the chamfer distance — same engine with a
@@ -7040,19 +7037,12 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                     }))
                     .ok()
                     .flatten();
-                    body = Some(match beveled {
-                        Some(m) => {
-                            bevel_edges = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                bevel_feature_edges(&b, *distance, edges)
-                            }))
-                            .unwrap_or_default();
-                            m
-                        }
-                        None => {
-                            bevel_edges.clear();
-                            chamfer_mesh(&b, *distance, edges).unwrap_or(b)
-                        }
-                    });
+                    let fe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bevel_feature_edges(&b, *distance, edges)
+                    }))
+                    .unwrap_or_default();
+                    bevel_edges.extend(fe);
+                    body = Some(beveled.unwrap_or_else(|| chamfer_mesh(&b, *distance, edges).unwrap_or(b)));
                 }
             }
             // Reflect the body across the plane and union it with the original.

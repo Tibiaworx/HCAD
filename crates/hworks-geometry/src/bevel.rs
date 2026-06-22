@@ -313,8 +313,15 @@ pub fn inset_loops(topo: &Topo, fi: usize, r: f64, selected: &[bool]) -> Vec<Vec
             let p_in = add(v, scale(w_in, setback[prev])); // a point on the incoming offset line
             let p_out = add(v, scale(w_out, setback[i]));
             // When the two boundary edges are collinear (a mid-edge vertex left by triangulation)
-            // the offset lines are parallel — there's no intersection, so just step perpendicular.
-            let pt = line_intersect(p_in, dir[prev], p_out, dir[i], n).unwrap_or(p_out);
+            // the offset lines are near-parallel — the intersection runs off to infinity, which
+            // would draw a feature edge shooting across the part. Cap how far the inset corner may
+            // travel from the vertex (a sane corner is within a few × the setback); past that,
+            // fall back to a plain perpendicular step.
+            let s = setback[prev].max(setback[i]);
+            let pt = match line_intersect(p_in, dir[prev], p_out, dir[i], n) {
+                Some(p) if dot(sub(p, v), sub(p, v)).sqrt() <= 2.5 * s + 1e-9 => p,
+                _ => p_out,
+            };
             ring.push(pt);
         }
         out.push(ring);
@@ -993,6 +1000,42 @@ mod tests {
         // A second cut sketched on the top frame (origin at (9,9,6)) must reproject to z=6.
         let z = reproject_z(&body, [9.0, 9.0, 6.0]);
         assert!((z - 6.0).abs() < 0.01, "reproject snapped cut plane to z={z}, not the top (6)");
+    }
+
+    #[test]
+    fn fillet_cylinder_boss_on_base_top_rim() {
+        // The user's case: a cylinder boss unioned onto a base block, then fillet just the
+        // cylinder's top rim. The union makes the topology messier than a lone cylinder.
+        let base = extrude_tool_mesh(&[[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], &[], &xy(), 0.0, 5.0).unwrap();
+        let n = 32;
+        let circ: Vec<[f64; 2]> = (0..n)
+            .map(|i| { let a = std::f64::consts::TAU * i as f64 / n as f64; [10.0 + 4.0 * a.cos(), 10.0 + 4.0 * a.sin()] })
+            .collect();
+        let boss = extrude_tool_mesh(&circ, &[], &xy(), 4.5, 7.5).unwrap(); // offset 4.5, height 7.5 → top z=12
+        let body = crate::mesh_union(&base, &boss);
+        let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], 12.0]).collect();
+        rim.push(rim[0]);
+        let picked = vec![rim];
+        // The bevel resolves a clean cylinder-boss rim fillet (watertight), and either way the
+        // topology-only feature edges are emitted so the rounded rim is selectable.
+        let body2 = bevel_mesh_selected(&body, 0.7, 3, &picked).expect("cyl-boss rim fillets");
+        assert!(is_watertight(&body2));
+        let top_edges = bevel_feature_edges(&body, 0.7, &picked);
+        assert!(top_edges.len() > 30, "rim tangent edges emitted");
+
+        // Bottom rim: the circle where the cylinder meets the box top (z=5) — an annulus face.
+        let mut brim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], 5.0]).collect();
+        brim.push(brim[0]);
+        let bedges = bevel_feature_edges(&body, 0.5, &[brim]);
+        let seg_len = |s: &[[f32; 3]; 2]| {
+            let d = [s[1][0] - s[0][0], s[1][1] - s[0][1], s[1][2] - s[0][2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let longest = bedges.iter().map(seg_len).fold(0.0f32, f32::max);
+        let long_count = bedges.iter().filter(|s| seg_len(s) > 1.5).count();
+        eprintln!("bottom rim: {} edges, longest={longest:.2}, long(>1.5)={long_count}", bedges.len());
+        // Rim chords are ~0.8 long; a segment shooting across the box would be »1.5.
+        assert_eq!(long_count, 0, "no spurious long feature edges (longest {longest:.2})");
     }
 
     #[test]
