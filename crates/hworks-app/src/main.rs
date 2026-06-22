@@ -229,6 +229,18 @@ enum SlotMode {
     Arc,
 }
 
+/// Trim-tool variant.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum TrimMode {
+    /// Click a piece → delete it back to the nearest intersections.
+    #[default]
+    Closest,
+    /// Drag a stroke → trim every entity the stroke crosses (paint-to-delete).
+    Power,
+    /// Pick two lines → trim/extend both so they meet at a clean corner.
+    Corner,
+}
+
 /// An in-progress drag of a placed Text entity's on-canvas handle.
 #[derive(Clone, Copy)]
 enum TextHandle {
@@ -579,6 +591,14 @@ struct SketchSession {
     rect_mode: RectMode,
     /// Slot-tool variant (straight / centrepoint / arc).
     slot_mode: SlotMode,
+    /// Trim-tool variant (closest / power / corner).
+    trim_mode: TrimMode,
+    /// Power-trim: the cursor position last frame (the running stroke).
+    power_prev: Option<Vec2>,
+    /// Power-trim: the cursor path of the current drag, drawn as a trail.
+    power_path: Vec<Vec2>,
+    /// Corner-trim: the first line picked (waiting for the second).
+    trim_first: Option<usize>,
     /// Polygon tool: number of sides (left-hand parameter), default 6.
     polygon_sides: usize,
     /// Text tool parameters (left-hand panel). `text_arc` is the text-on-arc radius (0 =
@@ -1343,17 +1363,31 @@ fn ui_system(
                             session.tool = Tool::Mirror;
                             session.pending = None;
                         }
-                        // Trim to closest: click a line segment to delete it back to the nearest
-                        // intersections.
+                        // Trim tool + a ▾ dropdown: closest / power / corner.
                         if ui
                             .selectable_label(session.tool == Tool::Trim, "Trim")
-                            .on_hover_text("Trim to closest — click a line to delete it back to the nearest intersections")
+                            .on_hover_text("Trim entities — pick a mode from the ▾ (closest / power / corner)")
                             .clicked()
                         {
                             session.tool = Tool::Trim;
                             session.pending = None;
                             session.spline_pts.clear();
                         }
+                        egui::Popup::menu(&dropdown_arrow(ui, "Trim modes")).show(|ui| {
+                            let m = session.trim_mode;
+                            if ui.selectable_label(m == TrimMode::Closest, "Trim to closest").on_hover_text("Click a piece → delete it back to the nearest intersections").clicked() {
+                                session.tool = Tool::Trim;
+                                session.trim_mode = TrimMode::Closest;
+                            }
+                            if ui.selectable_label(m == TrimMode::Power, "Power Trim").on_hover_text("Drag a stroke across entities → trim everything it crosses").clicked() {
+                                session.tool = Tool::Trim;
+                                session.trim_mode = TrimMode::Power;
+                            }
+                            if ui.selectable_label(m == TrimMode::Corner, "Corner").on_hover_text("Click two lines → trim/extend both to meet at a corner").clicked() {
+                                session.tool = Tool::Trim;
+                                session.trim_mode = TrimMode::Corner;
+                            }
+                        });
                         let mut snap = !session.hide_inference;
                         if ui
                             .checkbox(&mut snap, "Snap pts")
@@ -4881,6 +4915,11 @@ fn sketch_interaction(
     if session.tool != Tool::Spline && !session.spline_pts.is_empty() {
         session.spline_pts.clear(); // leaving the spline tool drops the in-progress curve
     }
+    if session.tool != Tool::Trim {
+        session.trim_first = None; // drop a half-finished corner / power stroke on tool change
+        session.power_prev = None;
+        session.power_path.clear();
+    }
     if session.tool != Tool::Rectangle && session.tool != Tool::Slot && session.tool != Tool::Arc {
         session.pending_b = None; // the second anchor belongs to the parallelogram / slot / arc
     }
@@ -5152,10 +5191,53 @@ fn sketch_interaction(
                 place_point(&mut session, uv);
             }
         }
-        Tool::Trim if just_pressed => {
-            // Click a line segment → delete it back to the nearest intersections.
-            if let Some(uv) = active_uv {
-                apply_trim(&mut session, uv, snap * 1.5);
+        Tool::Trim => {
+            let thresh = snap * 1.5;
+            match session.trim_mode {
+                // Click a piece → delete it back to the nearest intersections.
+                TrimMode::Closest => {
+                    if just_pressed {
+                        if let Some(uv) = active_uv {
+                            apply_trim(&mut session, uv, thresh);
+                        }
+                    }
+                }
+                // Drag a stroke → trim every entity the cursor path crosses.
+                TrimMode::Power => {
+                    if just_pressed {
+                        session.power_prev = active_uv;
+                        session.power_path.clear();
+                        session.power_path.extend(active_uv);
+                    } else if pressed {
+                        if let (Some(prev), Some(cur)) = (session.power_prev, active_uv) {
+                            if prev.distance(cur) > 1e-4 {
+                                power_trim_stroke(&mut session, prev, cur, thresh);
+                                session.power_prev = Some(cur);
+                                session.power_path.push(cur);
+                            }
+                        }
+                    }
+                    if just_released {
+                        session.power_prev = None;
+                        session.power_path.clear();
+                    }
+                }
+                // Pick two lines → trim/extend both to meet at a clean corner.
+                TrimMode::Corner => {
+                    if just_pressed {
+                        if let Some(uv) = active_uv {
+                            match (session.trim_first, nearest_line(&session.sketch, uv, thresh)) {
+                                (None, Some(li)) => session.trim_first = Some(li),
+                                (Some(first), Some(li)) if li != first => {
+                                    corner_trim(&mut session, first, li);
+                                    session.trim_first = None;
+                                }
+                                (_, None) => session.trim_first = None, // clicked empty → reset
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
         }
         Tool::Spline if just_pressed => {
@@ -6329,6 +6411,73 @@ fn arc_trim_bracket(sketch: &Sketch, ai: usize, uv: Vec2) -> Option<(f32, f32)> 
     let u_lo = us.iter().copied().filter(|&u| u < click - 1e-4).fold(0.0_f32, f32::max);
     let u_hi = us.iter().copied().filter(|&u| u > click + 1e-4).fold(1.0_f32, f32::min);
     Some((u_lo, u_hi))
+}
+
+/// The first point at which the stroke segment `prev`→`cur` crosses any (non-reference) entity —
+/// used by Power Trim to find what the dragged cursor is cutting.
+fn stroke_crosses(sketch: &Sketch, prev: Vec2, cur: Vec2) -> Option<Vec2> {
+    for e in &sketch.entities {
+        match e {
+            SketchEntity::Line { a, b, reference: false, .. } => {
+                if let Some(t) = seg_seg_t(prev, cur, pt2(sketch, *a), pt2(sketch, *b)) {
+                    return Some(prev + (cur - prev) * t);
+                }
+            }
+            SketchEntity::Circle { center, radius, .. } => {
+                if let Some(t) = seg_circle_t(prev, cur, pt2(sketch, *center), *radius as f32).into_iter().next() {
+                    return Some(prev + (cur - prev) * t);
+                }
+            }
+            SketchEntity::Arc { center, a, b, ccw, .. } => {
+                if let (Some(c), Some(pa), Some(pb)) = (sketch.points.get(*center), sketch.points.get(*a), sketch.points.get(*b)) {
+                    let poly = tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
+                    for w in poly.windows(2) {
+                        let (w0, w1) = (Vec2::new(w[0][0] as f32, w[0][1] as f32), Vec2::new(w[1][0] as f32, w[1][1] as f32));
+                        if let Some(t) = seg_seg_t(prev, cur, w0, w1) {
+                            return Some(prev + (cur - prev) * t);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Power Trim one stroke step: if the cursor's path `prev`→`cur` crossed an entity, trim that
+/// entity at the crossing (trim-to-closest there).
+fn power_trim_stroke(session: &mut SketchSession, prev: Vec2, cur: Vec2, thresh: f32) {
+    if let Some(p) = stroke_crosses(&session.sketch, prev, cur) {
+        apply_trim(session, p, thresh.max(0.05));
+    }
+}
+
+/// Corner Trim: trim/extend lines `li1` and `li2` so they meet at their intersection. Each line's
+/// endpoint nearest the intersection is moved onto a shared point there (forming a clean corner).
+fn corner_trim(session: &mut SketchSession, li1: usize, li2: usize) -> bool {
+    let (Some((a0, a1)), Some((b0, b1))) = (entity_line(&session.sketch, li1), entity_line(&session.sketch, li2)) else {
+        return false;
+    };
+    let (pa0, pa1, pb0, pb1) = (pt2(&session.sketch, a0), pt2(&session.sketch, a1), pt2(&session.sketch, b0), pt2(&session.sketch, b1));
+    let Some(x) = line_intersection(pa0, pa1, pb0, pb1) else { return false }; // parallel → no corner
+    let snap = session.snap_dist;
+    let xi = get_or_add_point(&mut session.sketch, x, snap);
+    // Re-point each line's endpoint nearest the intersection onto the shared corner point.
+    let near1 = if pa0.distance(x) <= pa1.distance(x) { a0 } else { a1 };
+    let near2 = if pb0.distance(x) <= pb1.distance(x) { b0 } else { b1 };
+    for (li, near) in [(li1, near1), (li2, near2)] {
+        if let SketchEntity::Line { a, b, .. } = &mut session.sketch.entities[li] {
+            if *a == near {
+                *a = xi;
+            } else if *b == near {
+                *b = xi;
+            }
+        }
+    }
+    session.sketch.remove_unused_points();
+    session.dirty = true;
+    true
 }
 
 /// The vertex and label anchor of an angle dimension between lines (a→b) and (c→d).
@@ -9475,8 +9624,28 @@ fn draw_sketch(
         draw_marker(&mut gizmos, ap, start, point_col, ms);
     }
 
-    // Trim-to-closest hover preview: the piece that a click would delete, in red.
-    if session.tool == Tool::Trim {
+    // Power Trim: draw the cursor stroke so far (where it's cutting), plus the live segment.
+    if session.tool == Tool::Trim && session.trim_mode == TrimMode::Power && !session.power_path.is_empty() {
+        let trail = Color::srgb(1.0, 0.45, 0.2);
+        for w in session.power_path.windows(2) {
+            gizmos.line(ap.to_world(w[0]), ap.to_world(w[1]), trail);
+        }
+        if let (Some(&last), Some(cur)) = (session.power_path.last(), session.cursor_uv) {
+            gizmos.line(ap.to_world(last), ap.to_world(cur), trail);
+        }
+    }
+    // Corner mode: highlight the first picked line while waiting for the second.
+    if session.tool == Tool::Trim && session.trim_mode == TrimMode::Corner {
+        if let Some((a, b)) = session.trim_first.and_then(|li| entity_line(&session.sketch, li)) {
+            gizmos.line(
+                ap.to_world(pt2(&session.sketch, a)),
+                ap.to_world(pt2(&session.sketch, b)),
+                Color::srgb(0.3, 0.9, 1.0),
+            );
+        }
+    }
+    // Trim/Power hover preview: the piece that a click (or stroke crossing) would delete, in red.
+    if session.tool == Tool::Trim && session.trim_mode != TrimMode::Corner {
         if let Some(uv) = session.cursor_uv {
             let red = Color::srgb(1.0, 0.3, 0.3);
             let thresh = ms * 0.04 + 0.25;
