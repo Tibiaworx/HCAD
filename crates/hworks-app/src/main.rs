@@ -6064,6 +6064,61 @@ fn seg_circle_t(a: Vec2, b: Vec2, center: Vec2, r: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Tessellated polyline of any sketch entity, for trim intersection tests. Closed shapes
+/// (circle, slot, closed spline) include the wrap segment back to the start. Reference lines,
+/// text and bare points return empty (they don't bound a trim).
+fn entity_polyline_app(sketch: &Sketch, ei: usize) -> Vec<Vec2> {
+    let v2 = |p: &[f64; 2]| Vec2::new(p[0] as f32, p[1] as f32);
+    match &sketch.entities[ei] {
+        SketchEntity::Line { a, b, reference: false, .. } => vec![pt2(sketch, *a), pt2(sketch, *b)],
+        SketchEntity::Circle { center, radius, .. } => {
+            let (c, r) = (pt2(sketch, *center), *radius as f32);
+            (0..=96).map(|k| { let a = std::f32::consts::TAU * k as f32 / 96.0; c + Vec2::new(a.cos(), a.sin()) * r }).collect()
+        }
+        SketchEntity::Arc { center, a, b, ccw, .. } => match (sketch.points.get(*center), sketch.points.get(*a), sketch.points.get(*b)) {
+            (Some(c), Some(pa), Some(pb)) => tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw).iter().map(v2).collect(),
+            _ => vec![],
+        },
+        SketchEntity::Spline { points, closed, control, .. } => {
+            let pts: Vec<[f64; 2]> = points.iter().filter_map(|&i| sketch.points.get(i)).map(|p| [p.x, p.y]).collect();
+            if pts.len() < 2 {
+                return vec![];
+            }
+            let mut poly: Vec<Vec2> = tessellate_spline(&pts, *closed, *control).iter().map(v2).collect();
+            if *closed && poly.len() >= 2 {
+                poly.push(poly[0]);
+            }
+            poly
+        }
+        SketchEntity::Slot { a, b, radius, mid, .. } => match (sketch.points.get(*a), sketch.points.get(*b)) {
+            (Some(pa), Some(pb)) => {
+                let pm = mid.and_then(|m| sketch.points.get(m)).map(|p| [p.x, p.y]);
+                let mut poly: Vec<Vec2> = match pm {
+                    Some(pm) => tessellate_arc_slot([pa.x, pa.y], pm, [pb.x, pb.y], *radius),
+                    None => tessellate_slot([pa.x, pa.y], [pb.x, pb.y], *radius),
+                }
+                .iter()
+                .map(v2)
+                .collect();
+                if poly.len() >= 2 {
+                    poly.push(poly[0]); // close the stadium loop
+                }
+                poly
+            }
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+/// Param `t∈(0,1)` values along segment `a→b` where it crosses entity `ei`'s polyline (any type).
+fn seg_entity_ts(sketch: &Sketch, a: Vec2, b: Vec2, ei: usize) -> Vec<f32> {
+    entity_polyline_app(sketch, ei)
+        .windows(2)
+        .filter_map(|w| seg_seg_t(a, b, w[0], w[1]))
+        .collect()
+}
+
 /// The nearest (non-reference) line to `uv` within `thresh`, by perpendicular segment distance.
 fn nearest_line(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
@@ -6108,6 +6163,10 @@ fn trim_bracket(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<(usize, f32, f
             }
             SketchEntity::Circle { center, radius, .. } => {
                 ts.extend(seg_circle_t(a, b, pt2(sketch, *center), *radius as f32));
+            }
+            // Arcs, splines and slots bound a trim via their tessellated outline.
+            SketchEntity::Arc { .. } | SketchEntity::Spline { .. } | SketchEntity::Slot { .. } => {
+                ts.extend(seg_entity_ts(sketch, a, b, j));
             }
             _ => {}
         }
@@ -6189,6 +6248,14 @@ fn cut_angles_on_circle(sketch: &Sketch, center: Vec2, r: f32, skip: usize) -> V
                     }
                 }
             }
+            // Splines and slots cross the rim along their tessellated outline.
+            SketchEntity::Spline { .. } | SketchEntity::Slot { .. } => {
+                for w in entity_polyline_app(sketch, j).windows(2) {
+                    for t in seg_circle_t(w[0], w[1], center, r) {
+                        out.push(ang(w[0] + (w[1] - w[0]) * t));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -6243,9 +6310,14 @@ fn apply_trim(session: &mut SketchSession, uv: Vec2, thresh: f32) -> bool {
     let line = nearest_line(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
     let circ = nearest_circle(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
     let arc = nearest_arc(&session.sketch, uv, thresh).map(|i| (i, dist_to_entity(&session.sketch, i, uv)));
+    let spline = nearest_spline(&session.sketch, uv, thresh);
     // Prefer whichever rim/segment the cursor is closest to.
-    let pick = [line, circ, arc].into_iter().flatten().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let pick = [line, circ, arc, spline].into_iter().flatten().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     let Some((ei, _)) = pick else { return false };
+
+    if let SketchEntity::Spline { .. } = session.sketch.entities[ei] {
+        return trim_spline(session, ei, uv);
+    }
 
     if let SketchEntity::Arc { .. } = session.sketch.entities[ei] {
         // Arc → trim to the nearest cuts, leaving the surviving sub-arc(s).
@@ -6398,6 +6470,28 @@ fn nearest_arc(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
+/// Nearest *open* spline (by distance to its tessellated outline) within `thresh` → (index, dist).
+fn nearest_spline(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, e) in sketch.entities.iter().enumerate() {
+        if !matches!(e, SketchEntity::Spline { closed: false, .. }) {
+            continue;
+        }
+        let poly = entity_polyline_app(sketch, i);
+        let mut d = f32::MAX;
+        for w in poly.windows(2) {
+            let ab = w[1] - w[0];
+            let l2 = ab.dot(ab);
+            let t = if l2 > 1e-9 { ((uv - w[0]).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            d = d.min(uv.distance(w[0] + ab * t));
+        }
+        if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best
+}
+
 /// Bracket (u_lo, u_hi) of arc `ai` to remove at `uv` — the piece between the nearest cuts on
 /// each side of the click. u_lo=0 / u_hi=1 mean "up to the arc's own end".
 fn arc_trim_bracket(sketch: &Sketch, ai: usize, uv: Vec2) -> Option<(f32, f32)> {
@@ -6416,30 +6510,20 @@ fn arc_trim_bracket(sketch: &Sketch, ai: usize, uv: Vec2) -> Option<(f32, f32)> 
 /// The first point at which the stroke segment `prev`→`cur` crosses any (non-reference) entity —
 /// used by Power Trim to find what the dragged cursor is cutting.
 fn stroke_crosses(sketch: &Sketch, prev: Vec2, cur: Vec2) -> Option<Vec2> {
-    for e in &sketch.entities {
+    for (j, e) in sketch.entities.iter().enumerate() {
         match e {
-            SketchEntity::Line { a, b, reference: false, .. } => {
-                if let Some(t) = seg_seg_t(prev, cur, pt2(sketch, *a), pt2(sketch, *b)) {
-                    return Some(prev + (cur - prev) * t);
-                }
-            }
+            SketchEntity::Line { reference: true, .. } | SketchEntity::Point { .. } | SketchEntity::Text { .. } => {}
+            // Circles need the exact rim crossing; everything else rides its tessellated outline.
             SketchEntity::Circle { center, radius, .. } => {
                 if let Some(t) = seg_circle_t(prev, cur, pt2(sketch, *center), *radius as f32).into_iter().next() {
                     return Some(prev + (cur - prev) * t);
                 }
             }
-            SketchEntity::Arc { center, a, b, ccw, .. } => {
-                if let (Some(c), Some(pa), Some(pb)) = (sketch.points.get(*center), sketch.points.get(*a), sketch.points.get(*b)) {
-                    let poly = tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
-                    for w in poly.windows(2) {
-                        let (w0, w1) = (Vec2::new(w[0][0] as f32, w[0][1] as f32), Vec2::new(w[1][0] as f32, w[1][1] as f32));
-                        if let Some(t) = seg_seg_t(prev, cur, w0, w1) {
-                            return Some(prev + (cur - prev) * t);
-                        }
-                    }
+            _ => {
+                if let Some(t) = seg_entity_ts(sketch, prev, cur, j).into_iter().next() {
+                    return Some(prev + (cur - prev) * t);
                 }
             }
-            _ => {}
         }
     }
     None
@@ -6475,6 +6559,88 @@ fn corner_trim(session: &mut SketchSession, li1: usize, li2: usize) -> bool {
             }
         }
     }
+    session.sketch.remove_unused_points();
+    session.dirty = true;
+    true
+}
+
+/// Trim an open spline `ei` at `uv`: drop the sub-curve between the nearest crossings on either
+/// side of the click, rebuilding the surviving piece(s) as splines through the original through-
+/// points plus the cut endpoints. (Closed splines and slots aren't trimmed as targets yet.)
+fn trim_spline(session: &mut SketchSession, ei: usize, uv: Vec2) -> bool {
+    const STEPS: usize = 16; // must match tessellate_spline's samples-per-segment
+    let (pt_idx, closed, control, construction) = match &session.sketch.entities[ei] {
+        SketchEntity::Spline { points, closed, control, construction } => (points.clone(), *closed, *control, *construction),
+        _ => return false,
+    };
+    if closed || pt_idx.len() < 3 {
+        return false;
+    }
+    let through: Vec<Vec2> = pt_idx.iter().map(|&i| pt2(&session.sketch, i)).collect();
+    let poly = entity_polyline_app(&session.sketch, ei); // open ⇒ (n-1)*STEPS + 1 vertices
+    if poly.len() < 2 {
+        return false;
+    }
+    // Position along the poly is "segment index + t". Through-point i sits at i*STEPS.
+    let project = |p: Vec2| -> f32 {
+        let (mut pos, mut best) = (0.0_f32, f32::MAX);
+        for (k, w) in poly.windows(2).enumerate() {
+            let ab = w[1] - w[0];
+            let l2 = ab.dot(ab);
+            let t = if l2 > 1e-9 { ((p - w[0]).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            let d = p.distance(w[0] + ab * t);
+            if d < best {
+                best = d;
+                pos = k as f32 + t;
+            }
+        }
+        pos
+    };
+    let click_pos = project(uv);
+    // Every crossing of this spline's outline with another entity → (pos, point).
+    let mut cuts: Vec<(f32, Vec2)> = Vec::new();
+    for j in 0..session.sketch.entities.len() {
+        if j == ei {
+            continue;
+        }
+        for w in entity_polyline_app(&session.sketch, j).windows(2) {
+            for (k, ws) in poly.windows(2).enumerate() {
+                if let Some(t) = seg_seg_t(ws[0], ws[1], w[0], w[1]) {
+                    cuts.push((k as f32 + t, ws[0] + (ws[1] - ws[0]) * t));
+                }
+            }
+        }
+    }
+    let lo = cuts.iter().filter(|(p, _)| *p < click_pos - 1e-3).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).copied();
+    let hi = cuts.iter().filter(|(p, _)| *p > click_pos + 1e-3).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).copied();
+    if lo.is_none() && hi.is_none() {
+        return false; // no bounding crossings → nothing to trim (leave the spline alone)
+    }
+    let snap = session.snap_dist;
+    let span = (poly.len() - 1) as f32;
+    let lo_pos = lo.map(|(p, _)| p).unwrap_or(0.0);
+    let hi_pos = hi.map(|(p, _)| p).unwrap_or(span);
+    // Build the two survivors' point lists (through-points outside [lo,hi] + the cut endpoints).
+    let mut left: Vec<Vec2> = through.iter().enumerate().filter(|(i, _)| ((*i as f32) * STEPS as f32) < lo_pos - 0.5).map(|(_, &p)| p).collect();
+    if let Some((_, cp)) = lo {
+        left.push(cp);
+    }
+    let mut right: Vec<Vec2> = Vec::new();
+    if let Some((_, cp)) = hi {
+        right.push(cp);
+    }
+    right.extend(through.iter().enumerate().filter(|(i, _)| ((*i as f32) * STEPS as f32) > hi_pos + 0.5).map(|(_, &p)| p));
+
+    let push_spline = |session: &mut SketchSession, pts: &[Vec2]| {
+        if pts.len() < 2 {
+            return;
+        }
+        let idx: Vec<usize> = pts.iter().map(|p| get_or_add_point(&mut session.sketch, *p, snap)).collect();
+        session.sketch.entities.push(SketchEntity::Spline { points: idx, closed: false, construction, control });
+    };
+    session.sketch.entities.remove(ei);
+    push_spline(session, &left);
+    push_spline(session, &right);
     session.sketch.remove_unused_points();
     session.dirty = true;
     true
