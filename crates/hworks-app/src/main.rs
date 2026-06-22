@@ -6589,7 +6589,13 @@ fn handle_keys(
     }
     if keys.just_pressed(KeyCode::Escape) {
         if !session.spline_pts.is_empty() {
-            session.spline_pts.clear(); // 0) cancel the in-progress spline…
+            // 0) Finish the in-progress spline at the current segment (open) rather than
+            // discarding it — ≥2 points make a real spline whose endpoints stay snappable.
+            if session.spline_pts.len() >= 2 {
+                commit_spline(&mut session, false);
+            } else {
+                session.spline_pts.clear(); // a lone point: nothing to keep
+            }
         } else if session.pending.is_some() || session.pending_b.is_some() || session.pending_c.is_some() {
             session.pending = None; // 1) cancel the in-progress entity…
             session.pending_b = None;
