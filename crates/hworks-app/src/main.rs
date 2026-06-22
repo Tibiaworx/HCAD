@@ -4210,7 +4210,9 @@ fn sketch_interaction(
     {
         if let Some(cursor) = window.cursor_position() {
             if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
-                let (chain, closed) = edge_chain(&part.edges, si);
+                // Loop-snap: one click on a face-perimeter edge grabs the whole closed loop, so
+                // the bevel gets a complete corner-closed set (and rounds the full rim at once).
+                let (chain, closed) = edge_loop(&part.edges, si);
                 if chain.len() >= 2 {
                     toggle_fillet_edge(&mut ui_state, &chain);
                     edge_sel.set(chain, closed);
@@ -4692,7 +4694,7 @@ fn sketch_interaction(
             if !part.edges.is_empty() {
                 if let Some(cursor) = window.cursor_position() {
                     if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
-                        let (chain, closed) = edge_chain(&part.edges, si);
+                        let (chain, closed) = edge_loop(&part.edges, si);
                         if chain.len() >= 2 {
                             edge_sel.set(chain, closed);
                             return;
@@ -9282,6 +9284,88 @@ fn edge_chain(edges: &[[[f32; 3]; 2]], seed: usize) -> (Vec<Vec3>, bool) {
     (chain, false)
 }
 
+/// Like [`edge_chain`], but when the tangent walk is *open* (it stopped at sharp corners), try
+/// to snap to the smallest **closed, planar** edge loop through the clicked edge — e.g. a box
+/// face's whole perimeter from one click. Selecting the full loop also hands the bevel a
+/// complete, corner-closed set, so it rounds cleanly instead of falling back at a lone edge.
+/// Falls back to the open chain when no planar loop exists (a truly isolated edge).
+fn edge_loop(edges: &[[[f32; 3]; 2]], seed: usize) -> (Vec<Vec3>, bool) {
+    use std::collections::HashMap;
+    let (chain, closed) = edge_chain(edges, seed);
+    if closed {
+        return (chain, true);
+    }
+    // Rebuild the welded segment graph.
+    let mut key_to_id: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut pos: Vec<Vec3> = Vec::new();
+    let mut seg: Vec<(usize, usize)> = Vec::with_capacity(edges.len());
+    for e in edges {
+        let a = vertex_id(Vec3::from_array(e[0]), &mut key_to_id, &mut pos);
+        let b = vertex_id(Vec3::from_array(e[1]), &mut key_to_id, &mut pos);
+        seg.push((a, b));
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); pos.len()];
+    for (si, (a, b)) in seg.iter().enumerate() {
+        adj[*a].push(si);
+        adj[*b].push(si);
+    }
+    let (sa, sb) = seg[seed];
+    // BFS the shortest path sa→sb that avoids the seed segment — that path plus the seed is the
+    // smallest cycle through the clicked edge.
+    let mut prev = vec![usize::MAX; pos.len()];
+    let mut seen = vec![false; pos.len()];
+    let mut q = std::collections::VecDeque::new();
+    seen[sa] = true;
+    q.push_back(sa);
+    while let Some(v) = q.pop_front() {
+        if v == sb {
+            break;
+        }
+        for &sg in &adj[v] {
+            if sg == seed {
+                continue;
+            }
+            let (a, b) = seg[sg];
+            let w = if a == v { b } else { a };
+            if !seen[w] {
+                seen[w] = true;
+                prev[w] = v;
+                q.push_back(w);
+            }
+        }
+    }
+    if !seen[sb] {
+        return (chain, false); // no cycle → lone edge
+    }
+    // Reconstruct the loop vertices sa..sb.
+    let mut loop_ids = vec![sb];
+    let mut v = sb;
+    while v != sa {
+        v = prev[v];
+        if v == usize::MAX {
+            return (chain, false);
+        }
+        loop_ids.push(v);
+    }
+    let pts: Vec<Vec3> = loop_ids.iter().map(|&i| pos[i]).collect();
+    // Accept only a reasonably planar loop (so we grab a flat face perimeter, not a path that
+    // wanders over the body). Newell normal, then max out-of-plane distance.
+    let c = pts.iter().copied().sum::<Vec3>() / pts.len() as f32;
+    let mut nrm = Vec3::ZERO;
+    for i in 0..pts.len() {
+        let (p, qn) = (pts[i] - c, pts[(i + 1) % pts.len()] - c);
+        nrm += p.cross(qn);
+    }
+    let nrm = nrm.normalize_or_zero();
+    let span = pts.iter().map(|p| (*p - c).length()).fold(0.0_f32, f32::max).max(1e-3);
+    let flat = nrm != Vec3::ZERO && pts.iter().all(|p| (*p - c).dot(nrm).abs() < 0.02 * span);
+    if flat {
+        (pts, true)
+    } else {
+        (chain, false)
+    }
+}
+
 /// Intern a world point, returning a stable per-position vertex id.
 fn vertex_id(
     p: Vec3,
@@ -9767,6 +9851,35 @@ mod tests {
         let (chain, closed) = edge_chain(&edges, 0);
         assert!(!closed, "90° corners are too sharp to chain");
         assert_eq!(chain.len(), 2, "just the one clicked side");
+    }
+
+    #[test]
+    fn edge_loop_closes_a_sharp_square_but_chains_an_open_run() {
+        let square = vec![
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+        ];
+        let (chain, closed) = edge_loop(&square, 0);
+        assert!(closed, "edge_loop snaps the whole planar square perimeter");
+        assert_eq!(chain.len(), 4, "all four sides");
+
+        // A lone edge with no closing loop stays a single open segment.
+        let lone = vec![[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]];
+        let (c2, closed2) = edge_loop(&lone, 0);
+        assert!(!closed2);
+        assert_eq!(c2.len(), 2);
+
+        // A non-planar 4-cycle must NOT be snapped (it's not a flat rim).
+        let skew = vec![
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [1.0, 1.0, 1.0]],
+            [[1.0, 1.0, 1.0], [0.0, 1.0, 0.0]],
+            [[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+        ];
+        let (_, closed3) = edge_loop(&skew, 0);
+        assert!(!closed3, "non-planar cycles are not loop-snapped");
     }
 
     #[test]
