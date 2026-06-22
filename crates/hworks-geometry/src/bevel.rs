@@ -589,18 +589,19 @@ pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
     bevel_mesh_selected(mesh, r, seg, &[])
 }
 
-/// The **selectable feature edges** a bevel produces: for each rounded edge, the two curves
-/// where the rounded strip meets its adjacent flat faces (a fillet's tangent edges, or a
-/// chamfer's hard edges). These follow the inset face boundary, so they sit exactly on the
-/// rounded body and chain up for picking. `picked` empty = every edge (matches `bevel_mesh`).
-/// Returns segments in the same `[[f32;3];2]` form the renderer/picker use.
-pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Vec<[[f32; 3]; 2]> {
+/// Shared front half of every bevel op: rebuild topology, decide which model edges round, and
+/// place each face's inset corners. `None` if nothing is selected. Computing this once lets the
+/// surgery and the feature-edge emission share a single (relatively costly) `build_topo` pass.
+type BevelPrep = (Topo, Vec<bool>, HashMap<(usize, usize), V3>);
+fn bevel_prep(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Option<BevelPrep> {
     let topo = build_topo(mesh);
     let all = picked.is_empty();
     let selected: Vec<bool> = topo.edges.iter().map(|e| all || edge_is_picked(&topo, e, picked)).collect();
     if !selected.iter().any(|&s| s) {
-        return Vec::new();
+        return None;
     }
+    // corner(v, f): where face f's boundary insets to at vertex v (rolling-ball setback, zero on
+    // sharp edges). Single source of truth for flat faces, edge strips, patches AND tangent edges.
     let mut corner: HashMap<(usize, usize), V3> = HashMap::new();
     for fi in 0..topo.faces.len() {
         let rings = inset_loops(&topo, fi, r, &selected);
@@ -610,6 +611,13 @@ pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> 
             }
         }
     }
+    Some((topo, selected, corner))
+}
+
+/// The selectable feature edges from a prepared bevel: the inset boundary segment along each
+/// selected model edge (a fillet's tangent edges / a chamfer's hard edges), one per adjacent
+/// face. Follows the rounded body and chains up for picking.
+fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>) -> Vec<[[f32; 3]; 2]> {
     let f32a = |p: V3| [p[0] as f32, p[1] as f32, p[2] as f32];
     let mut out = Vec::new();
     for fi in 0..topo.faces.len() {
@@ -617,8 +625,6 @@ pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> 
             let m = lp.len();
             for k in 0..m {
                 let (a, b) = (lp[k], lp[(k + 1) % m]);
-                // Emit the inset boundary segment along each *selected* model edge — that's the
-                // flat↔strip seam (one per adjacent face → both tangent edges of the round).
                 if topo.edge_between(a, b).is_some_and(|ei| selected[ei]) {
                     let pa = corner.get(&(a, fi)).copied().unwrap_or(topo.verts[a]);
                     let pb = corner.get(&(b, fi)).copied().unwrap_or(topo.verts[b]);
@@ -630,37 +636,12 @@ pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> 
     out
 }
 
-/// Bevel a solid by `r` with `seg` arc segments via mesh surgery (no CSG). `picked` is the set
-/// of world-space edge polylines to round; an **empty** list rounds every edge. Non-selected
-/// edges stay sharp, so corners where rounded and sharp edges meet are stitched with an end-cap
-/// patch. Flat faces inset by the rolling-ball setback (keeping their triangulation, so
-/// non-convex faces and holes work); each rounded edge becomes a convex/concave cylinder strip;
-/// corners become fanned patches. `seg = 1` gives a flat (chamfer) profile. Returns `None` if a
-/// corner ring can't be resolved.
-pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
-    let topo = build_topo(mesh);
-
-    // Which model edges actually round.
-    let all = picked.is_empty();
-    let selected: Vec<bool> = topo.edges.iter().map(|e| all || edge_is_picked(&topo, e, picked)).collect();
-    if !selected.iter().any(|&s| s) {
-        return None; // nothing matched → let the caller fall back
-    }
-
-    // corner(v, f): where face f's boundary insets to at vertex v (rolling-ball setback, zero on
-    // sharp edges). Single source of truth for flat faces, edge strips and corner patches.
-    let mut corner: HashMap<(usize, usize), V3> = HashMap::new();
-    for fi in 0..topo.faces.len() {
-        let rings = inset_loops(&topo, fi, r, &selected);
-        for (li, lp) in topo.faces[fi].loops.iter().enumerate() {
-            for (k, &vi) in lp.iter().enumerate() {
-                corner.insert((vi, fi), rings[li][k]);
-            }
-        }
-    }
+/// The surgery half of a prepared bevel: flat faces inset to their corners, a convex/concave
+/// cylinder strip per selected edge, and a fanned patch per corner. `None` if the result isn't
+/// watertight (a partial-vertex T-junction the prototype can't split → caller falls back to CSG).
+fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64, seg: usize) -> Option<TriMesh> {
     let verts = &topo.verts;
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
-
     let mut b = Build::new();
 
     // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset corner.
@@ -679,11 +660,11 @@ pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f6
         if !selected[ei] {
             continue;
         }
-        let r0 = match edge_end_ring(&topo, e, e.a, &cpt, r, seg) {
+        let r0 = match edge_end_ring(topo, e, e.a, &cpt, r, seg) {
             Some(p) => p,
             None => continue,
         };
-        let r1 = match edge_end_ring(&topo, e, e.b, &cpt, r, seg) {
+        let r1 = match edge_end_ring(topo, e, e.b, &cpt, r, seg) {
             Some(p) => p,
             None => continue,
         };
@@ -711,7 +692,7 @@ pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f6
         for &ei in inc {
             let e = &topo.edges[ei];
             let pts = if selected[ei] {
-                match edge_end_ring(&topo, e, vi, &cpt, r, seg) {
+                match edge_end_ring(topo, e, vi, &cpt, r, seg) {
                     Some(p) => p,
                     None => continue,
                 }
@@ -777,13 +758,41 @@ pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f6
     }
 
     let out = b.finish();
-    // Partial-bevel corners can leave a T-junction the prototype can't yet split (an isolated
-    // edge whose neighbour face doesn't move). Rather than emit a cracked mesh, self-check and
-    // bail so the caller falls back to CSG (which handles those simple cases fine).
     if is_closed(&out) {
         Some(out)
     } else {
         None
+    }
+}
+
+/// The **selectable feature edges** a bevel produces — see [`emit_feature_edges`]. `picked`
+/// empty = every edge.
+pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Vec<[[f32; 3]; 2]> {
+    match bevel_prep(mesh, r, picked) {
+        Some((topo, selected, corner)) => emit_feature_edges(&topo, &selected, &corner),
+        None => Vec::new(),
+    }
+}
+
+/// Bevel a solid by `r` with `seg` arc segments via mesh surgery (no CSG). `picked` is the set
+/// of world-space edge polylines to round; an **empty** list rounds every edge. `seg = 1` gives
+/// a flat (chamfer) profile. `None` if a corner ring can't be resolved (caller → CSG).
+pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
+    let (topo, selected, corner) = bevel_prep(mesh, r, picked)?;
+    run_surgery(&topo, &selected, &corner, r, seg)
+}
+
+/// Both the surgery mesh and the selectable feature edges from a **single** topology pass — what
+/// the app's regen wants. The mesh is `None` when the surgery can't close (caller falls back to
+/// CSG), but the edges are still returned: they sit at the same contact lines either way.
+pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> (Option<TriMesh>, Vec<[[f32; 3]; 2]>) {
+    match bevel_prep(mesh, r, picked) {
+        Some((topo, selected, corner)) => {
+            let edges = emit_feature_edges(&topo, &selected, &corner);
+            let mesh = run_surgery(&topo, &selected, &corner, r, seg);
+            (mesh, edges)
+        }
+        None => (None, Vec::new()),
     }
 }
 

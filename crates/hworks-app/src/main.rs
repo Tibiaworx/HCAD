@@ -24,7 +24,7 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    bevel_feature_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
+    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
     extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, round_mesh,
     tessellate, threaded_hole, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
@@ -6943,14 +6943,17 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 // A boss adds material elsewhere; it doesn't invalidate edges from an earlier
                 // fillet/chamfer, so keep them (don't clear here).
                 let all = sketch.regions();
-                // Reproject onto the live body's matching face (like the exact path), so a
-                // boss stacks on the *current* top rather than the stale stored plane.
+                let regs = merge_regions(&chosen_regions(&all, regions));
+                // Reproject onto the live body's matching face (like the exact path), so a boss
+                // stacks on the *current* top rather than the stale stored plane — testing under
+                // the footprint centroid so it can't snap onto an unrelated feature's top.
+                let ref_world = sketch_footprint_world(plane, regs.iter().flat_map(|r| r.outer.iter()));
                 let plane = match &body {
-                    Some(b) => reproject_plane_on_mesh(plane, b),
+                    Some(b) => reproject_plane_on_mesh(plane, b, ref_world),
                     None => plane.clone(),
                 };
                 let basis = basis_from_ref(&plane);
-                for r in &merge_regions(&chosen_regions(&all, regions)) {
+                for r in &regs {
                     body = match body.take() {
                         // Boss: dip the prism *substantially* into the body so the join ring
                         // is buried in continuous material — the surface wall then runs
@@ -6990,12 +6993,15 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 let all = sketch.regions();
                 // Reproject onto the live body's top face (like the exact path) so the cut
                 // starts at the real surface — otherwise a chamfered body (forced onto this
-                // mesh path) cuts from the stale stored plane and comes out shallow.
-                let plane = reproject_plane_on_mesh(plane, cur0);
+                // mesh path) cuts from the stale stored plane and comes out shallow. Test under
+                // the footprint centroid so it lands on the face the sketch actually sits on.
+                let cut_regs = merge_regions(&chosen_regions(&all, regions));
+                let ref_world = sketch_footprint_world(plane, cut_regs.iter().flat_map(|r| r.outer.iter()));
+                let plane = reproject_plane_on_mesh(plane, cur0, ref_world);
                 let basis = basis_from_ref(&plane);
                 let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
                 let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
-                for r in &merge_regions(&chosen_regions(&all, regions)) {
+                for r in &cut_regs {
                     let Some(cur) = body.take() else { break };
                     // Cut direction from the current body, mirroring the exact path.
                     let signed = if (mesh_centroid(&cur) - origin).dot(n) < 0.0 { -*distance } else { *distance };
@@ -7011,19 +7017,14 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
             FeatureKind::Fillet { radius, edges } => {
                 if let Some(b) = body.take() {
                     let seg = ((*radius * 6.0).round() as usize).clamp(3, 12);
-                    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        bevel_mesh_selected(&b, *radius, seg, edges)
+                    // One topology pass gives both the surgery mesh and the tangent edges. The
+                    // edges are emitted whether the surgery succeeded or fell back to CSG (they
+                    // sit at the same contact lines), so the rounded edges stay selectable. Stacked
+                    // fillets accumulate (a cylinder's top + bottom).
+                    let (beveled, fe) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bevel_mesh_and_edges(&b, *radius, seg, edges)
                     }))
-                    .ok()
-                    .flatten();
-                    // Emit the tangent edges from topology *regardless* of whether the surgery
-                    // succeeded or fell back to CSG — they sit at the same contact lines either
-                    // way, so the rounded edges stay selectable even on the CSG path. Several
-                    // fillets can stack with no body op between (a cylinder's top + bottom).
-                    let fe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        bevel_feature_edges(&b, *radius, edges)
-                    }))
-                    .unwrap_or_default();
+                    .unwrap_or((None, Vec::new()));
                     bevel_edges.extend(fe);
                     body = Some(beveled.unwrap_or_else(|| round_mesh(&b, *radius, edges).unwrap_or(b)));
                 }
@@ -7032,15 +7033,10 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
             // single (flat) profile segment; CSG chamfer fallback.
             FeatureKind::Chamfer { distance, edges } => {
                 if let Some(b) = body.take() {
-                    let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        bevel_mesh_selected(&b, *distance, 1, edges)
+                    let (beveled, fe) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        bevel_mesh_and_edges(&b, *distance, 1, edges)
                     }))
-                    .ok()
-                    .flatten();
-                    let fe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        bevel_feature_edges(&b, *distance, edges)
-                    }))
-                    .unwrap_or_default();
+                    .unwrap_or((None, Vec::new()));
                     bevel_edges.extend(fe);
                     body = Some(beveled.unwrap_or_else(|| chamfer_mesh(&b, *distance, edges).unwrap_or(b)));
                 }
@@ -7459,7 +7455,27 @@ fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
 /// feature sketched on a recessed/stepped face of the same orientation can resolve
 /// to the wrong one. Robust topological naming (DESIGN.md §4.3) is the eventual fix.
 fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
-    reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh)
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh, o)
+}
+
+/// World-space centroid of a sketch footprint (its 2D outer points lifted through the plane).
+/// Falls back to the plane origin when there are no points. Used to reproject under the face the
+/// sketch actually sits on, not under the arbitrary plane origin.
+fn sketch_footprint_world<'a>(plane: &PlaneRef, pts: impl Iterator<Item = &'a [f64; 2]>) -> Vec3 {
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let (mut cx, mut cy, mut n) = (0.0f64, 0.0f64, 0u32);
+    for p in pts {
+        cx += p[0];
+        cy += p[1];
+        n += 1;
+    }
+    if n == 0 {
+        return o;
+    }
+    o + u * (cx / n as f64) as f32 + v * (cy / n as f64) as f32
 }
 
 /// Exact `(centre_uv, radius)` of every body circular edge lying in the sketch plane `ap`,
@@ -7506,7 +7522,7 @@ fn exact_plane_circles(doc: &Document, ap: &ActivePlane) -> Vec<(Vec2, f32)> {
 /// Same as [`reproject_plane`] but driven by a triangle mesh directly — so the mesh-kernel
 /// path (forced by a fillet/chamfer/mirror) can reproject a feature's plane onto the live
 /// body too, instead of using the stale stored plane (which made cuts land shallow).
-fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh) -> PlaneRef {
+fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, ref_world: Vec3) -> PlaneRef {
     let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
     let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
     let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
@@ -7528,23 +7544,36 @@ fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh) -> PlaneRef {
         !(neg && pos)
     };
     let to2d = |p: Vec3| Vec2::new((p - o).dot(u), (p - o).dot(v));
-    let mut best: Option<f32> = None;
+    // Test the face *under the sketch footprint* (its centroid), not under the plane origin —
+    // the plane origin can sit over an unrelated feature (e.g. a tall boss), which would snap
+    // this boss's base up onto that feature's top and leave it floating.
+    let ref2d = to2d(ref_world);
+    // Prefer a face whose *outward* normal points the same way as the sketch (the face the
+    // sketch truly sits on) over one merely parallel — otherwise a boss on the top face could
+    // snap its base onto the body's *bottom* face (opposite normal, same axis) and sink in.
+    let mut best: Option<f32> = None; // same-direction faces (preferred)
+    let mut best_any: Option<f32> = None; // any parallel face (fallback)
     for t in mesh.indices.chunks(3) {
         let p = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
         let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
         let tn = (b - a).cross(c - a).normalize_or_zero();
-        if tn.dot(n).abs() < 0.9 {
+        let d = tn.dot(n);
+        if d.abs() < 0.9 {
             continue; // not a face parallel to the sketch plane
         }
-        if !in_tri(Vec2::ZERO, to2d(a), to2d(b), to2d(c)) {
-            continue; // sketch origin isn't over this face
+        if !in_tri(ref2d, to2d(a), to2d(b), to2d(c)) {
+            continue; // footprint centroid isn't over this face
         }
         let off = a.dot(n);
-        if best.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs()) {
-            best = Some(off); // the parallel face nearest the original origin along n
+        let nearer = |b: &Option<f32>| b.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs());
+        if d > 0.9 && nearer(&best) {
+            best = Some(off);
+        }
+        if nearer(&best_any) {
+            best_any = Some(off);
         }
     }
-    match best {
+    match best.or(best_any) {
         Some(off) => {
             let shifted = o + n * (off - o_n);
             PlaneRef { origin: [shifted.x as f64, shifted.y as f64, shifted.z as f64], ..plane.clone() }
