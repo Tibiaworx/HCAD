@@ -56,6 +56,9 @@ pub enum FeatureKind {
     Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
     /// Cut: subtract the chosen swept `regions` from the body (empty = all).
     Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
+    /// Revolve boss: sweep the chosen `regions` of `sketch` around an axis line (a point +
+    /// direction in the sketch's uv plane) by `angle` radians (τ = full turn).
+    Revolve { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, axis_pt: [f64; 2], axis_dir: [f64; 2], angle: f64 },
     /// Fillet: round body edges by `radius` (a mesh round). `edges` are the picked edge
     /// polylines (world space) to round; empty means "round every edge".
     Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
@@ -145,6 +148,10 @@ impl Document {
                 FeatureKind::Cut { distance, .. } => {
                     ct += 1;
                     format!("[cut]    Cut{ct}  h={distance:.1}")
+                }
+                FeatureKind::Revolve { angle, .. } => {
+                    ex += 1;
+                    format!("[rev]    Revolve{ex}  {:.0}°", angle.to_degrees())
                 }
                 FeatureKind::Fillet { radius, edges } => {
                     let scope = if edges.is_empty() { "all".to_string() } else { format!("{}", edges.len()) };

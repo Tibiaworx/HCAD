@@ -25,8 +25,8 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
-    extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, round_mesh,
-    tessellate, threaded_hole, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
+    extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
+    tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -265,12 +265,15 @@ impl Tool {
 enum SolidOp {
     Boss(f64),
     Cut(f64),
+    /// Revolve the profile around the sketch's construction-line axis by this many radians.
+    Revolve(f64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum OpKind {
     Boss,
     Cut,
+    Revolve,
 }
 
 /// An action chosen from a feature-tree right-click menu (applied after the
@@ -625,6 +628,9 @@ struct SketchSession {
     /// Which closed contours (indices into `sketch.regions()`) are selected for
     /// extrude/cut — the "Selected Contours". Empty means "all closed regions".
     selected_contours: Vec<usize>,
+    /// The sketch line chosen as the **revolve axis** (entity index), while the Revolve
+    /// PropertyManager is open. Click a line in the sketch to set it.
+    revolve_axis: Option<usize>,
     /// Sketch entities selected (with the Select tool) for applying a constraint.
     selected_entities: Vec<usize>,
     /// Snap/inference points for the entity currently under the cursor (line
@@ -1360,6 +1366,13 @@ fn ui_system(
                                 ui_state.edit_sketch_request = Some(i);
                             }
                             ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32, reverse: false });
+                        }
+                        if ui.button("Revolve").on_hover_text("Revolve the profile around a construction centerline").clicked() {
+                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
+                                ui_state.edit_sketch_request = Some(i);
+                            }
+                            // `depth` carries the revolve angle in degrees (default a full turn).
+                            ui_state.pending = Some(PendingOp { kind: OpKind::Revolve, depth: 360.0, reverse: false });
                         }
                     });
                     if !can_extrude {
@@ -2124,6 +2137,7 @@ fn ui_system(
                 ui.heading(match op.kind {
                     OpKind::Boss => "Boss-Extrude",
                     OpKind::Cut => "Cut-Extrude",
+                    OpKind::Revolve => "Revolve",
                 });
             });
             // OK (green ✔) / Cancel (red ✗) row, as in the PropertyManager header.
@@ -2141,6 +2155,7 @@ fn ui_system(
                     .clicked()
                 {
                     keep = false;
+                    session.revolve_axis = None;
                 }
             });
             ui.separator();
@@ -2150,16 +2165,43 @@ fn ui_system(
                 ui.add_enabled(false, egui::Button::new("Sketch Plane             ▼"));
             });
 
-            // Direction 1 — end condition, reverse, and depth (D1).
-            egui::CollapsingHeader::new("Direction 1").default_open(true).show(ui, |ui| {
-                ui.add_enabled(false, egui::Button::new("Blind                    ▼"))
-                    .on_disabled_hover_text("End condition (only Blind for now)");
-                ui.checkbox(&mut op.reverse, "Reverse direction");
+            let is_rev = matches!(op.kind, OpKind::Revolve);
+            // Revolve: an Axis box — click a sketch line to set the revolve axis.
+            if is_rev {
+                egui::CollapsingHeader::new("Axis").default_open(true).show(ui, |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(190.0);
+                        match session.revolve_axis {
+                            Some(e) => {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(egui::Color32::from_rgb(120, 200, 255), format!("Axis: Line {e}"));
+                                    if ui.small_button("Clear").clicked() {
+                                        session.revolve_axis = None;
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.colored_label(egui::Color32::from_rgb(230, 170, 90), "Click a line in the sketch to set the axis.");
+                            }
+                        }
+                    });
+                });
+            }
+
+            // Direction 1 (boss/cut: depth) or Angle (revolve).
+            egui::CollapsingHeader::new(if is_rev { "Angle" } else { "Direction 1" }).default_open(true).show(ui, |ui| {
+                if !is_rev {
+                    ui.add_enabled(false, egui::Button::new("Blind                    ▼"))
+                        .on_disabled_hover_text("End condition (only Blind for now)");
+                }
+                ui.checkbox(&mut op.reverse, if is_rev { "Reverse (spin other way)" } else { "Reverse direction" });
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("D1").strong());
-                    ui.add(
-                        egui::DragValue::new(&mut op.depth).speed(0.1).range(0.1..=10_000.0).suffix(" mm"),
-                    );
+                    ui.label(egui::RichText::new(if is_rev { "A1" } else { "D1" }).strong());
+                    if is_rev {
+                        ui.add(egui::DragValue::new(&mut op.depth).speed(1.0).range(1.0..=360.0).suffix("°"));
+                    } else {
+                        ui.add(egui::DragValue::new(&mut op.depth).speed(0.1).range(0.1..=10_000.0).suffix(" mm"));
+                    }
                 });
             });
 
@@ -2210,6 +2252,8 @@ fn ui_system(
                 session.op_request = Some(match op.kind {
                     OpKind::Boss => SolidOp::Boss(d),
                     OpKind::Cut => SolidOp::Cut(d),
+                    // For revolve, `depth` carries the angle in degrees.
+                    OpKind::Revolve => SolidOp::Revolve((d).to_radians()),
                 });
                 keep = false;
             }
@@ -2691,6 +2735,32 @@ fn ui_system(
                                     action = Some(TreeAction::Select(i));
                                     ui.close();
                                 }
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.header_response.rect
+                        }
+                        FeatureKind::Revolve { angle, .. } => {
+                            ex += 1;
+                            let label = format!("Revolve{ex}  ({:.0}°)", angle.to_degrees());
+                            let resp = egui::CollapsingHeader::new(styled(format!("⏀ {label}")))
+                                .id_salt(i)
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    let child_resp = ui.selectable_label(false, egui::RichText::new(format!("✎ Sketch of Revolve{ex}")).weak());
+                                    child_resp.context_menu(|ui| {
+                                        if ui.button("Edit sketch").clicked() {
+                                            action = Some(TreeAction::Edit(i));
+                                            ui.close();
+                                        }
+                                    });
+                                });
+                            if resp.header_response.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.header_response.context_menu(|ui| {
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -4864,10 +4934,15 @@ fn sketch_interaction(
                         let region = region_at(&session.sketch, uv);
                         let near_entity = nearest_entity(&session.sketch, uv, snap * 1.5);
                         if let Some(e) = on_entity.or(region.is_none().then_some(()).and(near_entity)) {
-                            // (de)select the entity for a constraint. Many can be selected
-                            // (e.g. Equal across several lines); pairwise relations just
-                            // stay disabled unless exactly two are chosen.
-                            if let Some(pos) = session.selected_entities.iter().position(|&x| x == e) {
+                            let picking_axis = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Revolve))
+                                && matches!(session.sketch.entities.get(e), Some(SketchEntity::Line { .. }));
+                            if picking_axis {
+                                // Revolve PM open + a line clicked → that line is the axis.
+                                session.revolve_axis = Some(e);
+                            } else if let Some(pos) = session.selected_entities.iter().position(|&x| x == e) {
+                                // (de)select the entity for a constraint. Many can be selected
+                                // (e.g. Equal across several lines); pairwise relations just
+                                // stay disabled unless exactly two are chosen.
                                 session.selected_entities.remove(pos);
                             } else {
                                 session.selected_entities.push(e);
@@ -5502,6 +5577,18 @@ fn mirror_axis(session: &SketchSession) -> Option<(usize, Vec2, Vec2)> {
     let axis = con.or_else(|| session.selected_entities.iter().copied().find(|&i| entity_line(&session.sketch, i).is_some()))?;
     let (a, b) = ep(axis)?;
     Some((axis, a, b))
+}
+
+/// The revolve axis: the line the user picked (`session.revolve_axis`, any sketch line) as a uv
+/// point and direction. `None` if nothing is picked or it's degenerate.
+fn revolve_axis(session: &SketchSession) -> Option<([f64; 2], [f64; 2])> {
+    let e = session.revolve_axis?;
+    if let Some(SketchEntity::Line { a, b, .. }) = session.sketch.entities.get(e) {
+        let (pa, pb) = (session.sketch.points[*a], session.sketch.points[*b]);
+        let dir = [pb.x - pa.x, pb.y - pa.y];
+        return (dir[0].hypot(dir[1]) > 1e-6).then_some(([pa.x, pa.y], dir));
+    }
+    None
 }
 
 /// Entities to mirror = selected geometry minus the axis line (and minus reference/text).
@@ -6679,6 +6766,13 @@ fn do_solid_op(
         warn!("Cut: there is no body yet — extrude a boss first.");
         return;
     }
+    // Revolve needs an axis — the line the user clicked in the sketch.
+    let axis = revolve_axis(&session);
+    if matches!(op, SolidOp::Revolve(_)) && axis.is_none() {
+        warn!("Revolve: click a line in the sketch to use as the axis.");
+        ui_state.last_error = Some("Revolve needs an axis — click a line in the sketch to select it.".into());
+        return;
+    }
 
     history.snapshot(&doc.0);
     let sketch = session.sketch.clone();
@@ -6686,6 +6780,10 @@ fn do_solid_op(
     let kind = match op {
         SolidOp::Boss(d) => FeatureKind::Extrude { sketch, regions, plane, distance: d },
         SolidOp::Cut(d) => FeatureKind::Cut { sketch, regions, plane, distance: d },
+        SolidOp::Revolve(angle) => {
+            let (axis_pt, axis_dir) = axis.unwrap();
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle }
+        }
     };
     // Editing an existing feature replaces it in place; otherwise append.
     let target = match session.editing {
@@ -6708,6 +6806,7 @@ fn do_solid_op(
     session.drag = None;
     session.cursor_uv = None;
     session.selected_contours.clear();
+    session.revolve_axis = None;
     if let Ok((mut tf, orbit)) = cam_q.single_mut() {
         *tf = camera_transform(orbit);
     }
@@ -6726,7 +6825,8 @@ fn handle_edit_sketch(
     let (sketch, plane, contours) = match &f.kind {
         FeatureKind::Sketch { sketch, plane } => (sketch.clone(), plane.clone(), Vec::new()),
         FeatureKind::Extrude { sketch, plane, regions, .. }
-        | FeatureKind::Cut { sketch, plane, regions, .. } => {
+        | FeatureKind::Cut { sketch, plane, regions, .. }
+        | FeatureKind::Revolve { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
         FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => return,
@@ -6800,7 +6900,8 @@ fn handle_exit_sketch(
             match &mut doc.0.features[i].kind {
                 FeatureKind::Sketch { sketch, .. } => *sketch = new_sketch,
                 FeatureKind::Extrude { sketch, regions: r, .. }
-                | FeatureKind::Cut { sketch, regions: r, .. } => {
+                | FeatureKind::Cut { sketch, regions: r, .. }
+                | FeatureKind::Revolve { sketch, regions: r, .. } => {
                     *sketch = new_sketch;
                     *r = contours;
                     ui_state.regen = true;
@@ -6922,6 +7023,24 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle } => {
+                let all = sketch.regions();
+                let resolved = match &body { Some(b) => reproject_plane(plane, b), None => plane.clone() };
+                let basis = basis_from_ref(&resolved);
+                for r in &merge_regions(&chosen_regions(&all, regions)) {
+                    let solid = revolve_solid(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle);
+                    let next = match (&body, solid) {
+                        (Some(b), Some(s)) => union(b, &s), // revolve boss onto the body
+                        (None, Some(s)) => Some(s),          // first feature: the revolve is the body
+                        (_, None) => None,
+                    };
+                    if let Some(s) = next {
+                        body = Some(s);
+                    } else {
+                        failures.push("Revolve failed — the profile may straddle the axis, or the union was rejected (the mesh path will retry).".into());
+                    }
+                }
+            }
             // These reshape the mesh, so a model with one always builds via the mesh path —
             // this exact-kernel path never runs with one present.
             FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => {
@@ -7038,6 +7157,25 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                         Some(tool) => mesh_difference(&cur, &tool),
                         None => cur,
                     });
+                }
+            }
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle } => {
+                bevel_edges.clear();
+                let all = sketch.regions();
+                let regs = merge_regions(&chosen_regions(&all, regions));
+                let ref_world = sketch_footprint_world(plane, regs.iter().flat_map(|r| r.outer.iter()));
+                let resolved = match &body {
+                    Some(b) => reproject_plane_on_mesh(plane, b, ref_world),
+                    None => plane.clone(),
+                };
+                let basis = basis_from_ref(&resolved);
+                for r in &regs {
+                    if let Some(tool) = revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle) {
+                        body = Some(match body.take() {
+                            Some(b) => mesh_union(&b, &tool), // revolve boss onto the body
+                            None => tool,                     // first feature
+                        });
+                    }
                 }
             }
             // Round the body's (picked, or all) edges by the fillet radius. We try the
@@ -8879,15 +9017,29 @@ fn draw_sketch(
         let indices: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
         // A boss goes out along +normal by default; a cut goes in (−normal, into the
         // material). Reverse flips either one.
+        if matches!(op.kind, OpKind::Revolve) {
+            // Revolve preview: highlight the axis line (the picked line) the profile will spin
+            // around. No linear ghost — the sweep is rotational.
+            if let Some((p, d)) = revolve_axis(&session) {
+                let a = Vec2::new(p[0] as f32, p[1] as f32);
+                let dir = Vec2::new(d[0] as f32, d[1] as f32).normalize_or_zero();
+                let half = (ms.max(2.0)) * 1.5;
+                let col = Color::srgba(0.4, 0.85, 0.95, 0.9);
+                overlay.line(ap.to_world(a - dir * half), ap.to_world(a + dir * half), col);
+            }
+            return;
+        }
         let kind_sign = match op.kind {
             OpKind::Boss => 1.0,
             OpKind::Cut => -1.0,
+            OpKind::Revolve => 1.0,
         };
         let nominal = kind_sign * if op.reverse { -1.0 } else { 1.0 };
         let lift = ap.n * (op.depth * nominal);
         let ghost = match op.kind {
             OpKind::Boss => Color::srgba(0.95, 0.85, 0.25, 0.8),
             OpKind::Cut => Color::srgba(1.0, 0.4, 0.35, 0.8),
+            OpKind::Revolve => Color::srgba(0.4, 0.85, 0.95, 0.8),
         };
 
         // Ghost prism, drawn on the overlay group so it shows THROUGH the model — the
@@ -8896,6 +9048,7 @@ fn draw_sketch(
         let far = match op.kind {
             OpKind::Boss => ghost,
             OpKind::Cut => Color::srgb(1.0, 0.75, 0.2), // bright depth ring for a cut
+            OpKind::Revolve => ghost,
         };
         for &i in &indices {
             for loop_pts in std::iter::once(&regions[i].outer).chain(regions[i].holes.iter()) {

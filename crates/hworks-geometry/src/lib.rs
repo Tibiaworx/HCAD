@@ -242,6 +242,39 @@ pub fn extrude_tool_mesh(
     })
 }
 
+/// Revolve a closed region (outer loop + optional holes, in plane-local uv) around an axis
+/// line — the line through `axis_pt` with direction `axis_dir`, both in the same uv plane — by
+/// `angle` radians, into a solid of revolution. `None` if degenerate. The profile must lie to
+/// one side of the axis (not straddle it) for a valid solid.
+pub fn revolve_solid(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    axis_pt: [f64; 2],
+    axis_dir: [f64; 2],
+    angle: f64,
+) -> Option<KSolid> {
+    build_revolve_solid(outer, holes, basis, axis_pt, axis_dir, angle).map(KSolid)
+}
+
+/// Mesh form of [`revolve_solid`] — for the mesh-boolean (Manifold) path, exactly as
+/// [`extrude_tool_mesh`] is the mesh form of [`extrude_solid`].
+pub fn revolve_tool_mesh(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    axis_pt: [f64; 2],
+    axis_dir: [f64; 2],
+    angle: f64,
+) -> Option<TriMesh> {
+    let solid = build_revolve_solid(outer, holes, basis, axis_pt, axis_dir, angle)?;
+    guard(|| {
+        let mut poly = solid.triangulation(TOL).to_polygon();
+        poly.triangulate();
+        Some(polymesh_to_trimesh(&poly))
+    })
+}
+
 /// Build the **cut tool** mesh for a signed cut `distance` (positive sweeps along the
 /// normal, negative against it). The tool overshoots both caps so they never end up
 /// coplanar with the body — matching [`cut_tol`]'s tool exactly, but as a mesh.
@@ -325,6 +358,60 @@ fn build_solid(
         }
         let face = builder::try_attach_plane(&wires).ok()?;
         Some(builder::tsweep(&face, n * length))
+    })
+}
+
+/// Build a solid of revolution: attach the region's planar face, then rotational-sweep it
+/// around the (3D) axis through `axis_pt` along `axis_dir` (uv) by `angle` radians.
+fn build_revolve_solid(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    axis_pt: [f64; 2],
+    axis_dir: [f64; 2],
+    angle: f64,
+) -> Option<truck_modeling::Solid> {
+    let outer = clean_loop(outer);
+    if outer.len() < 3 || angle.abs() < 1e-6 {
+        return None;
+    }
+    let holes: Vec<Vec<[f64; 2]>> =
+        holes.iter().map(|h| clean_loop(h)).filter(|h| h.len() >= 3).collect();
+
+    let origin = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+    let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+    let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+    // Axis line in 3D (a point and a unit direction in the sketch plane).
+    let ao = origin + u * axis_pt[0] + v * axis_pt[1];
+    let axis_origin = Point3::new(ao.x, ao.y, ao.z);
+    let adir = u * axis_dir[0] + v * axis_dir[1];
+    let alen = (adir.x * adir.x + adir.y * adir.y + adir.z * adir.z).sqrt();
+    if alen < 1e-9 {
+        return None;
+    }
+    let axis = adir / alen;
+
+    guard(move || {
+        let to_p3 = |uv: &[f64; 2]| {
+            let p = origin + u * uv[0] + v * uv[1];
+            Point3::new(p.x, p.y, p.z)
+        };
+        let make_wire = |loop_pts: &[[f64; 2]]| {
+            let verts: Vec<_> = loop_pts.iter().map(|uv| builder::vertex(to_p3(uv))).collect();
+            let np = verts.len();
+            let mut w = truck_modeling::Wire::new();
+            for i in 0..np {
+                w.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
+            }
+            w
+        };
+        let mut wires = vec![make_wire(&wound(&outer, true))];
+        for h in &holes {
+            wires.push(make_wire(&wound(h, false)));
+        }
+        let face = builder::try_attach_plane(&wires).ok()?;
+        // rsweep: full turn (|angle| ≈ 2π) closes the solid; a partial turn caps the ends.
+        Some(builder::rsweep(&face, axis_origin, axis, truck_modeling::Rad(angle)))
     })
 }
 
@@ -462,6 +549,35 @@ mod tests {
     }
     fn plane_at(z: f64) -> PlaneBasis {
         PlaneBasis { origin: [0.0, 0.0, z], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
+    }
+
+    fn mesh_vol(m: &TriMesh) -> f64 {
+        let mut v = 0.0;
+        for t in m.indices.chunks_exact(3) {
+            let p: Vec<[f64; 3]> = t.iter().map(|&i| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] }).collect();
+            v += p[0][0] * (p[1][1] * p[2][2] - p[1][2] * p[2][1]) - p[0][1] * (p[1][0] * p[2][2] - p[1][2] * p[2][0]) + p[0][2] * (p[1][0] * p[2][1] - p[1][1] * p[2][0]);
+        }
+        (v / 6.0).abs()
+    }
+
+    #[test]
+    fn revolve_rectangle_full_turn_is_a_washer() {
+        // Rectangle u∈[1,2], v∈[0,4] revolved 360° about the v-axis (u=0) → a cylindrical washer:
+        // inner r=1, outer r=2, height 4. Volume = π(2²−1²)·4 = 12π ≈ 37.70.
+        let prof = rect(1.0, 0.0, 2.0, 4.0);
+        let m = revolve_tool_mesh(&prof, &[], &xy_plane(), [0.0, 0.0], [0.0, 1.0], std::f64::consts::TAU)
+            .expect("full revolve builds");
+        let want = std::f64::consts::PI * 3.0 * 4.0;
+        assert!((mesh_vol(&m) - want).abs() < 1.0, "washer volume {} (want {want})", mesh_vol(&m));
+    }
+
+    #[test]
+    fn revolve_half_turn_is_half_volume() {
+        let prof = rect(1.0, 0.0, 2.0, 4.0);
+        let m = revolve_tool_mesh(&prof, &[], &xy_plane(), [0.0, 0.0], [0.0, 1.0], std::f64::consts::PI)
+            .expect("half revolve builds");
+        let want = std::f64::consts::PI * 3.0 * 4.0 / 2.0;
+        assert!((mesh_vol(&m) - want).abs() < 1.0, "half washer volume {} (want {want})", mesh_vol(&m));
     }
 
     #[test]
