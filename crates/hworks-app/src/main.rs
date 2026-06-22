@@ -187,6 +187,8 @@ enum Tool {
     Dimension,
     Pattern,
     Mirror,
+    /// Trim-to-closest: click a line segment to delete it back to the nearest intersections.
+    Trim,
 }
 
 /// Pattern-tool variant.
@@ -256,6 +258,7 @@ impl Tool {
             Tool::Dimension => "Dimension",
             Tool::Pattern => "Pattern",
             Tool::Mirror => "Mirror",
+            Tool::Trim => "Trim",
         }
     }
 }
@@ -1326,6 +1329,17 @@ fn ui_system(
                         {
                             session.tool = Tool::Mirror;
                             session.pending = None;
+                        }
+                        // Trim to closest: click a line segment to delete it back to the nearest
+                        // intersections.
+                        if ui
+                            .selectable_label(session.tool == Tool::Trim, "Trim")
+                            .on_hover_text("Trim to closest — click a line to delete it back to the nearest intersections")
+                            .clicked()
+                        {
+                            session.tool = Tool::Trim;
+                            session.pending = None;
+                            session.spline_pts.clear();
                         }
                         let mut snap = !session.hide_inference;
                         if ui
@@ -5107,6 +5121,12 @@ fn sketch_interaction(
                 place_point(&mut session, uv);
             }
         }
+        Tool::Trim if just_pressed => {
+            // Click a line segment → delete it back to the nearest intersections.
+            if let Some(uv) = active_uv {
+                apply_trim(&mut session, uv, snap * 1.5);
+            }
+        }
         Tool::Spline if just_pressed => {
             if let Some(uv) = session.cursor_uv {
                 // Clicking the first point (with ≥3 placed) closes the loop and commits.
@@ -5891,6 +5911,121 @@ fn line_intersection(p1: Vec2, p2: Vec2, p3: Vec2, p4: Vec2) -> Option<Vec2> {
     Some(p1 + d1 * t)
 }
 
+// ---- Trim Entities (trim to closest) ----
+
+fn pt2(sketch: &Sketch, i: usize) -> Vec2 {
+    Vec2::new(sketch.points[i].x as f32, sketch.points[i].y as f32)
+}
+
+/// Parameter `t` ∈ (0,1) along segment a→b where it actually crosses segment c→d (within both),
+/// or `None`.
+fn seg_seg_t(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<f32> {
+    let (r, s) = (b - a, d - c);
+    let denom = r.x * s.y - r.y * s.x;
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let t = ((c.x - a.x) * s.y - (c.y - a.y) * s.x) / denom;
+    let u = ((c.x - a.x) * r.y - (c.y - a.y) * r.x) / denom;
+    (t > 1e-3 && t < 1.0 - 1e-3 && u >= -1e-3 && u <= 1.0 + 1e-3).then_some(t)
+}
+
+/// Parameters along segment a→b where it crosses circle (`center`, `r`), within the segment.
+fn seg_circle_t(a: Vec2, b: Vec2, center: Vec2, r: f32) -> Vec<f32> {
+    let d = b - a;
+    let aa = d.dot(d);
+    if aa < 1e-9 {
+        return vec![];
+    }
+    let f = a - center;
+    let bb = 2.0 * f.dot(d);
+    let cc = f.dot(f) - r * r;
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 {
+        return vec![];
+    }
+    let sq = disc.sqrt();
+    [(-bb - sq) / (2.0 * aa), (-bb + sq) / (2.0 * aa)]
+        .into_iter()
+        .filter(|&t| t > 1e-3 && t < 1.0 - 1e-3)
+        .collect()
+}
+
+/// The nearest (non-reference) line to `uv` within `thresh`, by perpendicular segment distance.
+fn nearest_line(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, e) in sketch.entities.iter().enumerate() {
+        if let SketchEntity::Line { a, b, reference: false, .. } = e {
+            let (pa, pb) = (pt2(sketch, *a), pt2(sketch, *b));
+            let ab = pb - pa;
+            let l2 = ab.dot(ab);
+            let t = if l2 > 1e-9 { ((uv - pa).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            let d = uv.distance(pa + ab * t);
+            if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// For the line nearest `uv`, the sub-segment (params `t_lo`..`t_hi` along it) that "trim to
+/// closest" would delete — bracketed by the nearest intersections with other entities on each
+/// side of the click. Used for both the red hover preview and the actual trim.
+fn trim_bracket(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<(usize, f32, f32)> {
+    let li = nearest_line(sketch, uv, thresh)?;
+    let (ia, ib) = entity_line(sketch, li)?;
+    let (a, b) = (pt2(sketch, ia), pt2(sketch, ib));
+    let ab = b - a;
+    let l2 = ab.dot(ab);
+    if l2 < 1e-9 {
+        return None;
+    }
+    let t_click = ((uv - a).dot(ab) / l2).clamp(0.0, 1.0);
+    let mut ts: Vec<f32> = Vec::new();
+    for (j, e) in sketch.entities.iter().enumerate() {
+        if j == li {
+            continue;
+        }
+        match e {
+            SketchEntity::Line { a: c, b: d, .. } => {
+                if let Some(t) = seg_seg_t(a, b, pt2(sketch, *c), pt2(sketch, *d)) {
+                    ts.push(t);
+                }
+            }
+            SketchEntity::Circle { center, radius, .. } => {
+                ts.extend(seg_circle_t(a, b, pt2(sketch, *center), *radius as f32));
+            }
+            _ => {}
+        }
+    }
+    let t_lo = ts.iter().copied().filter(|&t| t < t_click - 1e-4).fold(0.0_f32, f32::max);
+    let t_hi = ts.iter().copied().filter(|&t| t > t_click + 1e-4).fold(1.0_f32, f32::min);
+    Some((li, t_lo, t_hi))
+}
+
+/// Perform a trim-to-closest at `uv`: drop the bracketed sub-segment of the nearest line,
+/// replacing it with the surviving piece(s). Returns true if anything changed.
+fn apply_trim(session: &mut SketchSession, uv: Vec2, thresh: f32) -> bool {
+    let Some((li, t_lo, t_hi)) = trim_bracket(&session.sketch, uv, thresh) else { return false };
+    let Some((ia, ib)) = entity_line(&session.sketch, li) else { return false };
+    let (a, b) = (pt2(&session.sketch, ia), pt2(&session.sketch, ib));
+    let construction = matches!(&session.sketch.entities[li], SketchEntity::Line { construction: true, .. });
+    let snap = session.snap_dist;
+    session.sketch.entities.remove(li); // drop the original; re-add the survivors
+    if t_lo > 1e-3 {
+        let p = get_or_add_point(&mut session.sketch, a + (b - a) * t_lo, snap);
+        session.sketch.add_line(ia, p, construction);
+    }
+    if t_hi < 1.0 - 1e-3 {
+        let p = get_or_add_point(&mut session.sketch, a + (b - a) * t_hi, snap);
+        session.sketch.add_line(p, ib, construction);
+    }
+    session.sketch.remove_unused_points();
+    session.dirty = true;
+    true
+}
+
 /// The vertex and label anchor of an angle dimension between lines (a→b) and (c→d).
 /// The label sits `offset` out along the bisector from the vertex, on the side *between*
 /// the two lines as they emanate from the vertex (so the arc spans the lines you picked).
@@ -6162,7 +6297,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
         }
         // Spline points are placed in `sketch_interaction` (it needs the full point list);
         // Pattern / Mirror act on existing geometry rather than placing points.
-        Tool::Select | Tool::Dimension | Tool::Spline | Tool::Pattern | Tool::Mirror => {}
+        Tool::Select | Tool::Dimension | Tool::Spline | Tool::Pattern | Tool::Mirror | Tool::Trim => {}
     }
 }
 
@@ -8939,9 +9074,23 @@ fn draw_sketch(
             }
             // Text commits on a single click (no rubber-band preview); Pattern / Mirror act
             // on existing geometry rather than rubber-banding a new entity.
-            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text | Tool::Pattern | Tool::Mirror => {}
+            Tool::Select | Tool::Dimension | Tool::Spline | Tool::Text | Tool::Pattern | Tool::Mirror | Tool::Trim => {}
         }
         draw_marker(&mut gizmos, ap, start, point_col, ms);
+    }
+
+    // Trim-to-closest hover preview: the sub-segment that a click would delete, in red.
+    if session.tool == Tool::Trim {
+        if let Some(uv) = session.cursor_uv {
+            if let Some((li, t_lo, t_hi)) = trim_bracket(&session.sketch, uv, ms * 0.04 + 0.25) {
+                if let Some((ia, ib)) = entity_line(&session.sketch, li) {
+                    let (a, b) = (pt2(&session.sketch, ia), pt2(&session.sketch, ib));
+                    let p0 = a + (b - a) * t_lo;
+                    let p1 = a + (b - a) * t_hi;
+                    gizmos.line(ap.to_world(p0), ap.to_world(p1), Color::srgb(1.0, 0.3, 0.3));
+                }
+            }
+        }
     }
 
     // In-progress spline preview: the curve through the placed points + the cursor.
