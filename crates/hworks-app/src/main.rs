@@ -1901,7 +1901,12 @@ fn ui_system(
                 .small(),
             );
             ui.separator();
-            if commit {
+            if commit && n_edges == 0 {
+                // Nothing picked → don't apply (would round every edge). Keep the panel open and
+                // wait for a selection.
+                ui_state.last_error = Some("Select one or more edges to round, then click OK.".into());
+                ui_state.pending_fillet = Some(r.max(0.01));
+            } else if commit {
                 ui_state.fillet_request = Some(r as f64);
                 ui_state.pending_fillet = None;
                 ui_state.fillet_shown = None;
@@ -1974,7 +1979,12 @@ fn ui_system(
             }
             ui.label(egui::RichText::new("Click edges on the body to bevel them.").weak().small());
             ui.separator();
-            if commit {
+            let has_edges = !ui_state.fillet_edges.is_empty();
+            if commit && !has_edges {
+                // Nothing picked → don't apply (would chamfer every edge). Keep the panel open.
+                ui_state.last_error = Some("Select one or more edges to bevel, then click OK.".into());
+                ui_state.pending_chamfer = Some(d.max(0.01));
+            } else if commit {
                 ui_state.chamfer_request = Some(d as f64);
                 ui_state.pending_chamfer = None;
                 ui_state.chamfer_shown = None;
