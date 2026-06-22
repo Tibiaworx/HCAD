@@ -6988,7 +6988,8 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 }
             }
             FeatureKind::Cut { sketch, regions, plane, distance } => {
-                bevel_edges.clear();
+                // A cut elsewhere doesn't invalidate an earlier fillet/chamfer's edges, so keep
+                // them (don't clear) — they accumulate through the timeline like the boss path.
                 let Some(cur0) = &body else { continue };
                 let all = sketch.regions();
                 // Reproject onto the live body's top face (like the exact path) so the cut
@@ -7001,10 +7002,26 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 let basis = basis_from_ref(&plane);
                 let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
                 let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+                // Cut INTO the material. Decide the direction *locally* — probe just under the cut
+                // point on each side and see which is solid. The old global-centroid test failed
+                // when a tall feature elsewhere (a boss) pulled the centroid past the cut plane,
+                // flipping the cut to face open air (a shallow nick).
+                let surf = ref_world - n * (ref_world - origin).dot(n); // footprint point on the plane
+                let eps = 0.02_f32.max(*distance as f32 * 0.01);
+                let neg_in = point_inside_mesh(cur0, surf - n * eps);
+                let pos_in = point_inside_mesh(cur0, surf + n * eps);
+                let into = if neg_in && !pos_in {
+                    -1.0
+                } else if pos_in && !neg_in {
+                    1.0
+                } else if (mesh_centroid(cur0) - origin).dot(n) < 0.0 {
+                    -1.0 // ambiguous → fall back to the centroid heuristic
+                } else {
+                    1.0
+                };
                 for r in &cut_regs {
                     let Some(cur) = body.take() else { break };
-                    // Cut direction from the current body, mirroring the exact path.
-                    let signed = if (mesh_centroid(&cur) - origin).dot(n) < 0.0 { -*distance } else { *distance };
+                    let signed = into * *distance;
                     body = Some(match cut_tool_mesh(&r.outer, &r.holes, &basis, signed) {
                         Some(tool) => mesh_difference(&cur, &tool),
                         None => cur,
@@ -7459,6 +7476,44 @@ fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
     reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh, o)
 }
 
+/// Möller–Trumbore ray/triangle; positive hit distance along `dir`, else `None`.
+fn ray_tri_hit(o: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let pv = dir.cross(e2);
+    let det = e1.dot(pv);
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tv = o - a;
+    let u = tv.dot(pv) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let qv = tv.cross(e1);
+    let v = dir.dot(qv) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(qv) * inv;
+    (t > 1e-5).then_some(t)
+}
+
+/// True if `p` is inside the closed mesh — odd number of ray crossings along an arbitrary ray.
+fn point_inside_mesh(mesh: &TriMesh, p: Vec3) -> bool {
+    let dir = Vec3::new(0.573_257, 0.577_350, 0.581_443).normalize();
+    let mut crossings = 0u32;
+    for t in mesh.indices.chunks(3) {
+        let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+        let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+        let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+        if ray_tri_hit(p, dir, a, b, c).is_some() {
+            crossings += 1;
+        }
+    }
+    crossings % 2 == 1
+}
+
 /// World-space centroid of a sketch footprint (its 2D outer points lifted through the plane).
 /// Falls back to the plane origin when there are no points. Used to reproject under the face the
 /// sketch actually sits on, not under the arbitrary plane origin.
@@ -7548,32 +7603,23 @@ fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, ref_world: Vec3) ->
     // the plane origin can sit over an unrelated feature (e.g. a tall boss), which would snap
     // this boss's base up onto that feature's top and leave it floating.
     let ref2d = to2d(ref_world);
-    // Prefer a face whose *outward* normal points the same way as the sketch (the face the
-    // sketch truly sits on) over one merely parallel — otherwise a boss on the top face could
-    // snap its base onto the body's *bottom* face (opposite normal, same axis) and sink in.
-    let mut best: Option<f32> = None; // same-direction faces (preferred)
-    let mut best_any: Option<f32> = None; // any parallel face (fallback)
+    let mut best: Option<f32> = None;
     for t in mesh.indices.chunks(3) {
         let p = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
         let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
         let tn = (b - a).cross(c - a).normalize_or_zero();
-        let d = tn.dot(n);
-        if d.abs() < 0.9 {
+        if tn.dot(n).abs() < 0.9 {
             continue; // not a face parallel to the sketch plane
         }
         if !in_tri(ref2d, to2d(a), to2d(b), to2d(c)) {
             continue; // footprint centroid isn't over this face
         }
         let off = a.dot(n);
-        let nearer = |b: &Option<f32>| b.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs());
-        if d > 0.9 && nearer(&best) {
-            best = Some(off);
-        }
-        if nearer(&best_any) {
-            best_any = Some(off);
+        if best.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs()) {
+            best = Some(off); // the parallel face nearest the original origin along n
         }
     }
-    match best.or(best_any) {
+    match best {
         Some(off) => {
             let shifted = o + n * (off - o_n);
             PlaneRef { origin: [shifted.x as f64, shifted.y as f64, shifted.z as f64], ..plane.clone() }
