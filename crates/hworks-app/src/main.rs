@@ -664,6 +664,9 @@ struct SketchSession {
     inference_points: Vec<Vec2>,
     /// User toggle to disable the snap/inference points.
     hide_inference: bool,
+    /// Live inference guide lines (uv → uv) to draw dotted this frame — SolidWorks-style
+    /// alignment/extension/tangent hints showing why the cursor snapped where it did.
+    inference_guides: Vec<(Vec2, Vec2)>,
     /// Entity (line/circle) under the cursor in Select mode, highlighted on hover.
     hover_entity: Option<usize>,
     /// Reference snap points (uv) from the body's edges lying in the sketch plane —
@@ -3589,6 +3592,115 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2, snap: f32) -> usize {
     nearest_point(sketch, uv, snap).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
+/// SolidWorks-style inferencing: when the cursor lines up with existing geometry, nudge it onto
+/// the alignment and report dotted guide segments (uv→uv) explaining the snap. Priority, highest
+/// first: horizontal/vertical alignment with an existing point (the dotted "even with" line you
+/// see in SolidWorks) → collinear extension of a nearby line → tangent off the in-progress line's
+/// start when that start sits on a circle/arc. `start` is the rubber-band's anchor (if any).
+fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f32) -> (Vec2, Vec<(Vec2, Vec2)>) {
+    let mut out = cur;
+    let mut guides: Vec<(Vec2, Vec2)> = Vec::new();
+
+    // Anchor points to align to: every sketch point + body reference points.
+    let mut anchors: Vec<Vec2> = session.sketch.points.iter().map(|p| Vec2::new(p.x as f32, p.y as f32)).collect();
+    anchors.extend_from_slice(&session.reference_points);
+
+    // --- Horizontal / vertical alignment with an anchor point ---
+    // Pick the closest anchor sharing the cursor's X (vertical guide) and the closest sharing its
+    // Y (horizontal guide); they can both fire, snapping the cursor onto their crossing.
+    let mut vx: Option<Vec2> = None; // anchor with matching X → vertical guide
+    let mut hy: Option<Vec2> = None; // anchor with matching Y → horizontal guide
+    for a in &anchors {
+        if (a.x - cur.x).abs() <= tol && (a.y - cur.y).abs() > tol && vx.map_or(true, |b: Vec2| (a.x - cur.x).abs() < (b.x - cur.x).abs()) {
+            vx = Some(*a);
+        }
+        if (a.y - cur.y).abs() <= tol && (a.x - cur.x).abs() > tol && hy.map_or(true, |b: Vec2| (a.y - cur.y).abs() < (b.y - cur.y).abs()) {
+            hy = Some(*a);
+        }
+    }
+    if let Some(a) = vx {
+        out.x = a.x;
+    }
+    if let Some(a) = hy {
+        out.y = a.y;
+    }
+    if vx.is_some() || hy.is_some() {
+        if let Some(a) = vx {
+            guides.push((a, Vec2::new(out.x, a.y))); // a → straight up/down to the cursor row
+            guides.push((Vec2::new(out.x, a.y), out));
+        }
+        if let Some(a) = hy {
+            guides.push((a, out));
+        }
+        return (out, guides);
+    }
+
+    // --- Collinear: snap onto the infinite extension of a nearby (non-reference) line ---
+    // Only past the segment's ends — the span itself is already a snap target elsewhere.
+    let mut best: Option<(f32, Vec2, Vec2)> = None; // (perp dist, projected pt, near endpoint)
+    for e in &session.sketch.entities {
+        if let SketchEntity::Line { a, b, reference: false, construction: false, .. } = e {
+            let (pa, pb) = (pt2(&session.sketch, *a), pt2(&session.sketch, *b));
+            let ab = pb - pa;
+            let len = ab.length();
+            if len < 1e-5 {
+                continue;
+            }
+            let dir = ab / len;
+            let t = (cur - pa).dot(dir);
+            if t > -tol && t < len + tol {
+                continue; // within (or right at) the span — not an extension
+            }
+            let proj = pa + dir * t;
+            let d = cur.distance(proj);
+            if d <= tol && best.map_or(true, |(bd, _, _)| d < bd) {
+                let near = if t < 0.0 { pa } else { pb };
+                best = Some((d, proj, near));
+            }
+        }
+    }
+    if let Some((_, proj, near)) = best {
+        return (proj, vec![(near, proj)]);
+    }
+
+    // --- Tangent: if the rubber-band started on a circle/arc rim, snap the line tangent there ---
+    if let Some(s) = start {
+        let on_rim = |c: Vec2, r: f32| (s.distance(c) - r).abs() <= tol && s.distance(c) > 1e-4;
+        let mut center_r: Option<(Vec2, f32)> = None;
+        for e in &session.sketch.entities {
+            match e {
+                SketchEntity::Circle { center, radius, construction: false } => {
+                    let c = pt2(&session.sketch, *center);
+                    if on_rim(c, *radius as f32) {
+                        center_r = Some((c, *radius as f32));
+                    }
+                }
+                SketchEntity::Arc { center, .. } => {
+                    let c = pt2(&session.sketch, *center);
+                    let r = (s - c).length();
+                    if on_rim(c, r) {
+                        center_r = Some((c, r));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((c, _)) = center_r {
+            let radial = (s - c).normalize_or_zero();
+            if radial != Vec2::ZERO {
+                let td = Vec2::new(-radial.y, radial.x); // tangent = perp to the radius at s
+                let along = (cur - s).dot(td);
+                let proj = s + td * along;
+                if cur.distance(proj) <= tol {
+                    return (proj, vec![(s, proj)]);
+                }
+            }
+        }
+    }
+
+    (out, guides)
+}
+
 /// Where to place the endpoint `i` while it's being dragged: snap onto the nearest *other*
 /// sketch point, body-projected reference point (corner/centre), or on-hover inference
 /// point within the snap tolerance; otherwise the raw cursor `uv`.
@@ -4403,8 +4515,10 @@ fn sketch_interaction(
 
     let active_uv = session.plane.as_ref().and_then(|ap| ray_plane(ap, &ray).map(|(_, uv)| uv));
 
-    // Snap tolerance scaled to the zoom, so snapping feels consistent at any scale.
-    let snap = (orbit.radius * (SNAP / 12.0)).clamp(0.03, 200.0);
+    // Snap tolerance scaled to the zoom, so the grab radius stays ~constant in *screen* space at
+    // any scale. The floor is tiny (not 0) so it keeps shrinking as you zoom way in — otherwise a
+    // fixed floor balloons on screen at deep zoom and over-snaps; it only guards radius → 0.
+    let snap = (orbit.radius * (SNAP / 12.0)).clamp(5.0e-4, 200.0);
     session.snap_dist = snap;
 
     // Inference/snap points for the entity under the cursor (shown on hover).
@@ -4685,6 +4799,27 @@ fn sketch_interaction(
             }
         }
     }
+    // Inferencing (SolidWorks-style): once the cursor is otherwise snapped, see if it lines up
+    // with existing geometry (horizontal/vertical with a point, collinear with a line, tangent off
+    // a circle the rubber-band started on) and nudge it onto that alignment, drawing dotted hints.
+    // Yields to a genuine coincident point snap so connections aren't pulled off.
+    session.inference_guides.clear();
+    let drawing_tool = matches!(
+        session.tool,
+        Tool::Line | Tool::Circle | Tool::Arc | Tool::Rectangle | Tool::Slot | Tool::Polygon | Tool::Spline
+    );
+    if drawing_tool && !session.hide_inference {
+        if let Some(cur) = session.cursor_uv {
+            let coincident = nearest_point(&session.sketch, cur, snap * 0.5).is_some()
+                || session.reference_points.iter().any(|r| r.distance(cur) <= snap * 0.5);
+            if !coincident {
+                let (snapped, guides) = infer_cursor(&session, cur, session.pending, snap * 0.8);
+                session.cursor_uv = Some(snapped);
+                session.inference_guides = guides;
+            }
+        }
+    }
+
     // Never let a non-finite cursor through — it poisons placed points and egui.
     if session.cursor_uv.is_some_and(|c| !c.is_finite()) {
         session.cursor_uv = None;
@@ -6470,11 +6605,11 @@ fn nearest_arc(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-/// Nearest *open* spline (by distance to its tessellated outline) within `thresh` → (index, dist).
+/// Nearest spline (by distance to its tessellated outline) within `thresh` → (index, dist).
 fn nearest_spline(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<(usize, f32)> {
     let mut best: Option<(usize, f32)> = None;
     for (i, e) in sketch.entities.iter().enumerate() {
-        if !matches!(e, SketchEntity::Spline { closed: false, .. }) {
+        if !matches!(e, SketchEntity::Spline { .. }) {
             continue;
         }
         let poly = entity_polyline_app(sketch, i);
@@ -6564,24 +6699,27 @@ fn corner_trim(session: &mut SketchSession, li1: usize, li2: usize) -> bool {
     true
 }
 
-/// Trim an open spline `ei` at `uv`: drop the sub-curve between the nearest crossings on either
-/// side of the click, rebuilding the surviving piece(s) as splines through the original through-
-/// points plus the cut endpoints. (Closed splines and slots aren't trimmed as targets yet.)
+/// Trim a spline `ei` at `uv`: drop the sub-curve between the nearest crossings on either side of
+/// the click, rebuilding the survivor(s) as splines through the original through-points plus the
+/// cut endpoints. An open spline leaves up to two pieces; a closed spline opens into the single
+/// complementary arc. (Slots aren't trimmed as targets yet.)
 fn trim_spline(session: &mut SketchSession, ei: usize, uv: Vec2) -> bool {
     const STEPS: usize = 16; // must match tessellate_spline's samples-per-segment
     let (pt_idx, closed, control, construction) = match &session.sketch.entities[ei] {
         SketchEntity::Spline { points, closed, control, construction } => (points.clone(), *closed, *control, *construction),
         _ => return false,
     };
-    if closed || pt_idx.len() < 3 {
+    if pt_idx.len() < 3 {
         return false;
     }
     let through: Vec<Vec2> = pt_idx.iter().map(|&i| pt2(&session.sketch, i)).collect();
-    let poly = entity_polyline_app(&session.sketch, ei); // open ⇒ (n-1)*STEPS + 1 vertices
+    let poly = entity_polyline_app(&session.sketch, ei); // open ⇒ (n-1)*STEPS+1, closed ⇒ n*STEPS+1
     if poly.len() < 2 {
         return false;
     }
-    // Position along the poly is "segment index + t". Through-point i sits at i*STEPS.
+    let span = (poly.len() - 1) as f32; // total parameter length; through-point i sits at i*STEPS
+    let step = STEPS as f32;
+    // Position along the poly is "segment index + t".
     let project = |p: Vec2| -> f32 {
         let (mut pos, mut best) = (0.0_f32, f32::MAX);
         for (k, w) in poly.windows(2).enumerate() {
@@ -6611,26 +6749,7 @@ fn trim_spline(session: &mut SketchSession, ei: usize, uv: Vec2) -> bool {
             }
         }
     }
-    let lo = cuts.iter().filter(|(p, _)| *p < click_pos - 1e-3).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).copied();
-    let hi = cuts.iter().filter(|(p, _)| *p > click_pos + 1e-3).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).copied();
-    if lo.is_none() && hi.is_none() {
-        return false; // no bounding crossings → nothing to trim (leave the spline alone)
-    }
     let snap = session.snap_dist;
-    let span = (poly.len() - 1) as f32;
-    let lo_pos = lo.map(|(p, _)| p).unwrap_or(0.0);
-    let hi_pos = hi.map(|(p, _)| p).unwrap_or(span);
-    // Build the two survivors' point lists (through-points outside [lo,hi] + the cut endpoints).
-    let mut left: Vec<Vec2> = through.iter().enumerate().filter(|(i, _)| ((*i as f32) * STEPS as f32) < lo_pos - 0.5).map(|(_, &p)| p).collect();
-    if let Some((_, cp)) = lo {
-        left.push(cp);
-    }
-    let mut right: Vec<Vec2> = Vec::new();
-    if let Some((_, cp)) = hi {
-        right.push(cp);
-    }
-    right.extend(through.iter().enumerate().filter(|(i, _)| ((*i as f32) * STEPS as f32) > hi_pos + 0.5).map(|(_, &p)| p));
-
     let push_spline = |session: &mut SketchSession, pts: &[Vec2]| {
         if pts.len() < 2 {
             return;
@@ -6638,9 +6757,56 @@ fn trim_spline(session: &mut SketchSession, ei: usize, uv: Vec2) -> bool {
         let idx: Vec<usize> = pts.iter().map(|p| get_or_add_point(&mut session.sketch, *p, snap)).collect();
         session.sketch.entities.push(SketchEntity::Spline { points: idx, closed: false, construction, control });
     };
-    session.sketch.entities.remove(ei);
-    push_spline(session, &left);
-    push_spline(session, &right);
+
+    if !closed {
+        // Open spline: bracket the click between the nearest crossings (or the spline's own ends).
+        let lo = cuts.iter().filter(|(p, _)| *p < click_pos - 1e-3).max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).copied();
+        let hi = cuts.iter().filter(|(p, _)| *p > click_pos + 1e-3).min_by(|a, b| a.0.partial_cmp(&b.0).unwrap()).copied();
+        if lo.is_none() && hi.is_none() {
+            return false; // no bounding crossings → nothing to trim
+        }
+        let lo_pos = lo.map(|(p, _)| p).unwrap_or(0.0);
+        let hi_pos = hi.map(|(p, _)| p).unwrap_or(span);
+        let mut left: Vec<Vec2> = through.iter().enumerate().filter(|(i, _)| (*i as f32) * step < lo_pos - 0.5).map(|(_, &p)| p).collect();
+        if let Some((_, cp)) = lo {
+            left.push(cp);
+        }
+        let mut right: Vec<Vec2> = Vec::new();
+        if let Some((_, cp)) = hi {
+            right.push(cp);
+        }
+        right.extend(through.iter().enumerate().filter(|(i, _)| (*i as f32) * step > hi_pos + 0.5).map(|(_, &p)| p));
+        session.sketch.entities.remove(ei);
+        push_spline(session, &left);
+        push_spline(session, &right);
+    } else {
+        // Closed spline: need two crossings to bound a removable arc. Bracket the click
+        // *circularly*; the survivor is the complementary arc opened into a single spline.
+        if cuts.len() < 2 {
+            return false;
+        }
+        let mut sorted = cuts.clone();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let (hi_pos, hi_pt) = sorted.iter().find(|(p, _)| *p > click_pos).copied().unwrap_or((sorted[0].0 + span, sorted[0].1));
+        let (lo_pos, lo_pt) = sorted.iter().rev().find(|(p, _)| *p < click_pos).copied().unwrap_or((sorted.last().unwrap().0 - span, sorted.last().unwrap().1));
+        // Survivor runs from hi_pos up to lo_pos+span (the arc NOT under the click). Collect the
+        // through-points whose position (or its +span image) lands inside that open window.
+        let mut surv: Vec<(f32, Vec2)> = Vec::new();
+        for (i, &p) in through.iter().enumerate() {
+            let base = i as f32 * step;
+            for img in [base, base + span] {
+                if img > hi_pos + 0.5 && img < lo_pos + span - 0.5 {
+                    surv.push((img, p));
+                }
+            }
+        }
+        surv.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut pts = vec![hi_pt];
+        pts.extend(surv.iter().map(|(_, p)| *p));
+        pts.push(lo_pt);
+        session.sketch.entities.remove(ei);
+        push_spline(session, &pts);
+    }
     session.sketch.remove_unused_points();
     session.dirty = true;
     true
@@ -9122,7 +9288,10 @@ fn orbit_camera(
     // Right-drag: orbit.
     if buttons.pressed(MouseButton::Right) && motion.delta != Vec2::ZERO {
         cam.yaw -= motion.delta.x * ORBIT_SENS;
-        cam.pitch = (cam.pitch - motion.delta.y * ORBIT_SENS).clamp(-1.54, 1.54);
+        // No pole stop: the camera rotation comes straight from Euler angles, so pitch can roll
+        // continuously over the top (turntable-style). Wrap into ±π so it never grows unbounded.
+        let tau = std::f32::consts::TAU;
+        cam.pitch = (cam.pitch - motion.delta.y * ORBIT_SENS + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
         changed = true;
     }
 
@@ -9202,6 +9371,19 @@ fn draw_sketch(
     let Some(ap) = &session.plane else { return };
     let radius = cam_q.single().map(|c| c.radius).unwrap_or(12.0);
 
+    // Lift the whole sketch a hair off its plane toward the camera. When you sketch on a solid
+    // face the geometry is exactly coplanar with that face and z-fights with it — flickering or
+    // vanishing until you orbit. A tiny zoom-relative offset along the camera-facing normal wins
+    // the depth test without visibly leaving the face. (Picking still uses the true plane.)
+    let lifted;
+    let ap = {
+        let eye = cam_q.single().map(|c| camera_transform(c).translation).unwrap_or(ap.origin + ap.n);
+        let sign = if (eye - ap.origin).dot(ap.n) >= 0.0 { 1.0 } else { -1.0 };
+        let lift = ap.n * (radius.max(1e-3) * 2.0e-3 * sign);
+        lifted = ActivePlane { name: ap.name.clone(), origin: ap.origin + lift, u: ap.u, v: ap.v, n: ap.n };
+        &lifted
+    };
+
     // Adaptive grid: spacing snaps to a nice 1/2/5×10^k that's ~1/16 of the view,
     // with a bounded number of cells, so it stays usable from millimetres to metres.
     let grid = Color::srgba(0.55, 0.55, 0.62, 0.18);
@@ -9230,6 +9412,14 @@ fn draw_sketch(
         let p = &session.sketch.points[i];
         Vec2::new(p.x as f32, p.y as f32)
     };
+
+    // Inference guides: dotted hints showing why the cursor snapped (alignment / extension /
+    // tangent). Faint amber dashes, drawn under the geometry.
+    let infer_col = Color::srgba(1.0, 0.82, 0.3, 0.75);
+    let dash = (radius * 0.012).clamp(0.02, 1.0);
+    for (a, b) in &session.inference_guides {
+        dashed_line(&mut gizmos, ap.to_world(*a), ap.to_world(*b), infer_col, dash, dash * 0.8);
+    }
 
     for e in &session.sketch.entities {
         match e {
