@@ -15,23 +15,34 @@ use std::collections::HashMap;
 /// Weld coincident vertices (truck flat-shades, so shared corners are duplicated) and
 /// return Manifold-ready flat vertex properties `[x,y,z, …]` + triangle indices.
 fn weld(m: &TriMesh) -> (Vec<f32>, Vec<u32>) {
-    // 1e-5 grid: truck emits *identical* f32 values for a shared vertex, so this only
-    // ever merges true duplicates, never distinct geometry (models are tens of units).
-    let key = |p: [f32; 3]| {
-        ((p[0] * 1.0e5).round() as i64, (p[1] * 1.0e5).round() as i64, (p[2] * 1.0e5).round() as i64)
-    };
+    // Snap to a 1e-4 grid and store the *grid-snapped* position, so vertices meant to be the
+    // same become bit-identical. This matters at a revolve's seam: truck computes the 0 and 2π
+    // vertices from cos/sin, which differ by a hair in f32 — too coarse a merge (the old 1e-5
+    // grid) left them split, an open seam, and a NotManifold mesh that fell to the lossy BSP
+    // (torn surface). 1e-4 (sub-micron at model scale) reliably fuses the seam without merging
+    // any distinct geometry.
+    const GRID: f32 = 1.0e4; // 1/GRID = 1e-4 tolerance
+    let snap = |c: f32| (c * GRID).round();
     let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
     let mut props: Vec<f32> = Vec::new();
     let mut remap = vec![0u32; m.positions.len()];
     for (i, p) in m.positions.iter().enumerate() {
-        let id = *map.entry(key(*p)).or_insert_with(|| {
-            props.extend_from_slice(&[p[0], p[1], p[2]]);
+        let (kx, ky, kz) = (snap(p[0]), snap(p[1]), snap(p[2]));
+        let id = *map.entry((kx as i64, ky as i64, kz as i64)).or_insert_with(|| {
+            // Store the grid-snapped position so merged vertices are exactly coincident.
+            props.extend_from_slice(&[kx / GRID, ky / GRID, kz / GRID]);
             (props.len() / 3 - 1) as u32
         });
         remap[i] = id;
     }
     let tris: Vec<u32> = m.indices.iter().map(|&i| remap[i as usize]).collect();
     (props, tris)
+}
+
+/// True if `m` can be ingested as a valid 2-manifold solid (welds coincident verts first).
+/// A `false` here means a boolean with this operand will fall back to the lossy BSP CSG.
+pub fn is_manifold(m: &TriMesh) -> bool {
+    to_manifold(m).is_some()
 }
 
 /// Build a `Manifold` from a triangle mesh; `None` if empty or not a valid solid.
@@ -87,9 +98,27 @@ enum Op {
     Intersection,
 }
 
-/// Run a Manifold boolean; `None` if either operand can't be ingested or the result
-/// isn't a valid manifold (so the caller can fall back to the BSP CSG).
-fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
+/// Count of booleans that fell back to the lossy BSP CSG this regen (Manifold rejected them).
+/// The app reads + resets this after a rebuild to warn that a result is unreliable.
+static BSP_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Read and reset the BSP-fallback counter (number of booleans Manifold couldn't do).
+pub fn take_fallback_count() -> u32 {
+    BSP_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Shift every vertex by `d` — a sub-micron nudge to break exact coincident/tangent faces (e.g. a
+/// revolve grazing a boss wall) that make Manifold's boolean fail.
+fn nudged(m: &TriMesh, d: [f32; 3]) -> TriMesh {
+    TriMesh {
+        positions: m.positions.iter().map(|p| [p[0] + d[0], p[1] + d[1], p[2] + d[2]]).collect(),
+        normals: m.normals.clone(),
+        indices: m.indices.clone(),
+    }
+}
+
+/// Run one Manifold boolean attempt; `None` if an operand won't ingest or the op errors.
+fn manifold_try(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     let (ma, mb) = (to_manifold(a)?, to_manifold(b)?);
     let r = match op {
         Op::Union => ma.union(&mb),
@@ -103,14 +132,37 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     (!mesh.indices.is_empty()).then_some(mesh)
 }
 
-/// Boolean **union** of two triangle meshes (Manifold; BSP CSG fallback).
-pub fn mesh_union(a: &TriMesh, b: &TriMesh) -> TriMesh {
-    manifold_boolean(a, b, Op::Union).unwrap_or_else(|| csg::bsp_union(a, b))
+/// Manifold boolean with a tangency-breaking retry; `None` only if every attempt fails (then the
+/// caller drops to the BSP CSG). The retries nudge `b` by a few sub-micron offsets — when the two
+/// solids share a tangent/coincident band (a concentric revolve grazing the boss wall), the exact
+/// coincidence is what trips Manifold up, and a tiny perturbation makes it resolve cleanly.
+fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
+    if let Some(m) = manifold_try(a, b, op) {
+        return Some(m);
+    }
+    // Asymmetric, irrational-ish nudges so no offset lands back on another coincidence.
+    for d in [[1.7e-4, 1.1e-4, 1.3e-4], [-2.3e-4, 1.9e-4, -1.5e-4], [3.1e-4, -2.7e-4, 2.1e-4]] {
+        if let Some(m) = manifold_try(a, &nudged(b, d), op) {
+            return Some(m);
+        }
+    }
+    None
 }
 
-/// Boolean **difference** `a − b` of two triangle meshes (Manifold; BSP CSG fallback).
+/// Boolean **union** of two triangle meshes (Manifold; lossy BSP CSG fallback as last resort).
+pub fn mesh_union(a: &TriMesh, b: &TriMesh) -> TriMesh {
+    manifold_boolean(a, b, Op::Union).unwrap_or_else(|| {
+        BSP_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        csg::bsp_union(a, b)
+    })
+}
+
+/// Boolean **difference** `a − b` of two triangle meshes (Manifold; lossy BSP CSG last resort).
 pub fn mesh_difference(a: &TriMesh, b: &TriMesh) -> TriMesh {
-    manifold_boolean(a, b, Op::Difference).unwrap_or_else(|| csg::bsp_difference(a, b))
+    manifold_boolean(a, b, Op::Difference).unwrap_or_else(|| {
+        BSP_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        csg::bsp_difference(a, b)
+    })
 }
 
 /// Boolean **intersection** `a ∩ b` of two triangle meshes (Manifold; empty on failure).

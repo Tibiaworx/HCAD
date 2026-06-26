@@ -524,7 +524,10 @@ impl Sketch {
                 }
                 SketchEntity::Circle { center, radius, construction: false } => {
                     if let Some(c) = self.points.get(*center) {
-                        const SEG: usize = 64;
+                        // Finer than the rendering tessellation: a circular profile becomes a
+                        // prism/revolve whose facets must meet cleanly at a boolean intersection
+                        // seam — too coarse and the seam shows tiny facet-mismatch gaps.
+                        const SEG: usize = 128;
                         let tau = std::f64::consts::TAU;
                         let step = tau / SEG as f64;
                         // Any sketch point sitting on this rim (a line/arc endpoint snapped

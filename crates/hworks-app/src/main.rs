@@ -24,9 +24,9 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
 use hworks_geometry::{
-    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, extrude_solid, extrude_solid_with_overlap,
+    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, difference, extrude_solid, extrude_solid_with_overlap,
     extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
-    tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
+    take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -154,6 +154,8 @@ fn main() {
                     handle_new_part,
                     highlight_face,
                     update_plane_visibility,
+                    update_body_transparency,
+                    draw_selected_plane,
                     orbit_camera,
                     draw_world_axes,
                     draw_body_edges,
@@ -283,8 +285,10 @@ impl Tool {
 enum SolidOp {
     Boss(f64),
     Cut(f64),
-    /// Revolve the profile around the sketch's construction-line axis by this many radians.
+    /// Revolve the profile around the picked axis line by this many radians (adds material).
     Revolve(f64),
+    /// Revolve, but subtract the swept solid from the body (a lathe groove/bore).
+    RevolveCut(f64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -292,6 +296,7 @@ enum OpKind {
     Boss,
     Cut,
     Revolve,
+    RevolveCut,
 }
 
 /// An action chosen from a feature-tree right-click menu (applied after the
@@ -345,6 +350,11 @@ struct UiState {
     open_request: bool,
     /// Request to (re)open a feature's sketch for editing.
     edit_sketch_request: Option<usize>,
+    /// Datum plane (by order: 0=Front, 1=Top, 2=Right) currently selected in the tree — shown
+    /// highlighted in the viewport, SolidWorks-style. `None` ⇒ no datum plane selected.
+    selected_plane: Option<usize>,
+    /// Request to start a *fresh* sketch on datum plane N (by order). Consumed by handle_edit_sketch.
+    sketch_plane_request: Option<usize>,
     /// Show smooth/tangent edges in the viewport (off = SolidWorks-style removed).
     show_tangent_edges: bool,
     /// Active CommandManager tab.
@@ -444,9 +454,9 @@ impl ThreadSpec {
 /// matching `Document::with_default_planes`.
 fn standard_plane_ref(which: u8) -> PlaneRef {
     match which {
-        1 => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] }, // Top (XZ)
-        2 => PlaneRef { origin: [0.0; 3], u: [0.0, 0.0, -1.0], v: [0.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0] }, // Right (YZ)
-        _ => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }, // Front (XY)
+        1 => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: true }, // Top (XZ)
+        2 => PlaneRef { origin: [0.0; 3], u: [0.0, 0.0, -1.0], v: [0.0, 1.0, 0.0], normal: [1.0, 0.0, 0.0], datum: true }, // Right (YZ)
+        _ => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: true }, // Front (XY)
     }
 }
 
@@ -521,13 +531,16 @@ struct ActivePlane {
     u: Vec3,
     v: Vec3,
     n: Vec3,
+    /// True for a fixed datum plane (Front/Top/Right); false for a body-face sketch plane. Carried
+    /// into the feature's `PlaneRef` so regeneration knows not to reproject a datum sketch.
+    datum: bool,
 }
 
 impl ActivePlane {
     fn from_doc(p: &Plane) -> Self {
         let u = Vec3::from_array(p.u);
         let v = Vec3::from_array(p.v);
-        Self { name: p.name.clone(), origin: Vec3::from_array(p.origin), u, v, n: u.cross(v) }
+        Self { name: p.name.clone(), origin: Vec3::from_array(p.origin), u, v, n: u.cross(v), datum: true }
     }
     fn to_world(&self, uv: Vec2) -> Vec3 {
         self.origin + self.u * uv.x + self.v * uv.y
@@ -734,10 +747,15 @@ impl Default for OrbitCamera {
 #[derive(Component)]
 struct SolidPart;
 
-/// A reference plane's quad — shown only while starting a part (no body, not yet
-/// sketching), so it can't be accidentally selected once you're modeling.
+/// A reference plane's quad. Visible at part-start, while a datum plane is selected in the tree,
+/// or hidden otherwise (see `update_plane_visibility`) — SolidWorks-style.
 #[derive(Component)]
 struct RefPlane;
+
+/// The datum plane's order (0=Front, 1=Top, 2=Right) — lets the visibility system show just the
+/// one selected in the tree.
+#[derive(Component)]
+struct RefPlaneIdx(usize);
 
 /// The translucent overlay that highlights the hovered / active face.
 #[derive(Component)]
@@ -789,6 +807,7 @@ fn setup(
             Transform { translation: ap.origin, rotation, ..default() },
             Name::new(plane.name.clone()),
             RefPlane,
+            RefPlaneIdx(i),
         ));
     }
 
@@ -1431,12 +1450,18 @@ fn ui_system(
                             }
                             ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32, reverse: false });
                         }
-                        if ui.button("Revolve").on_hover_text("Revolve the profile around a construction centerline").clicked() {
+                        if ui.button("Revolve").on_hover_text("Revolve the profile around a picked axis line (adds material)").clicked() {
                             if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
                                 ui_state.edit_sketch_request = Some(i);
                             }
                             // `depth` carries the revolve angle in degrees (default a full turn).
                             ui_state.pending = Some(PendingOp { kind: OpKind::Revolve, depth: 360.0, reverse: false });
+                        }
+                        if ui.button("Revolve Cut").on_hover_text("Revolve the profile around a picked axis line and subtract it (a lathe groove/bore)").clicked() {
+                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
+                                ui_state.edit_sketch_request = Some(i);
+                            }
+                            ui_state.pending = Some(PendingOp { kind: OpKind::RevolveCut, depth: 360.0, reverse: false });
                         }
                     });
                     if !can_extrude {
@@ -2202,6 +2227,7 @@ fn ui_system(
                     OpKind::Boss => "Boss-Extrude",
                     OpKind::Cut => "Cut-Extrude",
                     OpKind::Revolve => "Revolve",
+                    OpKind::RevolveCut => "Revolve Cut",
                 });
             });
             // OK (green ✔) / Cancel (red ✗) row, as in the PropertyManager header.
@@ -2229,7 +2255,7 @@ fn ui_system(
                 ui.add_enabled(false, egui::Button::new("Sketch Plane             ▼"));
             });
 
-            let is_rev = matches!(op.kind, OpKind::Revolve);
+            let is_rev = matches!(op.kind, OpKind::Revolve | OpKind::RevolveCut);
             // Revolve: an Axis box — click a sketch line to set the revolve axis.
             if is_rev {
                 egui::CollapsingHeader::new("Axis").default_open(true).show(ui, |ui| {
@@ -2318,6 +2344,7 @@ fn ui_system(
                     OpKind::Cut => SolidOp::Cut(d),
                     // For revolve, `depth` carries the angle in degrees.
                     OpKind::Revolve => SolidOp::Revolve((d).to_radians()),
+                    OpKind::RevolveCut => SolidOp::RevolveCut((d).to_radians()),
                 });
                 keep = false;
             }
@@ -2717,9 +2744,27 @@ fn ui_system(
             let mut feat_rows: Vec<(usize, egui::Rect)> = Vec::new();
 
             egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                // Datum planes + origin, shown flat at the top like SolidWorks.
-                for (_id, p) in doc.0.planes() {
-                    ui.label(egui::RichText::new(format!("▱  {} Plane", p.name)).weak());
+                // Datum planes + origin, shown flat at the top like SolidWorks. Click a plane to
+                // select/show it; double-click (or right-click → Sketch) to sketch on it — works
+                // even with a body present, so you can cut/revolve through the part's centre.
+                for (order, (_id, p)) in doc.0.planes().enumerate() {
+                    let sel = ui_state.selected_plane == Some(order);
+                    let resp = ui.selectable_label(sel, egui::RichText::new(format!("▱  {} Plane", p.name)).weak());
+                    if resp.clicked() {
+                        ui_state.selected_plane = if sel { None } else { Some(order) };
+                        ui_state.selected = None;
+                    }
+                    if resp.double_clicked() {
+                        ui_state.selected_plane = Some(order);
+                        ui_state.sketch_plane_request = Some(order);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Sketch on plane").clicked() {
+                            ui_state.selected_plane = Some(order);
+                            ui_state.sketch_plane_request = Some(order);
+                            ui.close();
+                        }
+                    });
                 }
                 ui.label(egui::RichText::new("⊕  Origin").weak());
                 ui.add_space(3.0);
@@ -3601,9 +3646,10 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
     let mut out = cur;
     let mut guides: Vec<(Vec2, Vec2)> = Vec::new();
 
-    // Anchor points to align to: every sketch point + body reference points.
+    // Anchor points to align to: every sketch point + body reference points + the origin (centre).
     let mut anchors: Vec<Vec2> = session.sketch.points.iter().map(|p| Vec2::new(p.x as f32, p.y as f32)).collect();
     anchors.extend_from_slice(&session.reference_points);
+    anchors.push(Vec2::ZERO);
 
     // --- Horizontal / vertical alignment with an anchor point ---
     // Pick the closest anchor sharing the cursor's X (vertical guide) and the closest sharing its
@@ -4314,13 +4360,13 @@ fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
     let u = (seed - n * seed.dot(n)).normalize();
     let v = n.cross(u).normalize();
 
-    Some((best_t, ActivePlane { name: "Face".into(), origin, u, v, n }))
+    Some((best_t, ActivePlane { name: "Face".into(), origin, u, v, n, datum: false }))
 }
 
 /// An `ActivePlane` (app-side) from a stored `PlaneRef` (document-side).
 fn active_plane_from_ref(p: &PlaneRef, name: &str) -> ActivePlane {
     let f = |a: [f64; 3]| Vec3::new(a[0] as f32, a[1] as f32, a[2] as f32);
-    ActivePlane { name: name.into(), origin: f(p.origin), u: f(p.u), v: f(p.v), n: f(p.normal) }
+    ActivePlane { name: name.into(), origin: f(p.origin), u: f(p.u), v: f(p.v), n: f(p.normal), datum: p.datum }
 }
 
 /// `PlaneRef` (document-side) from an active plane (app-side).
@@ -4330,6 +4376,7 @@ fn plane_ref(ap: &ActivePlane) -> PlaneRef {
         u: [ap.u.x as f64, ap.u.y as f64, ap.u.z as f64],
         v: [ap.v.x as f64, ap.v.y as f64, ap.v.z as f64],
         normal: [ap.n.x as f64, ap.n.y as f64, ap.n.z as f64],
+        datum: ap.datum,
     }
 }
 
@@ -4631,6 +4678,10 @@ fn sketch_interaction(
         for p in &session.sketch.points {
             snaps.push(Vec2::new(p.x as f32, p.y as f32));
         }
+        // The sketch origin (0,0) — on a datum plane this is the part's centre. Snapping to it
+        // lets you put a circle's centre or a revolve axis exactly on centreline, so a revolve
+        // is concentric with the body instead of slightly eccentric (which tears the boolean).
+        snaps.push(Vec2::ZERO);
         // Circle perimeters (quadrants + the nearest point on the rim) are *lower priority*
         // than explicit geometry: a line or point in front of a circle must win, so the
         // cursor isn't yanked past the line onto the rim behind it. These go in a separate
@@ -4963,8 +5014,12 @@ fn sketch_interaction(
     }
 
     // While a boss/cut is being configured, grabbing its direction arrow and dragging
-    // sets the depth live (which shows in the panel and the feature tree on commit).
-    if ui_state.pending.is_some() && session.plane.is_some() {
+    // sets the depth live (which shows in the panel and the feature tree on commit). NOT for a
+    // revolve: there's no arrow (the sweep is rotational), and the handler would otherwise hijack
+    // a viewport click — meant for picking the axis line — and drag `op.depth` (the angle) to a
+    // tiny value, so the revolve came out as a thin wedge instead of the full turn.
+    let revolving = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Revolve | OpKind::RevolveCut));
+    if ui_state.pending.is_some() && session.plane.is_some() && !revolving {
         if extrude_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
@@ -5153,7 +5208,7 @@ fn sketch_interaction(
                         let region = region_at(&session.sketch, uv);
                         let near_entity = nearest_entity(&session.sketch, uv, snap * 1.5);
                         if let Some(e) = on_entity.or(region.is_none().then_some(()).and(near_entity)) {
-                            let picking_axis = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Revolve))
+                            let picking_axis = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Revolve | OpKind::RevolveCut))
                                 && matches!(session.sketch.entities.get(e), Some(SketchEntity::Line { .. }));
                             if picking_axis {
                                 // Revolve PM open + a line clicked → that line is the axis.
@@ -7740,13 +7795,13 @@ fn do_solid_op(
 
     // A body exists if there's geometry — either an exact B-rep solid *or* a mesh body
     // (after a fillet/seamless build, `part.solid` is None but `part.mesh` is the body).
-    if matches!(op, SolidOp::Cut(_)) && part.solid.is_none() && part.mesh.is_none() {
+    if matches!(op, SolidOp::Cut(_) | SolidOp::RevolveCut(_)) && part.solid.is_none() && part.mesh.is_none() {
         warn!("Cut: there is no body yet — extrude a boss first.");
         return;
     }
     // Revolve needs an axis — the line the user clicked in the sketch.
     let axis = revolve_axis(&session);
-    if matches!(op, SolidOp::Revolve(_)) && axis.is_none() {
+    if matches!(op, SolidOp::Revolve(_) | SolidOp::RevolveCut(_)) && axis.is_none() {
         warn!("Revolve: click a line in the sketch to use as the axis.");
         ui_state.last_error = Some("Revolve needs an axis — click a line in the sketch to select it.".into());
         return;
@@ -7760,7 +7815,11 @@ fn do_solid_op(
         SolidOp::Cut(d) => FeatureKind::Cut { sketch, regions, plane, distance: d },
         SolidOp::Revolve(angle) => {
             let (axis_pt, axis_dir) = axis.unwrap();
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle }
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut: false }
+        }
+        SolidOp::RevolveCut(angle) => {
+            let (axis_pt, axis_dir) = axis.unwrap();
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut: true }
         }
     };
     // Editing an existing feature replaces it in place; otherwise append.
@@ -7798,6 +7857,35 @@ fn handle_edit_sketch(
     mut doc: ResMut<DocRes>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
+    // Start a fresh sketch on a datum plane picked from the tree (works with a body present).
+    if let Some(order) = ui_state.sketch_plane_request.take() {
+        if let Some((_, p)) = doc.0.planes().nth(order) {
+            let ap = ActivePlane::from_doc(p);
+            if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                orbit.radius = orbit.radius.max(6.0);
+                look_along(&mut orbit, ap.origin, ap.n);
+                *tf = camera_transform(&orbit);
+            }
+            session.sketch.clear();
+            session.editing = None;
+            session.pending = None;
+            session.dim_first = None;
+            session.cursor_uv = None;
+            session.drag = None;
+            session.selected_contours.clear();
+            session.selected_entities.clear();
+            session.needs_apply = false;
+            session.undo_sketch.clear();
+            session.redo_sketch.clear();
+            session.undo_baseline = Some(session.sketch.clone());
+            session.undo_fp = sketch_fingerprint(&session.sketch);
+            info!("Sketching on the {} plane.", ap.name);
+            session.plane = Some(ap);
+            ui_state.selected_plane = None; // it's now the sketch plane, not a standalone selection
+        }
+        return;
+    }
+
     let Some(i) = ui_state.edit_sketch_request.take() else { return };
     let Some(f) = doc.0.features.get(i) else { return };
     let (sketch, plane, contours) = match &f.kind {
@@ -8001,19 +8089,22 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle } => {
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut } => {
                 let all = sketch.regions();
                 let resolved = match &body { Some(b) => reproject_plane(plane, b), None => plane.clone() };
                 let basis = basis_from_ref(&resolved);
                 for r in &merge_regions(&chosen_regions(&all, regions)) {
                     let solid = revolve_solid(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle);
                     let next = match (&body, solid) {
-                        (Some(b), Some(s)) => union(b, &s), // revolve boss onto the body
-                        (None, Some(s)) => Some(s),          // first feature: the revolve is the body
+                        // Boss adds the swept solid; cut subtracts it from the body.
+                        (Some(b), Some(s)) => if *cut { difference(b, &s) } else { union(b, &s) },
+                        (None, Some(s)) => (!*cut).then_some(s), // first feature: a boss *is* the body
                         (_, None) => None,
                     };
                     if let Some(s) = next {
                         body = Some(s);
+                    } else if *cut {
+                        failures.push("Revolve cut failed — the kernel rejected the subtraction (the mesh path will retry).".into());
                     } else {
                         failures.push("Revolve failed — the profile may straddle the axis, or the union was rejected (the mesh path will retry).".into());
                     }
@@ -8137,7 +8228,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                     });
                 }
             }
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle } => {
+            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut } => {
                 bevel_edges.clear();
                 let all = sketch.regions();
                 let regs = merge_regions(&chosen_regions(&all, regions));
@@ -8150,8 +8241,9 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 for r in &regs {
                     if let Some(tool) = revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle) {
                         body = Some(match body.take() {
-                            Some(b) => mesh_union(&b, &tool), // revolve boss onto the body
-                            None => tool,                     // first feature
+                            // Boss unions the swept solid; cut subtracts it (no-op if no body yet).
+                            Some(b) => if *cut { mesh_difference(&b, &tool) } else { mesh_union(&b, &tool) },
+                            None => if *cut { continue } else { tool },
                         });
                     }
                 }
@@ -8236,6 +8328,7 @@ fn do_regenerate(
     if force_mesh {
         let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc.0)))
             .unwrap_or(None);
+        let fallbacks = take_fallback_count(); // booleans Manifold couldn't do (→ lossy BSP)
         for e in &existing {
             commands.entity(e).despawn();
         }
@@ -8249,7 +8342,10 @@ fn do_regenerate(
                 part.tangent_edges = tess.tangent_edges.clone();
                 spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
                 part.solid = None; // mesh body has no B-rep handle
-                ui_state.last_error = None;
+                ui_state.last_error = (fallbacks > 0).then(|| {
+                    warn!("{fallbacks} boolean(s) fell back to the lossy BSP CSG — surface may be torn.");
+                    format!("⚠ {fallbacks} boolean(s) used the lossy fallback (Manifold rejected them) — the surface may be torn. Likely an exact tangent/coincident face: check the revolve axis is centred and the profile isn't flush with the boss wall.")
+                });
             }
             _ => {
                 part.solid = None;
@@ -8716,6 +8812,11 @@ fn exact_plane_circles(doc: &Document, ap: &ActivePlane) -> Vec<(Vec2, f32)> {
 /// path (forced by a fillet/chamfer/mirror) can reproject a feature's plane onto the live
 /// body too, instead of using the stale stored plane (which made cuts land shallow).
 fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, ref_world: Vec3) -> PlaneRef {
+    // A datum plane (Front/Top/Right) is fixed in space — never snap it onto a body face, or a
+    // centre-plane sketch (e.g. a revolve-cut profile through the middle) gets shoved onto a cap.
+    if plane.datum {
+        return plane.clone();
+    }
     let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
     let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
     let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
@@ -9332,21 +9433,84 @@ fn orbit_camera(
 // Viewport gizmos
 // ---------------------------------------------------------------------------
 
-/// Reference planes are visible only when starting a fresh part — no body yet and
-/// not currently sketching. Once you're modeling they hide (and become unpickable),
-/// removing both the clutter/flicker and the risk of selecting them by accident.
+/// Reference-plane visibility, SolidWorks-style:
+///   * while actively sketching → all hidden (the sketch grid stands in);
+///   * a datum plane selected in the tree → show just that one (so you can pick it to sketch on,
+///     even with a body present — needed for e.g. a revolve cut through the centre);
+///   * no body yet and nothing selected → show all three (so the first sketch is easy to start);
+///   * otherwise (a body exists, nothing selected) → all hidden, to avoid clutter.
 fn update_plane_visibility(
     part: Res<Part>,
     session: Res<SketchSession>,
-    mut planes: Query<&mut Visibility, With<RefPlane>>,
+    ui_state: Res<UiState>,
+    mut planes: Query<(&mut Visibility, &RefPlaneIdx)>,
 ) {
-    let show = part.solid.is_none() && session.plane.is_none();
-    let want = if show { Visibility::Visible } else { Visibility::Hidden };
-    for mut vis in &mut planes {
+    let sketching = session.plane.is_some();
+    let show_all = part.solid.is_none() && ui_state.selected_plane.is_none();
+    for (mut vis, idx) in &mut planes {
+        let want = if sketching {
+            Visibility::Hidden
+        } else if ui_state.selected_plane == Some(idx.0) || show_all {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
         if *vis != want {
             *vis = want;
         }
     }
+}
+
+/// See-through mechanic: while sketching, fade the body to translucent so a sketch on an internal
+/// datum plane (e.g. a revolve-cut profile through the centre) is visible *through* the solid.
+/// Restores it to opaque when you leave the sketch. (SolidWorks does the same.)
+fn update_body_transparency(
+    session: Res<SketchSession>,
+    bodies: Query<&MeshMaterial3d<StandardMaterial>, With<SolidPart>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let sketching = session.plane.is_some();
+    let want = if sketching { 0.28 } else { 1.0 };
+    for mat in &bodies {
+        if let Some(m) = materials.get_mut(&mat.0) {
+            if (m.base_color.alpha() - want).abs() > 1e-3 {
+                m.base_color = m.base_color.with_alpha(want);
+                m.alpha_mode = if sketching { AlphaMode::Blend } else { AlphaMode::Opaque };
+            }
+        }
+    }
+}
+
+/// Draw a bright bordered outline (and a diagonal) for the datum plane selected in the tree, so it
+/// reads as a real plane to sketch on — not just the faint translucent quad. Skipped while
+/// sketching (the grid stands in then).
+fn draw_selected_plane(
+    mut gizmos: Gizmos,
+    ui_state: Res<UiState>,
+    session: Res<SketchSession>,
+    doc: Res<DocRes>,
+) {
+    if session.plane.is_some() {
+        return;
+    }
+    let Some(order) = ui_state.selected_plane else { return };
+    let Some((_, p)) = doc.0.planes().nth(order) else { return };
+    let ap = ActivePlane::from_doc(p);
+    let h = PLANE_SIZE * 0.5;
+    let col = Color::srgba(0.45, 0.8, 1.0, 0.9);
+    let c = [
+        ap.to_world(Vec2::new(-h, -h)),
+        ap.to_world(Vec2::new(h, -h)),
+        ap.to_world(Vec2::new(h, h)),
+        ap.to_world(Vec2::new(-h, h)),
+    ];
+    for k in 0..4 {
+        gizmos.line(c[k], c[(k + 1) % 4], col);
+    }
+    // Faint diagonals so it reads as a plane even edge-on.
+    let faint = Color::srgba(0.45, 0.8, 1.0, 0.35);
+    gizmos.line(c[0], c[2], faint);
+    gizmos.line(c[1], c[3], faint);
 }
 
 fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
@@ -9380,7 +9544,7 @@ fn draw_sketch(
         let eye = cam_q.single().map(|c| camera_transform(c).translation).unwrap_or(ap.origin + ap.n);
         let sign = if (eye - ap.origin).dot(ap.n) >= 0.0 { 1.0 } else { -1.0 };
         let lift = ap.n * (radius.max(1e-3) * 2.0e-3 * sign);
-        lifted = ActivePlane { name: ap.name.clone(), origin: ap.origin + lift, u: ap.u, v: ap.v, n: ap.n };
+        lifted = ActivePlane { name: ap.name.clone(), origin: ap.origin + lift, u: ap.u, v: ap.v, n: ap.n, datum: ap.datum };
         &lifted
     };
 
@@ -9412,6 +9576,14 @@ fn draw_sketch(
         let p = &session.sketch.points[i];
         Vec2::new(p.x as f32, p.y as f32)
     };
+
+    // Sketch origin (0,0): a small red/green crosshair marking the part centre, so circle centres
+    // and revolve axes can snap onto it (a concentric revolve, not a slightly eccentric one).
+    {
+        let os = 0.22 * ms;
+        gizmos.line(ap.to_world(Vec2::new(-os, 0.0)), ap.to_world(Vec2::new(os, 0.0)), Color::srgb(1.0, 0.35, 0.35));
+        gizmos.line(ap.to_world(Vec2::new(0.0, -os)), ap.to_world(Vec2::new(0.0, os)), Color::srgb(0.4, 1.0, 0.4));
+    }
 
     // Inference guides: dotted hints showing why the cursor snapped (alignment / extension /
     // tangent). Faint amber dashes, drawn under the geometry.
@@ -10135,14 +10307,18 @@ fn draw_sketch(
         let indices: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
         // A boss goes out along +normal by default; a cut goes in (−normal, into the
         // material). Reverse flips either one.
-        if matches!(op.kind, OpKind::Revolve) {
+        if matches!(op.kind, OpKind::Revolve | OpKind::RevolveCut) {
             // Revolve preview: highlight the axis line (the picked line) the profile will spin
-            // around. No linear ghost — the sweep is rotational.
+            // around. No linear ghost — the sweep is rotational. A cut axis reads red.
             if let Some((p, d)) = revolve_axis(&session) {
                 let a = Vec2::new(p[0] as f32, p[1] as f32);
                 let dir = Vec2::new(d[0] as f32, d[1] as f32).normalize_or_zero();
                 let half = (ms.max(2.0)) * 1.5;
-                let col = Color::srgba(0.4, 0.85, 0.95, 0.9);
+                let col = if matches!(op.kind, OpKind::RevolveCut) {
+                    Color::srgba(1.0, 0.45, 0.4, 0.9)
+                } else {
+                    Color::srgba(0.4, 0.85, 0.95, 0.9)
+                };
                 overlay.line(ap.to_world(a - dir * half), ap.to_world(a + dir * half), col);
             }
             return;
@@ -10150,14 +10326,14 @@ fn draw_sketch(
         let kind_sign = match op.kind {
             OpKind::Boss => 1.0,
             OpKind::Cut => -1.0,
-            OpKind::Revolve => 1.0,
+            OpKind::Revolve | OpKind::RevolveCut => 1.0, // unreachable (revolve returns above)
         };
         let nominal = kind_sign * if op.reverse { -1.0 } else { 1.0 };
         let lift = ap.n * (op.depth * nominal);
         let ghost = match op.kind {
             OpKind::Boss => Color::srgba(0.95, 0.85, 0.25, 0.8),
             OpKind::Cut => Color::srgba(1.0, 0.4, 0.35, 0.8),
-            OpKind::Revolve => Color::srgba(0.4, 0.85, 0.95, 0.8),
+            OpKind::Revolve | OpKind::RevolveCut => Color::srgba(0.4, 0.85, 0.95, 0.8),
         };
 
         // Ghost prism, drawn on the overlay group so it shows THROUGH the model — the
@@ -10166,7 +10342,7 @@ fn draw_sketch(
         let far = match op.kind {
             OpKind::Boss => ghost,
             OpKind::Cut => Color::srgb(1.0, 0.75, 0.2), // bright depth ring for a cut
-            OpKind::Revolve => ghost,
+            OpKind::Revolve | OpKind::RevolveCut => ghost, // unreachable (revolve returns above)
         };
         for &i in &indices {
             for loop_pts in std::iter::once(&regions[i].outer).chain(regions[i].holes.iter()) {
@@ -10766,7 +10942,7 @@ mod tests {
     }
 
     fn xy() -> PlaneRef {
-        PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
+        PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false }
     }
 
     fn height(solid: &KSolid) -> f32 {
@@ -10860,7 +11036,7 @@ mod tests {
         let mut cut = Sketch::default();
         let pc = cut.add_point(0.0, 0.0);
         cut.add_circle(pc, 1.0);
-        let top = PlaneRef { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let top = PlaneRef { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
         doc.add_feature(FeatureKind::Cut { sketch: cut, regions: vec![], plane: top, distance: 2.0 });
         let after_solid = regenerate(&doc).expect("body after cut");
         let after = tessellate(&after_solid, 0.05).edges.len();
@@ -10888,7 +11064,7 @@ mod tests {
         let mut cutsk = Sketch::default();
         let cc = cutsk.add_point(5.0, 0.0);
         cutsk.add_circle(cc, 1.0);
-        let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
         doc.add_feature(FeatureKind::Cut { sketch: cutsk, regions: vec![], plane: top, distance: 1.0 });
         let solid = regenerate(&doc); // must not panic
         assert!(solid.is_some(), "dumbbell with a cut should still produce a body");
@@ -10913,7 +11089,7 @@ mod tests {
         // Base box 4×4×2 on XY.
         doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0 });
         // Boss 2×2 sketched on the top face (z=2), 2 tall → stacked total height 4.
-        let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
         doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: top, distance: 2.0 });
         let before = height(&regenerate(&doc).unwrap());
         assert!((before - 4.0).abs() < 0.2, "stacked height should be 4, was {before}");

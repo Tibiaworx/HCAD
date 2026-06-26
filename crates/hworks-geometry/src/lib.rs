@@ -17,7 +17,7 @@ mod fillet;
 mod mesh_bool;
 pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_and_edges, bevel_mesh_selected};
 pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
-pub use mesh_bool::{mesh_difference, mesh_intersection, mesh_union, mirror_mesh};
+pub use mesh_bool::{is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, take_fallback_count};
 
 /// A tessellated triangle mesh handed up to the renderer.
 #[derive(Debug, Default, Clone)]
@@ -51,8 +51,9 @@ pub struct Tessellation {
     pub tangent_edges: Vec<[[f32; 3]; 2]>,
 }
 
-/// Tolerance for boolean operations and tessellation.
-const TOL: f64 = 0.05;
+/// Tolerance for boolean operations and tessellation. Finer than the old 0.05 so a revolve's
+/// angular facets are dense enough to meet a boss's wall cleanly at a boolean intersection seam.
+const TOL: f64 = 0.02;
 
 // ---------------------------------------------------------------------------
 // Public kernel operations
@@ -93,6 +94,23 @@ pub fn union(a: &KSolid, b: &KSolid) -> Option<KSolid> {
 /// to well within tessellation/manufacturing precision.
 pub fn union_tol(a: &KSolid, b: &KSolid, tol: f64) -> Option<KSolid> {
     guard(|| truck_shapeops::or(&a.0, &b.0, tol)).map(KSolid)
+}
+
+/// Boolean difference `a − b`: subtract solid `b` from `a` (the exact-kernel form of a
+/// revolve/extrude cut against an already-built tool solid). Inverts `b`'s faces and
+/// intersects, exactly like [`cut_tol`] does with its freshly-built prism tool.
+pub fn difference(a: &KSolid, b: &KSolid) -> Option<KSolid> {
+    difference_tol(a, b, TOL)
+}
+
+/// Boolean difference at a caller-chosen tolerance (see [`union_tol`] for why that matters).
+pub fn difference_tol(a: &KSolid, b: &KSolid, tol: f64) -> Option<KSolid> {
+    let mut tool = b.0.clone();
+    guard(move || {
+        tool.not(); // invert all faces → complement region, so AND becomes a subtraction
+        truck_shapeops::and(&a.0, &tool, tol)
+    })
+    .map(KSolid)
 }
 
 /// Run a kernel operation that may *panic* (truck asserts internally — e.g. "this
@@ -411,8 +429,34 @@ fn build_revolve_solid(
         }
         let face = builder::try_attach_plane(&wires).ok()?;
         // rsweep: full turn (|angle| ≈ 2π) closes the solid; a partial turn caps the ends.
-        Some(builder::rsweep(&face, axis_origin, axis, truck_modeling::Rad(angle)))
+        let solid = builder::rsweep(&face, axis_origin, axis, truck_modeling::Rad(angle));
+        // rsweep's orientation depends on which side of the axis the profile sits and the sweep
+        // sign, so the result can come out inside-out (inward-facing normals / negative volume).
+        // That renders fine alone (double-sided) but, unioned with a real body, the "negative"
+        // solid CANCELS it — the boss/cut would vanish. Flip to outward-facing if inverted.
+        let mut solid = solid;
+        if solid_signed_volume(&solid) < 0.0 {
+            solid.not();
+        }
+        Some(solid)
     })
+}
+
+/// Signed volume of a truck solid via its triangulation (positive ⇒ outward-facing normals).
+/// Used to detect and fix an inside-out revolve before it poisons a boolean.
+fn solid_signed_volume(solid: &truck_modeling::Solid) -> f64 {
+    guard(|| {
+        let mut poly = solid.triangulation(0.1).to_polygon();
+        poly.triangulate();
+        let pos = poly.positions();
+        let mut vol = 0.0;
+        for tri in poly.faces().tri_faces() {
+            let (a, b, c) = (pos[tri[0].pos], pos[tri[1].pos], pos[tri[2].pos]);
+            vol += a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x) + a.z * (b.x * c.y - b.y * c.x);
+        }
+        Some(vol / 6.0)
+    })
+    .unwrap_or(0.0)
 }
 
 /// Convert a truck `PolygonMesh` into a flat-shaded [`TriMesh`] (per-triangle
@@ -546,6 +590,50 @@ mod tests {
 
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<[f64; 2]> {
         vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+    fn circle(cx: f64, cy: f64, r: f64, n: usize) -> Vec<[f64; 2]> {
+        (0..n).map(|k| { let a = std::f64::consts::TAU * k as f64 / n as f64; [cx + r * a.cos(), cy + r * a.sin()] }).collect()
+    }
+
+    #[test]
+    fn revolve_boss_keeps_the_existing_body() {
+        // Reproduces the app's "revolve a profile while a body already exists" case: a cylinder
+        // (extruded along Z) plus a torus (a circle revolved around the perpendicular Y axis).
+        // The union MUST contain both — the bug was the cylinder vanishing, leaving only the ring.
+        let cyl = extrude_tool_mesh(&circle(0.0, 0.0, 5.0, 48), &[], &plane_at(-10.0), 0.0, 20.0).expect("cylinder");
+        let torus = revolve_tool_mesh(&circle(20.0, 0.0, 2.0, 32), &[], &xy_plane(), [0.0, 0.0], [0.0, 1.0], std::f64::consts::TAU).expect("torus");
+        let (cv, tv) = (mesh_vol(&cyl), mesh_vol(&torus));
+        let u = mesh_union(&cyl, &torus);
+        let uv = mesh_vol(&u);
+        assert!(uv > cv + tv * 0.5, "mesh union dropped a body: union {uv:.1}, cyl {cv:.1}, torus {tv:.1}");
+        // Exact-kernel union too.
+        let cyl_s = extrude_solid(&circle(0.0, 0.0, 5.0, 48), &[], &plane_at(-10.0), 20.0).expect("cyl solid");
+        let tor_s = revolve_solid(&circle(20.0, 0.0, 2.0, 32), &[], &xy_plane(), [0.0, 0.0], [0.0, 1.0], std::f64::consts::TAU).expect("torus solid");
+        let us = union(&cyl_s, &tor_s).expect("exact union builds");
+        let usv = mesh_vol(&tessellate(&us, 0.1).mesh);
+        assert!(usv > cv + tv * 0.5, "exact union dropped a body: union {usv:.1}, cyl {cv:.1}, torus {tv:.1}");
+    }
+
+    #[test]
+    fn revolve_overlapping_union_is_clean() {
+        // The user's actual case: a torus revolved so it straddles the cylinder wall (a bead
+        // around the cylinder). The union must go through Manifold and stay 2-manifold — if it
+        // falls back to BSP it leaves overlapping shells (the torn/striped surface).
+        let cyl = extrude_tool_mesh(&circle(0.0, 0.0, 5.0, 64), &[], &plane_at(-10.0), 0.0, 20.0).unwrap();
+        let torus = revolve_tool_mesh(&circle(5.0, 0.0, 2.0, 48), &[], &xy_plane(), [0.0, 0.0], [0.0, 1.0], std::f64::consts::TAU).unwrap();
+        let u = mesh_union(&cyl, &torus);
+        assert!(!u.indices.is_empty(), "overlapping union empty");
+        assert!(is_manifold(&u), "overlapping union isn't manifold → BSP fallback → torn shells");
+    }
+
+    #[test]
+    fn revolve_mesh_is_a_valid_manifold() {
+        // A full-turn revolve must ingest as a 2-manifold, or every boolean with it falls back to
+        // the lossy BSP CSG → torn/overlapping shells. (Cylinder for contrast.)
+        let cyl = extrude_tool_mesh(&circle(0.0, 0.0, 5.0, 48), &[], &plane_at(-10.0), 0.0, 20.0).unwrap();
+        assert!(is_manifold(&cyl), "extrude mesh isn't manifold");
+        let torus = revolve_tool_mesh(&circle(20.0, 0.0, 2.0, 32), &[], &xy_plane(), [0.0, 0.0], [0.0, 1.0], std::f64::consts::TAU).unwrap();
+        assert!(is_manifold(&torus), "full-turn revolve mesh isn't manifold (booleans will tear)");
     }
     fn plane_at(z: f64) -> PlaneBasis {
         PlaneBasis { origin: [0.0, 0.0, z], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }

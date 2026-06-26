@@ -37,6 +37,11 @@ pub struct PlaneRef {
     pub u: [f64; 3],
     pub v: [f64; 3],
     pub normal: [f64; 3],
+    /// True if the sketch was made on a fixed datum plane (Front/Top/Right), not a body face.
+    /// Datum planes never move, so regeneration must NOT reproject them onto a body face — doing
+    /// so would snap a centre-plane sketch onto a parallel cap and displace the profile.
+    #[serde(default)]
+    pub datum: bool,
 }
 
 /// The kinds of feature a timeline can hold. Grows along the roadmap.
@@ -56,9 +61,10 @@ pub enum FeatureKind {
     Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
     /// Cut: subtract the chosen swept `regions` from the body (empty = all).
     Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
-    /// Revolve boss: sweep the chosen `regions` of `sketch` around an axis line (a point +
-    /// direction in the sketch's uv plane) by `angle` radians (τ = full turn).
-    Revolve { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, axis_pt: [f64; 2], axis_dir: [f64; 2], angle: f64 },
+    /// Revolve: sweep the chosen `regions` of `sketch` around an axis line (a point + direction in
+    /// the sketch's uv plane) by `angle` radians (τ = full turn). `cut` subtracts the swept solid
+    /// from the body (a lathe groove/bore) instead of adding it (a revolve boss).
+    Revolve { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, axis_pt: [f64; 2], axis_dir: [f64; 2], angle: f64, #[serde(default)] cut: bool },
     /// Fillet: round body edges by `radius` (a mesh round). `edges` are the picked edge
     /// polylines (world space) to round; empty means "round every edge".
     Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
@@ -149,9 +155,14 @@ impl Document {
                     ct += 1;
                     format!("[cut]    Cut{ct}  h={distance:.1}")
                 }
-                FeatureKind::Revolve { angle, .. } => {
-                    ex += 1;
-                    format!("[rev]    Revolve{ex}  {:.0}°", angle.to_degrees())
+                FeatureKind::Revolve { angle, cut, .. } => {
+                    if *cut {
+                        ct += 1;
+                        format!("[rev]    RevCut{ct}  {:.0}°", angle.to_degrees())
+                    } else {
+                        ex += 1;
+                        format!("[rev]    Revolve{ex}  {:.0}°", angle.to_degrees())
+                    }
                 }
                 FeatureKind::Fillet { radius, edges } => {
                     let scope = if edges.is_empty() { "all".to_string() } else { format!("{}", edges.len()) };
