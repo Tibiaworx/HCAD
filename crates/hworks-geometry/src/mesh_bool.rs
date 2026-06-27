@@ -14,24 +14,60 @@ use std::collections::HashMap;
 
 /// Weld coincident vertices (truck flat-shades, so shared corners are duplicated) and
 /// return Manifold-ready flat vertex properties `[x,y,z, …]` + triangle indices.
+///
+/// The tolerance is **bounding-box-relative** and the merge is **neighbour-checked**, both for one
+/// reason: a full-turn revolve's seam. truck computes the 0 and 2π vertices from cos/sin, and the
+/// 2π rotation error grows with distance from the axis — on a big part (major radius tens of mm)
+/// the two "identical" seam verts can sit microns apart, far enough that a fixed grid leaves an
+/// open seam → NotManifold → the lossy BSP CSG (torn surface, or an OOM on dense meshes). Scaling
+/// the tolerance with the model and searching the 27 neighbour cells fuses the seam at any size
+/// without merging genuinely distinct (mm-scale) geometry.
 fn weld(m: &TriMesh) -> (Vec<f32>, Vec<u32>) {
-    // Snap to a 1e-4 grid and store the *grid-snapped* position, so vertices meant to be the
-    // same become bit-identical. This matters at a revolve's seam: truck computes the 0 and 2π
-    // vertices from cos/sin, which differ by a hair in f32 — too coarse a merge (the old 1e-5
-    // grid) left them split, an open seam, and a NotManifold mesh that fell to the lossy BSP
-    // (torn surface). 1e-4 (sub-micron at model scale) reliably fuses the seam without merging
-    // any distinct geometry.
-    const GRID: f32 = 1.0e4; // 1/GRID = 1e-4 tolerance
-    let snap = |c: f32| (c * GRID).round();
-    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    weld_tol(m, 3.0e-5)
+}
+
+/// `weld` with a caller-chosen bbox-relative tolerance factor (exposed for diagnostics).
+fn weld_tol(m: &TriMesh, rel: f32) -> (Vec<f32>, Vec<u32>) {
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    // `rel` of the model size: comfortably exceeds the seam gap yet stays far below any real
+    // feature; floored so tiny models still merge exact duplicates.
+    let tol = (diag * rel).max(1.0e-5);
+    let inv = 1.0 / tol;
+    let cell = |c: f32| (c * inv).floor() as i64;
+    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
     let mut props: Vec<f32> = Vec::new();
     let mut remap = vec![0u32; m.positions.len()];
     for (i, p) in m.positions.iter().enumerate() {
-        let (kx, ky, kz) = (snap(p[0]), snap(p[1]), snap(p[2]));
-        let id = *map.entry((kx as i64, ky as i64, kz as i64)).or_insert_with(|| {
-            // Store the grid-snapped position so merged vertices are exactly coincident.
-            props.extend_from_slice(&[kx / GRID, ky / GRID, kz / GRID]);
-            (props.len() / 3 - 1) as u32
+        let (cx, cy, cz) = (cell(p[0]), cell(p[1]), cell(p[2]));
+        // Cell size == tol, so any vertex within tol lies in one of the 27 surrounding cells.
+        let mut hit: Option<u32> = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(ids) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &id in ids {
+                            let b = id as usize * 3;
+                            if (props[b] - p[0]).abs() < tol && (props[b + 1] - p[1]).abs() < tol && (props[b + 2] - p[2]).abs() < tol {
+                                hit = Some(id);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let id = hit.unwrap_or_else(|| {
+            let id = (props.len() / 3) as u32;
+            props.extend_from_slice(&[p[0], p[1], p[2]]);
+            grid.entry((cx, cy, cz)).or_default().push(id);
+            id
         });
         remap[i] = id;
     }
@@ -43,6 +79,45 @@ fn weld(m: &TriMesh) -> (Vec<f32>, Vec<u32>) {
 /// A `false` here means a boolean with this operand will fall back to the lossy BSP CSG.
 pub fn is_manifold(m: &TriMesh) -> bool {
     to_manifold(m).is_some()
+}
+
+/// Test-only: the Manifold difference WITHOUT the BSP fallback (so a failing case can be inspected
+/// without the BSP CSG exploding). `None` ⇒ Manifold (and its retries) couldn't do it.
+#[cfg(test)]
+pub fn manifold_difference_only(a: &TriMesh, b: &TriMesh) -> Option<TriMesh> {
+    manifold_boolean(a, b, Op::Difference)
+}
+
+/// Test-only edge topology after welding: (verts, tris, boundary edges [used once], non-manifold
+/// edges [used >2×]). A watertight 2-manifold has every edge used exactly twice → both 0.
+#[cfg(test)]
+pub fn weld_edge_stats_tol(m: &TriMesh, rel: f32) -> (usize, usize, usize, usize) {
+    let (props, tris) = weld_tol(m, rel);
+    let mut edge: HashMap<(u32, u32), i32> = HashMap::new();
+    for t in tris.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let k = if a < b { (a, b) } else { (b, a) };
+            *edge.entry(k).or_insert(0) += 1;
+        }
+    }
+    let boundary = edge.values().filter(|&&c| c == 1).count();
+    let nonman = edge.values().filter(|&&c| c > 2).count();
+    (props.len() / 3, tris.len() / 3, boundary, nonman)
+}
+
+#[cfg(test)]
+pub fn weld_edge_stats(m: &TriMesh) -> (usize, usize, usize, usize) {
+    let (props, tris) = weld(m);
+    let mut edge: HashMap<(u32, u32), i32> = HashMap::new();
+    for t in tris.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let k = if a < b { (a, b) } else { (b, a) };
+            *edge.entry(k).or_insert(0) += 1;
+        }
+    }
+    let boundary = edge.values().filter(|&&c| c == 1).count();
+    let nonman = edge.values().filter(|&&c| c > 2).count();
+    (props.len() / 3, tris.len() / 3, boundary, nonman)
 }
 
 /// Build a `Manifold` from a triangle mesh; `None` if empty or not a valid solid.

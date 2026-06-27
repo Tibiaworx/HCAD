@@ -277,6 +277,12 @@ pub fn revolve_solid(
 
 /// Mesh form of [`revolve_solid`] — for the mesh-boolean (Manifold) path, exactly as
 /// [`extrude_tool_mesh`] is the mesh form of [`extrude_solid`].
+///
+/// A **full turn** is built *directly* as a shared-vertex surface-of-revolution grid: truck's
+/// own triangulation of a large/fine revolve comes out non-watertight (cracks between B-rep
+/// faces), which then breaks Manifold booleans (NotManifold → lossy BSP → torn surface / OOM).
+/// The direct grid is watertight by construction at any scale. Partial turns (which need profile
+/// caps) still go through truck.
 pub fn revolve_tool_mesh(
     outer: &[[f64; 2]],
     holes: &[Vec<[f64; 2]>],
@@ -285,12 +291,127 @@ pub fn revolve_tool_mesh(
     axis_dir: [f64; 2],
     angle: f64,
 ) -> Option<TriMesh> {
+    let tau = std::f64::consts::TAU;
+    if (angle.abs() - tau).abs() < 1.0e-4 {
+        if let Some(m) = revolve_mesh_full(outer, holes, basis, axis_pt, axis_dir) {
+            return Some(m);
+        }
+    }
     let solid = build_revolve_solid(outer, holes, basis, axis_pt, axis_dir, angle)?;
     guard(|| {
         let mut poly = solid.triangulation(TOL).to_polygon();
         poly.triangulate();
         Some(polymesh_to_trimesh(&poly))
     })
+}
+
+/// Build a **full-turn** solid of revolution directly as a watertight, shared-vertex triangle
+/// mesh: each profile boundary loop (outer + holes) is swept around the axis in `N` steps and the
+/// rings are stitched into quad strips that wrap closed (no caps for a full turn). Smooth vertex
+/// normals; orientation corrected to outward-facing. `None` if degenerate.
+fn revolve_mesh_full(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    axis_pt: [f64; 2],
+    axis_dir: [f64; 2],
+) -> Option<TriMesh> {
+    let o = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+    let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+    let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+    let to3 = |p: &[f64; 2]| o + u * p[0] + v * p[1];
+    let ao = o + u * axis_pt[0] + v * axis_pt[1];
+    let ad = u * axis_dir[0] + v * axis_dir[1];
+    let alen = ad.magnitude();
+    if alen < 1.0e-9 {
+        return None;
+    }
+    let k = ad / alen; // unit axis
+
+    let loops: Vec<Vec<[f64; 2]>> = std::iter::once(clean_loop(outer))
+        .chain(holes.iter().map(|h| clean_loop(h)))
+        .filter(|l| l.len() >= 3)
+        .collect();
+    if loops.is_empty() {
+        return None;
+    }
+    // Angular step count from the largest swept radius (chord error ≈ TOL).
+    let mut r_max: f64 = 0.0;
+    for l in &loops {
+        for p in l {
+            let d = to3(p) - ao;
+            r_max = r_max.max((d - k * d.dot(k)).magnitude());
+        }
+    }
+    if r_max < 1.0e-6 {
+        return None;
+    }
+    let n = (std::f64::consts::PI * (r_max / (2.0 * TOL)).sqrt()).ceil().clamp(32.0, 360.0) as usize;
+    let rot = |p: Vector3, theta: f64| {
+        let d = p - ao;
+        let (c, s) = (theta.cos(), theta.sin());
+        ao + d * c + k.cross(d) * s + k * (k.dot(d)) * (1.0 - c) // Rodrigues
+    };
+
+    let mut pos: Vec<Vector3> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for l in &loops {
+        let m = l.len();
+        let base = pos.len() as u32;
+        for ki in 0..n {
+            let theta = std::f64::consts::TAU * ki as f64 / n as f64;
+            for p in l {
+                pos.push(rot(to3(p), theta));
+            }
+        }
+        let vid = |ki: usize, i: usize| base + (ki * m + i) as u32;
+        for ki in 0..n {
+            let kn = (ki + 1) % n; // wrap closed (full turn)
+            for i in 0..m {
+                let inx = (i + 1) % m;
+                let (a, b, c, d) = (vid(ki, i), vid(kn, i), vid(kn, inx), vid(ki, inx));
+                indices.extend([a, b, c, a, c, d]);
+            }
+        }
+    }
+
+    // Smooth vertex normals (accumulate incident face normals).
+    let mut nrm = vec![Vector3::new(0.0_f64, 0.0, 0.0); pos.len()];
+    for t in indices.chunks_exact(3) {
+        let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+        let fn_ = (b - a).cross(c - a);
+        for &i in t {
+            nrm[i as usize] += fn_;
+        }
+    }
+    // Signed volume → flip winding + normals if inside-out.
+    let mut vol = 0.0;
+    for t in indices.chunks_exact(3) {
+        let (a, b, c) = (pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]);
+        vol += a.dot(b.cross(c));
+    }
+    let flip = vol < 0.0;
+
+    let mut out = TriMesh::default();
+    out.positions = pos.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect();
+    out.normals = nrm
+        .iter()
+        .map(|nv| {
+            let nv = if flip { -*nv } else { *nv };
+            let nl = nv.magnitude();
+            if nl > 1.0e-12 {
+                [(nv.x / nl) as f32, (nv.y / nl) as f32, (nv.z / nl) as f32]
+            } else {
+                [0.0, 0.0, 1.0]
+            }
+        })
+        .collect();
+    out.indices = if flip {
+        indices.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).collect()
+    } else {
+        indices
+    };
+    Some(out)
 }
 
 /// Build the **cut tool** mesh for a signed cut `distance` (positive sweeps along the
@@ -612,6 +733,22 @@ mod tests {
         let us = union(&cyl_s, &tor_s).expect("exact union builds");
         let usv = mesh_vol(&tessellate(&us, 0.1).mesh);
         assert!(usv > cv + tv * 0.5, "exact union dropped a body: union {usv:.1}, cyl {cv:.1}, torus {tv:.1}");
+    }
+
+    #[test]
+    fn coaxial_revolve_cut_groove_stays_manifold() {
+        // From the user's "bad revolve.hcad": a cylinder (r=57.29, axis +Y, h=189.2) with a torus
+        // groove cut into its wall — the torus tube centre is at r=57.96 about the SAME Y axis,
+        // minor r=21.35. truck's tessellation of this large revolve came out non-watertight, so
+        // Manifold rejected the difference (→ lossy BSP → torn surface / OOM). The direct full-turn
+        // revolve mesh is watertight at any scale, so the cut now stays 2-manifold.
+        let top = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] };
+        let front = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cyl = extrude_tool_mesh(&circle(0.0, 0.0, 57.29, 128), &[], &top, 0.0, 189.2).unwrap();
+        let torus = revolve_tool_mesh(&circle(-57.96, 106.4, 21.35, 128), &[], &front, [0.0, 0.627], [0.0, 211.6], std::f64::consts::TAU).unwrap();
+        assert!(is_manifold(&torus), "the file's torus must be a watertight manifold now");
+        let d = mesh_difference(&cyl, &torus);
+        assert!(!d.indices.is_empty() && is_manifold(&d), "coaxial groove cut not a clean manifold");
     }
 
     #[test]

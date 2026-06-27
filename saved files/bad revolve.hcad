@@ -1,0 +1,135 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+            )),
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+            )),
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+            )),
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Circle(
+                            center: 0,
+                            radius: 57.29241180419922,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 189.19993591308594,
+            ),
+        ),
+        (
+            id: (4),
+            kind: Revolve(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.6268596650837118,
+                            fixed: false,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 212.23850822443165,
+                            fixed: false,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 106.43268394475773,
+                            fixed: false,
+                        ),
+                        (
+                            x: -57.96411895751953,
+                            y: 106.43268394475776,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Line(
+                            a: 0,
+                            b: 1,
+                            construction: true,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 2,
+                            b: 3,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Circle(
+                            center: 3,
+                            radius: 21.350900650024414,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Vertical(0, 1),
+                        Horizontal(2, 3),
+                        Midpoint(
+                            mid: 2,
+                            a: 0,
+                            b: 1,
+                        ),
+                    ],
+                ),
+                regions: [
+                    0,
+                ],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 1.0, 0.0),
+                    normal: (0.0, 0.0, 1.0),
+                    datum: true,
+                ),
+                axis_pt: (0.0, 0.6268596650837118),
+                axis_dir: (0.0, 211.61164855934794),
+                angle: 6.283185307179586,
+                cut: true,
+            ),
+        ),
+    ],
+    rollback: 5,
+    next_id: 5,
+)

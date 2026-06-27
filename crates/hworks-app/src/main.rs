@@ -2973,15 +2973,21 @@ fn ui_system(
                     TreeAction::Select(i) => {
                         // "Edit feature" → reopen the sketch and the PropertyManager
                         // prefilled with the feature's kind/depth (no separate editor).
+                        // (kind, PM value, reverse). Boss/Cut carry a distance; a revolve carries
+                        // its angle in degrees (negative stored angle ⇒ the "spin other way" flag).
                         let op = doc.0.features.get(i).and_then(|f| match &f.kind {
-                            FeatureKind::Extrude { distance, .. } => Some((OpKind::Boss, *distance)),
-                            FeatureKind::Cut { distance, .. } => Some((OpKind::Cut, *distance)),
+                            FeatureKind::Extrude { distance, .. } => Some((OpKind::Boss, (distance.abs() as f32).max(0.1), *distance < 0.0)),
+                            FeatureKind::Cut { distance, .. } => Some((OpKind::Cut, (distance.abs() as f32).max(0.1), *distance < 0.0)),
+                            FeatureKind::Revolve { angle, cut, .. } => Some((
+                                if *cut { OpKind::RevolveCut } else { OpKind::Revolve },
+                                (angle.abs().to_degrees() as f32).clamp(1.0, 360.0),
+                                *angle < 0.0,
+                            )),
                             _ => None,
                         });
-                        if let Some((kind, dist)) = op {
+                        if let Some((kind, depth, reverse)) = op {
                             ui_state.edit_sketch_request = Some(i);
-                            ui_state.pending =
-                                Some(PendingOp { kind, depth: (dist.abs() as f32).max(0.1), reverse: dist < 0.0 });
+                            ui_state.pending = Some(PendingOp { kind, depth, reverse });
                         } else {
                             ui_state.selected = Some(i);
                         }
@@ -5902,6 +5908,31 @@ fn mirror_axis(session: &SketchSession) -> Option<(usize, Vec2, Vec2)> {
     Some((axis, a, b))
 }
 
+/// Find the sketch line entity collinear with a stored revolve axis (point + direction) — used to
+/// re-select the axis when reopening a Revolve feature for editing.
+fn find_axis_line(sketch: &Sketch, axis_pt: [f64; 2], axis_dir: [f64; 2]) -> Option<usize> {
+    let ap = Vec2::new(axis_pt[0] as f32, axis_pt[1] as f32);
+    let ad = Vec2::new(axis_dir[0] as f32, axis_dir[1] as f32).normalize_or_zero();
+    if ad == Vec2::ZERO {
+        return None;
+    }
+    for (i, e) in sketch.entities.iter().enumerate() {
+        if let SketchEntity::Line { a, b, .. } = e {
+            let (pa, pb) = (pt2(sketch, *a), pt2(sketch, *b));
+            let d = (pb - pa).normalize_or_zero();
+            if d == Vec2::ZERO || d.perp_dot(ad).abs() > 1.0e-3 {
+                continue; // not parallel to the stored axis
+            }
+            // Does the stored axis point lie on this line's infinite extension?
+            let off = ap - pa;
+            if (off - d * off.dot(d)).length() < 1.0e-3 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// The revolve axis: the line the user picked (`session.revolve_axis`, any sketch line) as a uv
 /// point and direction. `None` if nothing is picked or it's degenerate.
 fn revolve_axis(session: &SketchSession) -> Option<([f64; 2], [f64; 2])> {
@@ -7855,6 +7886,7 @@ fn handle_edit_sketch(
     mut ui_state: ResMut<UiState>,
     mut session: ResMut<SketchSession>,
     mut doc: ResMut<DocRes>,
+    part: Res<Part>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
     // Start a fresh sketch on a datum plane picked from the tree (works with a body present).
@@ -7862,8 +7894,13 @@ fn handle_edit_sketch(
         if let Some((_, p)) = doc.0.planes().nth(order) {
             let ap = ActivePlane::from_doc(p);
             if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-                orbit.radius = orbit.radius.max(6.0);
-                look_along(&mut orbit, ap.origin, ap.n);
+                // Frame the body (centre + fit radius) so it sits centred in the viewport — aiming
+                // at the plane origin alone would put the part's base at centre, not the part. The
+                // extra 1.4× zooms out a little so the whole part fits with padding (room to draw
+                // a profile beside it).
+                let (center, radius) = fit_view(&part);
+                orbit.radius = (radius * 2.1).max(6.0);
+                look_along(&mut orbit, center, ap.n);
                 *tf = camera_transform(&orbit);
             }
             session.sketch.clear();
@@ -7897,16 +7934,26 @@ fn handle_edit_sketch(
         }
         FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => return,
     };
+    // A revolve also remembers its axis (point + direction) — re-select the matching line so the
+    // PropertyManager's Axis box is filled and the preview shows when reopening it.
+    let axis = match &f.kind {
+        FeatureKind::Revolve { axis_pt, axis_dir, .. } => Some((*axis_pt, *axis_dir)),
+        _ => None,
+    };
     let ap = active_plane_from_ref(&plane, "Face");
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-        orbit.radius = orbit.radius.max(6.0);
-        look_along(&mut orbit, ap.origin, ap.n);
+        // Centre the body (not the plane origin) in the viewport, looking down the sketch normal,
+        // with a little padding (1.4×) so the whole part fits with room to draw.
+        let (center, radius) = fit_view(&part);
+        orbit.radius = (radius * 2.1).max(6.0);
+        look_along(&mut orbit, center, ap.n);
         *tf = camera_transform(&orbit);
     }
     session.sketch = sketch;
     session.plane = Some(ap);
     session.editing = Some(i);
     session.selected_contours = contours;
+    session.revolve_axis = axis.and_then(|(pt, dir)| find_axis_line(&session.sketch, pt, dir));
     session.selected_entities.clear();
     session.pending = None;
     session.dim_first = None;
