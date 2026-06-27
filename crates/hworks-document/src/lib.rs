@@ -25,6 +25,23 @@ pub struct Plane {
     pub origin: [f32; 3],
     pub u: [f32; 3],
     pub v: [f32; 3],
+    /// For a user-created offset plane: how it was built (base + distance), so it can be re-edited.
+    /// `None` for the three standard datum planes.
+    #[serde(default)]
+    pub offset: Option<PlaneOffset>,
+}
+
+/// How a construction plane was built — a base plane/face and a signed offset along its normal —
+/// kept so the plane can be reopened and edited after creation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PlaneOffset {
+    /// Base origin + axes the plane was offset from (the face/plane geometry at creation time).
+    pub base_origin: [f32; 3],
+    pub base_u: [f32; 3],
+    pub base_v: [f32; 3],
+    pub base_name: String,
+    pub distance: f32,
+    pub flip: bool,
 }
 
 /// A geometric reference to the plane a sketch was made on — a reference plane
@@ -106,18 +123,21 @@ impl Document {
             origin: [0.0, 0.0, 0.0],
             u: [1.0, 0.0, 0.0], // +X
             v: [0.0, 1.0, 0.0], // +Y  (normal +Z)
+            offset: None,
         });
         doc.push_plane(Plane {
             name: "Top".into(),
             origin: [0.0, 0.0, 0.0],
             u: [1.0, 0.0, 0.0],  // +X
             v: [0.0, 0.0, -1.0], // -Z  (normal +Y)
+            offset: None,
         });
         doc.push_plane(Plane {
             name: "Right".into(),
             origin: [0.0, 0.0, 0.0],
             u: [0.0, 0.0, -1.0], // -Z
             v: [0.0, 1.0, 0.0],  // +Y  (normal +X)
+            offset: None,
         });
         doc
     }

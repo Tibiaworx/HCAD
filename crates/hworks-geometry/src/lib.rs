@@ -70,9 +70,10 @@ pub fn extrude_solid(
     build_solid(outer, holes, basis, 0.0, distance).map(KSolid)
 }
 
-/// Like [`extrude_solid`] but the prism starts `back` units *behind* the plane,
-/// so a boss built on a face overlaps the body it sits on — avoiding a coplanar
-/// shared face that would make the following union fail.
+/// Like [`extrude_solid`] but the prism overlaps the body by `back` on the side *away* from the
+/// sketch plane's exposed face — so a boss overlaps the body it sits on (avoiding a coplanar shared
+/// face that fails the union) while its plane-side face stays flush. A normal (+) boss dips `back`
+/// behind the plane; a reversed (−) boss keeps its top at the plane and dips its tip past `distance`.
 pub fn extrude_solid_with_overlap(
     outer: &[[f64; 2]],
     holes: &[Vec<[f64; 2]>],
@@ -80,7 +81,8 @@ pub fn extrude_solid_with_overlap(
     distance: f64,
     back: f64,
 ) -> Option<KSolid> {
-    build_solid(outer, holes, basis, -back, distance + back).map(KSolid)
+    let (start, length) = if distance >= 0.0 { (-back, distance + back) } else { (distance - back, -distance + back) };
+    build_solid(outer, holes, basis, start, length).map(KSolid)
 }
 
 /// Boolean union of two solids (boss added to an existing body).

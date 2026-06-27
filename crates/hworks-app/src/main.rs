@@ -22,7 +22,7 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Document, FeatureKind, Plane, PlaneRef};
+use hworks_document::{Document, FeatureKind, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, difference, extrude_solid, extrude_solid_with_overlap,
     extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
@@ -121,7 +121,7 @@ fn main() {
         .init_resource::<Part>()
         // Seamless on by default — build with the robust mesh kernel so shared/coincident
         // walls fuse without a seam. Toggle off in the toolbar for exact B-rep faces.
-        .insert_resource(UiState { seamless: true, ..Default::default() })
+        .insert_resource(UiState { seamless: true, plane_size: PLANE_SIZE, ..Default::default() })
         .init_resource::<UiBlocking>()
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
@@ -153,6 +153,8 @@ fn main() {
                 (
                     handle_new_part,
                     highlight_face,
+                    sync_ref_planes,
+                    scale_ref_planes,
                     update_plane_visibility,
                     update_body_transparency,
                     draw_selected_plane,
@@ -329,6 +331,19 @@ struct PendingOp {
     reverse: bool,
 }
 
+/// PropertyManager state for creating a reference (construction) plane offset from a base — a datum
+/// plane *or* a picked body face — the groundwork for lofts (each profile on its own plane). The
+/// base is stored as a full plane so it works for either source; `base_name` is for display.
+#[derive(Clone)]
+struct PlaneSpec {
+    base: ActivePlane,
+    base_name: String,
+    offset: f32,
+    flip: bool,
+    /// When editing an existing plane: the feature index to replace in place (else append a new one).
+    edit_target: Option<usize>,
+}
+
 #[derive(Resource, Default)]
 struct UiState {
     pending: Option<PendingOp>,
@@ -355,6 +370,11 @@ struct UiState {
     selected_plane: Option<usize>,
     /// Request to start a *fresh* sketch on datum plane N (by order). Consumed by handle_edit_sketch.
     sketch_plane_request: Option<usize>,
+    /// Reference-plane creation PropertyManager (offset plane), when open.
+    plane_spec: Option<PlaneSpec>,
+    /// Display size (edge length) of the reference-plane quads/outlines — adjustable so planes can
+    /// be made large enough to see/use on a big part. Defaults to `PLANE_SIZE`.
+    plane_size: f32,
     /// Show smooth/tangent edges in the viewport (off = SolidWorks-style removed).
     show_tangent_edges: bool,
     /// Active CommandManager tab.
@@ -680,6 +700,13 @@ struct SketchSession {
     /// Live inference guide lines (uv → uv) to draw dotted this frame — SolidWorks-style
     /// alignment/extension/tangent hints showing why the cursor snapped where it did.
     inference_guides: Vec<(Vec2, Vec2)>,
+    /// Sketch point the cursor is currently vertically / horizontally aligned with (inference).
+    /// On placing the point these become captured Vertical/Horizontal relations so the alignment
+    /// survives later edits. `start_infer` snapshots them at the first click of a two-click tool
+    /// so the *start* endpoint also captures its alignment.
+    infer_v: Option<usize>,
+    infer_h: Option<usize>,
+    start_infer: (Option<usize>, Option<usize>),
     /// Entity (line/circle) under the cursor in Select mode, highlighted on hover.
     hover_entity: Option<usize>,
     /// Reference snap points (uv) from the body's edges lying in the sketch plane —
@@ -774,7 +801,6 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut gizmo_store: ResMut<GizmoConfigStore>,
-    doc: Res<DocRes>,
 ) {
     // Overlay gizmos draw in front of the solid so the extrude preview/arrow and the
     // cut-depth indicator are visible through the model.
@@ -782,34 +808,9 @@ fn setup(
     // Drawn sketch lines are a touch thicker than the grid/markers for visibility.
     gizmo_store.config_mut::<ProfileGizmos>().0.line.width = 3.2;
 
-    let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
-    let colors = [
-        Color::srgba(0.85, 0.25, 0.25, 0.16),
-        Color::srgba(0.25, 0.75, 0.30, 0.16),
-        Color::srgba(0.25, 0.45, 0.90, 0.16),
-    ];
-    for (i, (_id, plane)) in doc.0.planes().enumerate() {
-        let ap = ActivePlane::from_doc(plane);
-        let rotation = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
-        let material = materials.add(StandardMaterial {
-            base_color: colors[i % colors.len()],
-            alpha_mode: AlphaMode::Blend,
-            cull_mode: None,
-            double_sided: true,
-            // Distinct bias per plane so the three transparent quads sort
-            // deterministically instead of flickering as the camera moves.
-            depth_bias: i as f32,
-            ..default()
-        });
-        commands.spawn((
-            Mesh3d(plane_mesh.clone()),
-            MeshMaterial3d(material),
-            Transform { translation: ap.origin, rotation, ..default() },
-            Name::new(plane.name.clone()),
-            RefPlane,
-            RefPlaneIdx(i),
-        ));
-    }
+    // Reference-plane quads (Front/Top/Right, plus any the user creates later) are spawned by
+    // `sync_ref_planes` from the document — keeping one source of truth so New Part / added planes
+    // stay in sync.
 
     commands.spawn((
         DirectionalLight { illuminance: 6_000.0, shadows_enabled: false, ..default() },
@@ -1502,6 +1503,13 @@ fn ui_system(
                             ui_state.pending_mirror = None;
                         }
                     });
+                    ui.separator();
+                    // Reference geometry — always available (you can build a plane with no body yet).
+                    if ui.button("Plane").on_hover_text("Create a reference plane offset from a plane or a picked face — then sketch on it (e.g. stacked loft profiles)").clicked() {
+                        if let Some((_, p)) = doc.0.planes().next() {
+                            ui_state.plane_spec = Some(PlaneSpec { base: ActivePlane::from_doc(p), base_name: p.name.clone(), offset: 10.0, flip: false, edit_target: None });
+                        }
+                    }
                 }
             }
         });
@@ -1982,7 +1990,7 @@ fn ui_system(
             egui::ScrollArea::vertical().id_salt("fillet_edge_list").max_height(140.0).show(ui, |ui| {
                 for i in 0..n_edges {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✕").on_hover_text("Remove this edge").clicked() {
+                        if ui.small_button("✖").on_hover_text("Remove this edge").clicked() {
                             remove = Some(i);
                         }
                         ui.label(format!("Edge {}", i + 1));
@@ -2068,7 +2076,7 @@ fn ui_system(
             egui::ScrollArea::vertical().id_salt("chamfer_edge_list").max_height(140.0).show(ui, |ui| {
                 for i in 0..n_edges {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✕").on_hover_text("Remove this edge").clicked() {
+                        if ui.small_button("✖").on_hover_text("Remove this edge").clicked() {
                             remove = Some(i);
                         }
                         ui.label(format!("Edge {}", i + 1));
@@ -2211,6 +2219,104 @@ fn ui_system(
                 ui_state.regen = true;
             } else {
                 ui_state.pending_thread = Some(spec);
+            }
+        }
+        if let Some(mut spec) = ui_state.plane_spec.clone() {
+            // Reference-plane PropertyManager: a plane parallel to a base (a datum plane or a picked
+            // body face), offset along its normal. Live preview + drag arrow in the viewport.
+            ui.heading("Reference Plane");
+            let datums: Vec<(String, ActivePlane)> = doc.0.planes().map(|(_, p)| (p.name.clone(), ActivePlane::from_doc(p))).collect();
+            let mut keep = true;
+            let mut create = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    create = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    keep = false;
+                }
+            });
+            ui.separator();
+            ui.label("Reference (offset from)");
+            egui::ComboBox::from_id_salt("plane_base").selected_text(&spec.base_name).show_ui(ui, |ui| {
+                for (n, ap) in &datums {
+                    if ui.selectable_label(spec.base_name == *n, n).clicked() {
+                        spec.base = ap.clone();
+                        spec.base_name = n.clone();
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("…or click a body face in the viewport.").italics().weak().small());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Distance");
+                ui.add(egui::DragValue::new(&mut spec.offset).speed(0.5).range(0.0..=100_000.0).suffix(" mm"));
+            });
+            ui.checkbox(&mut spec.flip, "Flip to the other side");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Plane size");
+                let mut sz = ui_state.plane_size.max(1.0);
+                if ui.add(egui::DragValue::new(&mut sz).speed(0.5).range(1.0..=100_000.0).suffix(" mm")).on_hover_text("Display size of every reference plane — make it larger to see/use on a big part").changed() {
+                    ui_state.plane_size = sz;
+                }
+            });
+            ui.label(egui::RichText::new("Drag the arrow in the viewport to set the offset, or\ntype it above. Double-click the plane in the tree to sketch.").weak().small());
+
+            if create {
+                let ap = &spec.base;
+                let nrm = ap.n.normalize_or_zero();
+                let off = if spec.flip { -spec.offset } else { spec.offset };
+                let origin = ap.origin + nrm * off;
+                // Editing keeps the existing name; a new plane is the next Plane#.
+                let name = match spec.edit_target.and_then(|fi| doc.0.features.get(fi)) {
+                    Some(f) => match &f.kind {
+                        FeatureKind::Plane(p) => p.name.clone(),
+                        _ => format!("Plane{}", doc.0.planes().count().saturating_sub(2)),
+                    },
+                    None => format!("Plane{}", doc.0.planes().count().saturating_sub(2)),
+                };
+                let plane = Plane {
+                    name,
+                    origin: [origin.x, origin.y, origin.z],
+                    u: [ap.u.x, ap.u.y, ap.u.z],
+                    v: [ap.v.x, ap.v.y, ap.v.z],
+                    offset: Some(PlaneOffset {
+                        base_origin: [ap.origin.x, ap.origin.y, ap.origin.z],
+                        base_u: [ap.u.x, ap.u.y, ap.u.z],
+                        base_v: [ap.v.x, ap.v.y, ap.v.z],
+                        base_name: spec.base_name.clone(),
+                        distance: spec.offset,
+                        flip: spec.flip,
+                    }),
+                };
+                match spec.edit_target {
+                    Some(fi) if fi < doc.0.features.len() => doc.0.features[fi].kind = FeatureKind::Plane(plane),
+                    _ => {
+                        doc.0.add_feature(FeatureKind::Plane(plane));
+                    }
+                }
+                ui_state.regen = true; // a moved plane shifts any sketch/feature built on it
+                keep = false;
+            }
+            ui_state.plane_spec = if keep { Some(spec) } else { None };
+        }
+        // A datum/construction plane selected in the tree: quick size control + a Sketch button.
+        if ui_state.plane_spec.is_none() && ui_state.pending.is_none() && session.plane.is_none() {
+            if let Some(order) = ui_state.selected_plane {
+                let name = doc.0.planes().nth(order).map(|(_, p)| p.name.clone()).unwrap_or_default();
+                ui.heading(format!("Plane: {name}"));
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    let mut sz = ui_state.plane_size.max(1.0);
+                    if ui.add(egui::DragValue::new(&mut sz).speed(0.5).range(1.0..=100_000.0).suffix(" mm")).on_hover_text("Display size of the reference planes").changed() {
+                        ui_state.plane_size = sz;
+                    }
+                });
+                if ui.button("Sketch on this plane").clicked() {
+                    ui_state.sketch_plane_request = Some(order);
+                }
+                ui.separator();
             }
         }
         if let Some(mut op) = ui_state.pending.clone() {
@@ -2747,9 +2853,16 @@ fn ui_system(
                 // Datum planes + origin, shown flat at the top like SolidWorks. Click a plane to
                 // select/show it; double-click (or right-click → Sketch) to sketch on it — works
                 // even with a body present, so you can cut/revolve through the part's centre.
-                for (order, (_id, p)) in doc.0.planes().enumerate() {
+                // Snapshot (order, name, feature index, offset) so the borrow ends before we mutate.
+                let plane_rows: Vec<(usize, String, Option<usize>, Option<PlaneOffset>)> = doc
+                    .0
+                    .planes()
+                    .enumerate()
+                    .map(|(order, (id, p))| (order, p.name.clone(), doc.0.features.iter().position(|f| f.id == *id), p.offset.clone()))
+                    .collect();
+                for (order, name, feat_idx, offset) in plane_rows {
                     let sel = ui_state.selected_plane == Some(order);
-                    let resp = ui.selectable_label(sel, egui::RichText::new(format!("▱  {} Plane", p.name)).weak());
+                    let resp = ui.selectable_label(sel, egui::RichText::new(format!("▱  {name} Plane")).weak());
                     if resp.clicked() {
                         ui_state.selected_plane = if sel { None } else { Some(order) };
                         ui_state.selected = None;
@@ -2763,6 +2876,21 @@ fn ui_system(
                             ui_state.selected_plane = Some(order);
                             ui_state.sketch_plane_request = Some(order);
                             ui.close();
+                        }
+                        // Only user-created offset planes carry construction info to edit.
+                        if let (Some(off), Some(fi)) = (&offset, feat_idx) {
+                            if ui.button("Edit plane").clicked() {
+                                let base = ActivePlane {
+                                    name: off.base_name.clone(),
+                                    origin: Vec3::from_array(off.base_origin),
+                                    u: Vec3::from_array(off.base_u),
+                                    v: Vec3::from_array(off.base_v),
+                                    n: Vec3::from_array(off.base_u).cross(Vec3::from_array(off.base_v)),
+                                    datum: true,
+                                };
+                                ui_state.plane_spec = Some(PlaneSpec { base, base_name: off.base_name.clone(), offset: off.distance, flip: off.flip, edit_target: Some(fi) });
+                                ui.close();
+                            }
                         }
                     });
                 }
@@ -2851,14 +2979,19 @@ fn ui_system(
                             });
                             resp.header_response.rect
                         }
-                        FeatureKind::Revolve { angle, .. } => {
-                            ex += 1;
-                            let label = format!("Revolve{ex}  ({:.0}°)", angle.to_degrees());
+                        FeatureKind::Revolve { angle, cut, .. } => {
+                            let (label, child) = if *cut {
+                                ct += 1;
+                                (format!("RevCut{ct}  ({:.0}°)", angle.to_degrees()), format!("✎ Sketch of RevCut{ct}"))
+                            } else {
+                                ex += 1;
+                                (format!("Revolve{ex}  ({:.0}°)", angle.to_degrees()), format!("✎ Sketch of Revolve{ex}"))
+                            };
                             let resp = egui::CollapsingHeader::new(styled(format!("⏀ {label}")))
                                 .id_salt(i)
                                 .default_open(false)
                                 .show(ui, |ui| {
-                                    let child_resp = ui.selectable_label(false, egui::RichText::new(format!("✎ Sketch of Revolve{ex}")).weak());
+                                    let child_resp = ui.selectable_label(false, egui::RichText::new(child).weak());
                                     child_resp.context_menu(|ui| {
                                         if ui.button("Edit sketch").clicked() {
                                             action = Some(TreeAction::Edit(i));
@@ -2870,6 +3003,10 @@ fn ui_system(
                                 ui_state.selected = Some(i);
                             }
                             resp.header_response.context_menu(|ui| {
+                                if ui.button("Edit feature (angle/axis)").clicked() {
+                                    action = Some(TreeAction::Select(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -3571,6 +3708,27 @@ fn ui_system(
     }
 
     // ---- Error banner: a failed operation (e.g. a boolean the kernel rejected) ----
+    // World-axis labels (X/Y/Z) at the axis tips while starting a part (no body, not sketching),
+    // matching the coloured gizmo axis lines so the reference-plane orientation is readable.
+    if part.solid.is_none() && part.mesh.is_none() && session.plane.is_none() {
+        if let Ok((camera, cam_gt)) = cam_read.single() {
+            for (world, label, color) in [
+                (Vec3::X * 5.2, "X", egui::Color32::from_rgb(255, 80, 80)),
+                (Vec3::Y * 5.2, "Y", egui::Color32::from_rgb(90, 230, 90)),
+                (Vec3::Z * 5.2, "Z", egui::Color32::from_rgb(110, 150, 255)),
+            ] {
+                if let Ok(p) = camera.world_to_viewport(cam_gt, world) {
+                    egui::Area::new(egui::Id::new(("axislabel", label)))
+                        .order(egui::Order::Middle)
+                        .fixed_pos(egui::pos2(p.x - 5.0, p.y - 9.0))
+                        .show(ctx, |ui| {
+                            ui.label(egui::RichText::new(label).size(16.0).strong().color(color));
+                        });
+                }
+            }
+        }
+    }
+
     if let Some(msg) = ui_state.last_error.clone() {
         let mut dismiss = false;
         let screen = ctx.screen_rect();
@@ -3588,7 +3746,7 @@ fn ui_system(
                             ui.label(egui::RichText::new("⚠").size(18.0).color(egui::Color32::from_rgb(255, 170, 80)));
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(255, 225, 225)).strong());
-                            if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                            if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
                                 dismiss = true;
                             }
                         });
@@ -3643,48 +3801,87 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2, snap: f32) -> usize {
     nearest_point(sketch, uv, snap).unwrap_or_else(|| sketch.add_point(uv.x as f64, uv.y as f64))
 }
 
+/// Lock an active inference alignment into a real relation when its point is placed: a shared-X
+/// alignment (`v`) becomes `Vertical(p, anchor)`, a shared-Y alignment (`h`) becomes
+/// `Horizontal(p, anchor)`, so the "even with that point" alignment survives later edits — exactly
+/// like clicking an inference in SolidWorks. Skips self / duplicate / stale-index anchors.
+fn capture_inference(sketch: &mut Sketch, p: usize, v: Option<usize>, h: Option<usize>) {
+    let n = sketch.points.len();
+    let has = |sk: &Sketch, vert: bool, a: usize, b: usize| {
+        sk.constraints.iter().any(|c| match c {
+            Constraint::Vertical(x, y) if vert => (*x == a && *y == b) || (*x == b && *y == a),
+            Constraint::Horizontal(x, y) if !vert => (*x == a && *y == b) || (*x == b && *y == a),
+            _ => false,
+        })
+    };
+    if let Some(a) = v {
+        if a != p && a < n && p < n && !has(sketch, true, p, a) {
+            sketch.constraints.push(Constraint::Vertical(p, a));
+        }
+    }
+    if let Some(a) = h {
+        if a != p && a < n && p < n && !has(sketch, false, p, a) {
+            sketch.constraints.push(Constraint::Horizontal(p, a));
+        }
+    }
+}
+
 /// SolidWorks-style inferencing: when the cursor lines up with existing geometry, nudge it onto
 /// the alignment and report dotted guide segments (uv→uv) explaining the snap. Priority, highest
 /// first: horizontal/vertical alignment with an existing point (the dotted "even with" line you
 /// see in SolidWorks) → collinear extension of a nearby line → tangent off the in-progress line's
 /// start when that start sits on a circle/arc. `start` is the rubber-band's anchor (if any).
-fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f32) -> (Vec2, Vec<(Vec2, Vec2)>) {
+/// Result of inferencing: the (possibly snapped) cursor, dotted guides to draw, and — for relation
+/// capture — the sketch point this cursor is now vertically / horizontally aligned with (if any).
+struct Inference {
+    uv: Vec2,
+    guides: Vec<(Vec2, Vec2)>,
+    /// Sketch point sharing the cursor's X (a Vertical relation can be captured against it).
+    v_anchor: Option<usize>,
+    /// Sketch point sharing the cursor's Y (a Horizontal relation can be captured against it).
+    h_anchor: Option<usize>,
+}
+
+fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f32) -> Inference {
     let mut out = cur;
     let mut guides: Vec<(Vec2, Vec2)> = Vec::new();
+    let none = |uv, guides| Inference { uv, guides, v_anchor: None, h_anchor: None };
 
-    // Anchor points to align to: every sketch point + body reference points + the origin (centre).
-    let mut anchors: Vec<Vec2> = session.sketch.points.iter().map(|p| Vec2::new(p.x as f32, p.y as f32)).collect();
-    anchors.extend_from_slice(&session.reference_points);
-    anchors.push(Vec2::ZERO);
+    // Anchor points to align to: every sketch point (capturable, carries its index) + body
+    // reference points + the origin (centre) — the latter two align/snap but can't be constrained.
+    let mut anchors: Vec<(Vec2, Option<usize>)> =
+        session.sketch.points.iter().enumerate().map(|(i, p)| (Vec2::new(p.x as f32, p.y as f32), Some(i))).collect();
+    anchors.extend(session.reference_points.iter().map(|p| (*p, None)));
+    anchors.push((Vec2::ZERO, None));
 
     // --- Horizontal / vertical alignment with an anchor point ---
     // Pick the closest anchor sharing the cursor's X (vertical guide) and the closest sharing its
     // Y (horizontal guide); they can both fire, snapping the cursor onto their crossing.
-    let mut vx: Option<Vec2> = None; // anchor with matching X → vertical guide
-    let mut hy: Option<Vec2> = None; // anchor with matching Y → horizontal guide
-    for a in &anchors {
-        if (a.x - cur.x).abs() <= tol && (a.y - cur.y).abs() > tol && vx.map_or(true, |b: Vec2| (a.x - cur.x).abs() < (b.x - cur.x).abs()) {
-            vx = Some(*a);
+    let mut vx: Option<(Vec2, Option<usize>)> = None; // anchor with matching X → vertical guide
+    let mut hy: Option<(Vec2, Option<usize>)> = None; // anchor with matching Y → horizontal guide
+    for &(a, idx) in &anchors {
+        if (a.x - cur.x).abs() <= tol && (a.y - cur.y).abs() > tol && vx.map_or(true, |(b, _): (Vec2, _)| (a.x - cur.x).abs() < (b.x - cur.x).abs()) {
+            vx = Some((a, idx));
         }
-        if (a.y - cur.y).abs() <= tol && (a.x - cur.x).abs() > tol && hy.map_or(true, |b: Vec2| (a.y - cur.y).abs() < (b.y - cur.y).abs()) {
-            hy = Some(*a);
+        if (a.y - cur.y).abs() <= tol && (a.x - cur.x).abs() > tol && hy.map_or(true, |(b, _): (Vec2, _)| (a.y - cur.y).abs() < (b.y - cur.y).abs()) {
+            hy = Some((a, idx));
         }
     }
-    if let Some(a) = vx {
+    if let Some((a, _)) = vx {
         out.x = a.x;
     }
-    if let Some(a) = hy {
+    if let Some((a, _)) = hy {
         out.y = a.y;
     }
     if vx.is_some() || hy.is_some() {
-        if let Some(a) = vx {
+        if let Some((a, _)) = vx {
             guides.push((a, Vec2::new(out.x, a.y))); // a → straight up/down to the cursor row
             guides.push((Vec2::new(out.x, a.y), out));
         }
-        if let Some(a) = hy {
+        if let Some((a, _)) = hy {
             guides.push((a, out));
         }
-        return (out, guides);
+        return Inference { uv: out, guides, v_anchor: vx.and_then(|(_, i)| i), h_anchor: hy.and_then(|(_, i)| i) };
     }
 
     // --- Collinear: snap onto the infinite extension of a nearby (non-reference) line ---
@@ -3712,7 +3909,7 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
         }
     }
     if let Some((_, proj, near)) = best {
-        return (proj, vec![(near, proj)]);
+        return none(proj, vec![(near, proj)]);
     }
 
     // --- Tangent: if the rubber-band started on a circle/arc rim, snap the line tangent there ---
@@ -3744,13 +3941,13 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
                 let along = (cur - s).dot(td);
                 let proj = s + td * along;
                 if cur.distance(proj) <= tol {
-                    return (proj, vec![(s, proj)]);
+                    return none(proj, vec![(s, proj)]);
                 }
             }
         }
     }
 
-    (out, guides)
+    none(out, guides)
 }
 
 /// Where to place the endpoint `i` while it's being dragged: snap onto the nearest *other*
@@ -4861,6 +5058,8 @@ fn sketch_interaction(
     // a circle the rubber-band started on) and nudge it onto that alignment, drawing dotted hints.
     // Yields to a genuine coincident point snap so connections aren't pulled off.
     session.inference_guides.clear();
+    session.infer_v = None;
+    session.infer_h = None;
     let drawing_tool = matches!(
         session.tool,
         Tool::Line | Tool::Circle | Tool::Arc | Tool::Rectangle | Tool::Slot | Tool::Polygon | Tool::Spline
@@ -4870,9 +5069,11 @@ fn sketch_interaction(
             let coincident = nearest_point(&session.sketch, cur, snap * 0.5).is_some()
                 || session.reference_points.iter().any(|r| r.distance(cur) <= snap * 0.5);
             if !coincident {
-                let (snapped, guides) = infer_cursor(&session, cur, session.pending, snap * 0.8);
-                session.cursor_uv = Some(snapped);
-                session.inference_guides = guides;
+                let inf = infer_cursor(&session, cur, session.pending, snap * 0.8);
+                session.cursor_uv = Some(inf.uv);
+                session.inference_guides = inf.guides;
+                session.infer_v = inf.v_anchor;
+                session.infer_h = inf.h_anchor;
             }
         }
     }
@@ -5031,6 +5232,38 @@ fn sketch_interaction(
         }
     }
 
+    // Reference-plane creation: drag the offset arrow, or click a face / datum plane to set the
+    // base to offset from. (Swallows viewport interaction while the Plane PM is open.)
+    if ui_state.plane_spec.is_some() && session.plane.is_none() {
+        if plane_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
+            return;
+        }
+        if just_pressed {
+            let mut best: Option<(f32, ActivePlane, String)> = None;
+            for (_id, p) in doc.0.planes() {
+                let ap = ActivePlane::from_doc(p);
+                if let Some((t, uv)) = ray_plane(&ap, &ray) {
+                    let half = ui_state.plane_size.max(1.0) * 0.5;
+                    if uv.x.abs() <= half && uv.y.abs() <= half && best.as_ref().map_or(true, |(bt, _, _)| t < *bt) {
+                        best = Some((t, ap, p.name.clone()));
+                    }
+                }
+            }
+            if let Some(mesh) = &part.mesh {
+                if let Some((t, ap)) = pick_face(mesh, &ray) {
+                    if best.as_ref().map_or(true, |(bt, _, _)| t < *bt) {
+                        best = Some((t, ap, "Face".to_string()));
+                    }
+                }
+            }
+            if let (Some((_, ap, name)), Some(spec)) = (best, ui_state.plane_spec.as_mut()) {
+                spec.base = ap;
+                spec.base_name = name;
+            }
+        }
+        return;
+    }
+
     if session.plane.is_none() {
         if just_pressed {
             // A click near a body edge selects that edge/loop (and flashes its key
@@ -5055,7 +5288,7 @@ fn sketch_interaction(
                 for (_id, p) in doc.0.planes() {
                     let ap = ActivePlane::from_doc(p);
                     if let Some((t, uv)) = ray_plane(&ap, &ray) {
-                        let half = PLANE_SIZE * 0.5;
+                        let half = ui_state.plane_size.max(1.0) * 0.5;
                         if uv.x.abs() <= half && uv.y.abs() <= half {
                             if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
                                 best = Some((t, ap));
@@ -7066,6 +7299,13 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 let a = get_or_add_point_ref(session, start, snap);
                 let b = get_or_add_point_ref(session, uv, snap);
                 session.sketch.add_line(a, b, session.construction);
+                // Capture the SolidWorks-style inference alignments as real relations: the cursor
+                // endpoint `b` against this frame's inference, the start `a` against the snapshot
+                // taken at its (first) click.
+                let (sv, sh) = session.start_infer;
+                capture_inference(&mut session.sketch, a, sv, sh);
+                capture_inference(&mut session.sketch, b, session.infer_v, session.infer_h);
+                session.start_infer = (None, None);
                 // Persist the square/perpendicular relation the 90° snap implied, so resizing
                 // keeps the sketch square (the shared point already keeps lines connected).
                 add_square_relations(&mut session.sketch, a, b);
@@ -7090,6 +7330,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             } else {
                 session.pending = Some(uv);
                 session.pending_edge = session.cursor_edge; // remember the start's edge
+                session.start_infer = (session.infer_v, session.infer_h); // capture start's alignment
                 session.request_live_focus = true;
             }
         }
@@ -8223,8 +8464,16 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                             // ~1mm is plenty to bury the join in well-formed triangles; never
                             // dip past the body's far side.
                             let overlap = ((behind * 0.5).min(1.0).max(0.05)).min(behind.max(0.0)) as f64;
+                            // Dip into the body on the side AWAY from the sketch plane so the
+                            // plane-side face stays flush: a normal (+) boss dips below the plane;
+                            // a reversed (−) boss keeps its top at the plane and dips its tip down.
+                            let (start, length) = if *distance >= 0.0 {
+                                (-overlap, distance + overlap)
+                            } else {
+                                (distance - overlap, -distance + overlap)
+                            };
                             Some(
-                                extrude_tool_mesh(&r.outer, &r.holes, &basis, -overlap, distance + overlap)
+                                extrude_tool_mesh(&r.outer, &r.holes, &basis, start, length)
                                     .map(|tool| mesh_union(&b, &tool))
                                     .unwrap_or(b),
                             )
@@ -9336,6 +9585,7 @@ fn handle_new_part(
     for e in &existing {
         commands.entity(e).despawn();
     }
+    // Reference-plane quads resync via `sync_ref_planes` once the doc resets to default planes.
     part.solid = None;
     part.mesh = None;
     part.edges.clear();
@@ -9508,6 +9758,68 @@ fn update_plane_visibility(
     }
 }
 
+/// Keep the reference-plane quads in sync with the document: the default Front/Top/Right plus any
+/// the user creates (an offset construction plane). On a mismatch (a plane added, or New Part /
+/// Open changing the set) it respawns the whole set, so user-created planes show in the viewport
+/// and are pickable/sketchable exactly like the defaults.
+fn sync_ref_planes(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    doc: Res<DocRes>,
+    existing: Query<(Entity, &RefPlaneIdx)>,
+) {
+    let have = existing.iter().count();
+    let want = doc.0.planes().count();
+    if have == want {
+        return;
+    }
+    for (e, _) in &existing {
+        commands.entity(e).despawn();
+    }
+    let plane_mesh = meshes.add(Rectangle::new(PLANE_SIZE, PLANE_SIZE));
+    for (i, (_id, plane)) in doc.0.planes().enumerate() {
+        let ap = ActivePlane::from_doc(plane);
+        let rotation = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
+        // Front/Top/Right keep their red/green/blue tint; user-created planes are amber.
+        let base_color = [
+            Color::srgba(0.85, 0.25, 0.25, 0.16),
+            Color::srgba(0.25, 0.75, 0.30, 0.16),
+            Color::srgba(0.25, 0.45, 0.90, 0.16),
+        ]
+        .get(i)
+        .copied()
+        .unwrap_or(Color::srgba(0.85, 0.75, 0.30, 0.16));
+        let material = materials.add(StandardMaterial {
+            base_color,
+            alpha_mode: AlphaMode::Blend,
+            cull_mode: None,
+            double_sided: true,
+            depth_bias: i as f32,
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(plane_mesh.clone()),
+            MeshMaterial3d(material),
+            Transform { translation: ap.origin, rotation, ..default() },
+            Name::new(plane.name.clone()),
+            RefPlane,
+            RefPlaneIdx(i),
+        ));
+    }
+}
+
+/// Scale the reference-plane quads to the user's chosen display size (they're spawned at the base
+/// `PLANE_SIZE`), so planes can be enlarged to suit a big part without rebuilding the mesh.
+fn scale_ref_planes(ui_state: Res<UiState>, mut q: Query<&mut Transform, With<RefPlane>>) {
+    let s = (ui_state.plane_size.max(1.0) / PLANE_SIZE).max(0.01);
+    for mut t in &mut q {
+        if (t.scale.x - s).abs() > 1.0e-4 {
+            t.scale = Vec3::splat(s);
+        }
+    }
+}
+
 /// See-through mechanic: while sketching, fade the body to translucent so a sketch on an internal
 /// datum plane (e.g. a revolve-cut profile through the centre) is visible *through* the solid.
 /// Restores it to opaque when you leave the sketch. (SolidWorks does the same.)
@@ -9540,24 +9852,40 @@ fn draw_selected_plane(
     if session.plane.is_some() {
         return;
     }
+    let h = ui_state.plane_size.max(1.0) * 0.5;
+    // Outline a plane (centre + in-plane axes u,v) as a rectangle with diagonals.
+    let outline = |gizmos: &mut Gizmos, center: Vec3, u: Vec3, v: Vec3, col: Color, faint: Color| {
+        let c = [center - u * h - v * h, center + u * h - v * h, center + u * h + v * h, center - u * h + v * h];
+        for k in 0..4 {
+            gizmos.line(c[k], c[(k + 1) % 4], col);
+        }
+        gizmos.line(c[0], c[2], faint);
+        gizmos.line(c[1], c[3], faint);
+    };
+
+    // Construction-plane creation preview: the offset plane outline + a draggable normal arrow.
+    if let Some(spec) = &ui_state.plane_spec {
+        let ap = &spec.base;
+        let n = ap.n.normalize_or_zero();
+        let signed = if spec.flip { -spec.offset } else { spec.offset };
+        let center = ap.origin + n * signed;
+        outline(&mut gizmos, center, ap.u, ap.v, Color::srgba(1.0, 0.8, 0.3, 0.95), Color::srgba(1.0, 0.8, 0.3, 0.3));
+        // Normal arrow from the base origin out to the new plane.
+        let arrow = Color::srgb(1.0, 0.6, 0.2);
+        gizmos.line(ap.origin, center, arrow);
+        let dir = (center - ap.origin).normalize_or_zero();
+        if dir != Vec3::ZERO {
+            let head = (signed.abs() * 0.18).clamp(0.3, 2.0);
+            for s in [ap.u, -ap.u, ap.v, -ap.v] {
+                gizmos.line(center, center - dir * head + s.normalize_or_zero() * (head * 0.5), arrow);
+            }
+        }
+    }
+
     let Some(order) = ui_state.selected_plane else { return };
     let Some((_, p)) = doc.0.planes().nth(order) else { return };
     let ap = ActivePlane::from_doc(p);
-    let h = PLANE_SIZE * 0.5;
-    let col = Color::srgba(0.45, 0.8, 1.0, 0.9);
-    let c = [
-        ap.to_world(Vec2::new(-h, -h)),
-        ap.to_world(Vec2::new(h, -h)),
-        ap.to_world(Vec2::new(h, h)),
-        ap.to_world(Vec2::new(-h, h)),
-    ];
-    for k in 0..4 {
-        gizmos.line(c[k], c[(k + 1) % 4], col);
-    }
-    // Faint diagonals so it reads as a plane even edge-on.
-    let faint = Color::srgba(0.45, 0.8, 1.0, 0.35);
-    gizmos.line(c[0], c[2], faint);
-    gizmos.line(c[1], c[3], faint);
+    outline(&mut gizmos, ap.origin, ap.u, ap.v, Color::srgba(0.45, 0.8, 1.0, 0.9), Color::srgba(0.45, 0.8, 1.0, 0.35));
 }
 
 fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
@@ -9582,15 +9910,16 @@ fn draw_sketch(
     let Some(ap) = &session.plane else { return };
     let radius = cam_q.single().map(|c| c.radius).unwrap_or(12.0);
 
-    // Lift the whole sketch a hair off its plane toward the camera. When you sketch on a solid
-    // face the geometry is exactly coplanar with that face and z-fights with it — flickering or
-    // vanishing until you orbit. A tiny zoom-relative offset along the camera-facing normal wins
-    // the depth test without visibly leaving the face. (Picking still uses the true plane.)
+    // Lift the whole sketch a hair off its plane toward the camera ONLY when sketching on a body
+    // face: there the geometry is coplanar with that face and z-fights with it (flicker/vanish).
+    // A datum/construction plane has no coplanar face to fight, so it isn't lifted — the lift
+    // scales with zoom and would otherwise show as a small gap between the sketch and an extrusion
+    // drawn from the true plane. (Picking always uses the true plane.)
     let lifted;
     let ap = {
         let eye = cam_q.single().map(|c| camera_transform(c).translation).unwrap_or(ap.origin + ap.n);
         let sign = if (eye - ap.origin).dot(ap.n) >= 0.0 { 1.0 } else { -1.0 };
-        let lift = ap.n * (radius.max(1e-3) * 2.0e-3 * sign);
+        let lift = if ap.datum { Vec3::ZERO } else { ap.n * (radius.max(1e-3) * 2.0e-3 * sign) };
         lifted = ActivePlane { name: ap.name.clone(), origin: ap.origin + lift, u: ap.u, v: ap.v, n: ap.n, datum: ap.datum };
         &lifted
     };
@@ -9630,6 +9959,33 @@ fn draw_sketch(
         let os = 0.22 * ms;
         gizmos.line(ap.to_world(Vec2::new(-os, 0.0)), ap.to_world(Vec2::new(os, 0.0)), Color::srgb(1.0, 0.35, 0.35));
         gizmos.line(ap.to_world(Vec2::new(0.0, -os)), ap.to_world(Vec2::new(0.0, os)), Color::srgb(0.4, 1.0, 0.4));
+    }
+
+    // The active sketch plane's outline — a faint bordered rectangle around the sketch, so when
+    // you sketch on an offset/construction plane it reads as floating off the nearby geometry
+    // (not lying on it). Sized to enclose the sketch content, with a margin.
+    {
+        let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for p in &session.sketch.points {
+            let v = Vec2::new(p.x as f32, p.y as f32);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let (cen, half) = if lo.x.is_finite() {
+            ((lo + hi) * 0.5, ((hi - lo).max_element() * 0.65).max(PLANE_SIZE * 0.5))
+        } else {
+            (Vec2::ZERO, PLANE_SIZE * 0.5)
+        };
+        let border = Color::srgba(0.5, 0.72, 1.0, 0.3);
+        let bc = [
+            cen + Vec2::new(-half, -half),
+            cen + Vec2::new(half, -half),
+            cen + Vec2::new(half, half),
+            cen + Vec2::new(-half, half),
+        ];
+        for k in 0..4 {
+            gizmos.line(ap.to_world(bc[k]), ap.to_world(bc[(k + 1) % 4]), border);
+        }
     }
 
     // Inference guides: dotted hints showing why the cursor snapped (alignment / extension /
@@ -10556,6 +10912,56 @@ fn closest_t_on_axis(base: Vec3, n: Vec3, ro: Vec3, rd: Vec3) -> f32 {
 
 /// Drag the boss/cut direction arrow to set the depth live. Returns true while it's
 /// actively handling the drag (so the caller skips the normal sketch tools).
+/// Drag the reference-plane creation arrow (along the base normal) to set the offset live — the
+/// plane analogue of [`extrude_arrow_drag`]. The drag sign sets the `flip` flag, so a wobble past
+/// the base flips sides cleanly. Returns true while dragging (so the caller swallows the click).
+fn plane_arrow_drag(
+    session: &mut SketchSession,
+    ui_state: &mut UiState,
+    window: &Window,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    ray: &Ray3d,
+    just_pressed: bool,
+    pressed: bool,
+    just_released: bool,
+) -> bool {
+    let Some(spec) = ui_state.plane_spec.clone() else { return false };
+    let base = spec.base.origin;
+    let n = spec.base.n.normalize_or_zero();
+    if n == Vec3::ZERO {
+        return false;
+    }
+    let signed = if spec.flip { -spec.offset } else { spec.offset };
+    let tip = base + n * signed;
+    if just_pressed {
+        if let Some(cursor) = window.cursor_position() {
+            let near_shaft = segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 22.0);
+            let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 26.0).unwrap_or(false);
+            if near_shaft || near_tip {
+                session.arrow_drag = true;
+            }
+        }
+    }
+    if session.arrow_drag && pressed {
+        let t = closest_t_on_axis(base, n, ray.origin, ray.direction.as_vec3());
+        if t.is_finite() {
+            if let Some(s) = ui_state.plane_spec.as_mut() {
+                s.flip = t < 0.0;
+                s.offset = t.abs().clamp(0.0, 100_000.0);
+            }
+        }
+        if just_released {
+            session.arrow_drag = false;
+        }
+        return true;
+    }
+    if just_released {
+        session.arrow_drag = false;
+    }
+    false
+}
+
 fn extrude_arrow_drag(
     session: &mut SketchSession,
     ui_state: &mut UiState,
@@ -10593,14 +10999,18 @@ fn extrude_arrow_drag(
         }
     }
     if session.arrow_drag && pressed {
-        // `t` is the distance dragged out along +normal. Set the depth from it (clamped
-        // to a sane, finite range); keep the direction on the Reverse checkbox so a
-        // little wobble past the face can't silently flip the cut. A non-finite `t`
-        // (axis nearly edge-on to the view) is ignored — a NaN here crashes egui.
+        // `t` is the signed distance dragged along +normal. Drag past the back of the sketch and
+        // the direction flips (sign → Reverse), like SolidWorks; a small deadzone near zero keeps
+        // a wobble from flickering the side. A non-finite `t` (axis edge-on) is ignored (NaN
+        // crashes egui).
         let t = closest_t_on_axis(base, n, ray.origin, ray.direction.as_vec3());
         if t.is_finite() {
-            let depth = t.clamp(0.1, 10_000.0);
-            ui_state.pending = Some(PendingOp { kind: op.kind, depth, reverse: op.reverse });
+            let mut p = op.clone();
+            p.depth = t.abs().clamp(0.1, 10_000.0);
+            if t.abs() > 0.05 {
+                p.reverse = t < 0.0;
+            }
+            ui_state.pending = Some(p);
         }
         if just_released {
             session.arrow_drag = false;
