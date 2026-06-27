@@ -11,6 +11,8 @@ truck-meshalgo = "0.4"
 truck-polymesh = "0.6"
 truck-topology = "0.6"
 truck-shapeops = "0.4"
+# STEP (ISO 10303) export of the exact B-rep solid.
+truck-stepio = "0.3"
 # Robust manifold mesh booleans (the engine behind OpenSCAD); used for coincident-face
 # cases truck's exact B-rep boolean rejects. Builds the C++ Manifold via CMake.
 manifold3d = "0.3"

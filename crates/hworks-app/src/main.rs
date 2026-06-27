@@ -22,10 +22,10 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Document, FeatureKind, Plane, PlaneOffset, PlaneRef};
+use hworks_document::{Document, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, difference, extrude_solid, extrude_solid_with_overlap,
-    extrude_tool_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
+    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
     take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -155,12 +155,14 @@ fn main() {
                     highlight_face,
                     sync_ref_planes,
                     scale_ref_planes,
+                    update_window_title,
                     update_plane_visibility,
                     update_body_transparency,
                     draw_selected_plane,
                     orbit_camera,
                     draw_world_axes,
                     draw_body_edges,
+                    draw_feature_previews,
                     draw_sketch,
                     tick_edge_flash,
                     draw_edge_selection,
@@ -363,6 +365,12 @@ struct UiState {
     /// Save / open requested (from buttons or Ctrl+S / Ctrl+O).
     save_request: bool,
     open_request: bool,
+    /// Save As (always prompt) and Export (STL / STEP) requests.
+    save_as_request: bool,
+    export_stl_request: bool,
+    export_step_request: bool,
+    /// The file this part is bound to — Save writes here directly (no dialog) once it's set.
+    current_file: Option<std::path::PathBuf>,
     /// Request to (re)open a feature's sketch for editing.
     edit_sketch_request: Option<usize>,
     /// Datum plane (by order: 0=Front, 1=Top, 2=Right) currently selected in the tree — shown
@@ -375,6 +383,9 @@ struct UiState {
     /// Display size (edge length) of the reference-plane quads/outlines — adjustable so planes can
     /// be made large enough to see/use on a big part. Defaults to `PLANE_SIZE`.
     plane_size: f32,
+    /// Loft PropertyManager: ordered `(sketch feature index, chosen region)` pairs — click sketches
+    /// in the tree to add them, click a contour in the viewport to choose its region. `None` ⇒ not lofting.
+    loft_spec: Option<Vec<(usize, usize)>>,
     /// Show smooth/tangent edges in the viewport (off = SolidWorks-style removed).
     show_tangent_edges: bool,
     /// Active CommandManager tab.
@@ -1011,7 +1022,21 @@ fn ui_system(
                     ui_state.save_request = true;
                     ui.close();
                 }
-                let _ = ui.button("Save As…"); // TODO: distinct Save-As path
+                if ui.button("Save As…").clicked() {
+                    ui_state.save_as_request = true;
+                    ui.close();
+                }
+                ui.separator();
+                ui.menu_button("Export", |ui| {
+                    if ui.button("STL… (mesh)").on_hover_text("Triangle mesh for 3D printing — works for any body").clicked() {
+                        ui_state.export_stl_request = true;
+                        ui.close();
+                    }
+                    if ui.button("STEP… (B-rep)").on_hover_text("Exact CAD interchange — needs the exact kernel (turn off Seamless; no loft/fillet)").clicked() {
+                        ui_state.export_step_request = true;
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 let _ = ui.button("Exit"); // TODO: graceful shutdown
             });
@@ -1510,6 +1535,12 @@ fn ui_system(
                             ui_state.plane_spec = Some(PlaneSpec { base: ActivePlane::from_doc(p), base_name: p.name.clone(), offset: 10.0, flip: false, edit_target: None });
                         }
                     }
+                    let sketch_count = doc.0.features.iter().filter(|f| matches!(f.kind, FeatureKind::Sketch { .. })).count();
+                    ui.add_enabled_ui(sketch_count >= 2 && !in_sketch, |ui| {
+                        if ui.button("Loft").on_hover_text("Skin a solid between 2+ sketch profiles — click the sketches in the tree in order").clicked() {
+                            ui_state.loft_spec = Some(Vec::new());
+                        }
+                    });
                 }
             }
         });
@@ -2301,6 +2332,58 @@ fn ui_system(
             }
             ui_state.plane_spec = if keep { Some(spec) } else { None };
         }
+        if let Some(profiles) = ui_state.loft_spec.clone() {
+            ui.heading("Loft");
+            let mut keep = true;
+            let mut create = false;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(profiles.len() >= 2, egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    create = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    keep = false;
+                }
+            });
+            ui.separator();
+            ui.label("Profiles (skinned in this order):");
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(190.0);
+                if profiles.is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 90), "Click sketches in the tree to add them.");
+                } else {
+                    // Sketch ordinal + which contour, for a friendly label.
+                    for (n, &(fi, region)) in profiles.iter().enumerate() {
+                        let sk_ord = doc.0.features[..fi.min(doc.0.features.len())].iter().filter(|f| matches!(f.kind, FeatureKind::Sketch { .. })).count() + 1;
+                        let nreg = match doc.0.features.get(fi).map(|f| &f.kind) {
+                            Some(FeatureKind::Sketch { sketch, .. }) => sketch.regions().len(),
+                            _ => 0,
+                        };
+                        let contour = if nreg > 1 { format!("  ·  contour {}/{nreg}", region + 1) } else { String::new() };
+                        ui.colored_label(egui::Color32::from_rgb(150, 180, 255), format!("{}.  Sketch{sk_ord}{contour}", n + 1));
+                    }
+                }
+            });
+            if !profiles.is_empty() && ui.button("Clear profiles").clicked() {
+                ui_state.loft_spec = Some(Vec::new());
+            }
+            ui.label(egui::RichText::new("Pick ≥2 closed profiles (click sketches in the tree).\nClick a contour in the viewport to choose its region.").weak().small());
+
+            if create {
+                let built: Vec<LoftProfile> = profiles
+                    .iter()
+                    .filter_map(|&(fi, region)| match doc.0.features.get(fi).map(|f| &f.kind) {
+                        Some(FeatureKind::Sketch { sketch, plane }) => Some(LoftProfile { sketch: sketch.clone(), plane: plane.clone(), region }),
+                        _ => None,
+                    })
+                    .collect();
+                if built.len() >= 2 {
+                    doc.0.add_feature(FeatureKind::Loft { profiles: built });
+                    ui_state.regen = true;
+                }
+                keep = false;
+            }
+            ui_state.loft_spec = if keep { Some(profiles) } else { None };
+        }
         // A datum/construction plane selected in the tree: quick size control + a Sketch button.
         if ui_state.plane_spec.is_none() && ui_state.pending.is_none() && session.plane.is_none() {
             if let Some(order) = ui_state.selected_plane {
@@ -2916,9 +2999,20 @@ fn ui_system(
                         FeatureKind::Plane(_) => continue,
                         FeatureKind::Sketch { .. } => {
                             sk += 1;
-                            let resp = ui.selectable_label(selected, styled(format!("✎ Sketch{sk}")));
+                            // While the Loft PM is open, a sketch row is highlighted if already a
+                            // profile; clicking adds it (or removes it) from the loft's ordered list.
+                            let in_loft = ui_state.loft_spec.as_ref().is_some_and(|v| v.iter().any(|(x, _)| *x == i));
+                            let resp = ui.selectable_label(selected || in_loft, styled(format!("✎ Sketch{sk}")));
                             if resp.clicked() {
-                                ui_state.selected = Some(i);
+                                if let Some(v) = ui_state.loft_spec.as_mut() {
+                                    if let Some(pos) = v.iter().position(|(x, _)| *x == i) {
+                                        v.remove(pos);
+                                    } else {
+                                        v.push((i, 0)); // default to the first region; pick a contour in the viewport
+                                    }
+                                } else {
+                                    ui_state.selected = Some(i);
+                                }
                             }
                             resp.context_menu(|ui| {
                                 if ui.button("Edit sketch").clicked() {
@@ -3043,6 +3137,20 @@ fn ui_system(
                         }
                         FeatureKind::Mirror { .. } => {
                             let resp = ui.selectable_label(selected, styled("◧ Mirror".to_string()));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::Loft { profiles } => {
+                            ex += 1;
+                            let resp = ui.selectable_label(selected, styled(format!("⏃ Loft{ex}  ({} profiles)", profiles.len())));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -5230,6 +5338,32 @@ fn sketch_interaction(
         if extrude_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
+    }
+
+    // Loft contour pick: while the Loft PM is open, a viewport click inside a profile's contour
+    // chooses that region for the profile (nearest plane hit wins).
+    if ui_state.loft_spec.is_some() && session.plane.is_none() {
+        if just_pressed {
+            let mut best: Option<(f32, usize, usize)> = None; // (depth, profile index, region index)
+            if let Some(profiles) = ui_state.loft_spec.clone() {
+                for (pi, (fi, _)) in profiles.iter().enumerate() {
+                    if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(*fi).map(|f| &f.kind) {
+                        let ap = active_plane_from_ref(plane, "");
+                        if let Some((t, uv)) = ray_plane(&ap, &ray) {
+                            for (ri, r) in sketch.regions().iter().enumerate() {
+                                if point_in_poly([uv.x as f64, uv.y as f64], &r.outer) && best.map_or(true, |(bt, _, _)| t < bt) {
+                                    best = Some((t, pi, ri));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some((_, pi, ri)), Some(v)) = (best, ui_state.loft_spec.as_mut()) {
+                v[pi].1 = ri;
+            }
+        }
+        return; // swallow viewport clicks while lofting (orbit still works on right-drag)
     }
 
     // Reference-plane creation: drag the offset arrow, or click a face / datum plane to set the
@@ -7949,20 +8083,106 @@ fn handle_file_io(
     mut doc: ResMut<DocRes>,
     mut history: ResMut<History>,
     mut session: ResMut<SketchSession>,
+    part: Res<Part>,
 ) {
+    // Force a `.hcad` extension on a chosen path (so Save As without a typed extension still saves a part).
+    let with_hcad = |mut p: std::path::PathBuf| {
+        if p.extension().is_none() {
+            p.set_extension("hcad");
+        }
+        p
+    };
+    let write_doc = |doc: &Document, path: &std::path::Path| -> bool {
+        match ron::ser::to_string_pretty(doc, ron::ser::PrettyConfig::default()) {
+            Ok(text) => match std::fs::write(path, text) {
+                Ok(()) => {
+                    info!("Saved {}", path.display());
+                    true
+                }
+                Err(e) => {
+                    warn!("Save failed: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("Serialize failed: {e}");
+                false
+            }
+        }
+    };
+
+    // Save: write to the bound file directly; if there isn't one yet, fall through to Save As.
     if ui_state.save_request {
         ui_state.save_request = false;
+        match ui_state.current_file.clone() {
+            Some(path) => {
+                write_doc(&doc.0, &path);
+            }
+            None => ui_state.save_as_request = true,
+        }
+    }
+    // Save As: always prompt; bind the chosen path so later Saves are dialog-free.
+    if ui_state.save_as_request {
+        ui_state.save_as_request = false;
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("HCAD part", &["hcad", "ron"])
-            .set_file_name("part.hcad")
+            .add_filter("HCAD part", &["hcad"])
+            .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("part.hcad"))
             .save_file()
         {
-            match ron::ser::to_string_pretty(&doc.0, ron::ser::PrettyConfig::default()) {
-                Ok(text) => match std::fs::write(&path, text) {
-                    Ok(()) => info!("Saved {}", path.display()),
-                    Err(e) => warn!("Save failed: {e}"),
-                },
-                Err(e) => warn!("Serialize failed: {e}"),
+            let path = with_hcad(path);
+            if write_doc(&doc.0, &path) {
+                ui_state.current_file = Some(path);
+            }
+        }
+    }
+
+    // Export STL — the mesh body (works for any part).
+    if ui_state.export_stl_request {
+        ui_state.export_stl_request = false;
+        match &part.mesh {
+            Some(mesh) if !mesh.positions.is_empty() => {
+                if let Some(mut path) = rfd::FileDialog::new().add_filter("STL mesh", &["stl"]).set_file_name("part.stl").save_file() {
+                    if path.extension().is_none() {
+                        path.set_extension("stl");
+                    }
+                    match std::fs::write(&path, export_stl(mesh)) {
+                        Ok(()) => info!("Exported STL {}", path.display()),
+                        Err(e) => {
+                            warn!("STL export failed: {e}");
+                            ui_state.last_error = Some(format!("STL export failed: {e}"));
+                        }
+                    }
+                }
+            }
+            _ => ui_state.last_error = Some("Nothing to export — build a body first.".into()),
+        }
+    }
+
+    // Export STEP — the exact B-rep (only available without mesh-only features).
+    if ui_state.export_step_request {
+        ui_state.export_step_request = false;
+        match &part.solid {
+            Some(solid) => match export_step(solid) {
+                Some(step) => {
+                    if let Some(mut path) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).set_file_name("part.step").save_file() {
+                        if path.extension().is_none() {
+                            path.set_extension("step");
+                        }
+                        match std::fs::write(&path, step) {
+                            Ok(()) => info!("Exported STEP {}", path.display()),
+                            Err(e) => {
+                                warn!("STEP export failed: {e}");
+                                ui_state.last_error = Some(format!("STEP export failed: {e}"));
+                            }
+                        }
+                    }
+                }
+                None => ui_state.last_error = Some("STEP export: the kernel couldn't express this solid.".into()),
+            },
+            None => {
+                ui_state.last_error = Some(
+                    "STEP needs the exact B-rep, which this body doesn't have (it was built with the mesh kernel — Seamless, or a loft/fillet/chamfer/mirror). Turn off Seamless and avoid those features, or export STL.".into(),
+                );
             }
         }
     }
@@ -7981,6 +8201,7 @@ fn handle_file_io(
                         session.selected_contours.clear();
                         session.sketch.clear();
                         ui_state.selected = None;
+                        ui_state.current_file = Some(path.clone());
                         ui_state.regen = true;
                         info!("Opened {}", path.display());
                     }
@@ -8173,7 +8394,7 @@ fn handle_edit_sketch(
         | FeatureKind::Revolve { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } => return,
     };
     // A revolve also remembers its axis (point + direction) — re-select the matching line so the
     // PropertyManager's Axis box is filled and the preview shows when reopening it.
@@ -8260,7 +8481,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -8400,8 +8621,8 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
             }
             // These reshape the mesh, so a model with one always builds via the mesh path —
             // this exact-kernel path never runs with one present.
-            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } => {
-                failures.push("Fillet/chamfer/mirror/thread needs the mesh kernel.".into());
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } => {
+                failures.push("Fillet/chamfer/mirror/thread/loft needs the mesh kernel.".into());
             }
         }
     }
@@ -8544,6 +8765,16 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                     }
                 }
             }
+            FeatureKind::Loft { profiles } => {
+                bevel_edges.clear();
+                let secs: Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = profiles.iter().filter_map(loft_profile_loops).collect();
+                if let Some(m) = loft_mesh(&secs) {
+                    body = Some(match body.take() {
+                        Some(b) => mesh_union(&b, &m), // loft onto an existing body
+                        None => m,
+                    });
+                }
+            }
             // Round the body's (picked, or all) edges by the fillet radius. We try the
             // mesh-surgery bevel first (no CSG → clean corners); it self-checks watertightness
             // and returns None on cases it can't resolve, so we fall back to the CSG round.
@@ -8616,7 +8847,8 @@ fn do_regenerate(
     // Text produces hundreds of tiny glyph faces; truck's recursive B-rep booleans can
     // *stack-overflow* on that (a hard abort `catch_unwind` can't trap), so any model
     // containing text is built with the robust mesh kernel from the start.
-    let force_mesh = ui_state.seamless || doc_has_text(&doc.0) || doc_has_fillet(&doc.0);
+    let has_loft = doc.0.features.iter().any(|f| matches!(f.kind, FeatureKind::Loft { .. }));
+    let force_mesh = ui_state.seamless || doc_has_text(&doc.0) || doc_has_fillet(&doc.0) || has_loft;
 
     // Seamless mode: build the whole model with the mesh kernel (Manifold), which fuses
     // coincident/coplanar faces so adjacent features merge without a seam. The exact
@@ -8990,6 +9222,18 @@ fn ring(overlay: &mut Gizmos<OverlayGizmos>, c: Vec3, n: Vec3, radius: f32, colo
 /// `PlaneBasis` (kernel-side) from a stored `PlaneRef`.
 fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
     PlaneBasis { origin: p.origin, u: p.u, v: p.v, normal: p.normal }
+}
+
+/// A loft profile's outer boundary + hole loops lifted into 3D world space (its sketch region
+/// through the profile's plane). `None` if the sketch has no usable closed region.
+fn loft_profile_loops(p: &LoftProfile) -> Option<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> {
+    let regions = p.sketch.regions();
+    let r = regions.get(p.region).or_else(|| regions.first())?;
+    let (o, u, v) = (p.plane.origin, p.plane.u, p.plane.v);
+    let to3 = |uv: &[f64; 2]| [o[0] + u[0] * uv[0] + v[0] * uv[1], o[1] + u[1] * uv[0] + v[1] * uv[1], o[2] + u[2] * uv[0] + v[2] * uv[1]];
+    let outer = r.outer.iter().map(to3).collect();
+    let holes = r.holes.iter().map(|h| h.iter().map(to3).collect()).collect();
+    Some((outer, holes))
 }
 
 /// Re-resolve a face-built feature's plane against the current body: keep its
@@ -9599,6 +9843,7 @@ fn handle_new_part(
     session.sketch.clear();
     ui_state.pending = None;
     ui_state.selected = None;
+    ui_state.current_file = None; // a fresh part isn't bound to the old file
     if let Ok((mut tf, orbit)) = cam_q.single_mut() {
         *tf = camera_transform(orbit);
     }
@@ -9809,6 +10054,18 @@ fn sync_ref_planes(
     }
 }
 
+/// Keep the window title showing the bound file name (or "Untitled") — a quick at-a-glance of
+/// what's open and whether it's been saved to a file yet.
+fn update_window_title(ui_state: Res<UiState>, mut windows: Query<&mut Window>) {
+    if let Ok(mut w) = windows.single_mut() {
+        let name = ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("Untitled");
+        let want = format!("HCAD — {name}");
+        if w.title != want {
+            w.title = want;
+        }
+    }
+}
+
 /// Scale the reference-plane quads to the user's chosen display size (they're spawned at the base
 /// `PLANE_SIZE`), so planes can be enlarged to suit a big part without rebuilding the mesh.
 fn scale_ref_planes(ui_state: Res<UiState>, mut q: Query<&mut Transform, With<RefPlane>>) {
@@ -9820,21 +10077,25 @@ fn scale_ref_planes(ui_state: Res<UiState>, mut q: Query<&mut Transform, With<Re
     }
 }
 
-/// See-through mechanic: while sketching, fade the body to translucent so a sketch on an internal
-/// datum plane (e.g. a revolve-cut profile through the centre) is visible *through* the solid.
-/// Restores it to opaque when you leave the sketch. (SolidWorks does the same.)
+/// See-through mechanic: fade the body to translucent only when you actually need to see *into* it
+/// — sketching on a datum/construction plane (Front/Top/Right/offset, which pass through the body)
+/// or configuring a cut (extrude/revolve cut). Sketching on a face, or a plain boss, stays opaque
+/// (the see-through is just clutter there). Restores to opaque otherwise.
 fn update_body_transparency(
     session: Res<SketchSession>,
+    ui_state: Res<UiState>,
     bodies: Query<&MeshMaterial3d<StandardMaterial>, With<SolidPart>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let sketching = session.plane.is_some();
-    let want = if sketching { 0.28 } else { 1.0 };
+    let on_datum = session.plane.as_ref().is_some_and(|p| p.datum);
+    let cutting = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Cut | OpKind::RevolveCut));
+    let see_through = on_datum || cutting;
+    let want = if see_through { 0.28 } else { 1.0 };
     for mat in &bodies {
         if let Some(m) = materials.get_mut(&mat.0) {
             if (m.base_color.alpha() - want).abs() > 1e-3 {
                 m.base_color = m.base_color.with_alpha(want);
-                m.alpha_mode = if sketching { AlphaMode::Blend } else { AlphaMode::Opaque };
+                m.alpha_mode = if see_through { AlphaMode::Blend } else { AlphaMode::Opaque };
             }
         }
     }
@@ -9899,6 +10160,96 @@ fn draw_world_axes(mut gizmos: Gizmos, part: Res<Part>) {
     gizmos.line(Vec3::ZERO, Vec3::Z * L, Color::srgb(0.3, 0.5, 1.0));
 }
 
+/// Draw a stored sketch's profile geometry in world space — a read-only preview (a selected sketch
+/// in the tree, or the profiles picked for a loft). `pick` highlights one region's outer loop and
+/// faintly hatches it, so you can see which contour is chosen.
+fn draw_stored_sketch(gizmos: &mut Gizmos, sketch: &Sketch, plane: &PlaneRef, color: Color, pick: Option<usize>) {
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let w = |x: f32, y: f32| o + u * x + v * y;
+    let p2 = |i: usize| -> (f32, f32) {
+        let p = &sketch.points[i];
+        (p.x as f32, p.y as f32)
+    };
+    let poly_line = |gizmos: &mut Gizmos, poly: &[[f64; 2]], close: bool, col: Color| {
+        let m = poly.len();
+        let last = if close { m } else { m.saturating_sub(1) };
+        for k in 0..last {
+            let a = poly[k];
+            let b = poly[(k + 1) % m];
+            gizmos.line(w(a[0] as f32, a[1] as f32), w(b[0] as f32, b[1] as f32), col);
+        }
+    };
+    for e in &sketch.entities {
+        match e {
+            SketchEntity::Line { a, b, construction: false, reference: false } => {
+                let (ax, ay) = p2(*a);
+                let (bx, by) = p2(*b);
+                gizmos.line(w(ax, ay), w(bx, by), color);
+            }
+            SketchEntity::Circle { center, radius, construction: false } => {
+                let (cx, cy) = p2(*center);
+                let r = *radius as f32;
+                let pts: Vec<[f64; 2]> = (0..48).map(|k| { let a = std::f32::consts::TAU * k as f32 / 48.0; [(cx + r * a.cos()) as f64, (cy + r * a.sin()) as f64] }).collect();
+                poly_line(gizmos, &pts, true, color);
+            }
+            SketchEntity::Arc { center, a, b, ccw, construction: false } => {
+                if let (Some(c), Some(pa), Some(pb)) = (sketch.points.get(*center), sketch.points.get(*a), sketch.points.get(*b)) {
+                    poly_line(gizmos, &tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw), false, color);
+                }
+            }
+            SketchEntity::Spline { points, closed, control, construction: false } => {
+                let pts: Vec<[f64; 2]> = points.iter().filter_map(|&i| sketch.points.get(i)).map(|p| [p.x, p.y]).collect();
+                if pts.len() >= 2 {
+                    poly_line(gizmos, &tessellate_spline(&pts, *closed, *control), *closed, color);
+                }
+            }
+            SketchEntity::Slot { a, b, radius, construction: false, mid } => {
+                if let (Some(pa), Some(pb)) = (sketch.points.get(*a), sketch.points.get(*b)) {
+                    let pm = mid.and_then(|m| sketch.points.get(m)).map(|p| [p.x, p.y]);
+                    let poly = match pm {
+                        Some(pm) => tessellate_arc_slot([pa.x, pa.y], pm, [pb.x, pb.y], *radius),
+                        None => tessellate_slot([pa.x, pa.y], [pb.x, pb.y], *radius),
+                    };
+                    poly_line(gizmos, &poly, true, color);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(ri) = pick {
+        if let Some(r) = sketch.regions().get(ri) {
+            poly_line(gizmos, &r.outer, true, Color::srgb(0.3, 1.0, 0.5));
+            for hole in &r.holes {
+                poly_line(gizmos, hole, true, Color::srgb(0.3, 1.0, 0.5));
+            }
+        }
+    }
+}
+
+/// Preview the geometry of the selected sketch (or, while lofting, every picked profile with its
+/// chosen contour highlighted) so you can see what's on a sketch without opening it.
+fn draw_feature_previews(mut gizmos: Gizmos, ui_state: Res<UiState>, doc: Res<DocRes>, session: Res<SketchSession>) {
+    if session.plane.is_some() {
+        return; // the live sketch already draws itself
+    }
+    if let Some(profiles) = &ui_state.loft_spec {
+        let palette = [Color::srgb(0.95, 0.85, 0.25), Color::srgb(0.25, 0.9, 0.95), Color::srgb(0.9, 0.5, 0.95), Color::srgb(0.4, 0.95, 0.5)];
+        for (n, &(fi, region)) in profiles.iter().enumerate() {
+            if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(fi).map(|f| &f.kind) {
+                draw_stored_sketch(&mut gizmos, sketch, plane, palette[n % palette.len()], Some(region));
+            }
+        }
+        return;
+    }
+    if let Some(i) = ui_state.selected {
+        if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(i).map(|f| &f.kind) {
+            draw_stored_sketch(&mut gizmos, sketch, plane, Color::srgb(0.95, 0.9, 0.3), None);
+        }
+    }
+}
+
 fn draw_sketch(
     mut gizmos: Gizmos,
     mut overlay: Gizmos<OverlayGizmos>,
@@ -9953,12 +10304,17 @@ fn draw_sketch(
         Vec2::new(p.x as f32, p.y as f32)
     };
 
-    // Sketch origin (0,0): a small red/green crosshair marking the part centre, so circle centres
-    // and revolve axes can snap onto it (a concentric revolve, not a slightly eccentric one).
+    // Centre axes through the origin (0,0): full-length guide lines (X=0 vertical green, Y=0
+    // horizontal red) so a centreline / symmetric profile is easy to line up to the part centre —
+    // the cursor inference snaps onto these, and a bright crosshair marks the exact origin.
     {
-        let os = 0.22 * ms;
-        gizmos.line(ap.to_world(Vec2::new(-os, 0.0)), ap.to_world(Vec2::new(os, 0.0)), Color::srgb(1.0, 0.35, 0.35));
-        gizmos.line(ap.to_world(Vec2::new(0.0, -os)), ap.to_world(Vec2::new(0.0, os)), Color::srgb(0.4, 1.0, 0.4));
+        let vcol = Color::srgba(0.4, 1.0, 0.45, 0.55); // x = 0 (vertical centre line)
+        let hcol = Color::srgba(1.0, 0.4, 0.4, 0.55); // y = 0 (horizontal centre line)
+        gizmos.line(ap.to_world(Vec2::new(0.0, -ext)), ap.to_world(Vec2::new(0.0, ext)), vcol);
+        gizmos.line(ap.to_world(Vec2::new(-ext, 0.0)), ap.to_world(Vec2::new(ext, 0.0)), hcol);
+        let os = 0.3 * ms;
+        gizmos.line(ap.to_world(Vec2::new(-os, 0.0)), ap.to_world(Vec2::new(os, 0.0)), Color::srgb(1.0, 0.4, 0.4));
+        gizmos.line(ap.to_world(Vec2::new(0.0, -os)), ap.to_world(Vec2::new(0.0, os)), Color::srgb(0.4, 1.0, 0.45));
     }
 
     // The active sketch plane's outline — a faint bordered rectangle around the sketch, so when
@@ -11384,6 +11740,55 @@ mod tests {
     use super::*;
     use hworks_document::{Document, FeatureKind, PlaneRef};
     use hworks_sketch::Sketch;
+
+    /// On-demand manifold check of a saved part: load the `.hcad`, regenerate the mesh body, and
+    /// report watertightness + edge topology. Ignored by default — run with the path:
+    ///   cargo test -p hworks-app check_hcad_manifold -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn check_hcad_manifold() {
+        // Path from $HCAD_FILE, else the default sample. e.g.:
+        //   HCAD_FILE="C:\path\to\part.hcad" cargo test -p hworks-app check_hcad_manifold -- --ignored --nocapture
+        let path = std::env::var("HCAD_FILE").unwrap_or_else(|_| r"C:\Users\BIG2\Desktop\DEV for BIG\HCAD\saved files\lofttest.hcad".to_string());
+        eprintln!("checking: {path}");
+        let text = std::fs::read_to_string(&path).expect("read .hcad");
+        let doc: Document = ron::from_str(&text).expect("parse RON");
+        let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc))).ok().flatten().map(|(m, _)| m);
+        eprintln!("BSP fallbacks during regen: {}", hworks_geometry::take_fallback_count());
+        let Some(m) = mesh.filter(|m| !m.positions.is_empty()) else {
+            eprintln!("RESULT: no mesh body produced (regen failed)");
+            return;
+        };
+        // Weld by position, then count how many times each undirected edge is used.
+        use std::collections::HashMap;
+        let key = |p: [f32; 3]| ((p[0] * 1e3).round() as i64, (p[1] * 1e3).round() as i64, (p[2] * 1e3).round() as i64);
+        let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        let mut remap = vec![0u32; m.positions.len()];
+        for (i, p) in m.positions.iter().enumerate() {
+            let n = map.len() as u32;
+            remap[i] = *map.entry(key(*p)).or_insert(n);
+        }
+        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        for t in m.indices.chunks_exact(3) {
+            let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+            for (x, y) in [(a, b), (b, c), (c, a)] {
+                let k = if x < y { (x, y) } else { (y, x) };
+                *edges.entry(k).or_insert(0) += 1;
+            }
+        }
+        let boundary = edges.values().filter(|&&v| v == 1).count();
+        let nonman = edges.values().filter(|&&v| v > 2).count();
+        let watertight = boundary == 0 && nonman == 0;
+        eprintln!(
+            "RESULT: manifold(Manifold-ingestible)={}  watertight={}  verts={}  tris={}  boundary_edges={}  nonmanifold_edges={}",
+            hworks_geometry::is_manifold(&m),
+            watertight,
+            map.len(),
+            m.indices.len() / 3,
+            boundary,
+            nonman,
+        );
+    }
 
     fn rect_sketch(w: f64, h: f64) -> Sketch {
         let mut s = Sketch::default();

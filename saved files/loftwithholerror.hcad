@@ -1,0 +1,228 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Circle(
+                            center: 0,
+                            radius: 3.8499436378479004,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 3.190133810043335,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 2.0,
+            ),
+        ),
+        (
+            id: (4),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.000034264056012034416,
+                            y: 0.00005336292088031769,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Circle(
+                            center: 0,
+                            radius: 3.8499436378479004,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 3.1901190280914307,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                plane: (
+                    origin: (-0.000034264056012034416, 2.0, 0.00005336292088031769),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, -0.0, -1.0),
+                    normal: (0.0, 1.0, -0.0),
+                    datum: false,
+                ),
+            ),
+        ),
+        (
+            id: (5),
+            kind: Plane((
+                name: "Plane1",
+                origin: (-0.00003407756, 11.0, 0.000053202733),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, -0.0, -1.0),
+                offset: Some((
+                    base_origin: (-0.00003407756, 1.9999995, 0.000053202733),
+                    base_u: (1.0, 0.0, 0.0),
+                    base_v: (0.0, -0.0, -1.0),
+                    base_name: "Face",
+                    distance: 9.0,
+                    flip: false,
+                )),
+            )),
+        ),
+        (
+            id: (6),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Circle(
+                            center: 0,
+                            radius: 6.93665075302124,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 5.77573823928833,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                plane: (
+                    origin: (-0.00003407755866646767, 11.0, 0.000053202733397483826),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, -0.0, -1.0),
+                    normal: (0.0, 1.0, -0.0),
+                    datum: true,
+                ),
+            ),
+        ),
+        (
+            id: (7),
+            kind: Loft(
+                profiles: [
+                    (
+                        sketch: (
+                            points: [
+                                (
+                                    x: 0.000034264056012034416,
+                                    y: 0.00005336292088031769,
+                                    fixed: true,
+                                ),
+                            ],
+                            entities: [
+                                Circle(
+                                    center: 0,
+                                    radius: 3.8499436378479004,
+                                    construction: false,
+                                ),
+                                Circle(
+                                    center: 0,
+                                    radius: 3.1901190280914307,
+                                    construction: false,
+                                ),
+                            ],
+                            constraints: [],
+                        ),
+                        plane: (
+                            origin: (-0.000034264056012034416, 2.0, 0.00005336292088031769),
+                            u: (1.0, 0.0, 0.0),
+                            v: (0.0, -0.0, -1.0),
+                            normal: (0.0, 1.0, -0.0),
+                            datum: false,
+                        ),
+                        region: 0,
+                    ),
+                    (
+                        sketch: (
+                            points: [
+                                (
+                                    x: 0.0,
+                                    y: 0.0,
+                                    fixed: false,
+                                ),
+                            ],
+                            entities: [
+                                Circle(
+                                    center: 0,
+                                    radius: 6.93665075302124,
+                                    construction: false,
+                                ),
+                                Circle(
+                                    center: 0,
+                                    radius: 5.77573823928833,
+                                    construction: false,
+                                ),
+                            ],
+                            constraints: [],
+                        ),
+                        plane: (
+                            origin: (-0.00003407755866646767, 11.0, 0.000053202733397483826),
+                            u: (1.0, 0.0, 0.0),
+                            v: (0.0, -0.0, -1.0),
+                            normal: (0.0, 1.0, -0.0),
+                            datum: true,
+                        ),
+                        region: 0,
+                    ),
+                ],
+            ),
+        ),
+    ],
+    rollback: 8,
+    next_id: 8,
+)

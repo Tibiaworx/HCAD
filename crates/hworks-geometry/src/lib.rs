@@ -435,6 +435,242 @@ pub fn cut_tool_mesh(
     extrude_tool_mesh(outer, holes, basis, start, length)
 }
 
+/// Serialize a triangle mesh as a **binary STL** blob (for 3D printing / mesh interchange).
+/// Every triangle's normal is recomputed from its winding so the STL is self-consistent.
+pub fn export_stl(mesh: &TriMesh) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(84 + mesh.indices.len() / 3 * 50);
+    out.extend_from_slice(&[0u8; 80]); // 80-byte header (ignored)
+    out.extend_from_slice(&((mesh.indices.len() / 3) as u32).to_le_bytes());
+    for t in mesh.indices.chunks_exact(3) {
+        let p = |i: u32| mesh.positions[i as usize];
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        let (e1, e2) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+        let mut n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if l > 1e-12 {
+            n = [n[0] / l, n[1] / l, n[2] / l];
+        }
+        for v in [n, a, b, c] {
+            for k in 0..3 {
+                out.extend_from_slice(&v[k].to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&[0u8, 0u8]); // attribute byte count
+    }
+    out
+}
+
+/// Serialize the exact B-rep solid to a **STEP** (ISO 10303 AP203) string. `None` if the kernel
+/// can't express it (or panics) — STEP needs the exact B-rep, so a mesh-only body has no STEP form.
+pub fn export_step(solid: &KSolid) -> Option<String> {
+    guard(|| {
+        let compressed = solid.0.compress();
+        let model = truck_stepio::out::CompleteStepDisplay::new(
+            truck_stepio::out::StepModel::from(&compressed),
+            truck_stepio::out::StepHeaderDescriptor::default(),
+        );
+        Some(model.to_string())
+    })
+}
+
+/// Append a triangle (with a winding-derived flat normal) to a mesh.
+fn push_tri(mesh: &mut TriMesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
+    let sub = |p: [f64; 3], q: [f64; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+    let (e1, e2) = (sub(b, a), sub(c, a));
+    let mut n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if l > 1e-12 {
+        n = [n[0] / l, n[1] / l, n[2] / l];
+    } else {
+        n = [0.0, 0.0, 1.0];
+    }
+    let base = mesh.positions.len() as u32;
+    for p in [a, b, c] {
+        mesh.positions.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+        mesh.normals.push([n[0] as f32, n[1] as f32, n[2] as f32]);
+    }
+    mesh.indices.extend([base, base + 1, base + 2]);
+}
+
+/// Triangulate a planar profile face (outer boundary + holes, all in 3D) via the kernel — used for
+/// a loft's annular end caps. `reverse` flips the winding (so the two ends face opposite ways).
+fn loft_cap_tris(outer: &[[f64; 3]], holes: &[Vec<[f64; 3]>], reverse: bool) -> Vec<[[f64; 3]; 3]> {
+    guard(|| {
+        let mk = |l: &[[f64; 3]]| -> truck_modeling::Wire {
+            let verts: Vec<_> = l.iter().map(|p| builder::vertex(Point3::new(p[0], p[1], p[2]))).collect();
+            let mut w = truck_modeling::Wire::new();
+            let np = verts.len();
+            for i in 0..np {
+                w.push_back(builder::line(&verts[i], &verts[(i + 1) % np]));
+            }
+            w
+        };
+        let mut wires = vec![mk(outer)];
+        for h in holes {
+            if h.len() >= 3 {
+                wires.push(mk(h));
+            }
+        }
+        let face = builder::try_attach_plane(&wires).ok()?;
+        let shell: truck_modeling::Shell = std::iter::once(face).collect();
+        let mut poly = shell.triangulation(TOL).to_polygon();
+        poly.triangulate();
+        let pos = poly.positions();
+        let mut tris = Vec::new();
+        for t in poly.faces().tri_faces() {
+            let g = |i: usize| {
+                let p = pos[i];
+                [p.x, p.y, p.z]
+            };
+            let (a, b, c) = (g(t[0].pos), g(t[1].pos), g(t[2].pos));
+            tris.push(if reverse { [a, c, b] } else { [a, b, c] });
+        }
+        Some(tris)
+    })
+    .unwrap_or_default()
+}
+
+/// Build a **lofted** solid mesh skinning between an ordered list of cross-section profiles. Each
+/// profile is `(outer boundary, hole loops)` in 3D. The outer boundaries are skinned into the side
+/// wall, each hole (matched by index across profiles) into an inner tube, and the two ends capped
+/// with the annular profile face — a watertight mesh oriented outward. `None` with < 2 profiles.
+pub fn loft_mesh(profiles: &[(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)]) -> Option<TriMesh> {
+    const N: usize = 96; // resample resolution
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let add = |a: [f64; 3], b: [f64; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+    let scale = |a: [f64; 3], s: f64| [a[0] * s, a[1] * s, a[2] * s];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let len = |a: [f64; 3]| dot(a, a).sqrt();
+    let lerp = |a: [f64; 3], b: [f64; 3], t: f64| add(a, scale(sub(b, a), t));
+    let centroid = |l: &[[f64; 3]]| scale(l.iter().fold([0.0; 3], |acc, &p| add(acc, p)), 1.0 / l.len() as f64);
+    let newell = |l: &[[f64; 3]]| {
+        let m = l.len();
+        let mut n = [0.0; 3];
+        for i in 0..m {
+            let (a, b) = (l[i], l[(i + 1) % m]);
+            n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+            n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+            n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+        }
+        n
+    };
+    let resample = |l: &[[f64; 3]]| -> Vec<[f64; 3]> {
+        let m = l.len();
+        let seg: Vec<f64> = (0..m).map(|i| len(sub(l[(i + 1) % m], l[i]))).collect();
+        let total: f64 = seg.iter().sum();
+        if total < 1e-9 {
+            return vec![l[0]; N];
+        }
+        let step = total / N as f64;
+        let (mut si, mut acc) = (0usize, 0.0);
+        (0..N)
+            .map(|k| {
+                let target = k as f64 * step;
+                while si < m && acc + seg[si] < target {
+                    acc += seg[si];
+                    si += 1;
+                }
+                let i = si % m;
+                let t = if seg[i] > 1e-9 { (target - acc) / seg[i] } else { 0.0 };
+                lerp(l[i], l[(i + 1) % m], t)
+            })
+            .collect()
+    };
+
+    let valid: Vec<&(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = profiles.iter().filter(|(o, _)| o.len() >= 3).collect();
+    if valid.len() < 2 {
+        return None;
+    }
+    let (c0, cl) = (centroid(&valid[0].0), centroid(&valid[valid.len() - 1].0));
+    let axis = {
+        let a = sub(cl, c0);
+        let la = len(a);
+        if la > 1e-9 { scale(a, 1.0 / la) } else { [0.0, 0.0, 1.0] }
+    };
+    // Resample a set of corresponding loops (the outers, or one hole index across profiles), force a
+    // winding sign relative to the axis, and rotationally align each to the previous to limit twist.
+    let process = |loops: Vec<&Vec<[f64; 3]>>, want_ccw: bool| -> Vec<Vec<[f64; 3]>> {
+        let mut out: Vec<Vec<[f64; 3]>> = loops
+            .iter()
+            .map(|l| {
+                let mut r = resample(l);
+                if (dot(newell(&r), axis) > 0.0) != want_ccw {
+                    r.reverse();
+                }
+                r
+            })
+            .collect();
+        for i in 1..out.len() {
+            let prev = out[i - 1].clone();
+            let mut best = (f64::MAX, 0usize);
+            for off in 0..N {
+                let d: f64 = (0..N).map(|k| len(sub(out[i][(k + off) % N], prev[k]))).sum();
+                if d < best.0 {
+                    best = (d, off);
+                }
+            }
+            let off = best.1;
+            out[i] = (0..N).map(|k| out[i][(k + off) % N]).collect();
+        }
+        out
+    };
+
+    let prof_outer = process(valid.iter().map(|(o, _)| o).collect(), true);
+    // Holes are skinned only when every profile has the same count (matched by index).
+    let hole_count = if valid.iter().all(|(_, h)| h.len() == valid[0].1.len()) { valid[0].1.len() } else { 0 };
+    let mut prof_holes: Vec<Vec<Vec<[f64; 3]>>> = vec![Vec::new(); valid.len()]; // [profile][hole][pt]
+    for h in 0..hole_count {
+        let processed = process(valid.iter().map(|(_, holes)| &holes[h]).collect(), false); // CW → inner faces the hole
+        for (pi, hp) in processed.into_iter().enumerate() {
+            prof_holes[pi].push(hp);
+        }
+    }
+
+    let mut mesh = TriMesh::default();
+    let mut skin = |a: &[[f64; 3]], b: &[[f64; 3]]| {
+        for k in 0..N {
+            let kn = (k + 1) % N;
+            push_tri(&mut mesh, a[k], a[kn], b[kn]);
+            push_tri(&mut mesh, a[k], b[kn], b[k]);
+        }
+    };
+    for s in 0..prof_outer.len() - 1 {
+        skin(&prof_outer[s], &prof_outer[s + 1]);
+    }
+    for h in 0..hole_count {
+        for s in 0..valid.len() - 1 {
+            skin(&prof_holes[s][h], &prof_holes[s + 1][h]);
+        }
+    }
+    // End caps (annular profile faces) — only the holes that were skinned, so the tube closes.
+    let last = prof_outer.len() - 1;
+    for [a, b, c] in loft_cap_tris(&prof_outer[0], &prof_holes[0], true) {
+        push_tri(&mut mesh, a, b, c);
+    }
+    for [a, b, c] in loft_cap_tris(&prof_outer[last], &prof_holes[last], false) {
+        push_tri(&mut mesh, a, b, c);
+    }
+    // Orient outward (flip winding + normals if the signed volume came out negative).
+    let mut vol = 0.0;
+    for t in mesh.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            let q = mesh.positions[i as usize];
+            [q[0] as f64, q[1] as f64, q[2] as f64]
+        };
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        vol += dot(a, [b[1] * c[2] - b[2] * c[1], b[2] * c[0] - b[0] * c[2], b[0] * c[1] - b[1] * c[0]]);
+    }
+    if vol < 0.0 {
+        for t in mesh.indices.chunks_exact_mut(3) {
+            t.swap(1, 2);
+        }
+        for n in &mut mesh.normals {
+            *n = [-n[0], -n[1], -n[2]];
+        }
+    }
+    Some(mesh)
+}
+
 /// Wrap a raw triangle mesh (e.g. a mesh-boolean result) as a renderable
 /// [`Tessellation`] by classifying its feature edges, so the mesh fallback renders
 /// with the same sharp/tangent edge treatment as the exact kernel.
@@ -735,6 +971,47 @@ mod tests {
         let us = union(&cyl_s, &tor_s).expect("exact union builds");
         let usv = mesh_vol(&tessellate(&us, 0.1).mesh);
         assert!(usv > cv + tv * 0.5, "exact union dropped a body: union {usv:.1}, cyl {cv:.1}, torus {tv:.1}");
+    }
+
+    fn circle3(cx: f64, cy: f64, cz: f64, r: f64, n: usize) -> Vec<[f64; 3]> {
+        (0..n).map(|k| { let a = std::f64::consts::TAU * k as f64 / n as f64; [cx + r * a.cos(), cy + r * a.sin(), cz] }).collect()
+    }
+
+    #[test]
+    fn step_and_stl_export_are_well_formed() {
+        let cyl = extrude_solid(&circle(0.0, 0.0, 5.0, 32), &[], &plane_at(0.0), 10.0).unwrap();
+        let step = export_step(&cyl).expect("step export");
+        assert!(step.contains("ISO-10303-21") && step.contains("CLOSED_SHELL"), "STEP looks malformed:\n{}", &step[..step.len().min(200)]);
+        let mesh = tessellate(&cyl, 0.1).mesh;
+        let stl = export_stl(&mesh);
+        assert_eq!(stl.len(), 84 + (mesh.indices.len() / 3) * 50, "binary STL size wrong");
+    }
+
+    #[test]
+    fn loft_two_circles_is_a_clean_frustum() {
+        // Loft a r=5 circle at z=0 to a r=2 circle at z=10 → a cone frustum. Must be watertight
+        // and have the frustum volume V = π·h·(R²+R·r+r²)/3.
+        let a = circle3(0.0, 0.0, 0.0, 5.0, 40);
+        let b = circle3(0.0, 0.0, 10.0, 2.0, 24);
+        let m = loft_mesh(&[(a, vec![]), (b, vec![])]).expect("loft builds");
+        assert!(is_manifold(&m), "loft result isn't watertight");
+        let want = std::f64::consts::PI * 10.0 * (25.0 + 10.0 + 4.0) / 3.0;
+        let got = mesh_vol(&m);
+        assert!((got - want).abs() / want < 0.02, "frustum volume {got:.1} (want {want:.1})");
+    }
+
+    #[test]
+    fn loft_two_annuli_keeps_the_hole() {
+        // Loft a ring (outer 5, hole 3) at z=0 to a ring (outer 8, hole 4) at z=10. The result must
+        // be a hollow tapered tube — watertight, with volume = outer frustum − inner frustum.
+        let frustum = |big: f64, small: f64| std::f64::consts::PI * 10.0 * (big * big + big * small + small * small) / 3.0;
+        let p0 = (circle3(0.0, 0.0, 0.0, 5.0, 48), vec![circle3(0.0, 0.0, 0.0, 3.0, 40)]);
+        let p1 = (circle3(0.0, 0.0, 10.0, 8.0, 48), vec![circle3(0.0, 0.0, 10.0, 4.0, 40)]);
+        let m = loft_mesh(&[p0, p1]).expect("annulus loft builds");
+        assert!(is_manifold(&m), "annular loft isn't watertight (hole not skinned/capped)");
+        let want = frustum(5.0, 8.0) - frustum(3.0, 4.0);
+        let got = mesh_vol(&m);
+        assert!((got - want).abs() / want < 0.03, "hollow loft volume {got:.1} (want {want:.1})");
     }
 
     #[test]

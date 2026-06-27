@@ -87,6 +87,9 @@ pub enum FeatureKind {
     Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
     /// Chamfer: flat-bevel the picked `edges` (world-space polylines) by `distance`.
     Chamfer { distance: f64, edges: Vec<Vec<[f64; 3]>> },
+    /// Loft: skin a solid between an ordered list of cross-section profiles (each a sketch on its
+    /// own plane). Builds a smooth body connecting the profiles — the construction-plane payoff.
+    Loft { profiles: Vec<LoftProfile> },
     /// Mirror: reflect the whole body across `plane` and union it with the original
     /// (a symmetric part). The plane is recorded so it survives regeneration.
     Mirror { plane: PlaneRef },
@@ -95,6 +98,14 @@ pub enum FeatureKind {
     /// threads an existing boss. `rh` = right-handed.
     Thread { origin: [f64; 3], axis: [f64; 3], major_d: f64, pitch: f64, depth: f64, internal: bool, rh: bool },
     // Revolve / … arrive at M8+.
+}
+
+/// One cross-section of a loft: a sketch on a plane, and which of its closed regions to skin.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LoftProfile {
+    pub sketch: Sketch,
+    pub plane: PlaneRef,
+    pub region: usize,
 }
 
 /// One node in the feature timeline.
@@ -190,6 +201,10 @@ impl Document {
                 }
                 FeatureKind::Chamfer { distance, edges } => {
                     format!("[chamfer] Chamfer  d={distance:.2} ({})", edges.len())
+                }
+                FeatureKind::Loft { profiles } => {
+                    ex += 1;
+                    format!("[loft]   Loft{ex}  ({} profiles)", profiles.len())
                 }
                 FeatureKind::Mirror { .. } => "[mirror] Mirror".to_string(),
                 FeatureKind::Thread { major_d, pitch, internal, .. } => {
