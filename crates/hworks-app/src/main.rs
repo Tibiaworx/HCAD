@@ -25,7 +25,7 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, difference, extrude_solid, extrude_solid_with_overlap,
-    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
+    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
     take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -8158,32 +8158,33 @@ fn handle_file_io(
         }
     }
 
-    // Export STEP — the exact B-rep (only available without mesh-only features).
+    // Export STEP — the exact B-rep when available; otherwise a faceted reconstruction from the
+    // mesh (so a loft / fillet / Seamless body still exports, just faceted rather than smooth).
     if ui_state.export_step_request {
         ui_state.export_step_request = false;
-        match &part.solid {
-            Some(solid) => match export_step(solid) {
-                Some(step) => {
-                    if let Some(mut path) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).set_file_name("part.step").save_file() {
-                        if path.extension().is_none() {
-                            path.set_extension("step");
-                        }
-                        match std::fs::write(&path, step) {
-                            Ok(()) => info!("Exported STEP {}", path.display()),
-                            Err(e) => {
-                                warn!("STEP export failed: {e}");
-                                ui_state.last_error = Some(format!("STEP export failed: {e}"));
+        let faceted = part.solid.is_none();
+        let solid = part.solid.clone().or_else(|| part.mesh.as_ref().and_then(|m| mesh_to_solid(m)));
+        match solid.as_ref().and_then(export_step) {
+            Some(step) => {
+                if let Some(mut path) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).set_file_name("part.step").save_file() {
+                    if path.extension().is_none() {
+                        path.set_extension("step");
+                    }
+                    match std::fs::write(&path, step) {
+                        Ok(()) => {
+                            info!("Exported STEP {} ({})", path.display(), if faceted { "faceted from mesh" } else { "exact B-rep" });
+                            if faceted {
+                                ui_state.last_error = Some("Exported a FACETED STEP (this body has no exact B-rep — built with the mesh kernel). Geometry is correct but flat-faced; for smooth surfaces, build with Seamless off and no loft/fillet.".into());
                             }
+                        }
+                        Err(e) => {
+                            warn!("STEP export failed: {e}");
+                            ui_state.last_error = Some(format!("STEP export failed: {e}"));
                         }
                     }
                 }
-                None => ui_state.last_error = Some("STEP export: the kernel couldn't express this solid.".into()),
-            },
-            None => {
-                ui_state.last_error = Some(
-                    "STEP needs the exact B-rep, which this body doesn't have (it was built with the mesh kernel — Seamless, or a loft/fillet/chamfer/mirror). Turn off Seamless and avoid those features, or export STL.".into(),
-                );
             }
+            None => ui_state.last_error = Some("STEP export failed — no exportable body (build a part first).".into()),
         }
     }
 

@@ -460,8 +460,56 @@ pub fn export_stl(mesh: &TriMesh) -> Vec<u8> {
     out
 }
 
+/// Reconstruct a **faceted** B-rep solid from a triangle mesh: weld coincident vertices, share an
+/// edge between adjacent triangles, and make each triangle a planar `Face`, assembled into a Shell
+/// → Solid. This lets a mesh-only body (loft, fillet, seamless boolean) still export to STEP — the
+/// result is faceted (one flat face per triangle), not smooth, but valid B-rep. `None` if it can't
+/// be assembled (panic-guarded). Large meshes make large STEP files.
+pub fn mesh_to_solid(mesh: &TriMesh) -> Option<KSolid> {
+    use std::collections::HashMap;
+    if mesh.indices.len() < 3 {
+        return None;
+    }
+    // Weld to unique vertices (truck topology shares Vertex objects; exact-ish merge only fuses
+    // truck/Manifold's duplicated corners, never distinct geometry).
+    let key = |p: [f32; 3]| ((p[0] * 1.0e5).round() as i64, (p[1] * 1.0e5).round() as i64, (p[2] * 1.0e5).round() as i64);
+    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut uniq: Vec<[f32; 3]> = Vec::new();
+    let mut remap = vec![0u32; mesh.positions.len()];
+    for (i, p) in mesh.positions.iter().enumerate() {
+        remap[i] = *map.entry(key(*p)).or_insert_with(|| {
+            uniq.push(*p);
+            (uniq.len() - 1) as u32
+        });
+    }
+    guard(|| {
+        let verts: Vec<truck_modeling::Vertex> = uniq.iter().map(|p| builder::vertex(Point3::new(p[0] as f64, p[1] as f64, p[2] as f64))).collect();
+        let mut edges: HashMap<(u32, u32), truck_modeling::Edge> = HashMap::new();
+        let mut faces: Vec<truck_modeling::Face> = Vec::new();
+        for t in mesh.indices.chunks_exact(3) {
+            let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+            if a == b || b == c || a == c {
+                continue; // degenerate after welding — skip
+            }
+            // A shared edge is built once (canonical low→high) and reused inverted by the other face.
+            let mut directed = |x: u32, y: u32| -> truck_modeling::Edge {
+                let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+                let e = edges.entry((lo, hi)).or_insert_with(|| builder::line(&verts[lo as usize], &verts[hi as usize])).clone();
+                if x < y { e } else { e.inverse() }
+            };
+            let wire: truck_modeling::Wire = vec![directed(a, b), directed(b, c), directed(c, a)].into_iter().collect();
+            faces.push(builder::try_attach_plane(&[wire]).ok()?);
+        }
+        if faces.len() < 4 {
+            return None;
+        }
+        let shell: truck_modeling::Shell = faces.into_iter().collect();
+        Some(KSolid(truck_modeling::Solid::new(vec![shell])))
+    })
+}
+
 /// Serialize the exact B-rep solid to a **STEP** (ISO 10303 AP203) string. `None` if the kernel
-/// can't express it (or panics) — STEP needs the exact B-rep, so a mesh-only body has no STEP form.
+/// can't express it (or panics).
 pub fn export_step(solid: &KSolid) -> Option<String> {
     guard(|| {
         let compressed = solid.0.compress();
@@ -985,6 +1033,15 @@ mod tests {
         let mesh = tessellate(&cyl, 0.1).mesh;
         let stl = export_stl(&mesh);
         assert_eq!(stl.len(), 84 + (mesh.indices.len() / 3) * 50, "binary STL size wrong");
+    }
+
+    #[test]
+    fn mesh_to_solid_exports_faceted_step() {
+        // A mesh-only body (here a loft, which has no exact B-rep) → faceted solid → STEP.
+        let m = loft_mesh(&[(circle3(0.0, 0.0, 0.0, 5.0, 24), vec![]), (circle3(0.0, 0.0, 10.0, 3.0, 24), vec![])]).unwrap();
+        let solid = mesh_to_solid(&m).expect("faceted solid from mesh");
+        let step = export_step(&solid).expect("step from faceted solid");
+        assert!(step.contains("ISO-10303-21") && step.matches("FACE").count() > 100, "faceted STEP malformed");
     }
 
     #[test]
