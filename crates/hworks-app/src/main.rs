@@ -161,6 +161,7 @@ fn main() {
                     draw_selected_plane,
                     orbit_camera,
                     draw_world_axes,
+                    draw_measure,
                     draw_body_edges,
                     draw_feature_previews,
                     draw_sketch,
@@ -324,6 +325,63 @@ enum ViewAction {
     ExitSketch,
 }
 
+/// Display units. The model is always stored in millimetres; this only affects what's shown and
+/// typed (1 in = 25.4 mm).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Unit {
+    #[default]
+    Mm,
+    Inch,
+}
+
+impl Unit {
+    /// mm × factor → display value.
+    fn factor(self) -> f32 {
+        match self {
+            Unit::Mm => 1.0,
+            Unit::Inch => 1.0 / 25.4,
+        }
+    }
+    fn suffix(self) -> &'static str {
+        match self {
+            Unit::Mm => " mm",
+            Unit::Inch => " in",
+        }
+    }
+    fn short(self) -> &'static str {
+        match self {
+            Unit::Mm => "mm",
+            Unit::Inch => "in",
+        }
+    }
+    /// Format a millimetre length in this unit (mm → 2 dp, inch → 4 dp).
+    fn fmt(self, mm: f32) -> String {
+        match self {
+            Unit::Mm => format!("{:.2} mm", mm),
+            Unit::Inch => format!("{:.4} in", mm / 25.4),
+        }
+    }
+}
+
+/// Format a millimetre length for a compact label (no suffix): mm → 2 dp, inch → 4 dp.
+fn fmt_len_bare(mm: f32, unit: Unit) -> String {
+    match unit {
+        Unit::Mm => format!("{mm:.2}"),
+        Unit::Inch => format!("{:.4}", mm / 25.4),
+    }
+}
+
+/// A length `DragValue` that stores millimetres but displays/edits in the current unit.
+fn unit_drag(ui: &mut egui::Ui, mm: &mut f32, unit: Unit, speed: f64, lo: f32, hi: f32) -> egui::Response {
+    let f = unit.factor();
+    let mut disp = *mm * f;
+    let r = ui.add(egui::DragValue::new(&mut disp).speed(speed * f as f64).range((lo * f)..=(hi * f)).suffix(unit.suffix()));
+    if r.changed() {
+        *mm = disp / f;
+    }
+    r
+}
+
 /// PropertyManager state for a boss/cut being configured in the UI.
 #[derive(Clone)]
 struct PendingOp {
@@ -386,6 +444,11 @@ struct UiState {
     /// Loft PropertyManager: ordered `(sketch feature index, chosen region)` pairs — click sketches
     /// in the tree to add them, click a contour in the viewport to choose its region. `None` ⇒ not lofting.
     loft_spec: Option<Vec<(usize, usize)>>,
+    /// Display unit (mm / inch) for all readouts and length inputs.
+    unit: Unit,
+    /// Measure tool: active flag + the up-to-two picked world points (a 3rd click restarts).
+    measuring: bool,
+    measure_pts: Vec<Vec3>,
     /// Show smooth/tangent edges in the viewport (off = SolidWorks-style removed).
     show_tangent_edges: bool,
     /// Active CommandManager tab.
@@ -938,6 +1001,7 @@ fn ui_system(
     edge_sel: Res<EdgeSelection>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    let unit = ui_state.unit; // display unit for this frame's readouts/labels
 
     // The first time the Text tool is active, register the system fonts with egui so the
     // font dropdown can render each name in its own typeface. `set_fonts` only applies on
@@ -1075,9 +1139,23 @@ fn ui_system(
                 let _ = ui.button("Reference Plane…"); // TODO
             });
             ui.menu_button("Tools", |ui| {
-                let _ = ui.button("Measure…"); // TODO
+                if ui.selectable_label(ui_state.measuring, "Measure").on_hover_text("Click two points on the body to measure the distance (Esc to stop)").clicked() {
+                    ui_state.measuring = !ui_state.measuring;
+                    ui_state.measure_pts.clear();
+                    ui.close();
+                }
                 let _ = ui.button("Mass Properties…"); // TODO
                 ui.separator();
+                ui.menu_button("Units", |ui| {
+                    if ui.selectable_label(ui_state.unit == Unit::Mm, "Millimetres (mm)").clicked() {
+                        ui_state.unit = Unit::Mm;
+                        ui.close();
+                    }
+                    if ui.selectable_label(ui_state.unit == Unit::Inch, "Inches (in)").clicked() {
+                        ui_state.unit = Unit::Inch;
+                        ui.close();
+                    }
+                });
                 let _ = ui.button("Options…"); // TODO
             });
         });
@@ -1521,7 +1599,11 @@ fn ui_system(
                             ui_state.pending_fillet = None;
                             ui_state.pending_chamfer = None;
                         }
-                        if ui.button("Hole Genie").on_hover_text("Threaded holes: click a face to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
+                    });
+                    // Hole Genie works even while a sketch is open (drill at a face feature or a
+                    // sketch point) — only needs a body, not "not sketching".
+                    ui.add_enabled_ui(part.mesh.is_some(), |ui| {
+                        if ui.button("Hole Genie").on_hover_text("Threaded holes: click a face (or a sketch point) to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
                             ui_state.pending_thread = Some(ThreadSpec::default());
                             ui_state.pending_fillet = None;
                             ui_state.pending_chamfer = None;
@@ -2281,7 +2363,7 @@ fn ui_system(
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Distance");
-                ui.add(egui::DragValue::new(&mut spec.offset).speed(0.5).range(0.0..=100_000.0).suffix(" mm"));
+                unit_drag(ui, &mut spec.offset, ui_state.unit, 0.5, 0.0, 100_000.0);
             });
             ui.checkbox(&mut spec.flip, "Flip to the other side");
             ui.add_space(4.0);
@@ -2479,7 +2561,7 @@ fn ui_system(
                     if is_rev {
                         ui.add(egui::DragValue::new(&mut op.depth).speed(1.0).range(1.0..=360.0).suffix("°"));
                     } else {
-                        ui.add(egui::DragValue::new(&mut op.depth).speed(0.1).range(0.1..=10_000.0).suffix(" mm"));
+                        unit_drag(ui, &mut op.depth, ui_state.unit, 0.1, 0.1, 10_000.0);
                     }
                 });
             });
@@ -3286,7 +3368,10 @@ fn ui_system(
             ui.label(format!("Tool: {}", session.tool.label()));
             ui.separator();
             match session.cursor_uv {
-                Some(uv) => ui.label(format!("x {:.2}  y {:.2}", uv.x, uv.y)),
+                Some(uv) => {
+                    let f = ui_state.unit.factor();
+                    ui.label(format!("x {:.3}  y {:.3}", uv.x * f, uv.y * f))
+                }
                 None => ui.label("x —  y —"),
             };
             ui.separator();
@@ -3313,8 +3398,19 @@ fn ui_system(
                 }
             }
             ui.label(format!("{} features", doc.0.features.len()));
+            // Measure readout (when two points are picked).
+            if ui_state.measure_pts.len() == 2 {
+                let d = ui_state.measure_pts[0].distance(ui_state.measure_pts[1]);
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(255, 220, 120), format!("📏 {}", ui_state.unit.fmt(d)));
+            } else if ui_state.measuring {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "Measure: click two points");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label("mm");
+                if ui.selectable_label(false, ui_state.unit.short()).on_hover_text("Switch units (mm / in)").clicked() {
+                    ui_state.unit = if ui_state.unit == Unit::Mm { Unit::Inch } else { Unit::Mm };
+                }
             });
         });
     });
@@ -3460,7 +3556,7 @@ fn ui_system(
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, _, lab) = distance_dim_geometry(a2, b2, *offset as f32, *axis);
-                        act(label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
                     }
                 }
                 Constraint::Radius { center, value, diameter } => {
@@ -3469,7 +3565,7 @@ fn ui_system(
                         let cu = Vec2::new(c.x as f32, c.y as f32);
                         let r = *value as f32;
                         let edge = cu + Vec2::new(r * 0.707, r * 0.707);
-                        let text = if *diameter { format!("Ø{:.2}", value * 2.0) } else { format!("R{value:.2}") };
+                        let text = if *diameter { format!("Ø{}", fmt_len_bare(*value as f32 * 2.0, unit)) } else { format!("R{}", fmt_len_bare(*value as f32, unit)) };
                         act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on), k, &mut dim_action);
                     }
                 }
@@ -3496,7 +3592,7 @@ fn ui_system(
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, lab) = point_line_geometry(p2, a2, b2);
-                        act(label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
                     }
                 }
                 Constraint::SlotWidth { a, b, value, .. } => {
@@ -3504,7 +3600,7 @@ fn ui_system(
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, _, lab) = slot_width_geometry(a2, b2, (*value * 0.5) as f32);
-                        act(label_at(ctx, egui::Id::new(("slotlabel", k)), ap.to_world(lab), format!("{value:.2}"), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("slotlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
                     }
                 }
                 _ => {}
@@ -3520,7 +3616,7 @@ fn ui_system(
                 if let Some(c) = session.sketch.points.get(*center) {
                     let cu = Vec2::new(c.x as f32, c.y as f32);
                     let edge = cu + Vec2::new(*radius as f32 * 0.707, *radius as f32 * 0.707);
-                    let resp = label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{:.2}", radius * 2.0), false);
+                    let resp = label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{}", fmt_len_bare(*radius as f32 * 2.0, unit)), false);
                     if resp.is_some_and(|r| r.double_clicked()) {
                         dia_action = Some(*center);
                     }
@@ -3587,10 +3683,13 @@ fn ui_system(
                         .show(ctx, |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.horizontal(|ui| {
+                                    let f = unit.factor();
+                                    let mut disp = buf * f;
                                     let resp = ui.add_sized(
                                         egui::vec2(78.0, ui.spacing().interact_size.y),
-                                        egui::DragValue::new(&mut buf).speed(0.1).range(0.001..=1_000_000.0).max_decimals(2).suffix(" mm"),
+                                        egui::DragValue::new(&mut disp).speed(0.1 * f as f64).range((0.001 * f)..=(1_000_000.0 * f)).max_decimals(if unit == Unit::Inch { 4 } else { 2 }).suffix(unit.suffix()),
                                     );
+                                    buf = disp / f;
                                     resp.request_focus();
                                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                                     if ui.button("OK").clicked() || enter {
@@ -4841,15 +4940,49 @@ fn sketch_interaction(
         return;
     }
 
+    // Measure tool (view mode): click body feature points (vertex / edge midpoint, else the surface
+    // hit); two points give a distance (shown in the status bar). A third click starts a new pair.
+    if ui_state.measuring && session.plane.is_none() && !blocking.0 {
+        if buttons.just_pressed(MouseButton::Left) {
+            if let Some(cursor) = window.cursor_position() {
+                if let Some(p) = nearest_measure_point(&part, camera, cam_gt, cursor) {
+                    if ui_state.measure_pts.len() >= 2 {
+                        ui_state.measure_pts.clear();
+                    }
+                    ui_state.measure_pts.push(p);
+                }
+            }
+            return;
+        }
+    }
+
     // Hole Genie: while its PM is open, hover the body and snap to the nearest feature point
     // (vertex / edge midpoint / circle centre) so the hole drops onto a precise location
     // without fiddly aiming. A click anchors it there (hit = centre, face normal = axis).
     ui_state.thread_hover = None;
     if ui_state.pending_thread.is_some() && !blocking.0 {
-        if let (Some(cursor), Some(mesh)) = (window.cursor_position(), part.mesh.as_ref()) {
-            if let Some((hit, normal)) = pick_face_point(mesh, camera, cam_gt, cursor) {
-                // Snap the raw hit to the nearest body feature point in screen space.
-                let origin = snap_place_point(&part, camera, cam_gt, cursor, hit);
+        if let Some(cursor) = window.cursor_position() {
+            // While a sketch is open, prefer snapping to one of its points (projected to 3D) — so
+            // you can drill exactly where you placed a point. The hole axis is the sketch-plane
+            // normal (the outward face normal when sketching on a face).
+            let sketch_hit = session.plane.as_ref().and_then(|ap| {
+                let mut best: Option<(f32, Vec3)> = None;
+                for p in &session.sketch.points {
+                    let w = ap.to_world(Vec2::new(p.x as f32, p.y as f32));
+                    if let Ok(s) = camera.world_to_viewport(cam_gt, w) {
+                        let d = s.distance(cursor);
+                        if d < 16.0 && best.map_or(true, |(bd, _)| d < bd) {
+                            best = Some((d, w));
+                        }
+                    }
+                }
+                best.map(|(_, w)| (w, ap.n))
+            });
+            // Otherwise snap to the nearest body feature point under the cursor.
+            let face_hit = part.mesh.as_ref().and_then(|mesh| {
+                pick_face_point(mesh, camera, cam_gt, cursor).map(|(hit, normal)| (snap_place_point(&part, camera, cam_gt, cursor, hit), normal))
+            });
+            if let Some((origin, normal)) = sketch_hit.or(face_hit) {
                 ui_state.thread_hover = Some((origin, normal));
                 if buttons.just_pressed(MouseButton::Left) {
                     if let Some(spec) = ui_state.pending_thread.clone() {
@@ -7950,8 +8083,14 @@ fn commit_parallelogram(s: &mut Sketch, a: Vec2, b: Vec2, c: Vec2, construction:
 fn handle_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut session: ResMut<SketchSession>,
+    mut ui_state: ResMut<UiState>,
     blocking: Res<UiBlocking>,
 ) {
+    // Escape leaves the measure tool (works in view mode, where the sketch shortcuts below don't run).
+    if keys.just_pressed(KeyCode::Escape) && ui_state.measuring && !blocking.1 {
+        ui_state.measuring = false;
+        ui_state.measure_pts.clear();
+    }
     if session.plane.is_none() {
         return;
     }
@@ -11424,6 +11563,45 @@ fn snap_place_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform, curs
 
 /// Raycast the cursor onto the body mesh: the nearest triangle hit, returning the world hit
 /// point and that face's normal (oriented toward the camera). Used to place a threaded hole.
+/// Nearest measure target under the cursor: a body edge endpoint or midpoint within ~14 px
+/// (screen space), else the raw surface hit. So a measurement snaps to vertices/midpoints.
+fn nearest_measure_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform, cursor: Vec2) -> Option<Vec3> {
+    let mut best: Option<(f32, Vec3)> = None;
+    for e in &part.edges {
+        let (a, b) = (Vec3::from_array(e[0]), Vec3::from_array(e[1]));
+        for p in [a, b, (a + b) * 0.5] {
+            if let Ok(s) = camera.world_to_viewport(cam_gt, p) {
+                let d = s.distance(cursor);
+                if d < 14.0 && best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, p));
+                }
+            }
+        }
+    }
+    if let Some((_, p)) = best {
+        return Some(p);
+    }
+    part.mesh.as_ref().and_then(|m| pick_face_point(m, camera, cam_gt, cursor).map(|(hit, _)| hit))
+}
+
+/// Draw the measure tool's picked points (small 3D crosses) and the line between two of them.
+fn draw_measure(mut gizmos: Gizmos, ui_state: Res<UiState>, cam_q: Query<&OrbitCamera>) {
+    if ui_state.measure_pts.is_empty() {
+        return;
+    }
+    let r = cam_q.single().map(|c| c.radius).unwrap_or(12.0);
+    let s = (r * 0.012).max(0.05);
+    let col = Color::srgb(1.0, 0.85, 0.3);
+    for &p in &ui_state.measure_pts {
+        gizmos.line(p - Vec3::X * s, p + Vec3::X * s, col);
+        gizmos.line(p - Vec3::Y * s, p + Vec3::Y * s, col);
+        gizmos.line(p - Vec3::Z * s, p + Vec3::Z * s, col);
+    }
+    if ui_state.measure_pts.len() == 2 {
+        gizmos.line(ui_state.measure_pts[0], ui_state.measure_pts[1], col);
+    }
+}
+
 fn pick_face_point(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cursor: Vec2) -> Option<(Vec3, Vec3)> {
     let ray = camera.viewport_to_world(cam_gt, cursor).ok()?;
     let (orig, dir) = (ray.origin, *ray.direction);

@@ -8,6 +8,10 @@ Cargo.lock
 run.log
 *.log
 
+# Installer build artifacts (the .nsi recipe is tracked; the binaries are not)
+/installer/HCAD-Setup.exe
+/installer/vc_redist.x64.exe
+
 # Editor / OS
 .vscode/
 .idea/
