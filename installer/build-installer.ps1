@@ -9,7 +9,7 @@ $env:PATH = "C:\Program Files\CMake\bin;$env:PATH"
 cargo build --release -p hworks-app
 Pop-Location
 
-# 2) The installer bundles vc_redist.x64.exe — fetch it once if missing.
+# 2) The installer bundles vc_redist.x64.exe - fetch it once if missing.
 $redist = Join-Path $PSScriptRoot "vc_redist.x64.exe"
 if (-not (Test-Path $redist)) {
     Write-Host "Downloading vc_redist.x64.exe..."
@@ -18,7 +18,7 @@ if (-not (Test-Path $redist)) {
 
 # 3) Package with NSIS.
 $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
-if (-not (Test-Path $makensis)) { throw "NSIS not found — install with: winget install -e --id NSIS.NSIS" }
+if (-not (Test-Path $makensis)) { throw "NSIS not found - install with: winget install -e --id NSIS.NSIS" }
 & $makensis (Join-Path $PSScriptRoot "HCAD.nsi")
 
 Write-Host "`nInstaller ready: $(Join-Path $PSScriptRoot 'HCAD-Setup.exe')"
