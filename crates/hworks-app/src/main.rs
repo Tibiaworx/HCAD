@@ -22,7 +22,7 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Document, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
+use hworks_document::{Document, FeatureId, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, difference, extrude_solid, extrude_solid_with_overlap,
     export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
@@ -153,18 +153,22 @@ fn main() {
                 (
                     handle_new_part,
                     highlight_face,
+                    hover_body_edge,
                     sync_ref_planes,
                     scale_ref_planes,
+                    sync_ref_images,
+                    update_ref_images,
                     update_window_title,
                     update_plane_visibility,
                     update_body_transparency,
                     draw_selected_plane,
                     orbit_camera,
+                    animate_camera,
                     draw_world_axes,
                     draw_measure,
                     draw_body_edges,
                     draw_feature_previews,
-                    draw_sketch,
+                    (draw_selected_feature, draw_sketch),
                     tick_edge_flash,
                     draw_edge_selection,
                 ),
@@ -288,8 +292,11 @@ impl Tool {
 /// A requested boolean solid operation, carrying its depth.
 #[derive(Clone, Copy)]
 enum SolidOp {
-    Boss(f64),
-    Cut(f64),
+    /// Boss extrude: `(distance, back, thin, thin_side)` — `back` is the Direction-2 distance
+    /// (0 = single direction); `thin` > 0 is a thin-feature wall thickness (0 = solid), `thin_side`
+    /// 0=outward/1=inward/2=mid.
+    Boss(f64, f64, f64, u8),
+    Cut(f64, f64, f64, u8),
     /// Revolve the profile around the picked axis line by this many radians (adds material).
     Revolve(f64),
     /// Revolve, but subtract the swept solid from the body (a lathe groove/bore).
@@ -310,9 +317,12 @@ enum OpKind {
 enum TreeAction {
     Select(usize),
     Edit(usize),
+    /// Reopen a sketch that holds a Text entity, straight into the Text tool with it selected.
+    EditText(usize),
     ExtrudeBoss(usize),
     ExtrudeCut(usize),
     Delete(usize),
+    EditImage(usize),
 }
 
 /// A camera action chosen from the right-click context menu.
@@ -389,6 +399,14 @@ struct PendingOp {
     depth: f32,
     /// Direction 1 "reverse" toggle — extrude/cut against the sketch normal.
     reverse: bool,
+    /// Direction 2: when enabled, the prism also extends `depth2` the *opposite* way.
+    dir2: bool,
+    depth2: f32,
+    /// Thin feature: when enabled, sweep a wall of thickness `thin` (mm) instead of a solid.
+    /// `thin_side`: 0 = outward, 1 = inward, 2 = mid-plane.
+    thin: bool,
+    thin_mm: f32,
+    thin_side: u8,
 }
 
 /// PropertyManager state for creating a reference (construction) plane offset from a base — a datum
@@ -429,6 +447,13 @@ struct UiState {
     export_step_request: bool,
     /// The file this part is bound to — Save writes here directly (no dialog) once it's set.
     current_file: Option<std::path::PathBuf>,
+    /// Transient status messages (text + remaining seconds) shown as fading toasts, bottom-right.
+    toasts: Vec<(String, f32)>,
+    /// Whether the About window is open.
+    show_about: bool,
+    /// Set with `edit_sketch_request` to reopen a Text feature straight into the Text tool with the
+    /// text entity selected and its parameters loaded into the PM. Consumed by `handle_edit_sketch`.
+    edit_as_text: bool,
     /// Request to (re)open a feature's sketch for editing.
     edit_sketch_request: Option<usize>,
     /// Datum plane (by order: 0=Front, 1=Top, 2=Right) currently selected in the tree — shown
@@ -444,6 +469,8 @@ struct UiState {
     /// Loft PropertyManager: ordered `(sketch feature index, chosen region)` pairs — click sketches
     /// in the tree to add them, click a contour in the viewport to choose its region. `None` ⇒ not lofting.
     loft_spec: Option<Vec<(usize, usize)>>,
+    /// True when the open Loft PM is a *cut* (subtract the lofted solid) rather than a boss.
+    loft_cut: bool,
     /// Display unit (mm / inch) for all readouts and length inputs.
     unit: Unit,
     /// Measure tool: active flag + the up-to-two picked world points (a 3rd click restarts).
@@ -477,6 +504,9 @@ struct UiState {
     /// While the Fillet PM is open, the edges (world-space polylines) the user has picked
     /// to round. Empty = round every edge. (Shared by the chamfer tool too.)
     fillet_edges: Vec<Vec<[f64; 3]>>,
+    /// The edge loop under the cursor while picking fillet/chamfer edges (world-space polyline +
+    /// closed flag), previewed so you can see what a click would grab. Recomputed each frame.
+    hover_edge_loop: Option<(Vec<Vec3>, bool)>,
     /// Chamfer tool: the bevel distance the PM is configuring (mirrors the fillet state).
     pending_chamfer: Option<f32>,
     chamfer_shown: Option<f32>,
@@ -492,6 +522,31 @@ struct UiState {
     /// The snapped placement point under the cursor while the Hole Genie PM is open
     /// (`(origin, axis)`), for the hover marker and to anchor on click.
     thread_hover: Option<(Vec3, Vec3)>,
+    /// Request to insert a reference image: open a file dialog and place it on the
+    /// currently-selected plane (or Front if none). Consumed by the file-IO system.
+    insert_image_request: bool,
+    /// Request to start a fresh sketch on an arbitrary stored plane (e.g. a reference image's plane,
+    /// so you can trace it). Consumed by `handle_edit_sketch`.
+    sketch_on_ref: Option<PlaneRef>,
+    /// Feature index of the reference image whose PropertyManager is open (`None` ⇒ closed).
+    image_edit: Option<usize>,
+    /// Lock the image's width:height to its source pixel aspect ratio when editing one dimension.
+    image_lock_aspect: bool,
+    /// Click-to-calibrate state: the up-to-two picked uv points (in the image plane, mm at the
+    /// current scale) and the entered real distance. `Some` ⇒ calibration mode is active.
+    image_calib: Option<ImageCalib>,
+}
+
+/// Two-point scale calibration for a reference image: pick two points on the picture, type the
+/// real distance between them, and the image is scaled so they match.
+#[derive(Clone, Default)]
+struct ImageCalib {
+    /// Picked uv points on the image plane (mm at the current scale); collects up to two.
+    pts: Vec<Vec2>,
+    /// The real-world distance the two points should be apart (mm), typed by the user.
+    target: f32,
+    /// Live cursor position on the image plane (uv), for the rubber-band line while picking.
+    cursor: Option<Vec2>,
 }
 
 /// A standard thread: display name, major diameter (mm), coarse pitch (mm).
@@ -636,9 +691,23 @@ impl ActivePlane {
         let v = Vec3::from_array(p.v);
         Self { name: p.name.clone(), origin: Vec3::from_array(p.origin), u, v, n: u.cross(v), datum: true }
     }
+    /// Build from a stored `PlaneRef` (a feature's recorded plane), normalising u/v to a clean basis.
+    fn from_ref(p: &PlaneRef) -> Self {
+        let u = Vec3::new(p.u[0] as f32, p.u[1] as f32, p.u[2] as f32).normalize_or_zero();
+        let v = Vec3::new(p.v[0] as f32, p.v[1] as f32, p.v[2] as f32).normalize_or_zero();
+        let origin = Vec3::new(p.origin[0] as f32, p.origin[1] as f32, p.origin[2] as f32);
+        Self { name: String::new(), origin, u, v, n: u.cross(v), datum: p.datum }
+    }
     fn to_world(&self, uv: Vec2) -> Vec3 {
         self.origin + self.u * uv.x + self.v * uv.y
     }
+}
+
+/// Marker on a spawned reference-image quad, tagged with the document feature it mirrors so the
+/// sync system can match/despawn it and the update system can refresh its transform/opacity.
+#[derive(Component)]
+struct RefImageEnt {
+    id: FeatureId,
 }
 
 #[derive(Resource, Default)]
@@ -781,6 +850,9 @@ struct SketchSession {
     infer_v: Option<usize>,
     infer_h: Option<usize>,
     start_infer: (Option<usize>, Option<usize>),
+    /// Relation badges to show next to the cursor this frame (SolidWorks-style hints for why the
+    /// cursor snapped: horizontal, vertical, coincident, on-edge, collinear, tangent).
+    infer_badges: Vec<InferBadge>,
     /// Entity (line/circle) under the cursor in Select mode, highlighted on hover.
     hover_entity: Option<usize>,
     /// Reference snap points (uv) from the body's edges lying in the sketch plane —
@@ -802,6 +874,8 @@ struct SketchSession {
     snap_dist: f32,
     /// True while the user is dragging the extrude direction arrow to set the depth.
     arrow_drag: bool,
+    /// True while dragging the *Direction 2* arrow (sets `depth2`).
+    arrow_drag2: bool,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -837,12 +911,65 @@ struct OrbitCamera {
     radius: f32,
     yaw: f32,
     pitch: f32,
+    /// When set, the camera eases toward this target (a "snap to view" button) instead of jumping.
+    /// Cleared once reached, or the moment the user orbits/pans/zooms by hand.
+    anim: Option<CamTarget>,
+}
+
+/// A camera pose to glide toward, used by the animated view transitions.
+#[derive(Clone, Copy)]
+struct CamTarget {
+    focus: Vec3,
+    radius: f32,
+    yaw: f32,
+    pitch: f32,
 }
 
 impl Default for OrbitCamera {
     fn default() -> Self {
-        Self { focus: Vec3::ZERO, radius: 12.0, yaw: 0.8, pitch: -0.55 }
+        Self { focus: Vec3::ZERO, radius: 12.0, yaw: 0.8, pitch: -0.55, anim: None }
     }
+}
+
+impl OrbitCamera {
+    /// Begin gliding to a new pose. Yaw/pitch use the shortest angular path, resolved each frame.
+    fn animate_to(&mut self, focus: Vec3, radius: f32, yaw: f32, pitch: f32) {
+        self.anim = Some(CamTarget { focus, radius, yaw, pitch });
+    }
+    /// Glide to a new orientation, keeping the current focus and zoom (Front/Top/Right/Iso).
+    fn animate_view(&mut self, yaw: f32, pitch: f32) {
+        self.animate_to(self.focus, self.radius, yaw, pitch);
+    }
+}
+
+/// Ease the orbit camera toward its `anim` target (smooth "snap to view"). Exponential smoothing
+/// gives a fast-in/slow-out glide that settles in ~0.2s; angles take the shortest way round. Runs
+/// right after `orbit_camera`, which clears `anim` on any manual orbit/pan/zoom so a drag wins.
+fn animate_camera(time: Res<Time>, mut query: Query<(&mut Transform, &mut OrbitCamera)>) {
+    let Ok((mut transform, mut cam)) = query.single_mut() else { return };
+    let Some(t) = cam.anim else { return };
+    let dt = time.delta_secs();
+    // 1 - e^(-dt/τ): frame-rate independent. τ≈0.07 → ~95% there in 0.2s.
+    let k = 1.0 - (-dt / 0.07).exp();
+    let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    let dyaw = wrap(t.yaw - cam.yaw);
+    let dpitch = wrap(t.pitch - cam.pitch);
+    let dfocus = t.focus - cam.focus;
+    let dradius = t.radius - cam.radius;
+    // Close enough → snap exactly and stop animating.
+    if dyaw.abs() < 1e-3 && dpitch.abs() < 1e-3 && dfocus.length() < 1e-3 && dradius.abs() < 1e-3 {
+        cam.focus = t.focus;
+        cam.radius = t.radius;
+        cam.yaw = t.yaw;
+        cam.pitch = t.pitch;
+        cam.anim = None;
+    } else {
+        cam.yaw += dyaw * k;
+        cam.pitch += dpitch * k;
+        cam.focus += dfocus * k;
+        cam.radius += dradius * k;
+    }
+    *transform = camera_transform(&cam);
 }
 
 #[derive(Component)]
@@ -963,6 +1090,25 @@ fn look_along(cam: &mut OrbitCamera, focus: Vec3, normal: Vec3) {
     cam.focus = focus;
 }
 
+/// Width (logical px) of the left PropertyManager panel — it overlays the 3D viewport, so the
+/// visible drawing area is the window minus this on the left.
+const LEFT_PANEL_PX: f32 = 240.0;
+
+/// Nudge the orbit pivot left (along camera-right) so a "Normal To" frame lands the geometry in
+/// the middle of the *visible* viewport, not the middle of the window. The left panel covers
+/// `LEFT_PANEL_PX`, so the visible centre sits half a panel-width right of window centre; shifting
+/// the pivot left by that many world units at the focus depth puts the sketch back on centre.
+/// Call *after* `look_along` (needs the final yaw/pitch/radius). `win_h` is the logical window height.
+fn recenter_for_panel(cam: &mut OrbitCamera, win_h: f32) {
+    const VFOV: f32 = std::f32::consts::PI / 4.0; // Bevy PerspectiveProjection default vertical fov
+    if win_h <= 1.0 {
+        return;
+    }
+    let world_per_px = 2.0 * cam.radius * (VFOV * 0.5).tan() / win_h;
+    let right = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0) * Vec3::X;
+    cam.focus -= right * (LEFT_PANEL_PX * 0.5 * world_per_px);
+}
+
 // ---------------------------------------------------------------------------
 // egui shell
 // ---------------------------------------------------------------------------
@@ -987,6 +1133,25 @@ fn dropdown_arrow(ui: &mut egui::Ui, hover: &str) -> egui::Response {
     resp
 }
 
+/// A menu button with a **drawn** down-arrow (our font has no ▼ glyph, so a text arrow renders as a
+/// box). Trailing space reserves room; the triangle is painted over the button's right edge.
+fn flyout_menu<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<Option<R>> {
+    let inner = ui.menu_button(format!("{label}    "), add);
+    let rect = inner.response.rect;
+    let c = egui::pos2(rect.right() - 10.0, rect.center().y);
+    let col = if inner.response.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - 4.0, c.y - 2.5),
+            egui::pos2(c.x + 4.0, c.y - 2.5),
+            egui::pos2(c.x, c.y + 3.0),
+        ],
+        col,
+        egui::Stroke::NONE,
+    ));
+    inner
+}
+
 fn ui_system(
     mut contexts: EguiContexts,
     mut session: ResMut<SketchSession>,
@@ -999,6 +1164,7 @@ fn ui_system(
     part: Res<Part>,
     mut font_previews: ResMut<FontPreviews>,
     edge_sel: Res<EdgeSelection>,
+    time: Res<Time>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
@@ -1066,30 +1232,32 @@ fn ui_system(
         ui_state.was_sketching = in_sketch;
     }
 
-    // ---- Menu bar (File / Edit / View / Insert / Tools) ----
-    // Placeholder menus for now; the entries are stubs wired to real actions where one
-    // already exists (New/Open/Save/Undo/Redo) and left inert otherwise so they can be
-    // populated later.
-    egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-        egui::MenuBar::new().ui(ui, |ui| {
+    // ---- Top toolbar: a classic menu bar row, then quick actions + view controls, then the
+    // CommandManager tabs. (The menu bar is kept on its own strip, SolidWorks-style.)
+    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        ui.add_space(2.0);
+        // Row 0: a compact menu-bar strip — tight spacing + small text, old-school, but using the
+        // program's own panel background so it blends with the rest of the toolbar (no inset tint).
+        egui::Frame::new()
+            .inner_margin(egui::Margin { left: 4, right: 4, top: 1, bottom: 1 })
+            .show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            // Classic application menu bar: items sit close together, small text, no button frame.
+            ui.spacing_mut().item_spacing.x = 1.0;
+            ui.spacing_mut().button_padding = egui::vec2(5.0, 1.0);
+            ui.style_mut().text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::new(12.5, egui::FontFamily::Proportional),
+            );
+            ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            // Menus — only real, wired actions (no dead placeholders).
             ui.menu_button("File", |ui| {
-                if ui.button("New Part").clicked() {
-                    ui_state.new_part = true;
-                    ui.close();
-                }
-                if ui.button("Open…").clicked() {
-                    ui_state.open_request = true;
-                    ui.close();
-                }
+                if ui.button("New Part").clicked() { ui_state.new_part = true; ui.close(); }
+                if ui.button("Open…").clicked() { ui_state.open_request = true; ui.close(); }
                 ui.separator();
-                if ui.button("Save").clicked() {
-                    ui_state.save_request = true;
-                    ui.close();
-                }
-                if ui.button("Save As…").clicked() {
-                    ui_state.save_as_request = true;
-                    ui.close();
-                }
+                if ui.button("Save").clicked() { ui_state.save_request = true; ui.close(); }
+                if ui.button("Save As…").clicked() { ui_state.save_as_request = true; ui.close(); }
                 ui.separator();
                 ui.menu_button("Export", |ui| {
                     if ui.button("STL… (mesh)").on_hover_text("Triangle mesh for 3D printing — works for any body").clicked() {
@@ -1101,42 +1269,24 @@ fn ui_system(
                         ui.close();
                     }
                 });
-                ui.separator();
-                let _ = ui.button("Exit"); // TODO: graceful shutdown
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).clicked() {
-                    ui_state.undo_request = true;
-                    ui.close();
-                }
-                if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).clicked() {
-                    ui_state.redo_request = true;
-                    ui.close();
-                }
-                ui.separator();
-                let _ = ui.button("Cut"); // TODO
-                let _ = ui.button("Copy"); // TODO
-                let _ = ui.button("Paste"); // TODO
-                let _ = ui.button("Delete"); // TODO
+                if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).clicked() { ui_state.undo_request = true; ui.close(); }
+                if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).clicked() { ui_state.redo_request = true; ui.close(); }
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut ui_state.show_tangent_edges, "Tangent edges");
-                ui.checkbox(&mut ui_state.seamless, "Seamless");
-                ui.separator();
-                let _ = ui.button("Zoom to Fit"); // TODO
-                let _ = ui.button("Isometric"); // TODO
-                let _ = ui.button("Front"); // TODO
-                let _ = ui.button("Top"); // TODO
-                let _ = ui.button("Right"); // TODO
+                if ui.checkbox(&mut ui_state.seamless, "Seamless").changed() { ui_state.regen = true; }
             });
             ui.menu_button("Insert", |ui| {
-                let _ = ui.button("Sketch"); // TODO: start a sketch
-                let _ = ui.button("Boss Extrude…"); // TODO
-                let _ = ui.button("Cut Extrude…"); // TODO
-                ui.separator();
-                let _ = ui.button("Fillet…"); // TODO
-                let _ = ui.button("Chamfer…"); // TODO
-                let _ = ui.button("Reference Plane…"); // TODO
+                if ui
+                    .button("Sketch Picture…")
+                    .on_hover_text("Place a reference image on the selected plane (or Front) to trace over — then sketch on the same plane")
+                    .clicked()
+                {
+                    ui_state.insert_image_request = true;
+                    ui.close();
+                }
             });
             ui.menu_button("Tools", |ui| {
                 if ui.selectable_label(ui_state.measuring, "Measure").on_hover_text("Click two points on the body to measure the distance (Esc to stop)").clicked() {
@@ -1144,30 +1294,24 @@ fn ui_system(
                     ui_state.measure_pts.clear();
                     ui.close();
                 }
-                let _ = ui.button("Mass Properties…"); // TODO
-                ui.separator();
                 ui.menu_button("Units", |ui| {
-                    if ui.selectable_label(ui_state.unit == Unit::Mm, "Millimetres (mm)").clicked() {
-                        ui_state.unit = Unit::Mm;
-                        ui.close();
-                    }
-                    if ui.selectable_label(ui_state.unit == Unit::Inch, "Inches (in)").clicked() {
-                        ui_state.unit = Unit::Inch;
-                        ui.close();
-                    }
+                    if ui.selectable_label(ui_state.unit == Unit::Mm, "Millimetres (mm)").clicked() { ui_state.unit = Unit::Mm; ui.close(); }
+                    if ui.selectable_label(ui_state.unit == Unit::Inch, "Inches (in)").clicked() { ui_state.unit = Unit::Inch; ui.close(); }
                 });
-                let _ = ui.button("Options…"); // TODO
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About HCAD").clicked() {
+                    ui_state.show_about = true;
+                    ui.close();
+                }
             });
         });
-    });
+        }); // close the menu-bar frame
+        ui.separator();
 
-    // ---- Top toolbar (CommandManager) ----
-    egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-        // Row 1: global actions + view controls.
-        ui.add_space(2.0);
+        // Row 1: quick actions + view controls.
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("HCAD").strong().size(16.0));
-            if ui.button("New Part").on_hover_text("Clear the model and start over").clicked() {
+            if ui.button("New").on_hover_text("Clear the model and start over").clicked() {
                 ui_state.new_part = true;
             }
             if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
@@ -1198,11 +1342,10 @@ fn ui_system(
                 }
                 ui.separator();
                 if ui.button("Fit").on_hover_text("Zoom to fit the part").clicked() {
-                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                    if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
                         let (focus, radius) = fit_view(&part);
-                        orbit.focus = focus;
-                        orbit.radius = radius;
-                        *tf = camera_transform(&orbit);
+                        let (yaw, pitch) = (orbit.yaw, orbit.pitch);
+                        orbit.animate_to(focus, radius, yaw, pitch);
                     }
                 }
                 for (name, yaw, pitch) in [
@@ -1212,10 +1355,8 @@ fn ui_system(
                     ("Front", 0.0, 0.0),
                 ] {
                     if ui.button(name).on_hover_text(format!("{name} view")).clicked() {
-                        if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-                            orbit.yaw = yaw;
-                            orbit.pitch = pitch;
-                            *tf = camera_transform(&orbit);
+                        if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
+                            orbit.animate_view(yaw, pitch);
                         }
                     }
                 }
@@ -1536,78 +1677,91 @@ fn ui_system(
                         if ui.button("Cancel").on_hover_text("Discard changes since opening this sketch").clicked() {
                             session.cancel_request = true;
                         }
-                    } else {
-                        ui.label(egui::RichText::new("Click a plane or face to start a sketch.").italics().weak());
                     }
+                    // (The "click a plane to sketch" prompt now lives in the status bar.)
                 }
                 Tab::Features => {
-                    ui.add_enabled_ui(can_extrude, |ui| {
-                        if ui.button("Extrude Boss").on_hover_text("Add material from the sketch (E)").clicked() {
-                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
-                                ui_state.edit_sketch_request = Some(i);
-                            }
-                            ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32, reverse: false });
+                    // SolidWorks-style flyouts: the ~dozen feature commands grouped by what they do
+                    // (add material / remove material / bevel / reference), so the strip is a handful of
+                    // labelled dropdowns instead of a wall of same-weight buttons.
+                    let sketch_count = doc.0.features.iter().filter(|f| matches!(f.kind, FeatureKind::Sketch { .. })).count();
+                    let has_mesh = part.mesh.is_some();
+                    let can_loft = sketch_count >= 2 && !in_sketch;
+                    let start_op = |ui_state: &mut UiState, kind: OpKind, depth: f32| {
+                        if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
+                            ui_state.edit_sketch_request = Some(i);
                         }
-                        if ui.button("Extrude Cut").on_hover_text("Remove material from the sketch (D)").clicked() {
-                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
-                                ui_state.edit_sketch_request = Some(i);
-                            }
-                            ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32, reverse: false });
+                        ui_state.pending = Some(PendingOp { kind, depth, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
+                    };
+                    // Add material.
+                    flyout_menu(ui, "Boss", |ui| {
+                        if ui.add_enabled(can_extrude, egui::Button::new("Extrude Boss")).on_hover_text("Add material from the sketch (E)").clicked() {
+                            start_op(&mut ui_state, OpKind::Boss, EXTRUDE_DISTANCE as f32);
+                            ui.close();
                         }
-                        if ui.button("Revolve").on_hover_text("Revolve the profile around a picked axis line (adds material)").clicked() {
-                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
-                                ui_state.edit_sketch_request = Some(i);
-                            }
-                            // `depth` carries the revolve angle in degrees (default a full turn).
-                            ui_state.pending = Some(PendingOp { kind: OpKind::Revolve, depth: 360.0, reverse: false });
+                        if ui.add_enabled(can_extrude, egui::Button::new("Revolve")).on_hover_text("Revolve the profile around a picked axis line (adds material)").clicked() {
+                            start_op(&mut ui_state, OpKind::Revolve, 360.0);
+                            ui.close();
                         }
-                        if ui.button("Revolve Cut").on_hover_text("Revolve the profile around a picked axis line and subtract it (a lathe groove/bore)").clicked() {
-                            if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
-                                ui_state.edit_sketch_request = Some(i);
-                            }
-                            ui_state.pending = Some(PendingOp { kind: OpKind::RevolveCut, depth: 360.0, reverse: false });
-                        }
-                    });
-                    if !can_extrude {
-                        ui.label(egui::RichText::new("Select a sketch or draw a closed profile.").italics().weak());
-                    }
-                    ui.add_enabled_ui(part.mesh.is_some() && !in_sketch, |ui| {
-                        // Seed the edge set from a pre-selected edge (click an edge, then the tool).
-                        let seed = |ui_state: &mut UiState| {
-                            ui_state.fillet_edges.clear();
-                            if edge_sel.chain.len() >= 2 {
-                                ui_state.fillet_edges.push(
-                                    edge_sel.chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect(),
-                                );
-                            }
-                        };
-                        if ui.button("Fillet").on_hover_text("Round picked edges by a radius — click edges on the body").clicked() {
-                            ui_state.pending_fillet = Some(0.2);
-                            ui_state.fillet_shown = None;
-                            ui_state.pending_chamfer = None;
-                            seed(&mut ui_state);
-                        }
-                        if ui.button("Chamfer").on_hover_text("Flat-bevel picked edges by a distance — click edges on the body").clicked() {
-                            ui_state.pending_chamfer = Some(0.2);
-                            ui_state.chamfer_shown = None;
-                            ui_state.pending_fillet = None;
-                            seed(&mut ui_state);
-                        }
-                        if ui.button("Mirror").on_hover_text("Reflect the whole body across a plane and union it (a symmetric part)").clicked() {
-                            ui_state.pending_mirror = Some(0);
-                            ui_state.mirror_shown = None;
-                            ui_state.pending_fillet = None;
-                            ui_state.pending_chamfer = None;
+                        if ui.add_enabled(can_loft, egui::Button::new("Loft")).on_hover_text("Skin a solid between 2+ sketch profiles — click the sketches in the tree in order").clicked() {
+                            ui_state.loft_spec = Some(Vec::new());
+                            ui_state.loft_cut = false;
+                            ui.close();
                         }
                     });
-                    // Hole Genie works even while a sketch is open (drill at a face feature or a
-                    // sketch point) — only needs a body, not "not sketching".
-                    ui.add_enabled_ui(part.mesh.is_some(), |ui| {
-                        if ui.button("Hole Genie").on_hover_text("Threaded holes: click a face (or a sketch point) to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
+                    // Remove material.
+                    flyout_menu(ui, "Cut", |ui| {
+                        if ui.add_enabled(can_extrude, egui::Button::new("Extrude Cut")).on_hover_text("Remove material from the sketch (D)").clicked() {
+                            start_op(&mut ui_state, OpKind::Cut, EXTRUDE_DISTANCE as f32);
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_extrude, egui::Button::new("Revolve Cut")).on_hover_text("Revolve the profile around a picked axis line and subtract it (a lathe groove/bore)").clicked() {
+                            start_op(&mut ui_state, OpKind::RevolveCut, 360.0);
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_loft && has_mesh, egui::Button::new("Loft Cut")).on_hover_text("Subtract a solid lofted between 2+ profiles from the body (a tapered pocket/bore)").clicked() {
+                            ui_state.loft_spec = Some(Vec::new());
+                            ui_state.loft_cut = true;
+                            ui.close();
+                        }
+                        if ui.add_enabled(has_mesh, egui::Button::new("Hole Genie")).on_hover_text("Threaded holes: click a face (or a sketch point) to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
                             ui_state.pending_thread = Some(ThreadSpec::default());
                             ui_state.pending_fillet = None;
                             ui_state.pending_chamfer = None;
                             ui_state.pending_mirror = None;
+                            ui.close();
+                        }
+                    });
+                    // Bevel / pattern the body.
+                    flyout_menu(ui, "Fillet", |ui| {
+                        // Seed the edge set from a pre-selected edge (click an edge, then the tool).
+                        let seed = |ui_state: &mut UiState| {
+                            ui_state.fillet_edges.clear();
+                            if edge_sel.chain.len() >= 2 {
+                                ui_state.fillet_edges.push(edge_sel.chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect());
+                            }
+                        };
+                        let bevel_ok = has_mesh && !in_sketch;
+                        if ui.add_enabled(bevel_ok, egui::Button::new("Fillet")).on_hover_text("Round picked edges by a radius — click edges on the body").clicked() {
+                            ui_state.pending_fillet = Some(0.2);
+                            ui_state.fillet_shown = None;
+                            ui_state.pending_chamfer = None;
+                            seed(&mut ui_state);
+                            ui.close();
+                        }
+                        if ui.add_enabled(bevel_ok, egui::Button::new("Chamfer")).on_hover_text("Flat-bevel picked edges by a distance — click edges on the body").clicked() {
+                            ui_state.pending_chamfer = Some(0.2);
+                            ui_state.chamfer_shown = None;
+                            ui_state.pending_fillet = None;
+                            seed(&mut ui_state);
+                            ui.close();
+                        }
+                        if ui.add_enabled(bevel_ok, egui::Button::new("Mirror")).on_hover_text("Reflect the whole body across a plane and union it (a symmetric part)").clicked() {
+                            ui_state.pending_mirror = Some(0);
+                            ui_state.mirror_shown = None;
+                            ui_state.pending_fillet = None;
+                            ui_state.pending_chamfer = None;
+                            ui.close();
                         }
                     });
                     ui.separator();
@@ -1617,12 +1771,6 @@ fn ui_system(
                             ui_state.plane_spec = Some(PlaneSpec { base: ActivePlane::from_doc(p), base_name: p.name.clone(), offset: 10.0, flip: false, edit_target: None });
                         }
                     }
-                    let sketch_count = doc.0.features.iter().filter(|f| matches!(f.kind, FeatureKind::Sketch { .. })).count();
-                    ui.add_enabled_ui(sketch_count >= 2 && !in_sketch, |ui| {
-                        if ui.button("Loft").on_hover_text("Skin a solid between 2+ sketch profiles — click the sketches in the tree in order").clicked() {
-                            ui_state.loft_spec = Some(Vec::new());
-                        }
-                    });
                 }
             }
         });
@@ -2414,8 +2562,172 @@ fn ui_system(
             }
             ui_state.plane_spec = if keep { Some(spec) } else { None };
         }
+        // Reference-image PropertyManager: opacity, size (with aspect lock), position, rotation,
+        // mirror, and the two-point scale calibration.
+        if let Some(idx) = ui_state.image_edit {
+            let cur = doc.0.features.get(idx).and_then(|f| match &f.kind {
+                FeatureKind::RefImage { px_w, px_h, center, rot, width, height, opacity, flip_h, flip_v, .. } => {
+                    Some((*px_w, *px_h, *center, *rot, *width, *height, *opacity, *flip_h, *flip_v))
+                }
+                _ => None,
+            });
+            if let Some((px_w, px_h, mut center, mut rot, mut width, mut height, mut opacity, mut flip_h, mut flip_v)) = cur {
+                ui.heading("Reference Image");
+                let mut close = false;
+                let mut delete = false;
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("✔  Done").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                        close = true;
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("🗑  Delete").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                        delete = true;
+                    }
+                });
+                ui.separator();
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("✎  Sketch on this plane").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(45, 95, 150)))
+                    .on_hover_text("Open a sketch on the picture's plane and trace over it")
+                    .clicked()
+                {
+                    if let Some(FeatureKind::RefImage { plane, .. }) = doc.0.features.get(idx).map(|f| &f.kind) {
+                        ui_state.sketch_on_ref = Some(plane.clone());
+                    }
+                    close = true;
+                }
+                ui.separator();
+                ui.label(format!("Source: {px_w}×{px_h} px"));
+                ui.add_space(4.0);
+                // Opacity.
+                ui.horizontal(|ui| {
+                    ui.label("Opacity");
+                    ui.add(egui::Slider::new(&mut opacity, 0.05..=1.0).fixed_decimals(2));
+                });
+                ui.separator();
+                // Size — width/height, optionally locked to the source pixel aspect ratio.
+                let aspect = px_h.max(1) as f64 / px_w.max(1) as f64; // h / w
+                ui.checkbox(&mut ui_state.image_lock_aspect, "Lock aspect ratio");
+                let lock = ui_state.image_lock_aspect;
+                ui.horizontal(|ui| {
+                    ui.label("Width ");
+                    let mut w = width as f32;
+                    if unit_drag(ui, &mut w, ui_state.unit, 0.5, 0.1, 100_000.0).changed() {
+                        width = w as f64;
+                        if lock {
+                            height = width * aspect;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Height");
+                    let mut h = height as f32;
+                    if unit_drag(ui, &mut h, ui_state.unit, 0.5, 0.1, 100_000.0).changed() {
+                        height = h as f64;
+                        if lock {
+                            width = height / aspect;
+                        }
+                    }
+                });
+                ui.separator();
+                // Position (centre on the plane) + rotation.
+                ui.horizontal(|ui| {
+                    ui.label("Pos U ");
+                    let mut u = center[0] as f32;
+                    if unit_drag(ui, &mut u, ui_state.unit, 0.5, -100_000.0, 100_000.0).changed() {
+                        center[0] = u as f64;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pos V ");
+                    let mut v = center[1] as f32;
+                    if unit_drag(ui, &mut v, ui_state.unit, 0.5, -100_000.0, 100_000.0).changed() {
+                        center[1] = v as f64;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Rotate");
+                    let mut deg = rot.to_degrees() as f32;
+                    if ui.add(egui::DragValue::new(&mut deg).speed(1.0).range(-360.0..=360.0).suffix("°")).changed() {
+                        rot = (deg as f64).to_radians();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut flip_h, "Flip H");
+                    ui.checkbox(&mut flip_v, "Flip V");
+                });
+                ui.separator();
+                // Two-point scale calibration.
+                match ui_state.image_calib.clone() {
+                    None => {
+                        if ui.button("📐  Calibrate scale…").on_hover_text("Click two points on the picture, then type the real distance between them").clicked() {
+                            ui_state.image_calib = Some(ImageCalib::default());
+                        }
+                    }
+                    Some(mut cal) => {
+                        ui.label(egui::RichText::new("Calibrate: click two points on the picture.").strong());
+                        ui.label(egui::RichText::new(format!("Picked {}/2 points.", cal.pts.len())).weak().small());
+                        let mut apply = false;
+                        if cal.pts.len() == 2 {
+                            let cur_d = (cal.pts[0] - cal.pts[1]).length();
+                            ui.horizontal(|ui| {
+                                ui.label("Real distance");
+                                unit_drag(ui, &mut cal.target, ui_state.unit, 0.5, 0.01, 1_000_000.0);
+                            });
+                            ui.label(egui::RichText::new(format!("Currently {} on the picture.", fmt_len_bare(cur_d, ui_state.unit))).weak().small());
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(cal.target > 0.0 && cur_d > 1e-4, egui::Button::new("Apply scale")).clicked() {
+                                    let k = (cal.target / cur_d) as f64;
+                                    width *= k;
+                                    height *= k;
+                                    apply = true;
+                                }
+                                if ui.button("Reset points").clicked() {
+                                    cal.pts.clear();
+                                }
+                            });
+                        }
+                        if ui.button("Cancel calibration").clicked() || apply {
+                            ui_state.image_calib = None;
+                        } else {
+                            ui_state.image_calib = Some(cal);
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Sketch on the same plane to trace over the picture.").italics().weak().small());
+
+                // Write the edited values back into the feature.
+                if let Some(FeatureKind::RefImage { center: c, rot: r, width: w, height: h, opacity: o, flip_h: fh, flip_v: fv, .. }) =
+                    doc.0.features.get_mut(idx).map(|f| &mut f.kind)
+                {
+                    *c = center;
+                    *r = rot;
+                    *w = width;
+                    *h = height;
+                    *o = opacity;
+                    *fh = flip_h;
+                    *fv = flip_v;
+                }
+                if delete {
+                    history.snapshot(&doc.0);
+                    if idx < doc.0.features.len() {
+                        doc.0.features.remove(idx);
+                        if doc.0.rollback > doc.0.features.len() {
+                            doc.0.rollback = doc.0.features.len();
+                        }
+                    }
+                    ui_state.image_edit = None;
+                    ui_state.image_calib = None;
+                } else if close {
+                    ui_state.image_edit = None;
+                    ui_state.image_calib = None;
+                }
+            } else {
+                ui_state.image_edit = None;
+                ui_state.image_calib = None;
+            }
+        }
         if let Some(profiles) = ui_state.loft_spec.clone() {
-            ui.heading("Loft");
+            ui.heading(if ui_state.loft_cut { "Loft Cut" } else { "Loft" });
             let mut keep = true;
             let mut create = false;
             ui.horizontal(|ui| {
@@ -2459,7 +2771,7 @@ fn ui_system(
                     })
                     .collect();
                 if built.len() >= 2 {
-                    doc.0.add_feature(FeatureKind::Loft { profiles: built });
+                    doc.0.add_feature(FeatureKind::Loft { profiles: built, cut: ui_state.loft_cut });
                     ui_state.regen = true;
                 }
                 keep = false;
@@ -2566,13 +2878,39 @@ fn ui_system(
                 });
             });
 
-            // Direction 2 / Thin Feature — present (like SolidWorks) but not yet built.
-            let mut off = false;
-            egui::CollapsingHeader::new("Direction 2").default_open(false).show(ui, |ui| {
-                ui.add_enabled(false, egui::Checkbox::new(&mut off, "Not implemented yet"));
-            });
-            egui::CollapsingHeader::new("Thin Feature").default_open(false).show(ui, |ui| {
-                ui.add_enabled(false, egui::Checkbox::new(&mut off, "Not implemented yet"));
+            // Direction 2 — extend the boss/cut the opposite way too. (Not for revolve.)
+            if !is_rev {
+                egui::CollapsingHeader::new("Direction 2").default_open(op.dir2).show(ui, |ui| {
+                    ui.checkbox(&mut op.dir2, "Extend the other direction");
+                    if op.dir2 {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("D2").strong());
+                            unit_drag(ui, &mut op.depth2, ui_state.unit, 0.1, 0.1, 10_000.0);
+                        });
+                    }
+                });
+            }
+            // Thin Feature — sweep a wall of a chosen thickness instead of filling the profile
+            // (a pipe/box shell). Builds with the mesh kernel (forces Seamless on).
+            egui::CollapsingHeader::new("Thin Feature").default_open(op.thin).show(ui, |ui| {
+                ui.checkbox(&mut op.thin, "Thin feature (wall)");
+                if op.thin {
+                    ui.horizontal(|ui| {
+                        ui.label("Thickness");
+                        unit_drag(ui, &mut op.thin_mm, ui_state.unit, 0.1, 0.01, 10_000.0);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Side");
+                        egui::ComboBox::from_id_salt("thin_side")
+                            .selected_text(match op.thin_side { 1 => "Inward", 2 => "Mid-plane", _ => "Outward" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut op.thin_side, 0, "Outward");
+                                ui.selectable_value(&mut op.thin_side, 1, "Inward");
+                                ui.selectable_value(&mut op.thin_side, 2, "Mid-plane");
+                            });
+                    });
+                    ui.label(egui::RichText::new("Wall follows the profile; the region isn't filled.").weak().small());
+                }
             });
 
             // Selected Contours — the closed regions this op will use (empty = all).
@@ -2608,11 +2946,13 @@ fn ui_system(
             });
 
             if commit {
-                // Reverse flips the sweep direction (signed distance).
+                // Reverse flips the sweep direction (signed distance); Direction 2 adds `back`.
                 let d = if op.reverse { -(op.depth as f64) } else { op.depth as f64 };
+                let back = if op.dir2 { op.depth2.max(0.0) as f64 } else { 0.0 };
+                let thin = if op.thin { op.thin_mm.max(0.001) as f64 } else { 0.0 };
                 session.op_request = Some(match op.kind {
-                    OpKind::Boss => SolidOp::Boss(d),
-                    OpKind::Cut => SolidOp::Cut(d),
+                    OpKind::Boss => SolidOp::Boss(d, back, thin, op.thin_side),
+                    OpKind::Cut => SolidOp::Cut(d, back, thin, op.thin_side),
                     // For revolve, `depth` carries the angle in degrees.
                     OpKind::Revolve => SolidOp::Revolve((d).to_radians()),
                     OpKind::RevolveCut => SolidOp::RevolveCut((d).to_radians()),
@@ -3000,7 +3340,21 @@ fn ui_system(
             let rollback = doc.0.rollback;
 
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("⬡ Part").strong().size(15.0));
+                // Root node shows the saved part's name (file stem), or "Part" for an unsaved doc.
+                let part_name = ui_state
+                    .current_file
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Part".to_string());
+                ui.label(egui::RichText::new(format!("⬡ {part_name}")).strong().size(15.0))
+                    .on_hover_text(
+                        ui_state
+                            .current_file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "Unsaved part".to_string()),
+                    );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let shown = rollback.saturating_sub(nplanes);
                     let total = doc.0.features.len().saturating_sub(nplanes);
@@ -3079,12 +3433,27 @@ fn ui_system(
 
                     let row = match &f.kind {
                         FeatureKind::Plane(_) => continue,
-                        FeatureKind::Sketch { .. } => {
+                        FeatureKind::Sketch { sketch, .. } => {
                             sk += 1;
+                            // A sketch made of text reads as a "Text" feature in the tree (SolidWorks
+                            // shows Sketch Text as its own node); double-click / Edit reopens it in the
+                            // Text tool. Any other sketch stays "Sketch{n}".
+                            let text_str = sketch.entities.iter().find_map(|e| match e {
+                                SketchEntity::Text { text, .. } => Some(text.clone()),
+                                _ => None,
+                            });
+                            let label = if let Some(t) = &text_str {
+                                let first_line = t.lines().next().unwrap_or("");
+                                let short: String = first_line.chars().take(18).collect();
+                                let ell = if first_line.chars().count() > 18 || t.contains('\n') { "…" } else { "" };
+                                format!("[text]   \"{short}{ell}\"")
+                            } else {
+                                format!("[sketch] Sketch{sk}")
+                            };
                             // While the Loft PM is open, a sketch row is highlighted if already a
                             // profile; clicking adds it (or removes it) from the loft's ordered list.
                             let in_loft = ui_state.loft_spec.as_ref().is_some_and(|v| v.iter().any(|(x, _)| *x == i));
-                            let resp = ui.selectable_label(selected || in_loft, styled(format!("✎ Sketch{sk}")));
+                            let resp = ui.selectable_label(selected || in_loft, styled(label));
                             if resp.clicked() {
                                 if let Some(v) = ui_state.loft_spec.as_mut() {
                                     if let Some(pos) = v.iter().position(|(x, _)| *x == i) {
@@ -3096,8 +3465,16 @@ fn ui_system(
                                     ui_state.selected = Some(i);
                                 }
                             }
+                            if resp.double_clicked() {
+                                action = Some(if text_str.is_some() { TreeAction::EditText(i) } else { TreeAction::Edit(i) });
+                            }
                             resp.context_menu(|ui| {
-                                if ui.button("Edit sketch").clicked() {
+                                if text_str.is_some() {
+                                    if ui.button("Edit text").clicked() {
+                                        action = Some(TreeAction::EditText(i));
+                                        ui.close();
+                                    }
+                                } else if ui.button("Edit sketch").clicked() {
                                     action = Some(TreeAction::Edit(i));
                                     ui.close();
                                 }
@@ -3117,25 +3494,56 @@ fn ui_system(
                             resp.rect
                         }
                         FeatureKind::Extrude { distance, .. } | FeatureKind::Cut { distance, .. } => {
-                            let (label, child, icon) = match &f.kind {
+                            // A text profile makes this an extruded/cut *Text* feature — surface that in
+                            // the label and let the child row (or double-click) reopen it in the Text tool.
+                            let text_str = match &f.kind {
+                                FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } => {
+                                    sketch.entities.iter().find_map(|e| match e {
+                                        SketchEntity::Text { text, .. } => Some(text.clone()),
+                                        _ => None,
+                                    })
+                                }
+                                _ => None,
+                            };
+                            let short = text_str.as_ref().map(|t| {
+                                let line = t.lines().next().unwrap_or("");
+                                let s: String = line.chars().take(14).collect();
+                                let ell = if line.chars().count() > 14 || t.contains('\n') { "…" } else { "" };
+                                format!("\"{s}{ell}\"")
+                            });
+                            let (label, child) = match &f.kind {
                                 FeatureKind::Extrude { .. } => {
                                     ex += 1;
-                                    (format!("Boss-Extrude{ex}  (h {distance:.1})"), format!("✎ Sketch of Extrude{ex}"), "⬢")
+                                    let l = match &short {
+                                        Some(s) => format!("Text-Extrude{ex}  {s}"),
+                                        None => format!("Boss-Extrude{ex}  (h {distance:.1})"),
+                                    };
+                                    (l, if short.is_some() { format!("Text of Extrude{ex}") } else { format!("Sketch of Extrude{ex}") })
                                 }
                                 _ => {
                                     ct += 1;
-                                    (format!("Cut-Extrude{ct}  (h {distance:.1})"), format!("✎ Sketch of Cut{ct}"), "⬣")
+                                    let l = match &short {
+                                        Some(s) => format!("Text-Cut{ct}  {s}"),
+                                        None => format!("Cut-Extrude{ct}  (h {distance:.1})"),
+                                    };
+                                    (l, if short.is_some() { format!("Text of Cut{ct}") } else { format!("Sketch of Cut{ct}") })
                                 }
                             };
-                            let resp = egui::CollapsingHeader::new(styled(format!("{icon} {label}")))
+                            let is_text = text_str.is_some();
+                            let edit_action = if is_text { TreeAction::EditText(i) } else { TreeAction::Edit(i) };
+                            let edit_label = if is_text { "Edit text" } else { "Edit sketch" };
+                            let resp = egui::CollapsingHeader::new(styled(label))
                                 .id_salt(i)
                                 .default_open(false)
                                 .show(ui, |ui| {
                                     let child_resp =
                                         ui.selectable_label(false, egui::RichText::new(child).weak());
+                                    if child_resp.double_clicked() {
+                                        action = Some(edit_action);
+                                    }
                                     child_resp.context_menu(|ui| {
-                                        if ui.button("Edit sketch").clicked() {
-                                            action = Some(TreeAction::Edit(i));
+                                        if ui.button(edit_label).clicked() {
+                                            action = Some(edit_action);
                                             ui.close();
                                         }
                                     });
@@ -3143,7 +3551,14 @@ fn ui_system(
                             if resp.header_response.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.header_response.double_clicked() && is_text {
+                                action = Some(edit_action);
+                            }
                             resp.header_response.context_menu(|ui| {
+                                if is_text && ui.button("Edit text").clicked() {
+                                    action = Some(edit_action);
+                                    ui.close();
+                                }
                                 if ui.button("Edit feature (depth)").clicked() {
                                     action = Some(TreeAction::Select(i));
                                     ui.close();
@@ -3158,12 +3573,12 @@ fn ui_system(
                         FeatureKind::Revolve { angle, cut, .. } => {
                             let (label, child) = if *cut {
                                 ct += 1;
-                                (format!("RevCut{ct}  ({:.0}°)", angle.to_degrees()), format!("✎ Sketch of RevCut{ct}"))
+                                (format!("RevCut{ct}  ({:.0}°)", angle.to_degrees()), format!("Sketch of RevCut{ct}"))
                             } else {
                                 ex += 1;
-                                (format!("Revolve{ex}  ({:.0}°)", angle.to_degrees()), format!("✎ Sketch of Revolve{ex}"))
+                                (format!("Revolve{ex}  ({:.0}°)", angle.to_degrees()), format!("Sketch of Revolve{ex}"))
                             };
-                            let resp = egui::CollapsingHeader::new(styled(format!("⏀ {label}")))
+                            let resp = egui::CollapsingHeader::new(styled(format!("{label}")))
                                 .id_salt(i)
                                 .default_open(false)
                                 .show(ui, |ui| {
@@ -3192,7 +3607,7 @@ fn ui_system(
                         }
                         FeatureKind::Fillet { radius, edges } => {
                             let scope = if edges.is_empty() { "all edges".to_string() } else { format!("{} edge(s)", edges.len()) };
-                            let resp = ui.selectable_label(selected, styled(format!("⬤ Fillet  (r {radius:.2}, {scope})")));
+                            let resp = ui.selectable_label(selected, styled(format!("Fillet  (r {radius:.2}, {scope})")));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -3205,7 +3620,7 @@ fn ui_system(
                             resp.rect
                         }
                         FeatureKind::Chamfer { distance, edges } => {
-                            let resp = ui.selectable_label(selected, styled(format!("⬤ Chamfer  (d {distance:.2}, {} edge(s))", edges.len())));
+                            let resp = ui.selectable_label(selected, styled(format!("Chamfer  (d {distance:.2}, {} edge(s))", edges.len())));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -3218,7 +3633,7 @@ fn ui_system(
                             resp.rect
                         }
                         FeatureKind::Mirror { .. } => {
-                            let resp = ui.selectable_label(selected, styled("◧ Mirror".to_string()));
+                            let resp = ui.selectable_label(selected, styled("Mirror".to_string()));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -3230,9 +3645,15 @@ fn ui_system(
                             });
                             resp.rect
                         }
-                        FeatureKind::Loft { profiles } => {
-                            ex += 1;
-                            let resp = ui.selectable_label(selected, styled(format!("⏃ Loft{ex}  ({} profiles)", profiles.len())));
+                        FeatureKind::Loft { profiles, cut } => {
+                            let label = if *cut {
+                                ct += 1;
+                                format!("LoftCut{ct}  ({} profiles)", profiles.len())
+                            } else {
+                                ex += 1;
+                                format!("Loft{ex}  ({} profiles)", profiles.len())
+                            };
+                            let resp = ui.selectable_label(selected, styled(label));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
@@ -3246,11 +3667,28 @@ fn ui_system(
                         }
                         FeatureKind::Thread { major_d, pitch, internal, .. } => {
                             let kind = if *internal { "tap" } else { "ext" };
-                            let resp = ui.selectable_label(selected, styled(format!("⛁ Thread {kind}  M{major_d:.1}×{pitch:.2}")));
+                            let resp = ui.selectable_label(selected, styled(format!("Thread {kind}  M{major_d:.1}×{pitch:.2}")));
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
                             resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::RefImage { width, height, .. } => {
+                            let resp = ui.selectable_label(selected, styled(format!("Picture  ({width:.0}×{height:.0})")));
+                            if resp.clicked() {
+                                action = Some(TreeAction::EditImage(i));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit picture").clicked() {
+                                    action = Some(TreeAction::EditImage(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -3302,31 +3740,39 @@ fn ui_system(
                         // prefilled with the feature's kind/depth (no separate editor).
                         // (kind, PM value, reverse). Boss/Cut carry a distance; a revolve carries
                         // its angle in degrees (negative stored angle ⇒ the "spin other way" flag).
+                        // (kind, PM depth, reverse, Direction-2 distance).
                         let op = doc.0.features.get(i).and_then(|f| match &f.kind {
-                            FeatureKind::Extrude { distance, .. } => Some((OpKind::Boss, (distance.abs() as f32).max(0.1), *distance < 0.0)),
-                            FeatureKind::Cut { distance, .. } => Some((OpKind::Cut, (distance.abs() as f32).max(0.1), *distance < 0.0)),
+                            FeatureKind::Extrude { distance, back, thin, thin_side, .. } => Some((OpKind::Boss, (distance.abs() as f32).max(0.1), *distance < 0.0, *back as f32, *thin, *thin_side)),
+                            FeatureKind::Cut { distance, back, thin, thin_side, .. } => Some((OpKind::Cut, (distance.abs() as f32).max(0.1), *distance < 0.0, *back as f32, *thin, *thin_side)),
                             FeatureKind::Revolve { angle, cut, .. } => Some((
                                 if *cut { OpKind::RevolveCut } else { OpKind::Revolve },
                                 (angle.abs().to_degrees() as f32).clamp(1.0, 360.0),
                                 *angle < 0.0,
+                                0.0,
+                                0.0,
+                                0,
                             )),
                             _ => None,
                         });
-                        if let Some((kind, depth, reverse)) = op {
+                        if let Some((kind, depth, reverse, back, thin, thin_side)) = op {
                             ui_state.edit_sketch_request = Some(i);
-                            ui_state.pending = Some(PendingOp { kind, depth, reverse });
+                            ui_state.pending = Some(PendingOp { kind, depth, reverse, dir2: back > 0.0, depth2: back.max(0.1), thin: thin > 0.0, thin_mm: if thin > 0.0 { thin as f32 } else { 2.0 }, thin_side });
                         } else {
                             ui_state.selected = Some(i);
                         }
                     }
                     TreeAction::Edit(i) => ui_state.edit_sketch_request = Some(i),
+                    TreeAction::EditText(i) => {
+                        ui_state.edit_sketch_request = Some(i);
+                        ui_state.edit_as_text = true;
+                    }
                     TreeAction::ExtrudeBoss(i) => {
                         ui_state.edit_sketch_request = Some(i);
-                        ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32, reverse: false });
+                        ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
                     }
                     TreeAction::ExtrudeCut(i) => {
                         ui_state.edit_sketch_request = Some(i);
-                        ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32, reverse: false });
+                        ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
                     }
                     TreeAction::Delete(i) => {
                         if i < doc.0.features.len() {
@@ -3336,8 +3782,14 @@ fn ui_system(
                                 doc.0.rollback = doc.0.features.len();
                             }
                             ui_state.selected = None;
+                            ui_state.image_edit = None;
                             ui_state.regen = true;
                         }
+                    }
+                    TreeAction::EditImage(i) => {
+                        ui_state.image_edit = Some(i);
+                        ui_state.image_lock_aspect = true;
+                        ui_state.image_calib = None;
                     }
                 }
             }
@@ -3398,6 +3850,18 @@ fn ui_system(
                 }
             }
             ui.label(format!("{} features", doc.0.features.len()));
+            // Context hint (moved out of the toolbar): what to do next when nothing is actionable yet.
+            if !in_sketch {
+                let hint = match ui_state.active_tab {
+                    Tab::Sketch => Some("Click a plane or face to start a sketch."),
+                    Tab::Features if !can_extrude => Some("Select a sketch, or draw a closed profile, to make a feature."),
+                    _ => None,
+                };
+                if let Some(h) = hint {
+                    ui.separator();
+                    ui.label(egui::RichText::new(h).italics().weak());
+                }
+            }
             // Measure readout (when two points are picked).
             if ui_state.measure_pts.len() == 2 {
                 let d = ui_state.measure_pts[0].distance(ui_state.measure_pts[1]);
@@ -3463,33 +3927,39 @@ fn ui_system(
         if let Some(act) = action {
             match act {
                 ViewAction::NormalToSketch => {
-                    if let (Some(ap), Ok((mut tf, mut orbit))) =
+                    if let (Some(ap), Ok((_tf, mut orbit))) =
                         (session.plane.clone(), cam_q.single_mut())
                     {
+                        // Reuse look_along/recenter to derive the target pose, then restore the
+                        // current pose and glide to it (so the transition animates).
+                        let cur = (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius);
                         look_along(&mut orbit, ap.origin, ap.n);
-                        *tf = camera_transform(&orbit);
+                        recenter_for_panel(&mut orbit, ctx.screen_rect().height());
+                        let tgt = (orbit.focus, orbit.radius, orbit.yaw, orbit.pitch);
+                        (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius) = cur;
+                        orbit.animate_to(tgt.0, tgt.1, tgt.2, tgt.3);
                     }
                 }
                 ViewAction::Normal(n) => {
-                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                    if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
+                        let cur = (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius);
                         look_along(&mut orbit, Vec3::ZERO, n);
-                        *tf = camera_transform(&orbit);
+                        let tgt = (orbit.focus, orbit.radius, orbit.yaw, orbit.pitch);
+                        (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius) = cur;
+                        orbit.animate_to(tgt.0, tgt.1, tgt.2, tgt.3);
                     }
                 }
                 ViewAction::Iso => {
-                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-                        orbit.focus = Vec3::ZERO;
-                        orbit.yaw = 0.8;
-                        orbit.pitch = -0.55;
-                        *tf = camera_transform(&orbit);
+                    if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
+                        let radius = orbit.radius;
+                        orbit.animate_to(Vec3::ZERO, radius, 0.8, -0.55);
                     }
                 }
                 ViewAction::Fit => {
-                    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+                    if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
                         let (focus, radius) = fit_view(&part);
-                        orbit.focus = focus;
-                        orbit.radius = radius;
-                        *tf = camera_transform(&orbit);
+                        let (yaw, pitch) = (orbit.yaw, orbit.pitch);
+                        orbit.animate_to(focus, radius, yaw, pitch);
                     }
                 }
                 ViewAction::ExitSketch => {
@@ -3501,6 +3971,24 @@ fn ui_system(
         // Close on any button, a left click elsewhere, or Escape.
         if close || ctx.input(|i| i.pointer.primary_clicked() || i.key_pressed(egui::Key::Escape)) {
             ui_state.context_pos = None;
+        }
+    }
+
+    // Sketch inference badges: small yellow relation chips beside the cursor (SolidWorks-style).
+    if !session.infer_badges.is_empty() {
+        if let (Some(ap), Some(cur), Ok((camera, cam_gt))) = (session.plane.clone(), session.cursor_uv, cam_read.single()) {
+            if let Ok(sp) = camera.world_to_viewport(cam_gt, ap.to_world(cur)) {
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("infer_badges")));
+                let mut x = sp.x + 14.0;
+                let y = sp.y - 22.0;
+                for b in &session.infer_badges {
+                    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(16.0, 16.0));
+                    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(245, 210, 70));
+                    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 95, 20)), egui::StrokeKind::Inside);
+                    painter.text(rect.center(), egui::Align2::CENTER_CENTER, b.symbol(), egui::FontId::proportional(12.0), egui::Color32::from_gray(20));
+                    x += 19.0;
+                }
+            }
         }
     }
 
@@ -3919,12 +4407,19 @@ fn ui_system(
     // matching the coloured gizmo axis lines so the reference-plane orientation is readable.
     if part.solid.is_none() && part.mesh.is_none() && session.plane.is_none() {
         if let Ok((camera, cam_gt)) = cam_read.single() {
+            // Only draw a tip label if it lands inside the 3D viewport — otherwise the projected tip
+            // can climb into the toolbar/side panels and bleed over them (the "Y popping through").
+            let view = ctx.available_rect();
             for (world, label, color) in [
                 (Vec3::X * 5.2, "X", egui::Color32::from_rgb(255, 80, 80)),
                 (Vec3::Y * 5.2, "Y", egui::Color32::from_rgb(90, 230, 90)),
                 (Vec3::Z * 5.2, "Z", egui::Color32::from_rgb(110, 150, 255)),
             ] {
                 if let Ok(p) = camera.world_to_viewport(cam_gt, world) {
+                    let tip = egui::pos2(p.x, p.y);
+                    if !view.contains(tip) {
+                        continue;
+                    }
                     egui::Area::new(egui::Id::new(("axislabel", label)))
                         .order(egui::Order::Middle)
                         .fixed_pos(egui::pos2(p.x - 5.0, p.y - 9.0))
@@ -3964,8 +4459,146 @@ fn ui_system(
         }
     }
 
+    // ---- Navigation triad: a small clickable axis gizmo, top-right of the viewport. It mirrors the
+    // camera orientation; clicking an axis tip glides to that standard view (SolidWorks/Fusion-style).
+    if let Ok((_, orbit)) = cam_q.single() {
+        let (yaw, pitch) = (orbit.yaw, orbit.pitch);
+        let rot = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+        let right = rot * Vec3::X;
+        let up = rot * Vec3::Y;
+        let fwd = rot * Vec3::NEG_Z; // into the scene
+        // Each world axis → a labelled tip. Project onto screen (x=right·d, y=−up·d); depth = fwd·d.
+        let axes: [(Vec3, &str, egui::Color32); 6] = [
+            (Vec3::X, "X", egui::Color32::from_rgb(230, 90, 90)),
+            (Vec3::NEG_X, "-X", egui::Color32::from_rgb(150, 70, 70)),
+            (Vec3::Y, "Y", egui::Color32::from_rgb(110, 210, 110)),
+            (Vec3::NEG_Y, "-Y", egui::Color32::from_rgb(70, 140, 70)),
+            (Vec3::Z, "Z", egui::Color32::from_rgb(110, 150, 240)),
+            (Vec3::NEG_Z, "-Z", egui::Color32::from_rgb(70, 95, 160)),
+        ];
+        let sz = 88.0;
+        let vr = ctx.available_rect();
+        let mut nav_target: Option<Vec3> = None;
+        egui::Area::new(egui::Id::new("nav_triad"))
+            .fixed_pos(egui::pos2(vr.right() - sz - 12.0, vr.top() + 12.0))
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                let c = rect.center();
+                let r = sz * 0.34;
+                let painter = ui.painter();
+                let ptr = resp.hover_pos();
+                // Draw back-to-front so near tips overlap far ones.
+                let mut order: Vec<usize> = (0..6).collect();
+                order.sort_by(|&a, &b| fwd.dot(axes[b].0).partial_cmp(&fwd.dot(axes[a].0)).unwrap());
+                let proj = |d: Vec3| egui::vec2(d.dot(right), -d.dot(up));
+                for &i in &order {
+                    let (axis, label, col) = axes[i];
+                    let tip = c + proj(axis) * r;
+                    let positive = !label.starts_with('-');
+                    let hovered = ptr.map_or(false, |p| p.distance(tip) < 12.0);
+                    // Axis stick (only for the positive tips, so the gizmo reads as a 3-arm triad).
+                    if positive {
+                        painter.line_segment([c, tip], egui::Stroke::new(2.0, col));
+                    }
+                    let rad = if positive { 9.0 } else { 6.0 };
+                    let fill = if hovered { egui::Color32::WHITE } else if positive { col } else { egui::Color32::from_gray(70) };
+                    painter.circle_filled(tip, rad, fill);
+                    painter.circle_stroke(tip, rad, egui::Stroke::new(1.0, col));
+                    if positive {
+                        painter.text(tip, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.0), egui::Color32::from_gray(20));
+                    }
+                    if hovered && resp.clicked() {
+                        nav_target = Some(axis);
+                    }
+                }
+                resp.on_hover_text("Click an axis to snap to that view");
+            });
+        if let Some(axis) = nav_target {
+            if let Ok((_, mut orbit)) = cam_q.single_mut() {
+                let n = axis.normalize();
+                let (ty, tp) = (n.x.atan2(n.z), (-n.y).asin().clamp(-1.54, 1.54));
+                orbit.animate_view(ty, tp);
+            }
+        }
+    }
+
+    // About window.
+    if ui_state.show_about {
+        let mut open = true;
+        egui::Window::new("About HCAD")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("HCAD").heading().strong());
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(6.0);
+                ui.label("A parametric solid modeler — sketch, extrude, revolve, loft,");
+                ui.label("fillet/chamfer, and mesh booleans, with STL/STEP export.");
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Kernels:");
+                    ui.label(egui::RichText::new("truck (exact B-rep) + Manifold (mesh)").weak());
+                });
+                ui.add_space(4.0);
+            });
+        ui_state.show_about = open;
+    }
+
+    // Toasts: transient status chips, bottom-right, fading out over their last second.
+    if !ui_state.toasts.is_empty() {
+        let dt = time.delta_secs();
+        for (_, ttl) in ui_state.toasts.iter_mut() {
+            *ttl -= dt;
+        }
+        ui_state.toasts.retain(|(_, ttl)| *ttl > 0.0);
+        let toasts = ui_state.toasts.clone();
+        for (i, (text, ttl)) in toasts.iter().enumerate() {
+            let a = ttl.clamp(0.0, 1.0); // fade over the final second
+            egui::Area::new(egui::Id::new(("toast", i)))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0 - i as f32 * 40.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_unmultiplied(40, 44, 52, (235.0 * a) as u8))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(90, 150, 90, (200.0 * a) as u8)))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .corner_radius(6.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(text)
+                                    .color(egui::Color32::from_rgba_unmultiplied(235, 245, 235, (255.0 * a) as u8)),
+                            );
+                        });
+                });
+        }
+        ctx.request_repaint(); // keep animating the fade
+    }
+
     blocking.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
     blocking.1 = ctx.wants_keyboard_input();
+
+    // Tool-aware cursor over the 3D viewport (only when the pointer isn't over an egui panel/widget,
+    // so egui's own resize/text cursors still win there). A crosshair for placing geometry or
+    // measuring; a pointing hand when a body edge loop is ready to pick.
+    if !ctx.is_pointer_over_area() {
+        let cursor = if in_sketch && session.tool != Tool::Select {
+            Some(egui::CursorIcon::Crosshair)
+        } else if ui_state.measuring {
+            Some(egui::CursorIcon::Crosshair)
+        } else if ui_state.hover_edge_loop.is_some() {
+            Some(egui::CursorIcon::PointingHand)
+        } else {
+            None
+        };
+        if let Some(c) = cursor {
+            ctx.set_cursor_icon(c);
+        }
+    }
     Ok(())
 }
 
@@ -4047,12 +4680,40 @@ struct Inference {
     v_anchor: Option<usize>,
     /// Sketch point sharing the cursor's Y (a Horizontal relation can be captured against it).
     h_anchor: Option<usize>,
+    /// A non-alignment relation the cursor snapped onto (collinear/tangent), for the cursor badge.
+    kind: Option<InferBadge>,
+}
+
+/// A relation hint shown as a small badge next to the sketch cursor.
+#[derive(Clone, Copy, PartialEq)]
+enum InferBadge {
+    Horizontal,
+    Vertical,
+    Coincident,
+    OnEdge,
+    Collinear,
+    Tangent,
+}
+
+impl InferBadge {
+    /// The single-glyph symbol drawn in the badge (kept to font-safe ASCII).
+    fn symbol(self) -> &'static str {
+        match self {
+            InferBadge::Horizontal => "—",
+            InferBadge::Vertical => "|",
+            InferBadge::Coincident => "•",
+            InferBadge::OnEdge => "/",
+            InferBadge::Collinear => "L",
+            InferBadge::Tangent => "T",
+        }
+    }
 }
 
 fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f32) -> Inference {
     let mut out = cur;
     let mut guides: Vec<(Vec2, Vec2)> = Vec::new();
-    let none = |uv, guides| Inference { uv, guides, v_anchor: None, h_anchor: None };
+    let none = |uv, guides| Inference { uv, guides, v_anchor: None, h_anchor: None, kind: None };
+    let with_kind = |uv, guides, kind| Inference { uv, guides, v_anchor: None, h_anchor: None, kind: Some(kind) };
 
     // Anchor points to align to: every sketch point (capturable, carries its index) + body
     // reference points + the origin (centre) — the latter two align/snap but can't be constrained.
@@ -4088,7 +4749,7 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
         if let Some((a, _)) = hy {
             guides.push((a, out));
         }
-        return Inference { uv: out, guides, v_anchor: vx.and_then(|(_, i)| i), h_anchor: hy.and_then(|(_, i)| i) };
+        return Inference { uv: out, guides, v_anchor: vx.and_then(|(_, i)| i), h_anchor: hy.and_then(|(_, i)| i), kind: None };
     }
 
     // --- Collinear: snap onto the infinite extension of a nearby (non-reference) line ---
@@ -4116,7 +4777,7 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
         }
     }
     if let Some((_, proj, near)) = best {
-        return none(proj, vec![(near, proj)]);
+        return with_kind(proj, vec![(near, proj)], InferBadge::Collinear);
     }
 
     // --- Tangent: if the rubber-band started on a circle/arc rim, snap the line tangent there ---
@@ -4148,7 +4809,7 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
                 let along = (cur - s).dot(td);
                 let proj = s + td * along;
                 if cur.distance(proj) <= tol {
-                    return none(proj, vec![(s, proj)]);
+                    return with_kind(proj, vec![(s, proj)], InferBadge::Tangent);
                 }
             }
         }
@@ -4899,6 +5560,35 @@ fn highlight_face(
     }
 }
 
+/// While the Fillet/Chamfer PropertyManager is open, preview the edge loop under the cursor so the
+/// user sees exactly what a click will grab (SolidWorks-style pre-highlight). Stored in `ui_state`
+/// and drawn by `draw_edge_selection`. Runs regardless of the egui pointer-block — `pick_edge`
+/// returns nothing unless the cursor is actually on a body edge, so it never fights the panel.
+fn hover_body_edge(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    part: Res<Part>,
+    session: Res<SketchSession>,
+    mut ui_state: ResMut<UiState>,
+) {
+    let picking = ui_state.pending_fillet.is_some() || ui_state.pending_chamfer.is_some();
+    if !picking || session.plane.is_some() {
+        if ui_state.hover_edge_loop.is_some() {
+            ui_state.hover_edge_loop = None;
+        }
+        return;
+    }
+    let hit = windows
+        .single()
+        .ok()
+        .zip(cam_q.single().ok())
+        .and_then(|(w, (cam, gt))| w.cursor_position().map(|c| (c, cam, gt)))
+        .and_then(|(cursor, cam, gt)| pick_edge(&part.edges, cam, gt, cursor, EDGE_PICK_PX))
+        .map(|si| edge_loop(&part.edges, si))
+        .filter(|(chain, _)| chain.len() >= 2);
+    ui_state.hover_edge_loop = hit;
+}
+
 // ---------------------------------------------------------------------------
 // Interaction
 // ---------------------------------------------------------------------------
@@ -4952,6 +5642,46 @@ fn sketch_interaction(
                     ui_state.measure_pts.push(p);
                 }
             }
+            return;
+        }
+    }
+
+    // Reference-image calibration: while the "Calibrate scale" tool is armed, the user DRAGS a line
+    // across a known feature of the picture (press = start, drag = rubber-band, release = end). A
+    // plain two-click also works (press near the previous point restarts; a real drag/second point
+    // sets the span). The PM reads the two points back to compute the scale factor.
+    if ui_state.image_calib.is_some() && ui_state.image_edit.is_some() && !blocking.0 {
+        let plane = ui_state
+            .image_edit
+            .and_then(|i| doc.0.features.get(i))
+            .and_then(|f| match &f.kind {
+                FeatureKind::RefImage { plane, .. } => Some(plane.clone()),
+                _ => None,
+            });
+        if let Some(plane) = plane {
+            let ap = ActivePlane::from_ref(&plane);
+            let uv = ray_plane(&ap, &ray).map(|(_, uv)| uv);
+            if let Some(cal) = ui_state.image_calib.as_mut() {
+                cal.cursor = uv;
+                if let Some(uv) = uv {
+                    // Min separation to count as the second point (so a click-in-place doesn't
+                    // collapse the span). Supports BOTH gestures: drag (press→release apart) and
+                    // two clicks (first click leaves one point, a second far click completes it).
+                    let eps = (orbit.radius * 0.02).max(0.5);
+                    let far = cal.pts.first().map(|p| (*p - uv).length() > eps).unwrap_or(false);
+                    if buttons.just_pressed(MouseButton::Left) {
+                        if cal.pts.len() == 1 && far {
+                            cal.pts.push(uv); // second click of a two-click measurement
+                        } else {
+                            cal.pts = vec![uv]; // start a fresh measurement
+                        }
+                    } else if buttons.just_released(MouseButton::Left) && cal.pts.len() == 1 && far {
+                        cal.pts.push(uv); // end of a drag
+                    }
+                }
+            }
+        }
+        if buttons.just_pressed(MouseButton::Left) || buttons.just_released(MouseButton::Left) {
             return;
         }
     }
@@ -5301,6 +6031,7 @@ fn sketch_interaction(
     session.inference_guides.clear();
     session.infer_v = None;
     session.infer_h = None;
+    session.infer_badges.clear();
     let drawing_tool = matches!(
         session.tool,
         Tool::Line | Tool::Circle | Tool::Arc | Tool::Rectangle | Tool::Slot | Tool::Polygon | Tool::Spline
@@ -5309,13 +6040,28 @@ fn sketch_interaction(
         if let Some(cur) = session.cursor_uv {
             let coincident = nearest_point(&session.sketch, cur, snap * 0.5).is_some()
                 || session.reference_points.iter().any(|r| r.distance(cur) <= snap * 0.5);
-            if !coincident {
+            if coincident {
+                session.infer_badges.push(InferBadge::Coincident);
+            } else {
                 let inf = infer_cursor(&session, cur, session.pending, snap * 0.8);
                 session.cursor_uv = Some(inf.uv);
                 session.inference_guides = inf.guides;
                 session.infer_v = inf.v_anchor;
                 session.infer_h = inf.h_anchor;
+                if let Some(k) = inf.kind {
+                    session.infer_badges.push(k);
+                }
+                if session.infer_h.is_some() {
+                    session.infer_badges.push(InferBadge::Horizontal);
+                }
+                if session.infer_v.is_some() {
+                    session.infer_badges.push(InferBadge::Vertical);
+                }
             }
+        }
+        // Snapped onto a body edge → point-on-edge relation (shown unless already coincident).
+        if session.cursor_edge.is_some() && !session.infer_badges.contains(&InferBadge::Coincident) {
+            session.infer_badges.push(InferBadge::OnEdge);
         }
     }
 
@@ -5468,6 +6214,10 @@ fn sketch_interaction(
     // tiny value, so the revolve came out as a thin wedge instead of the full turn.
     let revolving = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Revolve | OpKind::RevolveCut));
     if ui_state.pending.is_some() && session.plane.is_some() && !revolving {
+        // Direction-2 arrow first (it lives on the opposite side), then the main arrow.
+        if extrude_dir2_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
+            return;
+        }
         if extrude_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
@@ -5577,6 +6327,7 @@ fn sketch_interaction(
                 edge_sel.clear();
                 orbit.radius = orbit.radius.max(6.0);
                 look_along(&mut orbit, ap.origin, ap.n);
+                recenter_for_panel(&mut orbit, window.height());
                 *cam_tf = camera_transform(&orbit);
                 session.sketch.clear();
                 session.pending = None;
@@ -7768,6 +8519,9 @@ fn fillet_edge_key(poly: &[[f64; 3]]) -> ([i64; 3], [i64; 3]) {
 /// Add a body edge (its world-space polyline) to the fillet set, or remove it if the same
 /// edge is clicked again. Refreshes the preview.
 fn toggle_fillet_edge(ui_state: &mut UiState, chain: &[Vec3]) {
+    // NOTE: keep the polyline OPEN (don't append the first point). The bevel reconstructs loop
+    // closure itself; a duplicated seam point makes its mesh surgery fail and fall back to the coarse
+    // CSG round. The *highlight* closes the loop visually on its own (see draw_edge_selection).
     let poly: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
     let key = fillet_edge_key(&poly);
     let before = ui_state.fillet_edges.len();
@@ -8129,10 +8883,10 @@ fn handle_keys(
         }
     }
     if keys.just_pressed(KeyCode::KeyE) {
-        session.op_request = Some(SolidOp::Boss(EXTRUDE_DISTANCE));
+        session.op_request = Some(SolidOp::Boss(EXTRUDE_DISTANCE, 0.0, 0.0, 0));
     }
     if keys.just_pressed(KeyCode::KeyD) {
-        session.op_request = Some(SolidOp::Cut(EXTRUDE_DISTANCE));
+        session.op_request = Some(SolidOp::Cut(EXTRUDE_DISTANCE, 0.0, 0.0, 0));
     }
     // Delete (or Backspace) removes a selected dimension first, else selected entities.
     if keys.just_pressed(KeyCode::Delete) || keys.just_pressed(KeyCode::Backspace) {
@@ -8255,7 +9009,12 @@ fn handle_file_io(
         ui_state.save_request = false;
         match ui_state.current_file.clone() {
             Some(path) => {
-                write_doc(&doc.0, &path);
+                if write_doc(&doc.0, &path) {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
+                    ui_state.toasts.push((format!("Saved {name}"), 2.5));
+                } else {
+                    ui_state.last_error = Some("Save failed — see the log.".into());
+                }
             }
             None => ui_state.save_as_request = true,
         }
@@ -8270,7 +9029,11 @@ fn handle_file_io(
         {
             let path = with_hcad(path);
             if write_doc(&doc.0, &path) {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
                 ui_state.current_file = Some(path);
+                ui_state.toasts.push((format!("Saved {name}"), 2.5));
+            } else {
+                ui_state.last_error = Some("Save failed — see the log.".into());
             }
         }
     }
@@ -8285,7 +9048,11 @@ fn handle_file_io(
                         path.set_extension("stl");
                     }
                     match std::fs::write(&path, export_stl(mesh)) {
-                        Ok(()) => info!("Exported STL {}", path.display()),
+                        Ok(()) => {
+                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part.stl").to_string();
+                            ui_state.toasts.push((format!("Exported {name}"), 2.5));
+                            info!("Exported STL {}", path.display());
+                        }
                         Err(e) => {
                             warn!("STL export failed: {e}");
                             ui_state.last_error = Some(format!("STL export failed: {e}"));
@@ -8311,6 +9078,8 @@ fn handle_file_io(
                     }
                     match std::fs::write(&path, step) {
                         Ok(()) => {
+                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part.step").to_string();
+                            ui_state.toasts.push((format!("Exported {name}"), 2.5));
                             info!("Exported STEP {} ({})", path.display(), if faceted { "faceted from mesh" } else { "exact B-rep" });
                             if faceted {
                                 ui_state.last_error = Some("Exported a FACETED STEP (this body has no exact B-rep — built with the mesh kernel). Geometry is correct but flat-faced; for smooth surfaces, build with Seamless off and no loft/fillet.".into());
@@ -8343,11 +9112,71 @@ fn handle_file_io(
                         ui_state.selected = None;
                         ui_state.current_file = Some(path.clone());
                         ui_state.regen = true;
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
+                        ui_state.toasts.push((format!("Opened {name}"), 2.5));
                         info!("Opened {}", path.display());
                     }
-                    Err(e) => warn!("Could not parse {}: {e}", path.display()),
+                    Err(e) => {
+                        warn!("Could not parse {}: {e}", path.display());
+                        ui_state.last_error = Some(format!("Couldn't open {} — it isn't a valid HCAD part.", path.display()));
+                    }
                 },
-                Err(e) => warn!("Could not read {}: {e}", path.display()),
+                Err(e) => {
+                    warn!("Could not read {}: {e}", path.display());
+                    ui_state.last_error = Some(format!("Couldn't read {}: {e}", path.display()));
+                }
+            }
+        }
+    }
+
+    // Insert a reference image: pick a PNG/JPG, embed it (base64), and pin it to the selected plane
+    // (or Front if none). It's a non-geometry underlay, so no regen — the sync system spawns the quad.
+    if ui_state.insert_image_request {
+        ui_state.insert_image_request = false;
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "webp"])
+            .pick_file()
+        {
+            match std::fs::read(&path) {
+                Ok(bytes) => match image::load_from_memory(&bytes) {
+                    Ok(img) => {
+                        use base64::Engine;
+                        let (px_w, px_h) = (img.width().max(1), img.height().max(1));
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        // Base the image on the selected datum plane, else Front.
+                        let which = ui_state.selected_plane.unwrap_or(0) as u8;
+                        let plane = standard_plane_ref(which);
+                        // Default size: 100 mm on the longer side, centred on the plane origin.
+                        let aspect = px_h as f64 / px_w as f64;
+                        let (width, height) = if px_w >= px_h { (100.0, 100.0 * aspect) } else { (100.0 / aspect, 100.0) };
+                        history.snapshot(&doc.0);
+                        let id = doc.0.add_feature(FeatureKind::RefImage {
+                            plane,
+                            data,
+                            px_w,
+                            px_h,
+                            center: [0.0, 0.0],
+                            rot: 0.0,
+                            width,
+                            height,
+                            opacity: 0.6,
+                            flip_h: false,
+                            flip_v: false,
+                        });
+                        // Open its PropertyManager (find its index).
+                        ui_state.image_edit = doc.0.features.iter().position(|f| f.id.0 == id.0);
+                        ui_state.image_lock_aspect = true;
+                        info!("Inserted reference image {} ({px_w}×{px_h})", path.display());
+                    }
+                    Err(e) => {
+                        warn!("Could not decode image {}: {e}", path.display());
+                        ui_state.last_error = Some(format!("Could not read that image: {e}"));
+                    }
+                },
+                Err(e) => {
+                    warn!("Could not read image {}: {e}", path.display());
+                    ui_state.last_error = Some(format!("Could not read the file: {e}"));
+                }
             }
         }
     }
@@ -8428,7 +9257,7 @@ fn do_solid_op(
 
     // A body exists if there's geometry — either an exact B-rep solid *or* a mesh body
     // (after a fillet/seamless build, `part.solid` is None but `part.mesh` is the body).
-    if matches!(op, SolidOp::Cut(_) | SolidOp::RevolveCut(_)) && part.solid.is_none() && part.mesh.is_none() {
+    if matches!(op, SolidOp::Cut(..) | SolidOp::RevolveCut(_)) && part.solid.is_none() && part.mesh.is_none() {
         warn!("Cut: there is no body yet — extrude a boss first.");
         return;
     }
@@ -8444,8 +9273,8 @@ fn do_solid_op(
     let sketch = session.sketch.clone();
     let plane = plane_ref(&ap);
     let kind = match op {
-        SolidOp::Boss(d) => FeatureKind::Extrude { sketch, regions, plane, distance: d },
-        SolidOp::Cut(d) => FeatureKind::Cut { sketch, regions, plane, distance: d },
+        SolidOp::Boss(d, back, thin, thin_side) => FeatureKind::Extrude { sketch, regions, plane, distance: d, back, thin, thin_side },
+        SolidOp::Cut(d, back, thin, thin_side) => FeatureKind::Cut { sketch, regions, plane, distance: d, back, thin, thin_side },
         SolidOp::Revolve(angle) => {
             let (axis_pt, axis_dir) = axis.unwrap();
             FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut: false }
@@ -8490,7 +9319,41 @@ fn handle_edit_sketch(
     mut doc: ResMut<DocRes>,
     part: Res<Part>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
+    windows: Query<&Window, With<PrimaryWindow>>,
 ) {
+    let win_h = windows.single().map(|w| w.height()).unwrap_or(0.0);
+    // Start a fresh sketch on an arbitrary stored plane (a reference image's plane) so you can
+    // trace over the picture. Same setup as the datum-plane path, but from a recorded PlaneRef.
+    if let Some(plane) = ui_state.sketch_on_ref.take() {
+        let ap = active_plane_from_ref(&plane, "Picture");
+        if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+            let (center, radius) = fit_view(&part);
+            orbit.radius = (radius * 2.1).max(6.0);
+            look_along(&mut orbit, center, ap.n);
+            recenter_for_panel(&mut orbit, win_h);
+            *tf = camera_transform(&orbit);
+        }
+        session.sketch.clear();
+        session.editing = None;
+        session.pending = None;
+        session.dim_first = None;
+        session.cursor_uv = None;
+        session.drag = None;
+        session.selected_contours.clear();
+        session.selected_entities.clear();
+        session.needs_apply = false;
+        session.undo_sketch.clear();
+        session.redo_sketch.clear();
+        session.undo_baseline = Some(session.sketch.clone());
+        session.undo_fp = sketch_fingerprint(&session.sketch);
+        info!("Sketching on a reference-image plane.");
+        session.plane = Some(ap);
+        ui_state.selected_plane = None;
+        ui_state.image_edit = None;
+        ui_state.image_calib = None;
+        return;
+    }
+
     // Start a fresh sketch on a datum plane picked from the tree (works with a body present).
     if let Some(order) = ui_state.sketch_plane_request.take() {
         if let Some((_, p)) = doc.0.planes().nth(order) {
@@ -8503,6 +9366,7 @@ fn handle_edit_sketch(
                 let (center, radius) = fit_view(&part);
                 orbit.radius = (radius * 2.1).max(6.0);
                 look_along(&mut orbit, center, ap.n);
+                recenter_for_panel(&mut orbit, win_h);
                 *tf = camera_transform(&orbit);
             }
             session.sketch.clear();
@@ -8534,7 +9398,7 @@ fn handle_edit_sketch(
         | FeatureKind::Revolve { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } => return,
     };
     // A revolve also remembers its axis (point + direction) — re-select the matching line so the
     // PropertyManager's Axis box is filled and the preview shows when reopening it.
@@ -8549,6 +9413,7 @@ fn handle_edit_sketch(
         let (center, radius) = fit_view(&part);
         orbit.radius = (radius * 2.1).max(6.0);
         look_along(&mut orbit, center, ap.n);
+        recenter_for_panel(&mut orbit, win_h);
         *tf = camera_transform(&orbit);
     }
     session.sketch = sketch;
@@ -8570,6 +9435,37 @@ fn handle_edit_sketch(
     // (the body without this feature); committing rolls forward again.
     doc.0.rollback = i;
     ui_state.regen = true;
+    // Reopened as a Text feature: jump straight into the Text tool with the text selected and its
+    // parameters loaded into the PM, so editing feels like editing a dedicated feature.
+    if std::mem::take(&mut ui_state.edit_as_text) {
+        let found = session.sketch.entities.iter().enumerate().find_map(|(ei, e)| match e {
+            SketchEntity::Text { text, font, height, arc, mirror, bold, italic, spacing, .. } => Some((
+                ei,
+                text.clone(),
+                font.clone(),
+                *height as f32,
+                *arc,
+                *mirror,
+                *bold,
+                *italic,
+                *spacing,
+            )),
+            _ => None,
+        });
+        if let Some((ei, text, font, height, arc, mirror, bold, italic, spacing)) = found {
+            session.text_string = text;
+            session.text_font = font;
+            session.text_height = height.max(0.05);
+            session.text_arc = arc;
+            session.text_mirror = mirror;
+            session.text_bold = bold;
+            session.text_italic = italic;
+            session.text_spacing = spacing;
+            session.text_font_init = true; // values come from the entity — don't reset to defaults
+            session.tool = Tool::Text;
+            session.selected_entities = vec![ei];
+        }
+    }
     info!("Editing sketch of feature {i}.");
 }
 
@@ -8621,7 +9517,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -8676,6 +9572,13 @@ fn doc_has_fillet(doc: &Document) -> bool {
         .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. }))
 }
 
+/// True if any extrude/cut is a **thin feature** (wall thickness > 0). The exact B-rep path
+/// ignores `thin`, so a doc with one must regenerate through the mesh kernel.
+fn doc_has_thin(doc: &Document) -> bool {
+    doc.features.iter().any(|f| matches!(&f.kind,
+        FeatureKind::Extrude { thin, .. } | FeatureKind::Cut { thin, .. } if *thin > 0.0))
+}
+
 /// failed to build, so the UI can tell the user which operation didn't apply.
 fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
     let mut failures: Vec<String> = Vec::new();
@@ -8685,7 +9588,8 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
         match &feature.kind {
             FeatureKind::Plane(_) => {}
             FeatureKind::Sketch { .. } => {} // 2D only — no solid contribution
-            FeatureKind::Extrude { sketch, regions, plane, distance } => {
+            FeatureKind::RefImage { .. } => {} // a visual underlay — no solid contribution
+            FeatureKind::Extrude { sketch, regions, plane, distance, back, .. } => {
                 let all = sketch.regions();
                 // A feature built on a face rides on that face: re-resolve its plane
                 // to the current body so stacked features build on each other and
@@ -8698,7 +9602,9 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 let merged = merge_regions(&chosen_regions(&all, regions));
                 for r in &merged {
                     let next = match &body {
-                        Some(b) => boss_union(b, r, &basis, *distance),
+                        Some(b) => boss_union(b, r, &basis, *distance, *back),
+                        // First feature: Direction 2 extends the prism the other way.
+                        None if *back > 0.0 => extrude_solid_with_overlap(&r.outer, &r.holes, &basis, *distance, *back),
                         None => extrude_solid(&r.outer, &r.holes, &basis, *distance),
                     };
                     if let Some(s) = next {
@@ -8714,7 +9620,7 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            FeatureKind::Cut { sketch, regions, plane, distance } => {
+            FeatureKind::Cut { sketch, regions, plane, distance, back, .. } => {
                 let Some(b0) = &body else { continue };
                 let all = sketch.regions();
                 let resolved = reproject_plane(plane, b0);
@@ -8730,7 +9636,7 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     // correct even after upstream edits move things around.
                     let centroid = mesh_centroid(&tessellate(b, 0.06).mesh);
                     let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
-                    if let Some(s) = cut_op(b, r, &basis, signed) {
+                    if let Some(s) = cut_op(b, r, &basis, signed, *back) {
                         body = Some(s);
                     } else {
                         warn!("Regen: a cut contour could not be built.");
@@ -8778,6 +9684,124 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
 /// Note: this fallback uses each feature's stored plane (no re-projection against the
 /// live body), which is correct for a straight build-up; an *edited* upstream feature
 /// may not shift downstream geometry here the way the exact path does.
+/// Closest distance from point `p` to triangle `abc` (Ericson, *Real-Time Collision Detection* §5.1.5).
+fn point_tri_dist(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let sub = |u: [f32; 3], v: [f32; 3]| [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let dist = |u: [f32; 3], v: [f32; 3]| dot(sub(u, v), sub(u, v)).sqrt();
+    let add = |u: [f32; 3], v: [f32; 3], s: f32| [u[0] + v[0] * s, u[1] + v[1] * s, u[2] + v[2] * s];
+    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return dist(p, a);
+    }
+    let bp = sub(p, b);
+    let (d3, d4) = (dot(ab, bp), dot(ac, bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return dist(p, b);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return dist(p, add(a, ab, d1 / (d1 - d3)));
+    }
+    let cp = sub(p, c);
+    let (d5, d6) = (dot(ab, cp), dot(ac, cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return dist(p, c);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return dist(p, add(a, ac, d2 / (d2 - d6)));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return dist(p, add(b, sub(c, b), w));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let proj = add(add(a, ab, vb * denom), ac, vc * denom);
+    dist(p, proj)
+}
+
+/// Keep only the (bevel) edges that still lie on the final surface. A fillet/chamfer emits its
+/// tangent/hard edges for selection, but a *later* cut can remove the material those edges sat on,
+/// leaving them floating in the void (the "lines sticking out" artifact, plus breaks where a chord
+/// straddles the boundary). The robust test is the edge **midpoint's distance to the nearest mesh
+/// triangle**: a normal fillet chord's midpoint sits a hair off the curved surface, while a void
+/// chord's midpoint is millimetres into open space. Triangles are spatial-hashed by bounding box.
+fn clip_edges_to_mesh(edges: &[[[f32; 3]; 2]], mesh: &TriMesh, rel: f32) -> Vec<[[f32; 3]; 2]> {
+    use std::collections::HashMap;
+    if mesh.positions.is_empty() || edges.is_empty() || mesh.indices.len() < 3 {
+        return Vec::new();
+    }
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &mesh.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let tol = (diag * rel).max(1.0e-4);
+    // Hash grid coarse enough that big flat triangles don't explode into millions of cells.
+    let cell = (diag * 0.03).max(tol);
+    let gq = |p: [f32; 3]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64, (p[2] / cell).floor() as i64);
+    let pos = |i: u32| mesh.positions[i as usize];
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (ti, t) in mesh.indices.chunks_exact(3).enumerate() {
+        let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
+        let (mut tl, mut th) = (a, a);
+        for v in [b, c] {
+            for k in 0..3 {
+                tl[k] = tl[k].min(v[k]);
+                th[k] = th[k].max(v[k]);
+            }
+        }
+        let (gl, gh) = (gq(tl), gq(th));
+        for gx in gl.0..=gh.0 {
+            for gy in gl.1..=gh.1 {
+                for gz in gl.2..=gh.2 {
+                    grid.entry((gx, gy, gz)).or_default().push(ti);
+                }
+            }
+        }
+    }
+    let on_surface = |p: [f32; 3]| -> bool {
+        let (gx, gy, gz) = gq(p);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(ts) = grid.get(&(gx + dx, gy + dy, gz + dz)) {
+                        for &ti in ts {
+                            let t = &mesh.indices[ti * 3..ti * 3 + 3];
+                            if point_tri_dist(p, pos(t[0]), pos(t[1]), pos(t[2])) <= tol {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    };
+    // Classify each bevel chord by which of {endpoint A, endpoint B, midpoint} lie on the final
+    // surface — a threshold-free discriminator (the earlier length cap was fragile because the
+    // legit/stray length ratio varies per model):
+    //   • legit chord:      both ends + midpoint on-surface        → keep
+    //   • straddling (break): exactly ONE end on-surface           → keep (reaches the cut edge)
+    //   • void-spanner (stray): both ends on-surface but MIDPOINT off (its body crosses the gap) → drop
+    //   • fully void:        nothing on-surface                    → drop
+    edges
+        .iter()
+        .copied()
+        .filter(|e| {
+            let mid = [(e[0][0] + e[1][0]) * 0.5, (e[0][1] + e[1][1]) * 0.5, (e[0][2] + e[1][2]) * 0.5];
+            let (a_on, b_on) = (on_surface(e[0]), on_surface(e[1]));
+            on_surface(mid) || (a_on != b_on)
+        })
+        .collect()
+}
+
 /// Rebuild the mesh-kernel body, plus the selectable feature edges emitted by the *last*
 /// bevel (fillet/chamfer) if it's still the final body operation — those tangent/hard edges
 /// are otherwise invisible to angle-based edge extraction, so we plumb them out explicitly.
@@ -8787,8 +9811,8 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
     let end = doc.rollback.min(doc.features.len());
     for feature in &doc.features[..end] {
         match &feature.kind {
-            FeatureKind::Plane(_) | FeatureKind::Sketch { .. } => {}
-            FeatureKind::Extrude { sketch, regions, plane, distance } => {
+            FeatureKind::Plane(_) | FeatureKind::Sketch { .. } | FeatureKind::RefImage { .. } => {}
+            FeatureKind::Extrude { sketch, regions, plane, distance, back, thin, thin_side } => {
                 // A boss adds material elsewhere; it doesn't invalidate edges from an earlier
                 // fillet/chamfer, so keep them (don't clear here).
                 let all = sketch.regions();
@@ -8796,12 +9820,20 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 // Reproject onto the live body's matching face (like the exact path), so a boss
                 // stacks on the *current* top rather than the stale stored plane — testing under
                 // the footprint centroid so it can't snap onto an unrelated feature's top.
-                let ref_world = sketch_footprint_world(plane, regs.iter().flat_map(|r| r.outer.iter()));
+                let samples = sketch_footprint_samples(plane, &regs);
                 let plane = match &body {
-                    Some(b) => reproject_plane_on_mesh(plane, b, ref_world),
+                    Some(b) => reproject_plane_on_mesh(plane, b, &samples),
                     None => plane.clone(),
                 };
                 let basis = basis_from_ref(&plane);
+                // A thin feature sweeps a wall of thickness `thin` instead of the filled region.
+                let make_prism = |outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>], start: f64, length: f64| {
+                    if *thin > 0.0 {
+                        thin_wall_mesh(outer, holes, &basis, start, length, *thin, *thin_side)
+                    } else {
+                        extrude_tool_mesh(outer, holes, &basis, start, length)
+                    }
+                };
                 for r in &regs {
                     body = match body.take() {
                         // Boss: dip the prism *substantially* into the body so the join ring
@@ -8825,26 +9857,39 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                             // ~1mm is plenty to bury the join in well-formed triangles; never
                             // dip past the body's far side.
                             let overlap = ((behind * 0.5).min(1.0).max(0.05)).min(behind.max(0.0)) as f64;
+                            // Direction 2 (`back`) extends the prism the opposite way — the same
+                            // side as the body dip — so burying the join by at least `back` gives
+                            // the both-directions extrude. Unlike the auto-dip it's NOT clamped to
+                            // the body depth: the user asked for that length, even through the back.
+                            let dip = overlap.max(*back);
                             // Dip into the body on the side AWAY from the sketch plane so the
                             // plane-side face stays flush: a normal (+) boss dips below the plane;
                             // a reversed (−) boss keeps its top at the plane and dips its tip down.
                             let (start, length) = if *distance >= 0.0 {
-                                (-overlap, distance + overlap)
+                                (-dip, distance + dip)
                             } else {
-                                (distance - overlap, -distance + overlap)
+                                (distance - dip, -distance + dip)
                             };
                             Some(
-                                extrude_tool_mesh(&r.outer, &r.holes, &basis, start, length)
+                                make_prism(&r.outer, &r.holes, start, length)
                                     .map(|tool| mesh_union(&b, &tool))
                                     .unwrap_or(b),
                             )
                         }
-                        // First feature: the prism itself is the body.
-                        None => extrude_tool_mesh(&r.outer, &r.holes, &basis, 0.0, *distance),
+                        // First feature: the prism itself is the body. Direction 2 extends it
+                        // the opposite way from the base plane.
+                        None => {
+                            let (start, length) = if *distance >= 0.0 {
+                                (-*back, distance + back)
+                            } else {
+                                (distance - back, -distance + back)
+                            };
+                            make_prism(&r.outer, &r.holes, start, length)
+                        }
                     };
                 }
             }
-            FeatureKind::Cut { sketch, regions, plane, distance } => {
+            FeatureKind::Cut { sketch, regions, plane, distance, back, thin, thin_side } => {
                 // A cut elsewhere doesn't invalidate an earlier fillet/chamfer's edges, so keep
                 // them (don't clear) — they accumulate through the timeline like the boss path.
                 let Some(cur0) = &body else { continue };
@@ -8855,7 +9900,8 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 // the footprint centroid so it lands on the face the sketch actually sits on.
                 let cut_regs = merge_regions(&chosen_regions(&all, regions));
                 let ref_world = sketch_footprint_world(plane, cut_regs.iter().flat_map(|r| r.outer.iter()));
-                let plane = reproject_plane_on_mesh(plane, cur0, ref_world);
+                let samples = sketch_footprint_samples(plane, &cut_regs);
+                let plane = reproject_plane_on_mesh(plane, cur0, &samples);
                 let basis = basis_from_ref(&plane);
                 let origin = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
                 let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
@@ -8879,7 +9925,18 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 for r in &cut_regs {
                     let Some(cur) = body.take() else { break };
                     let signed = into * *distance;
-                    body = Some(match cut_tool_mesh(&r.outer, &r.holes, &basis, signed) {
+                    // Thin cut: subtract a wall of thickness `thin` (over the same span cut_tool_mesh
+                    // would sweep, including its through-cut overshoot) instead of the filled region.
+                    let tool = if *thin > 0.0 {
+                        let depth = signed.abs();
+                        let e = 0.05 + depth * 0.02;
+                        let bk = back.max(0.0);
+                        let (start, length) = if signed >= 0.0 { (-(e + bk), depth + 2.0 * e + bk) } else { (-(depth + e), depth + 2.0 * e + bk) };
+                        thin_wall_mesh(&r.outer, &r.holes, &basis, start, length, *thin, *thin_side)
+                    } else {
+                        cut_tool_mesh(&r.outer, &r.holes, &basis, signed, *back)
+                    };
+                    body = Some(match tool {
                         Some(tool) => mesh_difference(&cur, &tool),
                         None => cur,
                     });
@@ -8889,9 +9946,9 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                 bevel_edges.clear();
                 let all = sketch.regions();
                 let regs = merge_regions(&chosen_regions(&all, regions));
-                let ref_world = sketch_footprint_world(plane, regs.iter().flat_map(|r| r.outer.iter()));
+                let samples = sketch_footprint_samples(plane, &regs);
                 let resolved = match &body {
-                    Some(b) => reproject_plane_on_mesh(plane, b, ref_world),
+                    Some(b) => reproject_plane_on_mesh(plane, b, &samples),
                     None => plane.clone(),
                 };
                 let basis = basis_from_ref(&resolved);
@@ -8905,14 +9962,23 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
                     }
                 }
             }
-            FeatureKind::Loft { profiles } => {
+            FeatureKind::Loft { profiles, cut } => {
                 bevel_edges.clear();
-                let secs: Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = profiles.iter().filter_map(loft_profile_loops).collect();
+                let mut secs: Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = profiles.iter().filter_map(loft_profile_loops).collect();
+                // A loft CUT whose end profile sits on a body face leaves the cap coincident with
+                // that face (a zero-thickness skin survives the subtraction). Extend the lofted
+                // solid a little past each end along the loft direction so the caps break cleanly
+                // through the surface — exactly like an extrude cut overshoots.
+                if *cut {
+                    extend_loft_caps(&mut secs);
+                }
                 if let Some(m) = loft_mesh(&secs) {
-                    body = Some(match body.take() {
-                        Some(b) => mesh_union(&b, &m), // loft onto an existing body
-                        None => m,
-                    });
+                    body = match body.take() {
+                        // Cut subtracts the lofted solid (a tapered pocket); boss unions it.
+                        Some(b) => Some(if *cut { mesh_difference(&b, &m) } else { mesh_union(&b, &m) }),
+                        // First feature: a boss *is* the body; a cut with nothing to cut is a no-op.
+                        None => (!*cut).then_some(m),
+                    };
                 }
             }
             // Round the body's (picked, or all) edges by the fillet radius. We try the
@@ -8988,7 +10054,7 @@ fn do_regenerate(
     // *stack-overflow* on that (a hard abort `catch_unwind` can't trap), so any model
     // containing text is built with the robust mesh kernel from the start.
     let has_loft = doc.0.features.iter().any(|f| matches!(f.kind, FeatureKind::Loft { .. }));
-    let force_mesh = ui_state.seamless || doc_has_text(&doc.0) || doc_has_fillet(&doc.0) || has_loft;
+    let force_mesh = ui_state.seamless || doc_has_text(&doc.0) || doc_has_fillet(&doc.0) || has_loft || doc_has_thin(&doc.0);
 
     // Seamless mode: build the whole model with the mesh kernel (Manifold), which fuses
     // coincident/coplanar faces so adjacent features merge without a seam. The exact
@@ -9003,8 +10069,14 @@ fn do_regenerate(
         match mesh {
             Some((m, bevel_edges)) if !m.positions.is_empty() => {
                 let mut tess = mesh_tessellation(m);
-                // Add the bevel's tangent/hard edges so the rounded edges are selectable.
-                tess.edges.extend(bevel_edges);
+                // The face-boundary detector already reports every real (sharp) edge, including a
+                // chamfer's flat-face boundaries. The bevel's own edges are only needed for the
+                // *tangent* boundary of a fillet (a rounded edge, which the face detector merges away
+                // and SolidWorks hides by default). Put them in the TANGENT set — hidden unless
+                // "Tangent edges" is on — so the default view is clean (no bevel-seam strays). Clip to
+                // the final surface first so a later cut doesn't leave them floating in the void.
+                let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+                tess.tangent_edges.extend(kept);
                 part.mesh = Some(tess.mesh.clone());
                 part.edges = tess.edges.clone();
                 part.tangent_edges = tess.tangent_edges.clone();
@@ -9067,7 +10139,8 @@ fn do_regenerate(
     match mesh_body {
         Some((mesh, bevel_edges)) if !mesh.positions.is_empty() => {
             let mut tess = mesh_tessellation(mesh);
-            tess.edges.extend(bevel_edges);
+            let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+            tess.tangent_edges.extend(kept); // fillet tangent boundaries → hidden unless Tangent edges on
             part.mesh = Some(tess.mesh.clone());
             part.edges = tess.edges.clone();
             part.tangent_edges = tess.tangent_edges.clone();
@@ -9150,6 +10223,13 @@ fn fillet_preview(
         return;
     };
     let edges = ui_state.fillet_edges.clone();
+    if edges.is_empty() {
+        // Nothing picked yet — don't preview (empty = "all edges" would round the whole body).
+        // Restore the real body and wait for the user to click edges.
+        ui_state.regen = true;
+        ui_state.fillet_shown = Some(r);
+        return;
+    }
     let seg = ((r * 6.0).round() as usize).clamp(3, 12);
     let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Mesh bevel first (clean corners); CSG round on anything it can't resolve.
@@ -9207,6 +10287,12 @@ fn chamfer_preview(
         return;
     };
     let edges = ui_state.fillet_edges.clone();
+    if edges.is_empty() {
+        // Nothing picked yet — don't preview (empty = "all edges" would bevel the whole body).
+        ui_state.regen = true;
+        ui_state.chamfer_shown = Some(d);
+        return;
+    }
     let beveled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Mesh bevel with a flat (1-segment) profile first; CSG chamfer fallback.
         bevel_mesh_selected(&base, d as f64, 1, &edges).or_else(|| chamfer_mesh(&base, d as f64, &edges))
@@ -9376,6 +10462,59 @@ fn loft_profile_loops(p: &LoftProfile) -> Option<(Vec<[f64; 3]>, Vec<Vec<[f64; 3
     Some((outer, holes))
 }
 
+/// Extend a loft's end caps outward along the loft direction by a small overshoot, so a loft *cut*
+/// whose end profile lies on a body face breaks cleanly through it instead of leaving a coincident
+/// zero-thickness skin. Prepends a copy of the first section shifted off the start, and appends a
+/// copy of the last section shifted off the end. No-op for fewer than two sections.
+fn extend_loft_caps(secs: &mut Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)>) {
+    if secs.len() < 2 {
+        return;
+    }
+    let centroid = |s: &(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)| {
+        let o = &s.0;
+        let n = o.len().max(1) as f64;
+        let mut c = [0.0; 3];
+        for p in o {
+            c[0] += p[0];
+            c[1] += p[1];
+            c[2] += p[2];
+        }
+        [c[0] / n, c[1] / n, c[2] / n]
+    };
+    let shift = |s: &(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>), d: [f64; 3]| {
+        let t = |loop_: &[[f64; 3]]| loop_.iter().map(|p| [p[0] + d[0], p[1] + d[1], p[2] + d[2]]).collect::<Vec<_>>();
+        (t(&s.0), s.1.iter().map(|h| t(h)).collect::<Vec<_>>())
+    };
+    let unit = |a: [f64; 3], b: [f64; 3]| {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if l < 1e-9 { [0.0, 0.0, 1.0] } else { [d[0] / l, d[1] / l, d[2] / l] }
+    };
+    // Overshoot scaled to the loft's own span (so it clears a surface without distorting the shape).
+    let n = secs.len();
+    let span: f64 = (0..n - 1)
+        .map(|i| {
+            let (a, b) = (centroid(&secs[i]), centroid(&secs[i + 1]));
+            unit_len(a, b)
+        })
+        .sum();
+    let over = (span * 0.05).clamp(0.5, 3.0);
+    // Start: push the first section away from the second (out of the body at an open end).
+    let d0 = unit(centroid(&secs[1]), centroid(&secs[0]));
+    let start = shift(&secs[0], [d0[0] * over, d0[1] * over, d0[2] * over]);
+    // End: push the last section away from the second-to-last.
+    let dn = unit(centroid(&secs[n - 2]), centroid(&secs[n - 1]));
+    let end = shift(&secs[n - 1], [dn[0] * over, dn[1] * over, dn[2] * over]);
+    secs.insert(0, start);
+    secs.push(end);
+}
+
+/// Euclidean distance between two 3D points.
+fn unit_len(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
 /// Re-resolve a face-built feature's plane against the current body: keep its
 /// in-plane location and axes, but slide the origin along the normal onto the body's
 /// extreme face in that direction (the "top" the sketch sits on). This is what lets
@@ -9387,7 +10526,7 @@ fn loft_profile_loops(p: &LoftProfile) -> Option<(Vec<[f64; 3]>, Vec<Vec<[f64; 3
 /// to the wrong one. Robust topological naming (DESIGN.md §4.3) is the eventual fix.
 fn reproject_plane(plane: &PlaneRef, body: &KSolid) -> PlaneRef {
     let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
-    reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh, o)
+    reproject_plane_on_mesh(plane, &tessellate(body, 0.2).mesh, &[o])
 }
 
 /// Möller–Trumbore ray/triangle; positive hit distance along `dir`, else `None`.
@@ -9447,6 +10586,48 @@ fn sketch_footprint_world<'a>(plane: &PlaneRef, pts: impl Iterator<Item = &'a [f
     o + u * (cx / n as f64) as f32 + v * (cy / n as f64) as f32
 }
 
+/// Footprint sample points in world space for face re-projection: each region's boundary points PLUS
+/// an interior grid (points inside the region, outside its holes). The interior grid is essential for
+/// a big overhanging profile — e.g. a large boss circle whose *perimeter* hangs over empty space and
+/// whose *centre* sits over a hole: the real face lies in the annulus between, which only interior
+/// samples reach. Falls back to the plane origin if empty.
+fn sketch_footprint_samples(plane: &PlaneRef, regs: &[hworks_sketch::Region]) -> Vec<Vec3> {
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let w = |p: [f64; 2]| o + u * p[0] as f32 + v * p[1] as f32;
+    let mut out = Vec::new();
+    for r in regs {
+        if r.outer.is_empty() {
+            continue;
+        }
+        for p in &r.outer {
+            out.push(w(*p));
+        }
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for p in &r.outer {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        const N: usize = 10;
+        for i in 0..N {
+            for j in 0..N {
+                let x = lo[0] + (hi[0] - lo[0]) * (i as f64 + 0.5) / N as f64;
+                let y = lo[1] + (hi[1] - lo[1]) * (j as f64 + 0.5) / N as f64;
+                if point_in_poly([x, y], &r.outer) && !r.holes.iter().any(|h| point_in_poly([x, y], h)) {
+                    out.push(w([x, y]));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(o);
+    }
+    out
+}
+
 /// Exact `(centre_uv, radius)` of every body circular edge lying in the sketch plane `ap`,
 /// read from the *source* sketch circles in the timeline. The B-rep tessellates circles to
 /// polygons, so a tessellation fit only approximates the radius (~sagitta); this recovers
@@ -9491,7 +10672,7 @@ fn exact_plane_circles(doc: &Document, ap: &ActivePlane) -> Vec<(Vec2, f32)> {
 /// Same as [`reproject_plane`] but driven by a triangle mesh directly — so the mesh-kernel
 /// path (forced by a fillet/chamfer/mirror) can reproject a feature's plane onto the live
 /// body too, instead of using the stale stored plane (which made cuts land shallow).
-fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, ref_world: Vec3) -> PlaneRef {
+fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, samples: &[Vec3]) -> PlaneRef {
     // A datum plane (Front/Top/Right) is fixed in space — never snap it onto a body face, or a
     // centre-plane sketch (e.g. a revolve-cut profile through the middle) gets shoved onto a cap.
     if plane.datum {
@@ -9518,24 +10699,31 @@ fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, ref_world: Vec3) ->
         !(neg && pos)
     };
     let to2d = |p: Vec3| Vec2::new((p - o).dot(u), (p - o).dot(v));
-    // Test the face *under the sketch footprint* (its centroid), not under the plane origin —
-    // the plane origin can sit over an unrelated feature (e.g. a tall boss), which would snap
-    // this boss's base up onto that feature's top and leave it floating.
-    let ref2d = to2d(ref_world);
+    // Snap the plane onto the body face it sits on. Consider only faces:
+    //  • **same-facing** (`tn·n > 0.9`, not `abs`) — a sketch rides a face whose outward normal points
+    //    the sketch's way; the back face would let a stacked boss drop onto the base's *bottom*.
+    //  • **under the footprint** — any of the sampled profile points projects onto the face. Sampling
+    //    the whole footprint (not just its centroid) is what fixes a big boss whose *centre* sits over
+    //    a hole: the real face is only under the perimeter, so a centroid-only test teleported it onto
+    //    a far floor at the bottom of the hole.
+    // Among those, take the one whose offset is nearest the stored plane (a no-op on a faithful replay,
+    // and it tracks the face if an upstream edit slid it along the normal).
+    let samples2d: Vec<Vec2> = samples.iter().map(|s| to2d(*s)).collect();
     let mut best: Option<f32> = None;
     for t in mesh.indices.chunks(3) {
         let p = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
         let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
         let tn = (b - a).cross(c - a).normalize_or_zero();
-        if tn.dot(n).abs() < 0.9 {
-            continue; // not a face parallel to the sketch plane
+        if tn.dot(n) < 0.9 {
+            continue;
         }
-        if !in_tri(ref2d, to2d(a), to2d(b), to2d(c)) {
-            continue; // footprint centroid isn't over this face
+        let (ta, tb, tc) = (to2d(a), to2d(b), to2d(c));
+        if !samples2d.iter().any(|&s| in_tri(s, ta, tb, tc)) {
+            continue; // no footprint sample is over this face
         }
         let off = a.dot(n);
         if best.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs()) {
-            best = Some(off); // the parallel face nearest the original origin along n
+            best = Some(off);
         }
     }
     match best {
@@ -9687,7 +10875,7 @@ fn nest_loops(loops: Vec<Vec<[f64; 2]>>) -> Vec<hworks_sketch::Region> {
 /// strategies so a boolean never simply fails: flush+exact, flush+nudge (coincident
 /// faces), then the robust overlap/tolerance with and without the nudge. The first
 /// (cleanest) one that works wins.
-fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
+fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64, back: f64) -> Option<KSolid> {
     // (radial nudge, overlap, tolerance). The later entries escalate: bigger radial
     // nudges break a boss that is *coincident/concentric* with an existing curved wall
     // (truck's union rejects coincident faces), and bigger overlaps/tolerances absorb
@@ -9707,7 +10895,9 @@ fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, dist
     let mut extruded_ok = false;
     for (k, &(nudge, overlap, tol)) in strategies.iter().enumerate() {
         let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
-        let Some(boss) = extrude_solid_with_overlap(&outer, &r.holes, basis, distance, overlap) else {
+        // Direction 2 (`back`) extends the prism the opposite way; it shares the same side
+        // as the union overlap, so burying by at least `back` gives the both-directions boss.
+        let Some(boss) = extrude_solid_with_overlap(&outer, &r.holes, basis, distance, overlap.max(back)) else {
             continue;
         };
         extruded_ok = true;
@@ -9740,7 +10930,7 @@ fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, dist
 }
 
 /// Cut region `r` from the body — same escalating fallback idea as [`boss_union`].
-fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64) -> Option<KSolid> {
+fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance: f64, back: f64) -> Option<KSolid> {
     // (radial nudge, boolean tolerance) — truck's cut boolean is flaky, so sweep a
     // range of tolerances/nudges; the first that produces a solid wins.
     let strategies = [
@@ -9754,7 +10944,7 @@ fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance
     ];
     for (k, &(nudge, tol)) in strategies.iter().enumerate() {
         let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
-        if let Some(s) = cut_tol(body, &outer, &r.holes, basis, distance, tol) {
+        if let Some(s) = cut_tol(body, &outer, &r.holes, basis, distance, back, tol) {
             if k > 0 {
                 info!("Cut: used fallback strategy {k} (truck's boolean is finicky here).");
             }
@@ -9948,6 +11138,71 @@ fn inflate_loop(pts: &[[f64; 2]], min_offset: f64) -> Vec<[f64; 2]> {
     pts.iter().map(|p| [cx + (p[0] - cx) * f, cy + (p[1] - cy) * f]).collect()
 }
 
+/// Miter-offset a closed 2D loop by `d`: shift each edge perpendicular by `d`, join at the
+/// intersections of consecutive offset edges. `d > 0` grows the loop's enclosed area (consistent for
+/// CW and CCW winding via the signed area); `d < 0` shrinks it. Powers thin-feature wall loops.
+fn offset_loop(pts: &[[f64; 2]], d: f64) -> Vec<[f64; 2]> {
+    let n = pts.len();
+    if n < 3 || d == 0.0 {
+        return pts.to_vec();
+    }
+    let mut area = 0.0;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        area += a[0] * b[1] - b[0] * a[1];
+    }
+    let s = if area >= 0.0 { 1.0 } else { -1.0 };
+    let normal = |i: usize| -> [f64; 2] {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-12 { [0.0, 0.0] } else { [s * dy / len, -s * dx / len] }
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let ep = (i + n - 1) % n;
+        let (np, nc) = (normal(ep), normal(i));
+        let p1 = [pts[ep][0] + d * np[0], pts[ep][1] + d * np[1]];
+        let d1 = [pts[i][0] - pts[ep][0], pts[i][1] - pts[ep][1]];
+        let p2 = [pts[i][0] + d * nc[0], pts[i][1] + d * nc[1]];
+        let d2 = [pts[(i + 1) % n][0] - pts[i][0], pts[(i + 1) % n][1] - pts[i][1]];
+        let denom = d1[0] * d2[1] - d1[1] * d2[0];
+        if denom.abs() < 1e-12 {
+            out.push([pts[i][0] + d * nc[0], pts[i][1] + d * nc[1]]); // collinear → plain edge shift
+        } else {
+            let t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / denom;
+            out.push([p1[0] + d1[0] * t, p1[1] + d1[1] * t]);
+        }
+    }
+    out
+}
+
+/// Grow (`+d`) or shrink (`-d`) a region-with-holes: the outer loop offsets by `d`; holes offset the
+/// opposite way so the *solid* dilates/erodes uniformly (growing the region shrinks its holes).
+fn offset_region(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>], d: f64) -> (Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>) {
+    (offset_loop(outer, d), holes.iter().map(|h| offset_loop(h, -d)).collect())
+}
+
+/// A **thin-feature** wall prism for one region over the span `[start, start+length]`: a wall of
+/// thickness `thin` following the profile instead of the filled region — a pipe/box shell. `side`:
+/// 0 = outward, 1 = inward, 2 = mid-plane. Built as extrude(grown region) − extrude(shrunk region),
+/// which handles convex, concave, and holed profiles uniformly. `None` if the wall is degenerate.
+fn thin_wall_mesh(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>], basis: &PlaneBasis, start: f64, length: f64, thin: f64, side: u8) -> Option<TriMesh> {
+    if thin <= 0.0 {
+        return None;
+    }
+    let (grow, shrink) = match side {
+        1 => (0.0, thin),             // inward: outer stays, inner wall shrinks in
+        2 => (thin * 0.5, thin * 0.5), // mid-plane: split the thickness
+        _ => (thin, 0.0),             // outward: outer wall grows out
+    };
+    let (bo, bh) = offset_region(outer, holes, grow);
+    let (so, sh) = offset_region(outer, holes, -shrink);
+    let big = extrude_tool_mesh(&bo, &bh, basis, start, length)?;
+    let small = extrude_tool_mesh(&so, &sh, basis, start, length)?;
+    Some(mesh_difference(&big, &small))
+}
+
 /// Reset the model to an empty part with the three default planes.
 fn handle_new_part(
     mut commands: Commands,
@@ -10107,6 +11362,7 @@ fn orbit_camera(
     }
 
     if changed {
+        cam.anim = None; // a hand movement cancels any in-flight view animation
         *transform = camera_transform(&cam);
     }
 }
@@ -10215,6 +11471,140 @@ fn scale_ref_planes(ui_state: Res<UiState>, mut q: Query<&mut Transform, With<Re
             t.scale = Vec3::splat(s);
         }
     }
+}
+
+/// Decode a base64 PNG/JPG into a Bevy RGBA8 texture. `None` if the data is unreadable.
+fn decode_image_texture(b64: &str) -> Option<Image> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let dynimg = image::load_from_memory(&bytes).ok()?;
+    let rgba = dynimg.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(Image::new(
+        bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        bevy::render::render_resource::TextureDimension::D2,
+        rgba.into_raw(),
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+    ))
+}
+
+/// Keep the reference-image quads in sync with the document: one textured quad per `RefImage`
+/// feature. On a mismatch (image inserted/deleted, New Part / Open) it respawns the whole set,
+/// decoding each texture once. Per-frame transform/opacity tweaks are handled by `update_ref_images`
+/// — this only fires when the *set of images* changes, so re-decoding is rare.
+fn sync_ref_images(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    doc: Res<DocRes>,
+    existing: Query<(Entity, &RefImageEnt)>,
+) {
+    use std::collections::HashSet;
+    let want: HashSet<u64> = doc
+        .0
+        .features
+        .iter()
+        .filter(|f| matches!(f.kind, FeatureKind::RefImage { .. }))
+        .map(|f| f.id.0)
+        .collect();
+    let have: HashSet<u64> = existing.iter().map(|(_, r)| r.id.0).collect();
+    if want == have {
+        return;
+    }
+    // Despawn quads whose feature is gone; remember which ids already have a quad.
+    for (e, r) in &existing {
+        if !want.contains(&r.id.0) {
+            commands.entity(e).despawn();
+        }
+    }
+    // A unit quad (1×1 in its local XY) — sized/oriented per-image via the Transform.
+    let quad = meshes.add(Rectangle::new(1.0, 1.0));
+    for f in &doc.0.features {
+        let FeatureKind::RefImage { plane, data, opacity, .. } = &f.kind else { continue };
+        if have.contains(&f.id.0) {
+            continue; // already spawned
+        }
+        let Some(tex) = decode_image_texture(data) else {
+            warn!("Reference image: could not decode the embedded picture data.");
+            continue;
+        };
+        let handle = images.add(tex);
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, *opacity),
+            base_color_texture: Some(handle),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            cull_mode: None,
+            double_sided: true,
+            depth_bias: -1.0, // sit just behind sketch lines so you trace on top
+            ..default()
+        });
+        let ap = ActivePlane::from_ref(plane);
+        commands.spawn((
+            Mesh3d(quad.clone()),
+            MeshMaterial3d(material),
+            Transform::from_translation(ap.origin), // real transform set by update_ref_images
+            Name::new("Reference Image"),
+            RefImageEnt { id: f.id },
+        ));
+    }
+}
+
+/// Cheaply refresh each reference-image quad every frame from its feature: position (centre on the
+/// plane), in-plane rotation, size (width × height via Transform scale), mirror (negative scale),
+/// and opacity (material alpha). No texture re-decode — that only happens in `sync_ref_images`.
+fn update_ref_images(
+    doc: Res<DocRes>,
+    session: Res<SketchSession>,
+    ui_state: Res<UiState>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut q: Query<(&RefImageEnt, &mut Transform, &MeshMaterial3d<StandardMaterial>, &mut Visibility)>,
+) {
+    // SolidWorks-style: a sketch picture is only visible while you're editing a sketch on its plane
+    // (so you can trace it) — or while its own PropertyManager is open (to place/calibrate it).
+    // Once you finish the sketch and move on, it hides; reopen that sketch and it returns.
+    let editing_plane = session.plane.clone();
+    for (r, mut tf, math, mut vis) in &mut q {
+        let Some(f) = doc.0.features.iter().find(|f| f.id.0 == r.id.0) else { continue };
+        let FeatureKind::RefImage { plane, center, rot, width, height, opacity, flip_h, flip_v, .. } = &f.kind else {
+            continue;
+        };
+        let ap = ActivePlane::from_ref(plane);
+        // Centre of the image on the plane.
+        tf.translation = ap.origin + ap.u * center[0] as f32 + ap.v * center[1] as f32;
+        // Orient to the plane (u→local X, v→local Y, n→local Z), then spin in-plane by `rot`.
+        let basis = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
+        tf.rotation = basis * Quat::from_rotation_z(*rot as f32);
+        // Size via scale; negative scale mirrors (double_sided keeps it lit either way).
+        let sx = width.max(0.001) as f32 * if *flip_h { -1.0 } else { 1.0 };
+        let sy = height.max(0.001) as f32 * if *flip_v { -1.0 } else { 1.0 };
+        tf.scale = Vec3::new(sx, sy, 1.0);
+        if let Some(m) = materials.get_mut(&math.0) {
+            let a = opacity.clamp(0.0, 1.0);
+            if m.base_color.alpha() != a {
+                m.base_color.set_alpha(a);
+            }
+        }
+        // Show only when relevant: sketching on this image's plane, or its PM is open.
+        let pm_open = ui_state.image_edit.and_then(|i| doc.0.features.get(i)).map(|f| f.id.0) == Some(r.id.0);
+        let sketching_here = editing_plane.as_ref().is_some_and(|sp| planes_coincident(sp, &ap));
+        let want = if pm_open || sketching_here { Visibility::Visible } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
+/// True when two planes are the same infinite plane (parallel normals, ~coincident): used to decide
+/// whether the sketch being edited lies on a reference image's plane.
+fn planes_coincident(a: &ActivePlane, b: &ActivePlane) -> bool {
+    let (na, nb) = (a.n.normalize_or_zero(), b.n.normalize_or_zero());
+    if na.cross(nb).length() > 1.0e-3 {
+        return false; // not parallel
+    }
+    (a.origin - b.origin).dot(na).abs() < 1.0e-3 // coincident along the normal
 }
 
 /// See-through mechanic: fade the body to translucent only when you actually need to see *into* it
@@ -10370,7 +11760,41 @@ fn draw_stored_sketch(gizmos: &mut Gizmos, sketch: &Sketch, plane: &PlaneRef, co
 
 /// Preview the geometry of the selected sketch (or, while lofting, every picked profile with its
 /// chosen contour highlighted) so you can see what's on a sketch without opening it.
-fn draw_feature_previews(mut gizmos: Gizmos, ui_state: Res<UiState>, doc: Res<DocRes>, session: Res<SketchSession>) {
+fn draw_feature_previews(
+    mut gizmos: Gizmos,
+    mut overlay: Gizmos<OverlayGizmos>,
+    ui_state: Res<UiState>,
+    doc: Res<DocRes>,
+    session: Res<SketchSession>,
+) {
+    // Reference-image calibration markers: the picked points (crosses), the rubber-band to the cursor
+    // (after the first pick), and the line between the two points. Drawn BEFORE the sketch-mode early
+    // return so it shows even while a sketch is open on the picture's plane (you can calibrate then
+    // trace). On the overlay group so the measuring line is clearly visible over the picture.
+    if let (Some(cal), Some(idx)) = (&ui_state.image_calib, ui_state.image_edit) {
+        if let Some(FeatureKind::RefImage { plane, .. }) = doc.0.features.get(idx).map(|f| &f.kind) {
+            let ap = ActivePlane::from_ref(plane);
+            let col = Color::srgb(1.0, 0.85, 0.2);
+            let cross = |overlay: &mut Gizmos<OverlayGizmos>, p: Vec2| {
+                let c = ap.to_world(p);
+                let s = 2.0;
+                overlay.line(c - ap.u * s, c + ap.u * s, col);
+                overlay.line(c - ap.v * s, c + ap.v * s, col);
+            };
+            for p in &cal.pts {
+                cross(&mut overlay, *p);
+            }
+            match (cal.pts.len(), cal.cursor) {
+                // After the first pick, rubber-band from it to the cursor so you can see the span.
+                (1, Some(cur)) => {
+                    cross(&mut overlay, cur);
+                    overlay.line(ap.to_world(cal.pts[0]), ap.to_world(cur), col);
+                }
+                (2, _) => overlay.line(ap.to_world(cal.pts[0]), ap.to_world(cal.pts[1]), col),
+                _ => {}
+            }
+        }
+    }
     if session.plane.is_some() {
         return; // the live sketch already draws itself
     }
@@ -10386,6 +11810,57 @@ fn draw_feature_previews(mut gizmos: Gizmos, ui_state: Res<UiState>, doc: Res<Do
     if let Some(i) = ui_state.selected {
         if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(i).map(|f| &f.kind) {
             draw_stored_sketch(&mut gizmos, sketch, plane, Color::srgb(0.95, 0.9, 0.3), None);
+        }
+    }
+}
+
+/// Outline the *selected* feature's sketch profile in the viewport (view mode), so picking a
+/// feature in the tree gives geometric feedback — not just a highlighted row. Uses the shared
+/// selection accent so tree, sketch, and this all read as "selected".
+fn draw_selected_feature(
+    mut gizmos: Gizmos,
+    doc: Res<DocRes>,
+    ui_state: Res<UiState>,
+    session: Res<SketchSession>,
+    cam_q: Query<&GlobalTransform, With<Camera3d>>,
+) {
+    if session.plane.is_some() {
+        return; // only in view mode (while sketching, the live sketch already shows)
+    }
+    let Some(i) = ui_state.selected else { return };
+    let Some(f) = doc.0.features.get(i) else { return };
+    let (sketch, plane) = match &f.kind {
+        FeatureKind::Sketch { sketch, plane }
+        | FeatureKind::Extrude { sketch, plane, .. }
+        | FeatureKind::Cut { sketch, plane, .. }
+        | FeatureKind::Revolve { sketch, plane, .. } => (sketch, plane),
+        _ => return,
+    };
+    let ap = active_plane_from_ref(plane, "sel");
+    let col = Color::srgb(1.0, 0.7, 0.1); // shared selection accent (matches sketch selection)
+    let cam_pos = cam_q.single().map(|g| g.translation()).unwrap_or(ap.origin + ap.n * 10.0);
+    let nudge = |p: Vec3| p + (cam_pos - p) * 0.004; // sit just in front, no z-fight
+    let w = |p: &[f64; 2]| ap.to_world(Vec2::new(p[0] as f32, p[1] as f32));
+    for reg in sketch.regions() {
+        for loop_pts in std::iter::once(&reg.outer).chain(reg.holes.iter()) {
+            for seg in loop_pts.windows(2) {
+                gizmos.line(nudge(w(&seg[0])), nudge(w(&seg[1])), col);
+            }
+            if let (Some(first), Some(last)) = (loop_pts.first(), loop_pts.last()) {
+                gizmos.line(nudge(w(last)), nudge(w(first)), col); // close the loop
+            }
+        }
+    }
+    // Text has no closed regions — outline its baked glyph contours directly.
+    for e in &sketch.entities {
+        if let SketchEntity::Text { origin, contours, height, rotation, mirror, arc, .. } = e {
+            let o = sketch.points.get(*origin).map(|p| [p.x, p.y]).unwrap_or([0.0, 0.0]);
+            for loop_ in text_contours(o, contours, *height, *rotation, *mirror, *arc) {
+                let n = loop_.len();
+                for k in 0..n {
+                    gizmos.line(nudge(w(&loop_[k])), nudge(w(&loop_[(k + 1) % n])), col);
+                }
+            }
         }
     }
 }
@@ -10416,28 +11891,46 @@ fn draw_sketch(
     };
 
     // Adaptive grid: spacing snaps to a nice 1/2/5×10^k that's ~1/16 of the view,
-    // with a bounded number of cells, so it stays usable from millimetres to metres.
-    let grid = Color::srgba(0.55, 0.55, 0.62, 0.18);
+    // with a bounded number of cells, so it stays usable from millimetres to metres. Each line is
+    // drawn cell-by-cell and faded by radial distance from the origin, so the grid dissolves into a
+    // soft disc instead of ending at a hard square edge.
+    let base_a = 0.24_f32;
     let raw = (radius / 16.0).max(1e-4);
     let mag = 10f32.powf(raw.log10().floor());
     let norm = raw / mag;
     let spacing = mag * if norm < 1.5 { 1.0 } else if norm < 3.5 { 2.0 } else if norm < 7.5 { 5.0 } else { 10.0 };
     let cells = 24;
     let ext = spacing * cells as f32;
+    let fade = |d: f32| base_a * (1.0 - d / ext).clamp(0.0, 1.0);
     for k in -cells..=cells {
         let f = k as f32 * spacing;
-        gizmos.line(ap.to_world(Vec2::new(f, -ext)), ap.to_world(Vec2::new(f, ext)), grid);
-        gizmos.line(ap.to_world(Vec2::new(-ext, f)), ap.to_world(Vec2::new(ext, f)), grid);
+        for j in -cells..cells {
+            let g0 = j as f32 * spacing;
+            let g1 = g0 + spacing;
+            let mid = g0 + spacing * 0.5;
+            let d = (f * f + mid * mid).sqrt();
+            let a = fade(d);
+            if a < 0.012 {
+                continue;
+            }
+            let col = Color::srgba(0.55, 0.55, 0.62, a);
+            // vertical line x = f, and horizontal line y = f (same radial distance profile)
+            gizmos.line(ap.to_world(Vec2::new(f, g0)), ap.to_world(Vec2::new(f, g1)), col);
+            gizmos.line(ap.to_world(Vec2::new(g0, f)), ap.to_world(Vec2::new(g1, f)), col);
+        }
     }
 
     let solid = Color::srgb(0.95, 0.95, 0.25);
     let construction = Color::srgb(0.9, 0.45, 0.95);
     let circle_col = Color::srgb(0.25, 0.9, 0.95);
     let point_col = Color::srgb(1.0, 0.55, 0.15);
-    let preview_col = Color::srgba(1.0, 1.0, 1.0, 0.6);
+    let preview_col = Color::srgb(1.0, 0.95, 0.45); // opaque so the rubber-band reads over a picture
     let plane_rot = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
-    // Marker/snap-glyph scale tied to the zoom, so points stay visible at any scale.
-    let ms = if session.snap_dist > 1e-6 { (session.snap_dist / SNAP).clamp(0.5, 40.0) } else { 1.0 };
+    // Marker/snap-glyph scale tied to the zoom so points stay a ~constant *screen* size. `snap_dist`
+    // already tracks the zoom (∝ camera radius), so `ms` ∝ radius keeps markers screen-constant. The
+    // clamp only guards the extremes — a floor of 0.5 kicked in at a moderate zoom-in and made the
+    // markers balloon on screen (very visible when picking a circular-pattern centre), so keep it low.
+    let ms = if session.snap_dist > 1e-6 { (session.snap_dist / SNAP).clamp(0.03, 400.0) } else { 1.0 };
 
     let uv_of = |i: usize| -> Vec2 {
         let p = &session.sketch.points[i];
@@ -10897,62 +12390,64 @@ fn draw_sketch(
     }
 
     if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
+        // Draw the rubber-band on the OVERLAY group (depth-biased, drawn on top) so it stays clearly
+        // visible over a reference picture / the body — the default group washes out against an image.
         match session.tool {
             // Midpoint line: preview grows both ways from the first click (the centre).
             Tool::Line if session.line_midpoint => {
                 let other = start * 2.0 - cur;
-                gizmos.line(ap.to_world(other), ap.to_world(cur), preview_col);
+                overlay.line(ap.to_world(other), ap.to_world(cur), preview_col);
             }
-            Tool::Line => gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col),
+            Tool::Line => overlay.line(ap.to_world(start), ap.to_world(cur), preview_col),
             // Perimeter circle: diameter from the first rim point to the cursor.
             Tool::Circle if session.circle_perimeter => {
                 let center = (start + cur) * 0.5;
                 let r = (cur - start).length() * 0.5;
                 let iso = Isometry3d::new(ap.to_world(center), plane_rot);
-                gizmos.circle(iso, r, preview_col);
+                overlay.circle(iso, r, preview_col);
             }
             Tool::Circle => {
                 let r = snap_radius(start.distance(cur), &session.reference_circles, session.snap_dist.max(SNAP));
                 let iso = Isometry3d::new(ap.to_world(start), plane_rot);
-                gizmos.circle(iso, r, preview_col);
+                overlay.circle(iso, r, preview_col);
             }
             Tool::Rectangle => {
                 let con_col = Color::srgba(0.9, 0.45, 0.95, 0.7);
-                let quad = |gizmos: &mut Gizmos, c: [Vec2; 4]| {
+                let quad = |g: &mut Gizmos<OverlayGizmos>, c: [Vec2; 4]| {
                     for k in 0..4 {
-                        gizmos.line(ap.to_world(c[k]), ap.to_world(c[(k + 1) % 4]), preview_col);
+                        g.line(ap.to_world(c[k]), ap.to_world(c[(k + 1) % 4]), preview_col);
                     }
                 };
                 match session.rect_mode {
                     RectMode::Corner => {
-                        quad(&mut gizmos, [start, Vec2::new(cur.x, start.y), cur, Vec2::new(start.x, cur.y)]);
+                        quad(&mut overlay, [start, Vec2::new(cur.x, start.y), cur, Vec2::new(start.x, cur.y)]);
                     }
                     RectMode::Center => {
                         let o = start * 2.0 - cur; // opposite corner
                         let c = [o, Vec2::new(cur.x, o.y), cur, Vec2::new(o.x, cur.y)];
-                        quad(&mut gizmos, c);
-                        gizmos.line(ap.to_world(c[0]), ap.to_world(c[2]), con_col); // X diagonals
-                        gizmos.line(ap.to_world(c[1]), ap.to_world(c[3]), con_col);
+                        quad(&mut overlay, c);
+                        overlay.line(ap.to_world(c[0]), ap.to_world(c[2]), con_col); // X diagonals
+                        overlay.line(ap.to_world(c[1]), ap.to_world(c[3]), con_col);
                     }
                     RectMode::Parallelogram => {
                         if let Some(b) = session.pending_b {
                             let d = start + (cur - b);
-                            quad(&mut gizmos, [start, b, cur, d]);
+                            quad(&mut overlay, [start, b, cur, d]);
                             draw_marker(&mut gizmos, ap, b, point_col, ms);
                         } else {
-                            gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col);
+                            overlay.line(ap.to_world(start), ap.to_world(cur), preview_col);
                         }
                     }
                 }
             }
             Tool::Slot => {
                 let cl_col = Color::srgba(0.9, 0.45, 0.95, 0.6);
-                let outline = |gizmos: &mut Gizmos, poly: &[[f64; 2]]| {
+                let outline = |g: &mut Gizmos<OverlayGizmos>, poly: &[[f64; 2]]| {
                     let n = poly.len();
                     for k in 0..n {
                         let p = Vec2::new(poly[k][0] as f32, poly[k][1] as f32);
                         let q = Vec2::new(poly[(k + 1) % n][0] as f32, poly[(k + 1) % n][1] as f32);
-                        gizmos.line(ap.to_world(p), ap.to_world(q), preview_col);
+                        g.line(ap.to_world(p), ap.to_world(q), preview_col);
                     }
                 };
                 match session.slot_mode {
@@ -10964,10 +12459,10 @@ fn draw_sketch(
                             (_, b) => (start, b.unwrap_or(cur)),
                         };
                         if session.pending_b.is_some() {
-                            outline(&mut gizmos, &tessellate_slot([a.x as f64, a.y as f64], [b.x as f64, b.y as f64], perp_dist(cur, a, b).max(0.01) as f64));
-                            gizmos.line(ap.to_world(a), ap.to_world(b), cl_col);
+                            outline(&mut overlay, &tessellate_slot([a.x as f64, a.y as f64], [b.x as f64, b.y as f64], perp_dist(cur, a, b).max(0.01) as f64));
+                            overlay.line(ap.to_world(a), ap.to_world(b), cl_col);
                         } else {
-                            gizmos.line(ap.to_world(a), ap.to_world(b), preview_col);
+                            overlay.line(ap.to_world(a), ap.to_world(b), preview_col);
                         }
                     }
                     SlotMode::Arc => {
@@ -10975,7 +12470,7 @@ fn draw_sketch(
                         match (b, session.pending_c) {
                             (Some(b), Some(p)) => {
                                 let r = arc_slot_width(cur, start, p, b).max(0.01);
-                                outline(&mut gizmos, &tessellate_arc_slot([start.x as f64, start.y as f64], [p.x as f64, p.y as f64], [b.x as f64, b.y as f64], r as f64));
+                                outline(&mut overlay, &tessellate_arc_slot([start.x as f64, start.y as f64], [p.x as f64, p.y as f64], [b.x as f64, b.y as f64], r as f64));
                                 draw_marker(&mut gizmos, ap, b, point_col, ms);
                                 draw_marker(&mut gizmos, ap, p, point_col, ms);
                             }
@@ -10987,11 +12482,11 @@ fn draw_sketch(
                                 for k in 0..n {
                                     let p = Vec2::new(arc[k][0] as f32, arc[k][1] as f32);
                                     let q = Vec2::new(arc[(k + 1) % n][0] as f32, arc[(k + 1) % n][1] as f32);
-                                    gizmos.line(ap.to_world(p), ap.to_world(q), cl_col);
+                                    overlay.line(ap.to_world(p), ap.to_world(q), cl_col);
                                 }
                                 draw_marker(&mut gizmos, ap, b, point_col, ms);
                             }
-                            _ => gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col),
+                            _ => overlay.line(ap.to_world(start), ap.to_world(cur), preview_col),
                         }
                     }
                 }
@@ -11008,7 +12503,7 @@ fn draw_sketch(
                     start + Vec2::new(a.cos(), a.sin()) * r
                 };
                 for k in 0..n {
-                    gizmos.line(ap.to_world(vert(k)), ap.to_world(vert((k + 1) % n)), preview_col);
+                    overlay.line(ap.to_world(vert(k)), ap.to_world(vert((k + 1) % n)), preview_col);
                 }
                 // Dashed circumscribed circle.
                 const SEG: usize = 64;
@@ -11017,14 +12512,14 @@ fn draw_sketch(
                     let a = std::f32::consts::TAU * k as f32 / SEG as f32;
                     let p = start + Vec2::new(r * a.cos(), r * a.sin());
                     if k % 2 == 0 {
-                        gizmos.line(ap.to_world(prev), ap.to_world(p), construction);
+                        overlay.line(ap.to_world(prev), ap.to_world(p), construction);
                     }
                     prev = p;
                 }
             }
             // 3-point arc: 1st click sets start; preview the chord, then the arc through cursor.
             Tool::Arc => match session.pending_b {
-                None => gizmos.line(ap.to_world(start), ap.to_world(cur), preview_col),
+                None => overlay.line(ap.to_world(start), ap.to_world(cur), preview_col),
                 Some(end) => {
                     if let Some(center) = circumcenter(start, end, cur) {
                         let tau = std::f32::consts::TAU;
@@ -11032,14 +12527,14 @@ fn draw_sketch(
                         let ccw = (ang(cur) - ang(start)).rem_euclid(tau) < (ang(end) - ang(start)).rem_euclid(tau);
                         let poly = tessellate_arc([center.x as f64, center.y as f64], [start.x as f64, start.y as f64], [end.x as f64, end.y as f64], ccw);
                         for w in poly.windows(2) {
-                            gizmos.line(
+                            overlay.line(
                                 ap.to_world(Vec2::new(w[0][0] as f32, w[0][1] as f32)),
                                 ap.to_world(Vec2::new(w[1][0] as f32, w[1][1] as f32)),
                                 preview_col,
                             );
                         }
                     } else {
-                        gizmos.line(ap.to_world(start), ap.to_world(end), preview_col);
+                        overlay.line(ap.to_world(start), ap.to_world(end), preview_col);
                     }
                     draw_marker(&mut gizmos, ap, end, point_col, ms);
                 }
@@ -11243,6 +12738,8 @@ fn draw_sketch(
             OpKind::Cut => Color::srgb(1.0, 0.75, 0.2), // bright depth ring for a cut
             OpKind::Revolve | OpKind::RevolveCut => ghost, // unreachable (revolve returns above)
         };
+        // Direction 2 extends the prism the opposite way by `depth2`.
+        let lift2 = if op.dir2 { ap.n * (-op.depth2 * nominal) } else { Vec3::ZERO };
         for &i in &indices {
             for loop_pts in std::iter::once(&regions[i].outer).chain(regions[i].holes.iter()) {
                 let m = loop_pts.len();
@@ -11251,6 +12748,10 @@ fn draw_sketch(
                     let b = Vec2::new(loop_pts[(k + 1) % m][0] as f32, loop_pts[(k + 1) % m][1] as f32);
                     overlay.line(ap.to_world(a) + lift, ap.to_world(b) + lift, far); // far loop (depth)
                     overlay.line(ap.to_world(a), ap.to_world(a) + lift, ghost); // riser
+                    if op.dir2 {
+                        overlay.line(ap.to_world(a) + lift2, ap.to_world(b) + lift2, far); // Direction-2 far loop
+                        overlay.line(ap.to_world(a), ap.to_world(a) + lift2, ghost); // Direction-2 riser
+                    }
                 }
             }
         }
@@ -11264,6 +12765,13 @@ fn draw_sketch(
             let handle = c + ap.n * op.depth.max(0.5 * ms.max(1.0));
             overlay.arrow(c, handle, acol);
             overlay.sphere(Isometry3d::from_translation(handle), 0.15 * ms.max(1.0), acol);
+            // Direction-2 arrow: points the OPPOSITE way along the normal, draggable to set depth2.
+            if op.dir2 {
+                let acol2 = if session.arrow_drag2 { Color::srgb(1.0, 1.0, 0.5) } else { Color::srgb(0.5, 0.8, 1.0) };
+                let handle2 = c - ap.n * op.depth2.max(0.5 * ms.max(1.0));
+                overlay.arrow(c, handle2, acol2);
+                overlay.sphere(Isometry3d::from_translation(handle2), 0.15 * ms.max(1.0), acol2);
+            }
         }
     }
 }
@@ -11515,6 +13023,63 @@ fn extrude_arrow_drag(
     }
     if just_released {
         session.arrow_drag = false;
+    }
+    false
+}
+
+/// Drag the *Direction 2* arrow (the one pointing the opposite way along the normal) to set
+/// `depth2`. Mirrors [`extrude_arrow_drag`] but on the −normal side, and never touches `reverse`
+/// (Direction 2 is always relative to Direction 1).
+fn extrude_dir2_arrow_drag(
+    session: &mut SketchSession,
+    ui_state: &mut UiState,
+    window: &Window,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    ray: &Ray3d,
+    just_pressed: bool,
+    pressed: bool,
+    just_released: bool,
+) -> bool {
+    let (Some(ap), Some(op)) = (session.plane.clone(), ui_state.pending.clone()) else {
+        return false;
+    };
+    if !op.dir2 {
+        return false;
+    }
+    let Some(base_uv) = contours_centroid(session) else { return false };
+    let base = ap.to_world(base_uv);
+    let n = -ap.n.normalize_or_zero(); // Direction 2 points the opposite way
+    let ms = if session.snap_dist > 1e-6 { (session.snap_dist / SNAP).clamp(0.5, 40.0) } else { 1.0 };
+    let tip = base + n * op.depth2.max(0.5 * ms.max(1.0));
+
+    if just_pressed {
+        if let Some(cursor) = window.cursor_position() {
+            let near_shaft = segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 22.0);
+            let near_tip = camera
+                .world_to_viewport(cam_gt, tip)
+                .map(|p| p.distance(cursor) < 26.0)
+                .unwrap_or(false);
+            if near_shaft || near_tip {
+                session.arrow_drag2 = true;
+            }
+        }
+    }
+    if session.arrow_drag2 && pressed {
+        // Distance dragged along the −normal axis sets depth2 (magnitude only).
+        let t = closest_t_on_axis(base, n, ray.origin, ray.direction.as_vec3());
+        if t.is_finite() {
+            let mut p = op.clone();
+            p.depth2 = t.abs().clamp(0.1, 10_000.0);
+            ui_state.pending = Some(p);
+        }
+        if just_released {
+            session.arrow_drag2 = false;
+        }
+        return true;
+    }
+    if just_released {
+        session.arrow_drag2 = false;
     }
     false
 }
@@ -11877,12 +13442,31 @@ fn draw_edge_selection(
 
     // While the Fillet/Chamfer PM is open, highlight every picked edge (bright yellow).
     if ui_state.pending_fillet.is_some() || ui_state.pending_chamfer.is_some() {
+        // Pre-highlight the loop under the cursor (soft cyan) so a click's target is obvious.
+        if let Some((chain, closed)) = &ui_state.hover_edge_loop {
+            let hcol = Color::srgb(0.4, 0.85, 1.0);
+            for w in chain.windows(2) {
+                gizmos.line(nudge(w[0]), nudge(w[1]), hcol);
+            }
+            if *closed && chain.len() >= 2 {
+                gizmos.line(nudge(*chain.last().unwrap()), nudge(chain[0]), hcol);
+            }
+        }
         let fcol = Color::srgb(1.0, 0.95, 0.2);
+        let v3 = |p: &[f64; 3]| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
         for edge in &ui_state.fillet_edges {
             for w in edge.windows(2) {
-                let a = Vec3::new(w[0][0] as f32, w[0][1] as f32, w[0][2] as f32);
-                let b = Vec3::new(w[1][0] as f32, w[1][1] as f32, w[1][2] as f32);
-                gizmos.line(nudge(a), nudge(b), fcol);
+                gizmos.line(nudge(v3(&w[0])), nudge(v3(&w[1])), fcol);
+            }
+            // The polyline is stored open. If it's actually a closed loop (its two ends are about one
+            // segment apart, not a full span), draw the closing segment so a filleted rim reads as an
+            // unbroken circle — without feeding the bevel a duplicate seam point (which breaks it).
+            if edge.len() >= 3 {
+                let (first, last) = (edge[0], edge[edge.len() - 1]);
+                let seg0 = (v3(&edge[1]) - v3(&edge[0])).length();
+                if (v3(&last) - v3(&first)).length() <= seg0 * 2.0 {
+                    gizmos.line(nudge(v3(&last)), nudge(v3(&first)), fcol);
+                }
             }
         }
     }
@@ -11921,8 +13505,113 @@ mod tests {
     use hworks_sketch::Sketch;
 
     /// On-demand manifold check of a saved part: load the `.hcad`, regenerate the mesh body, and
+    /// For a face-built Extrude/Cut, show where face re-projection moves its plane vs the stored one.
+    ///   HCAD_FILE="…\part.hcad" cargo test -p hworks-app diag_face_reprojection -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_face_reprojection() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for i in 0..doc.features.len() {
+            let (sketch, plane, regions, kind) = match &doc.features[i].kind {
+                FeatureKind::Extrude { sketch, plane, regions, .. } => (sketch, plane, regions, "boss"),
+                FeatureKind::Cut { sketch, plane, regions, .. } => (sketch, plane, regions, "cut"),
+                _ => continue,
+            };
+            if plane.datum {
+                continue;
+            }
+            // Body from all features strictly before i.
+            let mut d = doc.clone();
+            d.rollback = i;
+            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&d))).ok().flatten().map(|(m, _)| m);
+            let Some(body) = body.filter(|m| !m.positions.is_empty()) else {
+                eprintln!("feat {i} ({kind}): no body before it");
+                continue;
+            };
+            let all = sketch.regions();
+            let regs = merge_regions(&chosen_regions(&all, regions));
+            if regs.is_empty() {
+                continue;
+            }
+            let refw = sketch_footprint_world(plane, regs.iter().flat_map(|r| r.outer.iter()));
+            let samples = sketch_footprint_samples(plane, &regs);
+            let rp = reproject_plane_on_mesh(plane, &body, &samples);
+            let d3 = |a: [f64; 3], b: [f64; 3]| (((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)) as f64).sqrt();
+            let moved = d3(plane.origin, rp.origin);
+            eprintln!(
+                "feat {i} ({kind}): stored={:.2?} reproj={:.2?} moved={moved:.3}  ref_world=({:.2},{:.2},{:.2})",
+                plane.origin, rp.origin, refw.x, refw.y, refw.z
+            );
+        }
+    }
+
+    /// A thin-feature extrude of a square profile must produce a hollow box shell whose volume is the
+    /// wall-annulus area × height — not the filled prism. Validates `thin_wall_mesh` (grow/shrink offset
+    /// + boolean difference) end-to-end via the mesh's signed volume.
+    #[test]
+    fn thin_feature_makes_a_hollow_shell() {
+        // 20×20 square, centred, on the XY plane; extrude up 10 as a 2mm-thick outward wall.
+        let s = 10.0;
+        let outer = vec![[-s, -s], [s, -s], [s, s], [-s, s]];
+        let basis = PlaneBasis {
+            origin: [0.0, 0.0, 0.0],
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 1.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+        };
+        let thick = 2.0;
+        let height = 10.0;
+        let mesh = thin_wall_mesh(&outer, &[], &basis, 0.0, height, thick, 0).expect("thin wall");
+        // Signed volume of the closed triangle soup (divergence theorem).
+        let vol = {
+            let p = &mesh.positions;
+            let mut v = 0.0f64;
+            for t in mesh.indices.chunks(3) {
+                let a = p[t[0] as usize];
+                let b = p[t[1] as usize];
+                let c = p[t[2] as usize];
+                let (a, b, c) = ([a[0] as f64, a[1] as f64, a[2] as f64], [b[0] as f64, b[1] as f64, b[2] as f64], [c[0] as f64, c[1] as f64, c[2] as f64]);
+                v += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2]) + a[2] * (b[0] * c[1] - c[0] * b[1])) / 6.0;
+            }
+            v.abs()
+        };
+        // Outer 24×24 (grew 2 outward), inner 20×20 → annulus 576−400=176, × height 10 = 1760.
+        let outer_area = (2.0 * (s + thick)).powi(2);
+        let inner_area = (2.0 * s).powi(2);
+        let expected = (outer_area - inner_area) * height;
+        assert!((vol - expected).abs() < expected * 0.02, "thin-wall volume {vol:.1} vs expected {expected:.1}");
+        // Sanity: a hollow shell is far less than the filled prism (24×24×10 = 5760).
+        assert!(vol < outer_area * height * 0.7, "shell should be hollow, got {vol:.1}");
+    }
+
     /// report watertightness + edge topology. Ignored by default — run with the path:
     ///   cargo test -p hworks-app check_hcad_manifold -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn parse_saved_files() {
+        // Parse-only check of every .hcad under the saved-files dir — a schema regression here is
+        // exactly what makes "Open" silently fail (doc unchanged, no file bound → Save shows Save As).
+        //   HCAD_DIR="…\saved files" cargo test -p hworks-app parse_saved_files -- --ignored --nocapture
+        let dir = std::env::var("HCAD_DIR").expect("set HCAD_DIR");
+        let mut fails = 0;
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("hcad") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            match ron::from_str::<Document>(&text) {
+                Ok(_) => eprintln!("ok:   {}", path.file_name().unwrap().to_string_lossy()),
+                Err(e) => {
+                    fails += 1;
+                    eprintln!("FAIL: {} — {e}", path.file_name().unwrap().to_string_lossy());
+                }
+            }
+        }
+        assert_eq!(fails, 0, "{fails} saved file(s) failed to parse with the current schema");
+    }
+
     #[test]
     #[ignore]
     fn check_hcad_manifold() {
@@ -11969,6 +13658,153 @@ mod tests {
         );
     }
 
+    /// Detailed feature-edge diagnostics for a real model — characterises the strays so the edge
+    /// detector can be tuned. Run:
+    ///   HCAD_FILE="C:\path\to\part.hcad" cargo test -p hworks-app analyze_hcad_edges -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn analyze_hcad_edges() {
+        use std::collections::HashMap;
+        let path = std::env::var("HCAD_FILE").unwrap_or_else(|_| r"C:\Users\BIG2\Desktop\DEV for BIG\HCAD\saved files\lofttest.hcad".to_string());
+        eprintln!("analyzing: {path}");
+        let text = std::fs::read_to_string(&path).expect("read .hcad");
+        let doc: Document = ron::from_str(&text).expect("parse RON");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc)))
+            .ok().flatten().filter(|(m, _)| !m.positions.is_empty());
+        let Some((m, bevel_edges)) = res else { eprintln!("no mesh"); return };
+
+        // Bbox-relative weld (mirror feature_edges: 2e-4 of the diagonal).
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &m.positions { for k in 0..3 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); } }
+        let diag = ((hi[0]-lo[0]).powi(2)+(hi[1]-lo[1]).powi(2)+(hi[2]-lo[2]).powi(2)).sqrt();
+        let cell = (diag * 2.0e-4).max(1e-6);
+        let scale = 1.0 / cell;
+        let q = |p: [f32; 3]| ((p[0]*scale).round() as i64, (p[1]*scale).round() as i64, (p[2]*scale).round() as i64);
+        let mut canon: HashMap<(i64,i64,i64), usize> = HashMap::new();
+        let mut cpos: Vec<[f32;3]> = Vec::new();
+        let mut vid = vec![0usize; m.positions.len()];
+        for (i, p) in m.positions.iter().enumerate() {
+            vid[i] = *canon.entry(q(*p)).or_insert_with(|| { cpos.push(*p); cpos.len()-1 });
+        }
+        // edge -> incident face normals
+        let mut emap: HashMap<(usize,usize), Vec<[f32;3]>> = HashMap::new();
+        for t in m.indices.chunks_exact(3) {
+            let n = m.normals[t[0] as usize];
+            let (a,b,c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+            for (i,j) in [(a,b),(b,c),(c,a)] { let k = if i<j {(i,j)} else {(j,i)}; emap.entry(k).or_default().push(n); }
+        }
+        // dihedral histogram (manifold edges only) + counts at candidate thresholds
+        let mut buckets = [0u32; 19]; // 0-10,10-20,...,180
+        let (mut boundary, mut nonman) = (0u32, 0u32);
+        let mut deg_at = |deg_deg: f64| -> usize {
+            emap.iter().filter(|(_, ns)| ns.len()==2).filter(|(_, ns)| {
+                let d = (ns[0][0]*ns[1][0]+ns[0][1]*ns[1][1]+ns[0][2]*ns[1][2]).clamp(-1.0,1.0);
+                (d as f64).acos().to_degrees() >= deg_deg
+            }).count()
+        };
+        for (_, ns) in &emap {
+            match ns.len() {
+                1 => boundary += 1,
+                2 => {
+                    let d = (ns[0][0]*ns[1][0]+ns[0][1]*ns[1][1]+ns[0][2]*ns[1][2]).clamp(-1.0,1.0);
+                    let ang = (d as f64).acos().to_degrees();
+                    buckets[((ang/10.0) as usize).min(18)] += 1;
+                }
+                _ => nonman += 1,
+            }
+        }
+        eprintln!("diag={diag:.2} verts={} tris={} boundary={boundary} nonmanifold={nonman}", cpos.len(), m.indices.len()/3);
+        eprintln!("dihedral histogram (deg : count):");
+        for (i, &c) in buckets.iter().enumerate() { if c>0 { eprintln!("  {:>3}-{:<3}: {c}", i*10, i*10+10); } }
+        for th in [20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0] {
+            eprintln!("  sharp edges >= {th:>4}°: {}", deg_at(th));
+        }
+        // Degree distribution of the 30° sharp set (mirrors feature_edges: count==2 by dihedral,
+        // plus non-manifold count>=3 kept if any incident pair is a real corner).
+        let max_dihedral = |ns: &Vec<[f32;3]>| -> f64 {
+            let mut md = 1.0f32;
+            for a in 0..ns.len() { for b in (a+1)..ns.len() {
+                md = md.min((ns[a][0]*ns[b][0]+ns[a][1]*ns[b][1]+ns[a][2]*ns[b][2]).clamp(-1.0,1.0));
+            }}
+            (md as f64).acos().to_degrees()
+        };
+        let sharp: Vec<(usize,usize)> = emap.iter().filter(|(_, ns)| {
+            (ns.len()==2 || ns.len()>=3) && max_dihedral(ns) >= 30.0
+        }).map(|(&k,_)| k).collect();
+        let mut vdeg: HashMap<usize,u32> = HashMap::new();
+        for &(a,b) in &sharp { *vdeg.entry(a).or_default()+=1; *vdeg.entry(b).or_default()+=1; }
+        let (mut d1, mut d2, mut d3) = (0u32,0u32,0u32);
+        for (_, &d) in &vdeg { match d { 1 => d1+=1, 2 => d2+=1, _ => d3+=1 } }
+        let embedded = sharp.iter().filter(|&&(a,b)| vdeg[&a]>=2 && vdeg[&b]>=2).count();
+        eprintln!("30° set: {} edges | vertices deg1={d1} deg2={d2} deg3+={d3} | embedded(both ends deg>=2)={embedded}", sharp.len());
+
+        // Bevel (fillet/chamfer) edges: how many sit OFF the final surface (left floating in a void
+        // by a later cut)? Test each endpoint's distance to the nearest welded mesh vertex.
+        let cells = (scale).max(1e-6);
+        let mut grid: HashMap<(i64,i64,i64), Vec<usize>> = HashMap::new();
+        let gq = |p:[f32;3]| ((p[0]*cells/8.0).floor() as i64,(p[1]*cells/8.0).floor() as i64,(p[2]*cells/8.0).floor() as i64);
+        for (i,p) in cpos.iter().enumerate() { grid.entry(gq(*p)).or_default().push(i); }
+        let near_vert = |p:[f32;3]| -> f32 {
+            let (gx,gy,gz) = gq(p);
+            let mut best = f32::MAX;
+            for dx in -1..=1 { for dy in -1..=1 { for dz in -1..=1 {
+                if let Some(v) = grid.get(&(gx+dx,gy+dy,gz+dz)) {
+                    for &i in v { let q=cpos[i]; let d=((p[0]-q[0]).powi(2)+(p[1]-q[1]).powi(2)+(p[2]-q[2]).powi(2)).sqrt(); best=best.min(d); }
+                }
+            }}}
+            best
+        };
+        let tol = diag * 0.01;
+        let mid = |e: &[[f32;3];2]| [(e[0][0]+e[1][0])*0.5,(e[0][1]+e[1][1])*0.5,(e[0][2]+e[1][2])*0.5];
+        let (mut off_either, mut off_mid, mut off_all3) = (0,0,0);
+        let mut lens: Vec<f32> = Vec::new();
+        for e in &bevel_edges {
+            let (da, db, dm) = (near_vert(e[0]), near_vert(e[1]), near_vert(mid(e)));
+            if da > tol || db > tol { off_either += 1; }
+            if dm > tol { off_mid += 1; }
+            if da > tol && db > tol && dm > tol { off_all3 += 1; }
+            let d=[e[1][0]-e[0][0],e[1][1]-e[0][1],e[1][2]-e[0][2]];
+            lens.push((d[0]*d[0]+d[1]*d[1]+d[2]*d[2]).sqrt());
+        }
+        lens.sort_by(|a,b| a.partial_cmp(b).unwrap());
+        eprintln!("bevel_edges: {} total | tol={:.2}mm | off(either endpoint)={off_either} off(midpoint-to-vertex)={off_mid} off(all3)={off_all3}", bevel_edges.len(), tol);
+        eprintln!("  bevel seg length: min={:.3} median={:.3} max={:.3}", lens.first().copied().unwrap_or(0.0), lens.get(lens.len()/2).copied().unwrap_or(0.0), lens.last().copied().unwrap_or(0.0));
+        // Length histogram of bevel edges whose midpoint is on-surface (before any length cap) — is
+        // there a clean gap between the legit cluster and the void-spanner outliers?
+        {
+            // reuse the real clip's surface test by calling it without the cap is not exposed; approximate
+            // with midpoint-to-vertex unavailable for surface — instead show all bevel-edge lengths bucketed.
+            let mut hist = [0u32; 12];
+            for &l in &lens { hist[((l/0.25) as usize).min(11)] += 1; }
+            eprint!("  bevel length hist (0.25mm bins): ");
+            for (i,&c) in hist.iter().enumerate() { if c>0 { eprint!("[{:.2}:{}] ", i as f32*0.25, c); } }
+            eprintln!();
+        }
+        let kept = clip_edges_to_mesh(&bevel_edges, &m, 0.01);
+        let mut klens: Vec<f32> = kept.iter().map(|e| { let d=[e[1][0]-e[0][0],e[1][1]-e[0][1],e[1][2]-e[0][2]]; (d[0]*d[0]+d[1]*d[1]+d[2]*d[2]).sqrt() }).collect();
+        klens.sort_by(|a,b| a.partial_cmp(b).unwrap());
+        let kmed = klens.get(klens.len()/2).copied().unwrap_or(0.0);
+        let over = |t: f32| klens.iter().filter(|&&l| l > t).count();
+        eprintln!("  midpoint-to-SURFACE clip: kept {}/{} | dropped {}", kept.len(), bevel_edges.len(), bevel_edges.len()-kept.len());
+        eprintln!("  kept seg lengths: median={kmed:.3} | >1.5mm={} >2mm={} >2.5mm={} >3mm={} | >3*med({:.2})={}", over(1.5), over(2.0), over(2.5), over(3.0), kmed*3.0, over(kmed*3.0));
+
+        // FACE-BASED detector (FreeCAD-style) vs the angle detector: report edge count + degree
+        // distribution (deg1 dangles = gaps/strays). Clean = deg1==0, deg2 dominant.
+        if let Some((fsharp, ftan)) = hworks_geometry::feature_edges_by_face(&m, 20.0, 8.0) {
+            let mut fdeg: HashMap<(i64, i64, i64), u32> = HashMap::new();
+            for e in &fsharp {
+                let kf = |p: [f32; 3]| ((p[0] * 1e3).round() as i64, (p[1] * 1e3).round() as i64, (p[2] * 1e3).round() as i64);
+                *fdeg.entry(kf(e[0])).or_default() += 1;
+                *fdeg.entry(kf(e[1])).or_default() += 1;
+            }
+            let (mut f1, mut f2, mut f3) = (0, 0, 0);
+            for (_, &d) in &fdeg { match d { 1 => f1 += 1, 2 => f2 += 1, _ => f3 += 1 } }
+            eprintln!("FACE-DETECTOR: sharp={} tangent={} | vertices deg1={f1} deg2={f2} deg3+={f3}", fsharp.len(), ftan.len());
+        } else {
+            eprintln!("FACE-DETECTOR: (mesh could not be ingested)");
+        }
+    }
+
     fn rect_sketch(w: f64, h: f64) -> Sketch {
         let mut s = Sketch::default();
         let p0 = s.add_point(0.0, 0.0);
@@ -11999,7 +13835,7 @@ mod tests {
     #[test]
     fn regenerate_replays_an_extrude_into_a_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let solid = regenerate(&doc).expect("regen should produce a body");
         assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
     }
@@ -12067,18 +13903,18 @@ mod tests {
         let mut a = Sketch::default();
         let pa = a.add_point(0.0, 0.0);
         a.add_circle(pa, 3.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: a, regions: vec![], plane: xy(), distance: 5.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: a, regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut b = Sketch::default();
         let pb = b.add_point(10.0, 0.0);
         b.add_circle(pb, 3.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: b, regions: vec![], plane: xy(), distance: 3.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: b, regions: vec![], plane: xy(), distance: 3.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let before = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
         // Cut a 1mm hole in the top of cylinder A (z=5), 2mm deep.
         let mut cut = Sketch::default();
         let pc = cut.add_point(0.0, 0.0);
         cut.add_circle(pc, 1.0);
         let top = PlaneRef { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Cut { sketch: cut, regions: vec![], plane: top, distance: 2.0 });
+        doc.add_feature(FeatureKind::Cut { sketch: cut, regions: vec![], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let after_solid = regenerate(&doc).expect("body after cut");
         let after = tessellate(&after_solid, 0.05).edges.len();
         eprintln!("edges before cut {before}, after cut {after}");
@@ -12100,13 +13936,13 @@ mod tests {
         let b2 = boss.add_point(11.0, -2.0);
         boss.add_line(b1, b2, false);
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         // Cut a 1mm-radius hole in the middle, from the top face.
         let mut cutsk = Sketch::default();
         let cc = cutsk.add_point(5.0, 0.0);
         cutsk.add_circle(cc, 1.0);
         let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Cut { sketch: cutsk, regions: vec![], plane: top, distance: 1.0 });
+        doc.add_feature(FeatureKind::Cut { sketch: cutsk, regions: vec![], plane: top, distance: 1.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let solid = regenerate(&doc); // must not panic
         assert!(solid.is_some(), "dumbbell with a cut should still produce a body");
     }
@@ -12114,7 +13950,7 @@ mod tests {
     #[test]
     fn editing_a_distance_rebuilds_taller() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let h2 = height(&regenerate(&doc).unwrap());
         if let FeatureKind::Extrude { distance, .. } = &mut doc.features.last_mut().unwrap().kind {
             *distance = 6.0;
@@ -12128,10 +13964,10 @@ mod tests {
     fn editing_an_upstream_height_shifts_stacked_features() {
         let mut doc = Document::with_default_planes();
         // Base box 4×4×2 on XY.
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         // Boss 2×2 sketched on the top face (z=2), 2 tall → stacked total height 4.
         let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: top, distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let before = height(&regenerate(&doc).unwrap());
         assert!((before - 4.0).abs() < 0.2, "stacked height should be 4, was {before}");
         // Grow the base to 5 tall — the boss must ride up to z=5..7 (total 7), not
@@ -12146,7 +13982,7 @@ mod tests {
     #[test]
     fn rollback_suppresses_downstream_features() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         assert!(regenerate(&doc).is_some());
         // Roll the bar back before the extrude → no body.
         doc.rollback = doc.features.len() - 1;
@@ -12161,6 +13997,9 @@ mod tests {
             regions: vec![0],
             plane: xy(),
             distance: 2.0,
+            back: 0.0,
+            thin: 0.0,
+            thin_side: 0,
         });
         let text = ron::ser::to_string_pretty(&doc, ron::ser::PrettyConfig::default()).unwrap();
         let reloaded: Document = ron::from_str(&text).expect("RON parses back");
@@ -12172,7 +14011,7 @@ mod tests {
     #[test]
     fn regenerate_replays_a_cut_through_the_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         // Cut a centred 2x2 pocket from the same plane (body is on the +normal side).
         let mut pocket = Sketch::default();
         let a = pocket.add_point(1.0, 1.0);
@@ -12183,7 +14022,7 @@ mod tests {
         pocket.add_line(b, c, false);
         pocket.add_line(c, d, false);
         pocket.add_line(d, a, false);
-        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let solid = regenerate(&doc).expect("regen with a cut should produce a body");
         assert!(tessellate(&solid, 0.05).edges.len() > 12, "cut should add edges");
     }
@@ -12208,7 +14047,7 @@ mod tests {
         let s = two_disjoint_squares();
         assert_eq!(s.regions().len(), 2, "two separate squares are two regions");
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![0], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let edges = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
         assert_eq!(edges, 12, "one selected contour → one box, got {edges}");
     }
@@ -12218,7 +14057,7 @@ mod tests {
         let s = two_disjoint_squares();
         let mut doc = Document::with_default_planes();
         // Empty selection ⇒ all contours.
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: xy(), distance: 2.0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let edges = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
         // Two separate boxes = 24 edges (proves the disjoint union worked).
         assert_eq!(edges, 24, "all contours → two boxes (24 edges), got {edges}");
@@ -12262,7 +14101,7 @@ mod tests {
         let top = PlaneBasis { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
         let region = Region { outer: circle, holes: vec![] };
         // The exact union fails in truck; boss_union must recover via the nudge.
-        let solid = boss_union(&wedge, &region, &top, 2.0).expect("coincident cylinder boss should union");
+        let solid = boss_union(&wedge, &region, &top, 2.0, 0.0).expect("coincident cylinder boss should union");
         let edges = tessellate(&solid, 0.05).edges.len();
         assert!(edges > 12, "combined wedge+cylinder should have many edges, got {edges}");
     }

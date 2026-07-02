@@ -74,10 +74,15 @@ pub enum FeatureKind {
     /// sketch at regenerate time, so editing the sketch updates downstream.
     Sketch { sketch: Sketch, plane: PlaneRef },
     /// Boss extrude: add material by sweeping the chosen `regions` (the "Selected
-    /// Contours") of `sketch`. An empty list means "all closed regions".
-    Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
-    /// Cut: subtract the chosen swept `regions` from the body (empty = all).
-    Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64 },
+    /// Contours") of `sketch`. An empty list means "all closed regions". `back` is the optional
+    /// Direction-2 distance (≥0): the prism also extends `back` the opposite way (both directions).
+    /// `thin` > 0 makes it a **thin feature**: extrude a wall of that thickness along the profile
+    /// (a pipe/box shell) instead of filling the region. `thin_side`: 0 = outward (profile is the
+    /// inner wall), 1 = inward (outer wall), 2 = mid-plane (split evenly).
+    Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64, #[serde(default)] back: f64, #[serde(default)] thin: f64, #[serde(default)] thin_side: u8 },
+    /// Cut: subtract the chosen swept `regions` from the body (empty = all). `back` = Direction 2.
+    /// `thin`/`thin_side` as for [`Extrude`] — subtract a wall instead of the filled region.
+    Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64, #[serde(default)] back: f64, #[serde(default)] thin: f64, #[serde(default)] thin_side: u8 },
     /// Revolve: sweep the chosen `regions` of `sketch` around an axis line (a point + direction in
     /// the sketch's uv plane) by `angle` radians (τ = full turn). `cut` subtracts the swept solid
     /// from the body (a lathe groove/bore) instead of adding it (a revolve boss).
@@ -89,7 +94,8 @@ pub enum FeatureKind {
     Chamfer { distance: f64, edges: Vec<Vec<[f64; 3]>> },
     /// Loft: skin a solid between an ordered list of cross-section profiles (each a sketch on its
     /// own plane). Builds a smooth body connecting the profiles — the construction-plane payoff.
-    Loft { profiles: Vec<LoftProfile> },
+    /// `cut` subtracts the lofted solid from the body (a tapered pocket/bore) instead of adding it.
+    Loft { profiles: Vec<LoftProfile>, #[serde(default)] cut: bool },
     /// Mirror: reflect the whole body across `plane` and union it with the original
     /// (a symmetric part). The plane is recorded so it survives regeneration.
     Mirror { plane: PlaneRef },
@@ -97,6 +103,27 @@ pub enum FeatureKind {
     /// `axis`, a thread of `major_d` × `pitch` over `depth`. `internal` taps a hole; false
     /// threads an existing boss. `rh` = right-handed.
     Thread { origin: [f64; 3], axis: [f64; 3], major_d: f64, pitch: f64, depth: f64, internal: bool, rh: bool },
+    /// Reference image ("sketch picture"): a raster pinned to `plane` to trace over — not geometry,
+    /// just a visual underlay. `data` is the base64-encoded PNG/JPG; `px_w`/`px_h` the source pixel
+    /// size (for aspect ratio). `width`/`height` are the physical size on the plane (mm); `center` is
+    /// the uv offset of the image centre from the plane origin; `rot` rotates it in-plane (rad);
+    /// `opacity` is 0..1; `flip_h`/`flip_v` mirror it. Size starts at a default and is set by typing a
+    /// dimension or the click-to-calibrate tool.
+    RefImage {
+        plane: PlaneRef,
+        data: String,
+        px_w: u32,
+        px_h: u32,
+        center: [f64; 2],
+        rot: f64,
+        width: f64,
+        height: f64,
+        opacity: f32,
+        #[serde(default)]
+        flip_h: bool,
+        #[serde(default)]
+        flip_v: bool,
+    },
     // Revolve / … arrive at M8+.
 }
 
@@ -202,14 +229,22 @@ impl Document {
                 FeatureKind::Chamfer { distance, edges } => {
                     format!("[chamfer] Chamfer  d={distance:.2} ({})", edges.len())
                 }
-                FeatureKind::Loft { profiles } => {
-                    ex += 1;
-                    format!("[loft]   Loft{ex}  ({} profiles)", profiles.len())
+                FeatureKind::Loft { profiles, cut } => {
+                    if *cut {
+                        ct += 1;
+                        format!("[loft]   LoftCut{ct}  ({} profiles)", profiles.len())
+                    } else {
+                        ex += 1;
+                        format!("[loft]   Loft{ex}  ({} profiles)", profiles.len())
+                    }
                 }
                 FeatureKind::Mirror { .. } => "[mirror] Mirror".to_string(),
                 FeatureKind::Thread { major_d, pitch, internal, .. } => {
                     let kind = if *internal { "tap" } else { "ext" };
                     format!("[thread] Thread {kind}  M{major_d:.1}×{pitch:.2}")
+                }
+                FeatureKind::RefImage { width, height, .. } => {
+                    format!("[image]  Picture  {width:.0}×{height:.0}")
                 }
             })
             .collect()

@@ -154,6 +154,89 @@ fn from_manifold(man: &Manifold) -> TriMesh {
     out
 }
 
+/// **Face-boundary feature edges** — the FreeCAD-style detector. Ingest the mesh into Manifold, which
+/// groups coplanar-connected triangles into faces (exact for flats; per-facet for curves). Merge
+/// facet groups that meet tangentially (dihedral below `crease_deg`) into *smooth faces*, then the
+/// real edges are exactly the boundaries between different smooth faces.
+///
+/// Why this beats per-edge dihedral thresholding:
+/// - **No boolean-seam strays are possible** — re-tessellation inside a flat face shares that face's
+///   id, so it never crosses a face boundary.
+/// - **Flat-face edges are exact** — no threshold; a box edge is a face boundary, full stop.
+/// - **Curve facets vanish** — the 48 facets of a cylinder wall merge into one smooth face, so no
+///   starburst and no per-facet noise; the angle is used once per face-pair, not per triangle.
+///
+/// Returns `(sharp, tangent)` in world positions; `tangent` collects boundaries that are gentle
+/// (between `tangent_deg` and `crease_deg`) so they can be shown optionally. `None` if the mesh can't
+/// be ingested (caller falls back to the angle detector).
+pub fn feature_edges_by_face(mesh: &TriMesh, crease_deg: f64, tangent_deg: f64) -> Option<(Vec<[[f32; 3]; 2]>, Vec<[[f32; 3]; 2]>)> {
+    let man = to_manifold(mesh)?.as_original();
+    let mgl = man.to_meshgl();
+    let nprop = mgl.num_prop().max(3);
+    let vp = mgl.vert_properties();
+    let tris = mgl.tri_verts();
+    let fid = mgl.face_id();
+    if tris.len() < 3 || fid.len() * 3 != tris.len() {
+        return None;
+    }
+    let ntri = tris.len() / 3;
+    let pos = |v: u32| { let b = v as usize * nprop; [vp[b], vp[b + 1], vp[b + 2]] };
+    let dot = |u: [f32; 3], w: [f32; 3]| u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    // Per-triangle normal + dense face-id.
+    let tnorm: Vec<[f32; 3]> = (0..ntri).map(|t| face_normal(pos(tris[t * 3]), pos(tris[t * 3 + 1]), pos(tris[t * 3 + 2]))).collect();
+    let mut fmap: HashMap<u32, usize> = HashMap::new();
+    let face_of: Vec<usize> = (0..ntri).map(|t| { let n = fmap.len(); *fmap.entry(fid[t]).or_insert(n) }).collect();
+    // Edge → the (≤2) triangles that share it. Manifold shares vertices, so an index pair is exact.
+    let mut emap: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for t in 0..ntri {
+        let vs = [tris[t * 3], tris[t * 3 + 1], tris[t * 3 + 2]];
+        for k in 0..3 {
+            let (i, j) = (vs[k], vs[(k + 1) % 3]);
+            emap.entry(if i < j { (i, j) } else { (j, i) }).or_default().push(t);
+        }
+    }
+    // Union-find: merge tangent-connected face groups into smooth faces.
+    let mut uf: Vec<usize> = (0..fmap.len()).collect();
+    fn find(uf: &mut [usize], mut x: usize) -> usize {
+        while uf[x] != x {
+            uf[x] = uf[uf[x]];
+            x = uf[x];
+        }
+        x
+    }
+    let cos_crease = crease_deg.to_radians().cos() as f32;
+    for ts in emap.values() {
+        if ts.len() == 2 && face_of[ts[0]] != face_of[ts[1]] && dot(tnorm[ts[0]], tnorm[ts[1]]) > cos_crease {
+            let (ra, rb) = (find(&mut uf, face_of[ts[0]]), find(&mut uf, face_of[ts[1]]));
+            if ra != rb {
+                uf[ra] = rb;
+            }
+        }
+    }
+    // Edges = boundaries between different smooth faces.
+    let cos_tan = tangent_deg.to_radians().cos() as f32;
+    let (mut sharp, mut tangent) = (Vec::new(), Vec::new());
+    for ((i, j), ts) in &emap {
+        let edge = [pos(*i), pos(*j)];
+        let boundary = match ts.len() {
+            2 => find(&mut uf, face_of[ts[0]]) != find(&mut uf, face_of[ts[1]]),
+            1 => true, // a true boundary edge (open shell) — keep
+            _ => false,
+        };
+        if !boundary {
+            continue;
+        }
+        // Classify by the dihedral across the boundary: a hard crease vs a gentle (tangent) meeting.
+        let hard = ts.len() != 2 || dot(tnorm[ts[0]], tnorm[ts[1]]) < cos_tan;
+        if hard {
+            sharp.push(edge);
+        } else {
+            tangent.push(edge);
+        }
+    }
+    Some((sharp, tangent))
+}
+
 fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
@@ -335,5 +418,38 @@ mod tests {
         let u = mesh_union(&body, &boss);
         let expect = 10.0 * 10.0 * 4.0 + 4.0 * 4.0 * 4.01 - 4.0 * 4.0 * 0.01;
         assert!((volume(&u) - expect).abs() < 1.0, "flush-boss volume was {} (want {expect})", volume(&u));
+    }
+
+    #[test]
+    fn face_provenance_and_coplanar_grouping() {
+        use std::collections::HashSet;
+        // Manifold exposes per-face provenance the FreeCAD-style edge detector relies on. Two unioned
+        // boxes: (run_original_id, face_id) must key their 12 faces uniquely. And a fresh single ingest
+        // must group coplanar triangles into faces (box → 6, cylinder → caps + per-facet walls).
+        let a = to_manifold(&extrude_tool_mesh(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]], &[], &xy(), 0.0, 10.0).unwrap()).unwrap().as_original();
+        let b = to_manifold(&extrude_tool_mesh(&[[5.0, 5.0], [15.0, 5.0], [15.0, 15.0], [5.0, 15.0]], &[], &xy(), 5.0, 10.0).unwrap()).unwrap().as_original();
+        let u = a.union(&b);
+        let mgl = u.to_meshgl();
+        let (nrun, ntri) = (mgl.num_run(), mgl.num_tri());
+        let (roid, ridx, faceid) = (mgl.run_original_id(), mgl.run_index(), mgl.face_id());
+        let mut tri_oid = vec![0u32; ntri];
+        for i in 0..nrun {
+            let s = ridx[i] as usize / 3;
+            let e = if i + 1 < ridx.len() { ridx[i + 1] as usize / 3 } else { ntri };
+            for t in s..e {
+                tri_oid[t] = roid.get(i).copied().unwrap_or(0);
+            }
+        }
+        let keys: HashSet<(u32, u32)> = (0..ntri).map(|t| (tri_oid[t], faceid[t])).collect();
+        assert_eq!(keys.len(), 12, "two unioned boxes have 12 provenance-keyed faces");
+
+        let boxm = to_manifold(&extrude_tool_mesh(&[[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]], &[], &xy(), 0.0, 8.0).unwrap()).unwrap().as_original();
+        let bfaces: HashSet<u32> = boxm.to_meshgl().face_id().iter().copied().collect();
+        assert_eq!(bfaces.len(), 6, "a fresh box ingests to 6 coplanar faces");
+
+        let circle: Vec<[f64; 2]> = (0..48).map(|k| { let a = std::f64::consts::TAU * k as f64 / 48.0; [10.0 * a.cos(), 10.0 * a.sin()] }).collect();
+        let cm = to_manifold(&extrude_tool_mesh(&circle, &[], &xy(), 0.0, 20.0).unwrap()).unwrap().as_original();
+        let cfaces: HashSet<u32> = cm.to_meshgl().face_id().iter().copied().collect();
+        assert_eq!(cfaces.len(), 50, "cylinder: 2 caps + 48 wall facets");
     }
 }

@@ -17,7 +17,7 @@ mod fillet;
 mod mesh_bool;
 pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_and_edges, bevel_mesh_selected};
 pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
-pub use mesh_bool::{is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, take_fallback_count};
+pub use mesh_bool::{feature_edges_by_face, is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, take_fallback_count};
 
 /// A tessellated triangle mesh handed up to the renderer.
 #[derive(Debug, Default, Clone)]
@@ -174,7 +174,7 @@ pub fn cut(
     basis: &PlaneBasis,
     distance: f64,
 ) -> Option<KSolid> {
-    cut_tol(base, outer, holes, basis, distance, TOL)
+    cut_tol(base, outer, holes, basis, distance, 0.0, TOL)
 }
 
 /// Boolean cut at a caller-chosen tolerance — the cut equivalent of [`union_tol`],
@@ -186,6 +186,7 @@ pub fn cut_tol(
     holes: &[Vec<[f64; 2]>],
     basis: &PlaneBasis,
     distance: f64,
+    back: f64,
     tol: f64,
 ) -> Option<KSolid> {
     let depth = distance.abs();
@@ -193,10 +194,12 @@ pub fn cut_tol(
         return None;
     }
     let eps = 0.05 + depth * 0.02;
+    // `back` (Direction 2) extends the cut tool the opposite way from `distance`.
+    let b = back.max(0.0);
     let (start_offset, length) = if distance >= 0.0 {
-        (-eps, depth + 2.0 * eps)
+        (-(eps + b), depth + 2.0 * eps + b)
     } else {
-        (-(depth + eps), depth + 2.0 * eps)
+        (-(depth + eps), depth + 2.0 * eps + b)
     };
     let mut tool = build_solid(outer, holes, basis, start_offset, length)?;
     guard(move || {
@@ -424,14 +427,20 @@ pub fn cut_tool_mesh(
     holes: &[Vec<[f64; 2]>],
     basis: &PlaneBasis,
     distance: f64,
+    back: f64,
 ) -> Option<TriMesh> {
     let depth = distance.abs();
     if depth < 1e-9 {
         return None;
     }
     let eps = 0.05 + depth * 0.02;
-    let (start, length) =
-        if distance >= 0.0 { (-eps, depth + 2.0 * eps) } else { (-(depth + eps), depth + 2.0 * eps) };
+    // `back` (Direction 2) extends the cut the opposite way from `distance`.
+    let b = back.max(0.0);
+    let (start, length) = if distance >= 0.0 {
+        (-(eps + b), depth + 2.0 * eps + b)
+    } else {
+        (-(depth + eps), depth + 2.0 * eps + b)
+    };
     extrude_tool_mesh(outer, holes, basis, start, length)
 }
 
@@ -723,11 +732,13 @@ pub fn loft_mesh(profiles: &[(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)]) -> Option<Tri
 /// [`Tessellation`] by classifying its feature edges, so the mesh fallback renders
 /// with the same sharp/tangent edge treatment as the exact kernel.
 pub fn mesh_tessellation(mesh: TriMesh) -> Tessellation {
-    // CSG output has T-junctions and near-coincident vertices where two solids' separate
-    // tessellations meet. Weld coarsely (2e-3 grid) and keep only *manifold* edges above
-    // a slightly raised 50° threshold — so boolean seams don't draw as stray dashes,
-    // while real corners (≥~90°) still show.
-    let (edges, tangent_edges) = feature_edges_opts(&mesh, 50.0, 5.0e2, true);
+    // Prefer the **face-boundary** detector: it re-ingests the mesh into Manifold, groups coplanar
+    // triangles into faces, merges tangent facets into smooth faces, and takes the boundaries between
+    // smooth faces as the edges. This is topological, not angle-guessed — boolean re-tessellation
+    // inside a face can't produce strays, flat edges are exact, and curve facets vanish. Falls back to
+    // the angle detector (with its spur/gap cleanup) only if Manifold can't ingest the mesh.
+    let (edges, tangent_edges) = mesh_bool::feature_edges_by_face(&mesh, 25.0, 8.0)
+        .unwrap_or_else(|| feature_edges_opts(&mesh, 30.0, 2.0e-4, true));
     Tessellation { mesh, edges, tangent_edges }
 }
 
@@ -904,26 +915,43 @@ fn polymesh_to_trimesh(poly: &truck_polymesh::PolygonMesh) -> TriMesh {
 ///   threshold) — the curvature/facet lines of smooth surfaces and tangent blends.
 /// Exactly-coplanar interior edges are dropped from both.
 fn feature_edges(mesh: &TriMesh, sharp_deg: f64) -> (Vec<[[f32; 3]; 2]>, Vec<[[f32; 3]; 2]>) {
-    feature_edges_opts(mesh, sharp_deg, 1.0e4, false)
+    feature_edges_opts(mesh, sharp_deg, 1.0e-6, false)
 }
 
 /// `feature_edges`, parameterised for the two mesh sources:
-/// - `weld` is the quantisation scale used to merge coincident vertices (a larger
-///   number = finer grid; truck meshes are clean so 1e4 is right).
-/// - `manifold_only` keeps **only** edges shared by exactly two faces and drops
-///   boundary/non-manifold edges. Mesh-boolean (CSG) output is riddled with
-///   T-junctions whose "boundary" edges would otherwise draw as a starburst, so the
-///   mesh-fallback path turns this on; the exact (truck) path leaves it off.
+/// - `rel` is the vertex-merge tolerance as a fraction of the mesh's bounding-box diagonal, so it
+///   scales with the part (a fixed grid over- or under-merges as the model size changes). Two
+///   vertices closer than `rel · diag` fuse — recovering the shared-edge adjacency that flat-shading
+///   and CSG float error split apart. Mesh-boolean output needs a looser tolerance than clean truck
+///   meshes.
+/// - `manifold_only` keeps **only** edges shared by exactly two faces and drops boundary/non-manifold
+///   edges. Mesh-boolean (CSG) output can leave stray boundary slivers that would draw as a starburst,
+///   so the mesh-fallback path turns this on; the exact (truck) path leaves it off.
 fn feature_edges_opts(
     mesh: &TriMesh,
     sharp_deg: f64,
-    weld: f32,
+    rel: f32,
     manifold_only: bool,
 ) -> (Vec<[[f32; 3]; 2]>, Vec<[[f32; 3]; 2]>) {
     use std::collections::HashMap;
-    // Merge duplicated (flat-shaded) vertices by quantized position.
+    if mesh.positions.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // Bbox-relative merge grid: cell size scales with the part so coincident vertices fuse reliably
+    // at any model scale (a fixed grid is too coarse for tiny parts, too fine for big ones).
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &mesh.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let cell = (diag * rel).max(1.0e-6);
+    let scale = 1.0 / cell;
+    // Merge duplicated (flat-shaded) / near-coincident vertices by quantized position.
     let quant = |p: [f32; 3]| {
-        ((p[0] * weld).round() as i64, (p[1] * weld).round() as i64, (p[2] * weld).round() as i64)
+        ((p[0] * scale).round() as i64, (p[1] * scale).round() as i64, (p[2] * scale).round() as i64)
     };
     let mut canon: HashMap<(i64, i64, i64), usize> = HashMap::new();
     let mut canon_pos: Vec<[f32; 3]> = Vec::new();
@@ -950,18 +978,9 @@ fn feature_edges_opts(
 
     let cos_sharp = sharp_deg.to_radians().cos();
     let cos_flat = 1.0_f64.to_radians().cos(); // below this angle ⇒ coplanar, drop
-    let mut sharp = Vec::new();
+    let mut sharp_ids: Vec<(usize, usize)> = Vec::new();
     let mut tangent = Vec::new();
     for ((i, j), normals) in emap {
-        let edge = [canon_pos[i], canon_pos[j]];
-        if normals.len() != 2 {
-            // Boundary (1) or non-manifold (≥3). For CSG output these are T-junction
-            // artifacts → drop. For exact (truck) meshes a lone boundary edge is real.
-            if !manifold_only && normals.len() == 1 {
-                sharp.push(edge);
-            }
-            continue;
-        }
         // The widest angle between any incident pair of faces = the smallest dot.
         let mut min_dot = 1.0_f32;
         for a in 0..normals.len() {
@@ -972,14 +991,157 @@ fn feature_edges_opts(
                 min_dot = min_dot.min(d);
             }
         }
+        if normals.len() != 2 {
+            // Boundary (1 face): a lone normal can't give a dihedral — keep on the exact (truck) path
+            // where it's a real open edge, drop on the CSG path (seam slivers). Non-manifold (≥3
+            // faces): a CSG cut can make a real edge where 3 faces meet — KEEP it if some incident
+            // pair forms a real corner, so the cut's edges aren't lost (they were dropped before,
+            // which then let the spur-prune eat the whole chain).
+            match normals.len() {
+                1 if !manifold_only => sharp_ids.push((i, j)),
+                n if n >= 3 && (min_dot as f64) < cos_sharp => sharp_ids.push((i, j)),
+                _ => {}
+            }
+            continue;
+        }
         let md = min_dot as f64;
         if md < cos_sharp {
-            sharp.push(edge); // a real corner
+            sharp_ids.push((i, j)); // a real corner
         } else if md < cos_flat {
-            tangent.push(edge); // smooth/curvature edge
+            tangent.push([canon_pos[i], canon_pos[j]]); // smooth/curvature edge
         } // else coplanar interior → drop
     }
+    // Clean boolean-seam artifacts: prune short stray/spur paths (the pop-out segments) and bridge
+    // tiny gaps where a loop lost a segment at a seam.
+    let sharp = clean_feature_edges(&sharp_ids, &canon_pos, diag);
     (sharp, tangent)
+}
+
+/// Tidy the raw sharp-edge set extracted from a (mesh-boolean) mesh, using the invariant that on a
+/// *closed solid* real feature edges never dead-end — they close into loops or meet at corners. So a
+/// dangling (degree-1) endpoint is always a boolean-seam artifact.
+/// 1. **Prune spurs** — any degree-2 chain running from a dangling end to a junction is a stray that
+///    pokes off the real edge network; remove it whatever its length (this kills the long "sticking
+///    out" segments the short-only prune missed). Iterated, so nested spurs unwind.
+/// 2. **Resolve isolated open paths** — a connected piece with exactly two dangling ends and no
+///    junction is either a short stray (drop it) or a loop that lost a segment at a seam: if its two
+///    ends nearly meet, close it so the circle reads continuous; if they're far apart it's not a loop
+///    at all, so drop it.
+fn clean_feature_edges(ids: &[(usize, usize)], pos: &[[f32; 3]], diag: f32) -> Vec<[[f32; 3]; 2]> {
+    use std::collections::{HashMap, HashSet};
+    let elen = |a: usize, b: usize| -> f32 {
+        let (p, q) = (pos[a], pos[b]);
+        ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+    };
+    let mut edges: Vec<(usize, usize)> = ids.to_vec();
+    let adjacency = |edges: &[(usize, usize)]| {
+        let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ei, &(a, b)) in edges.iter().enumerate() {
+            adj.entry(a).or_default().push(ei);
+            adj.entry(b).or_default().push(ei);
+        }
+        adj
+    };
+
+    // --- Step 1: prune spurs (dangle → … → junction), any length. Iterate so unwinding a spur that
+    // exposes a new dangling end keeps pruning.
+    loop {
+        let adj = adjacency(&edges);
+        let deg = |v: usize| adj.get(&v).map_or(0, |e| e.len());
+        let mut remove: HashSet<usize> = HashSet::new();
+        for (&v, es) in &adj {
+            if es.len() != 1 {
+                continue; // start only from dangling ends
+            }
+            let mut chain = Vec::new();
+            let mut len = 0.0f32;
+            let mut cur = v;
+            let mut e = es[0];
+            let reached_junction = loop {
+                let (a, b) = edges[e];
+                let other = if a == cur { b } else { a };
+                chain.push(e);
+                len += elen(a, b);
+                match deg(other) {
+                    2 => match adj[&other].iter().copied().find(|&x| x != e) {
+                        Some(n) => {
+                            cur = other;
+                            e = n;
+                        }
+                        None => break false,
+                    },
+                    d if d >= 3 => break true, // attached to the real network → spur
+                    _ => break false,          // another dangle → isolated path (step 2)
+                }
+                if chain.len() > edges.len() {
+                    break false; // safety
+                }
+            };
+            // Only prune SHORT spurs. A *long* chain that dead-ends is a real edge that lost a
+            // neighbour at a non-manifold/boolean seam — deleting it would erase a real cut edge.
+            if reached_junction && len < diag * 0.08 {
+                for c in chain {
+                    remove.insert(c);
+                }
+            }
+        }
+        if remove.is_empty() {
+            break;
+        }
+        edges = edges.iter().enumerate().filter(|(i, _)| !remove.contains(i)).map(|(_, e)| *e).collect();
+    }
+
+    // --- Step 2: classify connected components; resolve isolated open paths.
+    let adj = adjacency(&edges);
+    let deg = |v: usize| adj.get(&v).map_or(0, |e| e.len());
+    let mut comp_of = vec![usize::MAX; edges.len()];
+    let mut ncomp = 0;
+    for start in 0..edges.len() {
+        if comp_of[start] != usize::MAX {
+            continue;
+        }
+        let mut stack = vec![start];
+        comp_of[start] = ncomp;
+        while let Some(ei) = stack.pop() {
+            let (a, b) = edges[ei];
+            for v in [a, b] {
+                for &ne in &adj[&v] {
+                    if comp_of[ne] == usize::MAX {
+                        comp_of[ne] = ncomp;
+                        stack.push(ne);
+                    }
+                }
+            }
+        }
+        ncomp += 1;
+    }
+    let stray_max = diag * 0.05; // a short isolated piece is a seam stray
+    let gap_max = diag * 0.2; // a loop that lost a segment has its two ends near each other
+    let mut drop_comp: HashSet<usize> = HashSet::new();
+    let mut close: Vec<(usize, usize)> = Vec::new();
+    for c in 0..ncomp {
+        let cedges: Vec<usize> = (0..edges.len()).filter(|&i| comp_of[i] == c).collect();
+        let mut verts: HashSet<usize> = HashSet::new();
+        for &ei in &cedges {
+            verts.insert(edges[ei].0);
+            verts.insert(edges[ei].1);
+        }
+        let dangles: Vec<usize> = verts.iter().copied().filter(|&v| deg(v) == 1).collect();
+        let has_junction = verts.iter().any(|&v| deg(v) >= 3);
+        if dangles.len() == 2 && !has_junction {
+            let length: f32 = cedges.iter().map(|&ei| { let (a, b) = edges[ei]; elen(a, b) }).sum();
+            let gap = elen(dangles[0], dangles[1]);
+            if length < stray_max || gap > gap_max {
+                drop_comp.insert(c); // short stray, or a long path that isn't a loop
+            } else {
+                close.push((dangles[0], dangles[1])); // a loop that lost a segment → close it
+            }
+        }
+    }
+    let mut out: Vec<(usize, usize)> =
+        edges.iter().enumerate().filter(|(i, _)| !drop_comp.contains(&comp_of[*i])).map(|(_, e)| *e).collect();
+    out.extend(close);
+    out.iter().map(|&(a, b)| [pos[a], pos[b]]).collect()
 }
 
 #[cfg(test)]
@@ -1251,5 +1413,84 @@ mod tests {
         // A box with a rectangular through-hole has more than the 12 edges of a plain box.
         assert!(t.edges.len() > 12, "cut result should have extra edges, got {}", t.edges.len());
         assert!(t.mesh.indices.len() % 3 == 0 && !t.mesh.positions.is_empty());
+    }
+
+    #[test]
+    fn direction_two_extends_the_prism_both_ways() {
+        // A 2×2 square, Direction 1 = 3 (z: 0..3), Direction 2 `back` = 1 (z: -1..0).
+        // The both-directions prism (start = -back, length = d + back) must span z ∈ [-1, 3].
+        let sq = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
+        let (d, back) = (3.0_f64, 1.0_f64);
+        let m = extrude_tool_mesh(&sq, &[], &xy_plane(), -back, d + back).expect("prism");
+        let (mut zlo, mut zhi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in &m.positions {
+            zlo = zlo.min(p[2]);
+            zhi = zhi.max(p[2]);
+        }
+        assert!((zlo - -1.0).abs() < 1e-4, "Direction 2 should reach z=-1, got {zlo}");
+        assert!((zhi - 3.0).abs() < 1e-4, "Direction 1 should reach z=3, got {zhi}");
+    }
+
+    #[test]
+    fn cylinder_rims_are_clean_closed_loops() {
+        // A plain cylinder's top + bottom rims must each be a clean closed loop in the displayed
+        // edges — no dangling vertices (a dangle is the "circle edge break").
+        use std::collections::HashMap;
+        let cyl = extrude_tool_mesh(&circle(0.0, 0.0, 20.0, 48), &[], &plane_at(0.0), 0.0, 50.0).expect("cyl");
+        let tess = mesh_tessellation(cyl);
+        let key = |p: [f32; 3]| ((p[0] * 1e3).round() as i64, (p[1] * 1e3).round() as i64, (p[2] * 1e3).round() as i64);
+        let mut deg: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        for e in &tess.edges {
+            *deg.entry(key(e[0])).or_default() += 1;
+            *deg.entry(key(e[1])).or_default() += 1;
+        }
+        assert!(deg.values().all(|&d| d == 2), "every rim vertex should have degree 2 (closed loops)");
+        assert_eq!(tess.edges.len(), 96, "two 48-segment rims");
+    }
+
+    #[test]
+    fn cleanup_prunes_a_short_spur() {
+        // A closed 10×10 square plus a tiny spur off a corner (a boolean-seam sliver). The short spur
+        // is pruned; the four loop edges stay.
+        let pos = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0], [10.4, 10.4, 0.0]];
+        let ids = vec![(0, 1), (1, 2), (2, 3), (3, 0), (2, 4)]; // (2,4) is a ~0.57mm spur
+        let out = clean_feature_edges(&ids, &pos, 14.14);
+        assert_eq!(out.len(), 4, "the short spur should be pruned, the square loop kept");
+    }
+
+    #[test]
+    fn cleanup_keeps_a_long_dangling_chain() {
+        // A square plus a LONG chain dead-ending off a corner. A long dead-end is a real edge that
+        // lost a neighbour at a non-manifold seam (not a stray), so it must be KEPT — deleting it is
+        // what erased real cut edges.
+        let pos = vec![
+            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 10.0, 0.0], [0.0, 10.0, 0.0],
+            [25.0, 25.0, 0.0], [40.0, 40.0, 0.0], // a long 2-segment chain off corner 2
+        ];
+        let ids = vec![(0, 1), (1, 2), (2, 3), (3, 0), (2, 4), (4, 5)];
+        let out = clean_feature_edges(&ids, &pos, 56.6);
+        assert_eq!(out.len(), 6, "a long dangling chain is a real edge and must be kept");
+    }
+
+    #[test]
+    fn cleanup_closes_a_gapped_loop() {
+        // A finely-faceted circle (a real curved rim) that lost ONE segment at a seam: an isolated
+        // open path whose two ends are one facet apart. It must be closed back into a full loop.
+        let n = 48usize;
+        let r = 10.0f32;
+        let pos: Vec<[f32; 3]> =
+            (0..n).map(|k| { let a = std::f32::consts::TAU * k as f32 / n as f32; [r * a.cos(), r * a.sin(), 0.0] }).collect();
+        let ids: Vec<(usize, usize)> = (0..n - 1).map(|k| (k, k + 1)).collect(); // missing (n-1, 0)
+        let out = clean_feature_edges(&ids, &pos, 2.0 * r);
+        assert_eq!(out.len(), n, "the one-facet gap should be closed back into the full loop");
+    }
+
+    #[test]
+    fn cleanup_drops_a_long_floating_stray() {
+        // An isolated open path whose ends are far apart isn't a loop — it's a stray streak. Drop it.
+        let pos = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [30.0, 0.0, 0.0]];
+        let ids = vec![(0, 1), (1, 2), (2, 3)];
+        let out = clean_feature_edges(&ids, &pos, 30.0);
+        assert!(out.is_empty(), "a long straight floating path is a stray, not a loop");
     }
 }
