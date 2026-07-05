@@ -50,6 +50,9 @@ use hworks_sketch::{
 
 mod text;
 
+/// The HCAD wordmark logo, embedded so it ships in the binary (window icon + About dialog).
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
 const EXTRUDE_DISTANCE: f64 = 2.0;
 const PLANE_SIZE: f32 = 8.0;
@@ -126,7 +129,7 @@ fn main() {
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
         .init_resource::<EdgeSelection>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, set_window_icon))
         .add_systems(EguiPrimaryContextPass, ui_system)
         .add_systems(
             Update,
@@ -1053,6 +1056,57 @@ fn setup(
     println!("HCAD ready — mouse-driven UI. Click a reference plane to start sketching.");
 }
 
+/// Decode the embedded logo and trim its white margins to the wordmark, returning (rgba, w, h) —
+/// a tight image for the About dialog (the raw asset is a square with generous whitespace).
+fn logo_cropped_rgba() -> Option<(Vec<u8>, usize, usize)> {
+    let img = image::load_from_memory(LOGO_PNG).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            let p = img.get_pixel(x, y).0;
+            // A pixel is "ink" if it's opaque and not near-white.
+            if p[3] > 16 && (p[0] < 220 || p[1] < 220 || p[2] < 220) {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let pad = 14u32;
+    let (x0, y0) = (x0.saturating_sub(pad), y0.saturating_sub(pad));
+    let (x1, y1) = ((x1 + pad).min(w - 1), (y1 + pad).min(h - 1));
+    let (cw, ch) = ((x1 - x0 + 1) as usize, (y1 - y0 + 1) as usize);
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            out.extend_from_slice(&img.get_pixel(x, y).0);
+        }
+    }
+    Some((out, cw, ch))
+}
+
+/// Set the OS window/taskbar icon from the embedded HCAD logo (winit — Bevy has no Window.icon
+/// field). Runs once at startup; the primary window already exists by then.
+fn set_window_icon(
+    windows: NonSend<bevy::winit::WinitWindows>,
+    primary: Query<Entity, With<PrimaryWindow>>,
+) {
+    let Ok(entity) = primary.single() else { return };
+    let Some(win) = windows.get_window(entity) else { return };
+    let Ok(img) = image::load_from_memory(LOGO_PNG) else { return };
+    // 256² is plenty for the OS to downscale to 16/32/48; keeps the icon payload small.
+    let rgba = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3).into_rgba8();
+    let (w, h) = rgba.dimensions();
+    if let Ok(icon) = winit::window::Icon::from_rgba(rgba.into_raw(), w, h) {
+        win.set_window_icon(Some(icon));
+    }
+}
+
 fn camera_transform(cam: &OrbitCamera) -> Transform {
     let rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
     let translation = cam.focus + rotation * Vec3::new(0.0, 0.0, cam.radius);
@@ -1165,6 +1219,7 @@ fn ui_system(
     mut font_previews: ResMut<FontPreviews>,
     edge_sel: Res<EdgeSelection>,
     time: Res<Time>,
+    mut logo_tex: Local<Option<egui::TextureHandle>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
@@ -4525,6 +4580,17 @@ fn ui_system(
 
     // About window.
     if ui_state.show_about {
+        // Lazily upload the (cropped) logo into an egui texture the first time About is shown.
+        let tex = logo_tex.get_or_insert_with(|| {
+            let (rgba, w, h) = logo_cropped_rgba().unwrap_or((vec![0, 0, 0, 0], 1, 1));
+            ctx.load_texture(
+                "hcad_logo",
+                egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        let logo_id = tex.id();
+        let logo_size = tex.size();
         let mut open = true;
         egui::Window::new("About HCAD")
             .collapsible(false)
@@ -4533,7 +4599,17 @@ fn ui_system(
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("HCAD").heading().strong());
+                // The wordmark logo on a white plate so the black ink reads on the dark theme.
+                let aspect = logo_size[0].max(1) as f32 / logo_size[1].max(1) as f32;
+                let lw = 260.0_f32.min(ui.available_width());
+                egui::Frame::new()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .corner_radius(6.0)
+                    .show(ui, |ui| {
+                        ui.add(egui::Image::new((logo_id, egui::vec2(lw, lw / aspect))));
+                    });
+                ui.add_space(6.0);
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.add_space(6.0);
                 ui.label("A parametric solid modeler — sketch, extrude, revolve, loft,");

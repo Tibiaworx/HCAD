@@ -12,6 +12,12 @@ InstallDirRegKey HKLM "Software\HCAD" "InstallDir"
 RequestExecutionLevel admin   ; needed to write to Program Files
 BrandingText "HCAD"
 
+; Branding: the setup/uninstall exe icons and the wizard header use the HCAD logo.
+Icon "hcad.ico"
+UninstallIcon "hcad.ico"
+
+!define MUI_ICON "hcad.ico"
+!define MUI_UNICON "hcad.ico"
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -30,6 +36,7 @@ Section "HCAD (required)" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   File /oname=HCAD.exe "..\target\release\hcad.exe"
+  File "hcad.ico"
 
   ; Visual C++ runtime the Manifold kernel needs — silent, only installs if missing.
   SetOutPath "$TEMP"
@@ -39,11 +46,11 @@ Section "HCAD (required)" SecMain
   Delete "$TEMP\vc_redist.x64.exe"
   SetOutPath "$INSTDIR"
 
-  ; Shortcuts
+  ; Shortcuts (icon from the installed .ico so they show the logo even without the exe resource).
   CreateDirectory "$SMPROGRAMS\HCAD"
-  CreateShortcut "$SMPROGRAMS\HCAD\HCAD.lnk" "$INSTDIR\HCAD.exe"
+  CreateShortcut "$SMPROGRAMS\HCAD\HCAD.lnk" "$INSTDIR\HCAD.exe" "" "$INSTDIR\hcad.ico"
   CreateShortcut "$SMPROGRAMS\HCAD\Uninstall HCAD.lnk" "$INSTDIR\Uninstall.exe"
-  CreateShortcut "$DESKTOP\HCAD.lnk" "$INSTDIR\HCAD.exe"
+  CreateShortcut "$DESKTOP\HCAD.lnk" "$INSTDIR\HCAD.exe" "" "$INSTDIR\hcad.ico"
 
   ; Registry: install dir + Add/Remove Programs entry.
   WriteRegStr HKLM "Software\HCAD" "InstallDir" "$INSTDIR"
@@ -51,7 +58,7 @@ Section "HCAD (required)" SecMain
   WriteRegStr HKLM "${UNINST}" "DisplayName" "HCAD"
   WriteRegStr HKLM "${UNINST}" "DisplayVersion" "0.16.0"
   WriteRegStr HKLM "${UNINST}" "Publisher" "HCAD"
-  WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\HCAD.exe"
+  WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\hcad.ico"
   WriteRegStr HKLM "${UNINST}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKLM "${UNINST}" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKLM "${UNINST}" "NoModify" 1
@@ -63,6 +70,7 @@ SectionEnd
 ; ---- Uninstall ----
 Section "Uninstall"
   Delete "$INSTDIR\HCAD.exe"
+  Delete "$INSTDIR\hcad.ico"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 
