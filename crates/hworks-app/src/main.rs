@@ -129,7 +129,7 @@ fn main() {
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
         .init_resource::<EdgeSelection>()
-        .add_systems(Startup, (setup, set_window_icon))
+        .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, ui_system)
         .add_systems(
             Update,
@@ -148,6 +148,7 @@ fn main() {
                     apply_mirror_feature,
                     apply_thread,
                     do_regenerate,
+                    set_window_icon,
                     fillet_preview,
                     chamfer_preview,
                     mirror_preview,
@@ -1091,11 +1092,17 @@ fn logo_cropped_rgba() -> Option<(Vec<u8>, usize, usize)> {
 }
 
 /// Set the OS window/taskbar icon from the embedded HCAD logo (winit — Bevy has no Window.icon
-/// field). Runs once at startup; the primary window already exists by then.
+/// field). Runs in Update with a run-once guard: `WinitWindows` isn't populated until the winit
+/// event loop has created the window, which is after `Startup`, so it's `Option` + retried.
 fn set_window_icon(
-    windows: NonSend<bevy::winit::WinitWindows>,
+    mut done: Local<bool>,
+    windows: Option<NonSend<bevy::winit::WinitWindows>>,
     primary: Query<Entity, With<PrimaryWindow>>,
 ) {
+    if *done {
+        return;
+    }
+    let Some(windows) = windows else { return };
     let Ok(entity) = primary.single() else { return };
     let Some(win) = windows.get_window(entity) else { return };
     let Ok(img) = image::load_from_memory(LOGO_PNG) else { return };
@@ -1105,6 +1112,7 @@ fn set_window_icon(
     if let Ok(icon) = winit::window::Icon::from_rgba(rgba.into_raw(), w, h) {
         win.set_window_icon(Some(icon));
     }
+    *done = true;
 }
 
 fn camera_transform(cam: &OrbitCamera) -> Transform {
