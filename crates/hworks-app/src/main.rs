@@ -50,8 +50,11 @@ use hworks_sketch::{
 
 mod text;
 
-/// The HCAD wordmark logo, embedded so it ships in the binary (window icon + About dialog).
+/// The HCAD wordmark logo, embedded so it ships in the binary (About dialog).
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+/// The square gear mark — the wordmark reads poorly at taskbar size, so the OS icon uses just the
+/// gear (the logo's "C" glyph on a white square).
+const GEAR_PNG: &[u8] = include_bytes!("../assets/gear.png");
 
 /// Default boss/cut depth used by the keyboard accelerators (the UI lets you edit it).
 const EXTRUDE_DISTANCE: f64 = 2.0;
@@ -1105,7 +1108,7 @@ fn set_window_icon(
     let Some(windows) = windows else { return };
     let Ok(entity) = primary.single() else { return };
     let Some(win) = windows.get_window(entity) else { return };
-    let Ok(img) = image::load_from_memory(LOGO_PNG) else { return };
+    let Ok(img) = image::load_from_memory(GEAR_PNG) else { return };
     // 256² is plenty for the OS to downscale to 16/32/48; keeps the icon payload small.
     let rgba = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3).into_rgba8();
     let (w, h) = rgba.dimensions();
