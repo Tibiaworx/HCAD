@@ -16,6 +16,20 @@ model rebuild itself.
 
 ---
 
+## Screenshots
+
+| Sketching | Boss extrude |
+|---|---|
+| ![Sketching a profile on a face with relations and dimensions](docs/screenshots/sketch.jpg) | ![Boss-extrude PropertyManager with direction gizmo and live preview](docs/screenshots/boss-extrude.jpg) |
+| *Sketch mode: a profile on a face with inference, geometric relations, and driving dimensions.* | *Boss extrude: PropertyManager, draggable direction gizmo, and live preview.* |
+
+| Cut + feature tree | Solid body |
+|---|---|
+| ![A square cut through a cylinder with the parametric feature tree](docs/screenshots/cut.jpg) | ![Finished cylinder with feature tree and edge selection highlight](docs/screenshots/cylinder.jpg) |
+| *Cut feature through a boss, with the editable feature tree and the selected feature's profile highlighted.* | *A finished solid — feature tree, view triad, and edge-selection highlight.* |
+
+---
+
 ## What it does (the intended workflow)
 
 1. **Reference planes.** Start with three datum planes (Front / Top / Right) and create
