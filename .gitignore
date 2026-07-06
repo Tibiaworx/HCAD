@@ -12,6 +12,11 @@ run.log
 /installer/HCAD-Setup.exe
 /installer/vc_redist.x64.exe
 
+# Raw source art / working screenshots (the ones used in the repo live under
+# crates/hworks-app/assets and docs/screenshots; these folders are the untracked originals).
+/logo/
+/screen shots/
+
 # Editor / OS
 .vscode/
 .idea/
