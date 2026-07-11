@@ -5515,25 +5515,32 @@ fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
         n = -n;
     }
 
-    // Average the centroids of all triangles coplanar with the hit → face origin.
+    // Area-weighted centroid of all triangles coplanar with the hit → face origin.
+    // Weighting by triangle area gives the *true* centroid of the face region, so a
+    // curved-edge face (e.g. a cylinder's circular top) centres exactly on its axis
+    // regardless of how it was triangulated. An unweighted mean of triangle
+    // centroids is biased by the tessellation (a fan packs more small triangles to
+    // one side), which drifted a stacked concentric boss off-axis by ~1% of radius.
     let plane_d = n.dot(hit);
     let mut sum = Vec3::ZERO;
-    let mut count = 0.0_f32;
+    let mut total_area = 0.0_f32;
     for tri in mesh.indices.chunks(3) {
         let a = Vec3::from_array(pos[tri[0] as usize]);
         let b = Vec3::from_array(pos[tri[1] as usize]);
         let c = Vec3::from_array(pos[tri[2] as usize]);
-        let mut tn = (b - a).cross(c - a).normalize_or_zero();
+        let cross = (b - a).cross(c - a);
+        let mut tn = cross.normalize_or_zero();
         if tn.dot(n) < 0.0 {
             tn = -tn;
         }
         let centroid = (a + b + c) / 3.0;
         if tn.dot(n) > 0.99 && (n.dot(centroid) - plane_d).abs() < 0.01 {
-            sum += centroid;
-            count += 1.0;
+            let area = cross.length() * 0.5;
+            sum += centroid * area;
+            total_area += area;
         }
     }
-    let mut origin = if count > 0.0 { sum / count } else { hit };
+    let mut origin = if total_area > 1e-12 { sum / total_area } else { hit };
     origin -= n * (n.dot(origin) - plane_d); // snap exactly onto the plane
 
     // In-plane axes from the normal.
@@ -14345,6 +14352,35 @@ mod tests {
             hi = hi.max(p[2]);
         }
         hi - lo
+    }
+
+    #[test]
+    fn pick_face_centroid_is_unbiased_by_tessellation() {
+        // A radius-50 disk at y=20 in the XZ plane, tessellated as a fan from ONE
+        // rim vertex — a deliberately lopsided triangulation (tiny slivers by the
+        // apex, big triangles opposite). The face origin must still land on the
+        // true centre (0,20,0): an unweighted mean of triangle centroids drifts
+        // toward the apex (the stacked-cylinder bug), the area-weighted one doesn't.
+        const R: f32 = 50.0;
+        const Y: f32 = 20.0;
+        const N: usize = 64;
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let apex = [R, Y, 0.0]; // rim vertex at angle 0
+        positions.push(apex);
+        for k in 0..=N {
+            let a = std::f32::consts::TAU * k as f32 / N as f32;
+            positions.push([R * a.cos(), Y, R * a.sin()]);
+        }
+        // Fan triangles wound so the normal points +Y (up).
+        for k in 1..N {
+            indices.extend([0u32, (k + 1) as u32, k as u32]);
+        }
+        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices };
+        // Ray straight down at the centre from above.
+        let ray = Ray3d { origin: Vec3::new(0.0, 100.0, 0.0), direction: Dir3::NEG_Y };
+        let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
+        assert!(ap.origin.distance(Vec3::new(0.0, Y, 0.0)) < 0.05, "face origin drifted to {:?}", ap.origin);
     }
 
     #[test]

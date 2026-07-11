@@ -1,0 +1,147 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 50.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 50.0,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+        ),
+        (
+            id: (4),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 50.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [],
+                plane: (
+                    origin: (-0.06982391327619553, 50.00001525878906, 0.7147214412689209),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (0.0, 1.0, 0.0),
+                    datum: false,
+                ),
+                distance: 26.75587272644043,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+        ),
+        (
+            id: (5),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 50.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [],
+                plane: (
+                    origin: (-0.1396438628435135, 76.75587463378906, 1.4294440746307373),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (0.0, 1.0, 0.0),
+                    datum: false,
+                ),
+                distance: 48.74667739868164,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+        ),
+    ],
+    rollback: 6,
+    next_id: 6,
+)
