@@ -6598,7 +6598,18 @@ fn sketch_interaction(
                         let on_entity = nearest_entity(&session.sketch, uv, snap * 0.6);
                         let region = region_at(&session.sketch, uv);
                         let near_entity = nearest_entity(&session.sketch, uv, snap * 1.5);
-                        if let Some(e) = on_entity.or(region.is_none().then_some(()).and(near_entity)) {
+                        // While a boss/cut PropertyManager is open the click is
+                        // unambiguously a *contour* pick, so a region always wins over a
+                        // nearby edge — otherwise thin arrangement faces (bounded by
+                        // close-together edges) are almost impossible to select.
+                        let choosing_contours =
+                            matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Boss | OpKind::Cut));
+                        let entity_pick = if choosing_contours {
+                            region.is_none().then(|| on_entity.or(near_entity)).flatten()
+                        } else {
+                            on_entity.or(region.is_none().then_some(()).and(near_entity))
+                        };
+                        if let Some(e) = entity_pick {
                             let picking_axis = matches!(ui_state.pending.as_ref().map(|o| o.kind), Some(OpKind::Revolve | OpKind::RevolveCut))
                                 && matches!(session.sketch.entities.get(e), Some(SketchEntity::Line { .. }));
                             if picking_axis {
