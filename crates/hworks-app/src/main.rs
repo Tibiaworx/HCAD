@@ -10984,11 +10984,13 @@ fn kernel_hole_spans(r: &hworks_sketch::Region) -> Vec<Vec<hworks_geometry::ArcS
 }
 
 /// Resolve the selected-contour indices against a sketch's regions. An empty
-/// selection means "all regions"; out-of-range indices are skipped (the sketch
-/// may have changed since the feature was created).
+/// selection means "all regions" — but excludes `nested` regions (holes re-exposed
+/// as selectable disks), which would double-cover the region that owns them as a
+/// hole. Explicit selections are honoured verbatim (you *can* pick a nested disk).
+/// Out-of-range indices are skipped (the sketch may have changed since creation).
 fn chosen_regions<'a>(all: &'a [hworks_sketch::Region], selected: &[usize]) -> Vec<&'a hworks_sketch::Region> {
     if selected.is_empty() {
-        all.iter().collect()
+        all.iter().filter(|r| !r.nested).collect()
     } else {
         selected.iter().filter_map(|&i| all.get(i)).collect()
     }

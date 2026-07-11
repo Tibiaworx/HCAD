@@ -1,0 +1,165 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 25.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Radius(
+                            center: 0,
+                            value: 25.0,
+                            diameter: true,
+                        ),
+                    ],
+                ),
+                regions: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 38.773956298828125,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+        ),
+        (
+            id: (4),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 20.315628051757813,
+                            fixed: false,
+                        ),
+                        (
+                            x: 20.426862716674805,
+                            y: 6.179814338684082,
+                            fixed: false,
+                        ),
+                        (
+                            x: 13.667577743530273,
+                            y: -15.032594680786133,
+                            fixed: false,
+                        ),
+                        (
+                            x: -19.51738739013672,
+                            y: -2.5828185081481934,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 6.212475299835205,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 8.368955612182617,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 2,
+                            radius: 7.6405415534973145,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 3,
+                            radius: 8.082878112792969,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 4,
+                            radius: 3.73671293258667,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 25.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [
+                    4,
+                    6,
+                    0,
+                ],
+                plane: (
+                    origin: (0.0000002218424981492717, 38.77394104003906, -0.000000016361074273163467),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (0.0, 1.0, 0.0),
+                    datum: false,
+                ),
+                distance: 5.172414302825928,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+        ),
+    ],
+    rollback: 5,
+    next_id: 5,
+)

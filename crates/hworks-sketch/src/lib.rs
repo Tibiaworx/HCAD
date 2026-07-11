@@ -248,6 +248,13 @@ pub struct Region {
     /// Exact-arc runs per hole, parallel to `holes` (empty ⇒ no arc info).
     #[serde(default)]
     pub hole_arcs: Vec<Vec<ArcSpan>>,
+    /// True ⇒ this region is the disk of a loop nested *inside* another region
+    /// (an even-odd "hole" re-exposed as its own solid). It's individually
+    /// selectable — so a circle fully inside another can still be picked — but
+    /// excluded from the "all contours" default, where it would double-cover the
+    /// region that owns it as a hole. Derived, never serialized.
+    #[serde(default, skip)]
+    pub nested: bool,
 }
 
 impl Region {
@@ -547,6 +554,13 @@ impl Sketch {
     /// (a rectangle with a separate circle inside becomes one region with a hole).
     /// Edge runs that came from a circle/arc entity are annotated as [`ArcSpan`]s
     /// so the exact kernel can rebuild them as true arcs.
+    ///
+    /// **Even-depth faces come first** (the solid regions of the even-odd fill), in a
+    /// stable order — those indices are what a feature's selected-contour list stores.
+    /// **Odd-depth faces are appended** as `nested` regions: each hole re-exposed as its
+    /// own selectable disk, so a loop fully inside another (e.g. a circle within a
+    /// circle) can still be picked. Nested regions are excluded from the "all contours"
+    /// default (they'd double-cover their owner), but are individually selectable.
     pub fn regions(&self) -> Vec<Region> {
         let faces = self.arrangement_faces();
         let n = faces.len();
@@ -560,20 +574,24 @@ impl Sketch {
         let depth: Vec<usize> =
             (0..n).map(|i| (0..n).filter(|&j| contains(j, i)).count()).collect();
 
-        let mut regions = Vec::new();
-        for i in 0..n {
-            if depth[i] % 2 != 0 {
-                continue; // odd nesting depth ⇒ this face is a hole, not a solid
-            }
+        // Build a solid region from face `i`, taking the faces one level deeper that it
+        // contains as its holes.
+        let make = |i: usize, nested: bool| {
             let hole_ids: Vec<usize> =
                 (0..n).filter(|&k| depth[k] == depth[i] + 1 && contains(i, k)).collect();
-            regions.push(Region {
+            Region {
                 outer: contours[i].clone(),
                 holes: hole_ids.iter().map(|&k| contours[k].clone()).collect(),
                 outer_arcs: spans[i].clone(),
                 hole_arcs: hole_ids.iter().map(|&k| spans[k].clone()).collect(),
-            });
-        }
+                nested,
+            }
+        };
+
+        // Primary (even-depth) regions first, preserving index stability; then the
+        // odd-depth holes as nested, selectable disks.
+        let mut regions: Vec<Region> = (0..n).filter(|&i| depth[i] % 2 == 0).map(|i| make(i, false)).collect();
+        regions.extend((0..n).filter(|&i| depth[i] % 2 != 0).map(|i| make(i, true)));
         regions
     }
 
@@ -2274,10 +2292,45 @@ mod tests {
     fn nested_loops_become_a_region_with_a_hole() {
         let mut s = Sketch::default();
         add_rect(&mut s, 0.0, 0.0, 10.0, 10.0); // outer
-        add_rect(&mut s, 3.0, 3.0, 7.0, 7.0); // inner → hole
+        add_rect(&mut s, 3.0, 3.0, 7.0, 7.0); // inner → hole (also selectable as a nested disk)
         let regions = s.regions();
-        assert_eq!(regions.len(), 1, "one region");
-        assert_eq!(regions[0].holes.len(), 1, "with one hole");
+        // The primary region is the outer rect with the inner as a hole; the inner is
+        // *also* re-exposed as a nested region so it can be individually selected.
+        let primary: Vec<&Region> = regions.iter().filter(|r| !r.nested).collect();
+        let nested: Vec<&Region> = regions.iter().filter(|r| r.nested).collect();
+        assert_eq!(primary.len(), 1, "one primary region");
+        assert_eq!(primary[0].holes.len(), 1, "with one hole");
+        assert_eq!(nested.len(), 1, "the inner loop is also selectable as a nested disk");
+        assert!(nested[0].holes.is_empty(), "the nested disk is solid");
+        // A click at the inner-rect centre lands in the nested disk (the primary region
+        // excludes it via its hole), so it's pickable.
+        assert!(point_in_poly([5.0, 5.0], &nested[0].outer));
+    }
+
+    #[test]
+    fn a_circle_inside_a_circle_is_selectable() {
+        // Reproduces the reported bug: an inner circle fully inside an outer one used to
+        // become only a hole and couldn't be clicked. Now its disk is a nested region.
+        let mut s = Sketch::default();
+        let co = s.add_point(0.0, 0.0);
+        s.add_circle(co, 10.0);
+        let ci = s.add_point(0.0, 0.0);
+        s.add_circle(ci, 3.0);
+        let regions = s.regions();
+        // The click at the shared centre must resolve to exactly one region (the inner
+        // disk), the way the app's region_at picks it.
+        let hits: Vec<usize> = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| point_in_poly([0.0, 0.0], &r.outer) && !r.holes.iter().any(|h| point_in_poly([0.0, 0.0], h)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hits.len(), 1, "the inner circle's centre selects exactly one region");
+        assert!(regions[hits[0]].nested, "and it's the nested inner disk");
+        // "Extrude all" (non-nested) still sees just the annulus, not the disk too.
+        let all_default: Vec<&Region> = regions.iter().filter(|r| !r.nested).collect();
+        assert_eq!(all_default.len(), 1, "the default all-contours set is just the annulus");
+        assert_eq!(all_default[0].holes.len(), 1);
     }
 
     #[test]
@@ -2626,13 +2679,17 @@ mod tests {
         let c = s.add_point(0.0, 0.0);
         s.add_circle(c, 2.0);
         let regions = s.regions();
-        assert_eq!(regions.len(), 1);
-        let r = &regions[0];
+        // The primary rectangle-with-hole carries the circular hole's arc span.
+        let r = regions.iter().find(|r| !r.nested).expect("a primary region");
         assert!(r.outer_arcs.is_empty(), "rectangle outer is all lines");
         assert_eq!(r.holes.len(), 1);
         assert_eq!(r.hole_arcs.len(), 1);
         assert_eq!(r.hole_arcs[0].len(), 1, "hole is one full circle span");
         assert!((r.hole_arcs[0][0].radius - 2.0).abs() < 1e-9);
+        // The hole disk is also selectable as a nested region, with its own arc span.
+        let disk = regions.iter().find(|r| r.nested).expect("a nested disk");
+        assert_eq!(disk.outer_arcs.len(), 1, "the nested disk's rim is one circle span");
+        assert!((disk.outer_arcs[0].radius - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2722,3 +2779,4 @@ mod tests {
         assert!((s.points[p0].x - s.points[p3].x).abs() < 1e-6, "left edge not vertical");
     }
 }
+
