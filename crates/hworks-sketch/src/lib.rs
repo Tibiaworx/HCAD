@@ -218,12 +218,36 @@ pub enum DimAxis {
     Vertical,
 }
 
+/// A run of consecutive boundary edges that lies exactly on a circle: edges
+/// `first_edge .. first_edge+count` (wrapping) of the loop's polyline, sampled
+/// from the circle centred at `center` with `radius`. Carried alongside the
+/// polyline so the geometry kernel can rebuild the run as a **true circular
+/// arc** (a cylindrical face after sweeping) instead of `count` line facets.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct ArcSpan {
+    pub first_edge: usize,
+    pub count: usize,
+    pub center: [f64; 2],
+    pub radius: f64,
+}
+
 /// A closed area of a sketch, ready to extrude: one outer boundary loop plus any
 /// inner loops that are *holes* in it (e.g. a rectangle with a circular hole).
+///
+/// Loops are polylines (`outer` / `holes`) — the universal form every consumer
+/// (hit-testing, rendering, mesh booleans) understands — with [`ArcSpan`]
+/// annotations recording which edge runs lie on exact circles, so the exact
+/// B-rep path can rebuild those as true arcs.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Region {
     pub outer: Vec<[f64; 2]>,
     pub holes: Vec<Vec<[f64; 2]>>,
+    /// Exact-arc runs of `outer`'s edges (may be empty: all straight lines).
+    #[serde(default)]
+    pub outer_arcs: Vec<ArcSpan>,
+    /// Exact-arc runs per hole, parallel to `holes` (empty ⇒ no arc info).
+    #[serde(default)]
+    pub hole_arcs: Vec<Vec<ArcSpan>>,
 }
 
 impl Region {
@@ -485,13 +509,17 @@ impl Sketch {
     /// pie slice *and* the remainder as separate, individually-selectable regions.
     /// Disconnected inner loops are then nested as holes by even/odd containment
     /// (a rectangle with a separate circle inside becomes one region with a hole).
+    /// Edge runs that came from a circle/arc entity are annotated as [`ArcSpan`]s
+    /// so the exact kernel can rebuild them as true arcs.
     pub fn regions(&self) -> Vec<Region> {
-        let contours = self.arrangement_faces();
-        let n = contours.len();
+        let faces = self.arrangement_faces();
+        let n = faces.len();
+        let contours: Vec<&Vec<[f64; 2]>> = faces.iter().map(|f| &f.0).collect();
+        let spans: Vec<Vec<ArcSpan>> = faces.iter().map(|f| arc_spans(&f.1)).collect();
         let areas: Vec<f64> = contours.iter().map(|c| area(c)).collect();
         // `j` contains `i` if it's bigger and `i`'s centroid falls inside it.
         let contains = |j: usize, i: usize| {
-            j != i && areas[j] > areas[i] && point_in_poly(centroid(&contours[i]), &contours[j])
+            j != i && areas[j] > areas[i] && point_in_poly(centroid(contours[i]), contours[j])
         };
         let depth: Vec<usize> =
             (0..n).map(|i| (0..n).filter(|&j| contains(j, i)).count()).collect();
@@ -501,29 +529,35 @@ impl Sketch {
             if depth[i] % 2 != 0 {
                 continue; // odd nesting depth ⇒ this face is a hole, not a solid
             }
-            let holes = (0..n)
-                .filter(|&k| depth[k] == depth[i] + 1 && contains(i, k))
-                .map(|k| contours[k].clone())
-                .collect();
-            regions.push(Region { outer: contours[i].clone(), holes });
+            let hole_ids: Vec<usize> =
+                (0..n).filter(|&k| depth[k] == depth[i] + 1 && contains(i, k)).collect();
+            regions.push(Region {
+                outer: contours[i].clone(),
+                holes: hole_ids.iter().map(|&k| contours[k].clone()).collect(),
+                outer_arcs: spans[i].clone(),
+                hole_arcs: hole_ids.iter().map(|&k| spans[k].clone()).collect(),
+            });
         }
         regions
     }
 
     /// Tessellate all non-construction geometry to straight segments, split them at
     /// every intersection, and trace the bounded minimal faces of the resulting
-    /// planar arrangement. Each face is a simple polygon wound counter-clockwise.
-    fn arrangement_faces(&self) -> Vec<Vec<[f64; 2]>> {
-        let mut segs: Vec<([f64; 2], [f64; 2])> = Vec::new();
-        for e in &self.entities {
+    /// planar arrangement. Each face is a simple polygon wound counter-clockwise,
+    /// returned with a per-edge tag saying which circle/arc entity (if any) that
+    /// edge was sampled from — the raw material for [`ArcSpan`] annotations.
+    fn arrangement_faces(&self) -> Vec<(Vec<[f64; 2]>, Vec<Option<CurveTag>>)> {
+        let mut segs: Vec<TagSeg> = Vec::new();
+        for (ei, e) in self.entities.iter().enumerate() {
             match e {
                 SketchEntity::Line { a, b, construction: false, reference: false } => {
                     if let (Some(pa), Some(pb)) = (self.points.get(*a), self.points.get(*b)) {
-                        segs.push(([pa.x, pa.y], [pb.x, pb.y]));
+                        segs.push(([pa.x, pa.y], [pb.x, pb.y], None));
                     }
                 }
                 SketchEntity::Circle { center, radius, construction: false } => {
                     if let Some(c) = self.points.get(*center) {
+                        let tag = Some(CurveTag { id: ei, center: [c.x, c.y], radius: *radius });
                         // Finer than the rendering tessellation: a circular profile becomes a
                         // prism/revolve whose facets must meet cleanly at a boolean intersection
                         // seam — too coarse and the seam shows tiny facet-mismatch gaps.
@@ -562,10 +596,10 @@ impl Sketch {
                         samples.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
                         let ring: Vec<[f64; 2]> = samples.iter().map(|(_, p)| *p).collect();
                         for w in ring.windows(2) {
-                            segs.push((w[0], w[1]));
+                            segs.push((w[0], w[1], tag));
                         }
                         if ring.len() >= 2 {
-                            segs.push((ring[ring.len() - 1], ring[0]));
+                            segs.push((ring[ring.len() - 1], ring[0], tag));
                         }
                     }
                 }
@@ -575,10 +609,10 @@ impl Sketch {
                     if pts.len() >= 2 {
                         let poly = tessellate_spline(&pts, *closed, *control);
                         for w in poly.windows(2) {
-                            segs.push((w[0], w[1]));
+                            segs.push((w[0], w[1], None));
                         }
                         if *closed && poly.len() >= 2 {
-                            segs.push((poly[poly.len() - 1], poly[0]));
+                            segs.push((poly[poly.len() - 1], poly[0], None));
                         }
                     }
                 }
@@ -586,9 +620,11 @@ impl Sketch {
                     if let (Some(c), Some(pa), Some(pb)) =
                         (self.points.get(*center), self.points.get(*a), self.points.get(*b))
                     {
+                        let radius = ((pa.x - c.x).powi(2) + (pa.y - c.y).powi(2)).sqrt();
+                        let tag = Some(CurveTag { id: ei, center: [c.x, c.y], radius });
                         let poly = tessellate_arc([c.x, c.y], [pa.x, pa.y], [pb.x, pb.y], *ccw);
                         for w in poly.windows(2) {
-                            segs.push((w[0], w[1])); // open arc — no closing chord
+                            segs.push((w[0], w[1], tag)); // open arc — no closing chord
                         }
                     }
                 }
@@ -600,10 +636,10 @@ impl Sketch {
                             None => tessellate_slot([pa.x, pa.y], [pb.x, pb.y], *radius),
                         };
                         for w in poly.windows(2) {
-                            segs.push((w[0], w[1]));
+                            segs.push((w[0], w[1], None));
                         }
                         if poly.len() >= 2 {
-                            segs.push((poly[poly.len() - 1], poly[0]));
+                            segs.push((poly[poly.len() - 1], poly[0], None));
                         }
                     }
                 }
@@ -611,10 +647,10 @@ impl Sketch {
                     if let Some(o) = self.points.get(*origin) {
                         for loop_ in text_contours([o.x, o.y], contours, *height, *rotation, *mirror, *arc) {
                             for w in loop_.windows(2) {
-                                segs.push((w[0], w[1]));
+                                segs.push((w[0], w[1], None));
                             }
                             if loop_.len() >= 2 {
-                                segs.push((loop_[loop_.len() - 1], loop_[0]));
+                                segs.push((loop_[loop_.len() - 1], loop_[0], None));
                             }
                         }
                     }
@@ -878,6 +914,60 @@ fn dist2(a: [f64; 2], b: [f64; 2]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+/// Which exact curve an arrangement segment was sampled from: the tessellating
+/// entity's index plus the circle it lies on. Segments split at intersections
+/// inherit their parent's tag, so a face edge always knows its source curve.
+#[derive(Debug, Clone, Copy)]
+struct CurveTag {
+    id: usize,
+    center: [f64; 2],
+    radius: f64,
+}
+
+/// An arrangement segment: endpoints plus the source-curve tag (None ⇒ straight).
+type TagSeg = ([f64; 2], [f64; 2], Option<CurveTag>);
+
+/// Group a face loop's per-edge tags into maximal same-curve runs — the
+/// [`ArcSpan`]s the kernel rebuilds as true arcs. Runs may wrap the loop seam;
+/// a loop that is entirely one curve (a full circle) becomes a single span
+/// covering every edge.
+fn arc_spans(tags: &[Option<CurveTag>]) -> Vec<ArcSpan> {
+    let n = tags.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let same = |x: &Option<CurveTag>, y: &Option<CurveTag>| match (x, y) {
+        (Some(a), Some(b)) => a.id == b.id,
+        _ => false,
+    };
+    // An edge whose tag differs from its predecessor starts a run. No boundary
+    // at all ⇒ the whole loop is one curve.
+    let start = (0..n).find(|&i| !same(&tags[(i + n - 1) % n], &tags[i]));
+    let Some(start) = start else {
+        return match tags[0] {
+            Some(t) => vec![ArcSpan { first_edge: 0, count: n, center: t.center, radius: t.radius }],
+            None => Vec::new(),
+        };
+    };
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let e = (start + i) % n;
+        match tags[e] {
+            Some(t) => {
+                let mut count = 1;
+                while i + count < n && same(&tags[e], &tags[(start + i + count) % n]) {
+                    count += 1;
+                }
+                spans.push(ArcSpan { first_edge: e, count, center: t.center, radius: t.radius });
+                i += count;
+            }
+            None => i += 1,
+        }
+    }
+    spans
+}
+
 /// If segment p1→p2 meets segment p3→p4 at a single point, return the parameter
 /// t ∈ [0,1] of that point along p1→p2. Parallel/collinear segments give `None`.
 fn intersect_param(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> Option<f64> {
@@ -895,12 +985,13 @@ fn intersect_param(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> Op
 }
 
 /// Split every segment at all its intersections with the others, so the result is
-/// a planar set of segments that only meet at shared endpoints.
-fn split_at_intersections(segs: &[([f64; 2], [f64; 2])]) -> Vec<([f64; 2], [f64; 2])> {
+/// a planar set of segments that only meet at shared endpoints. Split pieces
+/// inherit the parent segment's source-curve tag.
+fn split_at_intersections(segs: &[TagSeg]) -> Vec<TagSeg> {
     let mut out = Vec::new();
-    for (i, (a, b)) in segs.iter().enumerate() {
+    for (i, (a, b, tag)) in segs.iter().enumerate() {
         let mut ts = vec![0.0, 1.0];
-        for (j, (c, d)) in segs.iter().enumerate() {
+        for (j, (c, d, _)) in segs.iter().enumerate() {
             if i != j {
                 if let Some(t) = intersect_param(*a, *b, *c, *d) {
                     ts.push(t);
@@ -913,7 +1004,7 @@ fn split_at_intersections(segs: &[([f64; 2], [f64; 2])]) -> Vec<([f64; 2], [f64;
             if t - prev > 1e-7 {
                 let (p, q) = (lerp2(*a, *b, prev), lerp2(*a, *b, t));
                 if dist2(p, q) > 1e-7 {
-                    out.push((p, q));
+                    out.push((p, q, *tag));
                 }
                 prev = t;
             }
@@ -923,10 +1014,11 @@ fn split_at_intersections(segs: &[([f64; 2], [f64; 2])]) -> Vec<([f64; 2], [f64;
 }
 
 /// Trace the bounded minimal faces of a planar arrangement of (already split)
-/// segments. Each face is returned as a simple CCW polygon; the unbounded face is
+/// segments. Each face is returned as a simple CCW polygon plus a per-edge
+/// source-curve tag (edge `i` runs vertex `i` → `i+1`); the unbounded face is
 /// discarded. This is what lets the user pick the individual closed areas formed
 /// by intersecting sketch geometry.
-fn trace_minimal_faces(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
+fn trace_minimal_faces(segs: &[TagSeg]) -> Vec<(Vec<[f64; 2]>, Vec<Option<CurveTag>>)> {
     use std::collections::{HashMap, HashSet};
     let key = |p: [f64; 2]| ((p[0] * 1.0e6).round() as i64, (p[1] * 1.0e6).round() as i64);
     let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
@@ -934,8 +1026,9 @@ fn trace_minimal_faces(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
 
     // Build directed half-edges (both directions of each undirected edge).
     let (mut he_from, mut he_to): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    let mut he_tag: Vec<Option<CurveTag>> = Vec::new();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
-    for (a, b) in segs {
+    for (a, b, tag) in segs {
         let va = *ids.entry(key(*a)).or_insert_with(|| {
             pos.push(*a);
             pos.len() - 1
@@ -951,6 +1044,7 @@ fn trace_minimal_faces(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
             if seen.insert((u, v)) {
                 he_from.push(u);
                 he_to.push(v);
+                he_tag.push(*tag);
             }
         }
     }
@@ -990,17 +1084,19 @@ fn trace_minimal_faces(segs: &[([f64; 2], [f64; 2])]) -> Vec<Vec<[f64; 2]>> {
             continue;
         }
         let mut cycle = Vec::new();
+        let mut tags = Vec::new();
         let mut h = start;
         loop {
             visited[h] = true;
             cycle.push(pos[he_from[h]]);
+            tags.push(he_tag[h]); // tag of the edge leaving this vertex
             h = next_of(h);
             if h == start || cycle.len() > nhe + 1 {
                 break;
             }
         }
         if cycle.len() >= 3 && signed_area(&cycle) > 1e-9 {
-            faces.push(cycle); // bounded (CCW) face; the outer face is CW → dropped
+            faces.push((cycle, tags)); // bounded (CCW) face; the outer face is CW → dropped
         }
     }
     faces
@@ -2235,6 +2331,64 @@ mod tests {
         s.solve();
         let dx = (s.points[a].x - s.points[b].x).abs();
         assert!((dx - 10.0).abs() < 1e-4, "horizontal extent was {dx}");
+    }
+
+    #[test]
+    fn a_lone_circle_region_is_one_full_arc_span() {
+        let mut s = Sketch::default();
+        let c = s.add_point(1.0, 2.0);
+        s.add_circle(c, 3.0);
+        let regions = s.regions();
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert_eq!(r.outer_arcs.len(), 1, "one span covering the whole rim");
+        let span = r.outer_arcs[0];
+        assert_eq!(span.count, r.outer.len(), "span covers every edge");
+        assert!((span.center[0] - 1.0).abs() < 1e-9 && (span.center[1] - 2.0).abs() < 1e-9);
+        assert!((span.radius - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_circular_hole_keeps_its_arc_span() {
+        let mut s = Sketch::default();
+        add_rect(&mut s, -10.0, -10.0, 10.0, 10.0);
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 2.0);
+        let regions = s.regions();
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert!(r.outer_arcs.is_empty(), "rectangle outer is all lines");
+        assert_eq!(r.holes.len(), 1);
+        assert_eq!(r.hole_arcs.len(), 1);
+        assert_eq!(r.hole_arcs[0].len(), 1, "hole is one full circle span");
+        assert!((r.hole_arcs[0][0].radius - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_chord_cut_circle_yields_partial_arc_spans() {
+        // A chord splits the disk: each region's boundary is one arc run + the chord.
+        let mut s = Sketch::default();
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 2.0);
+        let a = s.add_point(-3.0, 0.5);
+        let b = s.add_point(3.0, 0.5);
+        s.add_line(a, b, false);
+        let regions = s.regions();
+        assert_eq!(regions.len(), 2);
+        for r in &regions {
+            assert_eq!(r.outer_arcs.len(), 1, "each piece has exactly one arc run");
+            let span = r.outer_arcs[0];
+            assert!(span.count < r.outer.len(), "chord edges must not be inside the span");
+            assert!((span.radius - 2.0).abs() < 1e-9);
+            // Every vertex the span covers (excluding its intersection endpoints)
+            // sits exactly on the circle.
+            let n = r.outer.len();
+            for k in 1..span.count {
+                let p = r.outer[(span.first_edge + k) % n];
+                let d = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                assert!((d - 2.0).abs() < 1e-9, "span vertex off the circle: {d}");
+            }
+        }
     }
 
     #[test]

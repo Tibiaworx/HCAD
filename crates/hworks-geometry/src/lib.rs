@@ -42,6 +42,28 @@ pub struct PlaneBasis {
 #[derive(Clone)]
 pub struct KSolid(truck_modeling::Solid);
 
+/// A run of consecutive boundary edges that lies exactly on a circle: edges
+/// `first_edge .. first_edge+count` (wrapping) of a profile's polyline loop,
+/// sampled from the circle at `center` with `radius`. The wire builder turns
+/// each run into a **true circular-arc edge**, so sweeping produces exact
+/// cylindrical faces instead of prism facets. Mirrors `hworks_sketch::ArcSpan`.
+#[derive(Debug, Clone, Copy)]
+pub struct ArcSpan {
+    pub first_edge: usize,
+    pub count: usize,
+    pub center: [f64; 2],
+    pub radius: f64,
+}
+
+/// One profile boundary segment in plane-local uv: a straight edge, or an exact
+/// circular arc through a `transit` point that disambiguates which arc joins
+/// the endpoints.
+#[derive(Debug, Clone, Copy)]
+enum PathSeg {
+    Line([f64; 2], [f64; 2]),
+    Arc { a: [f64; 2], b: [f64; 2], transit: [f64; 2] },
+}
+
 /// A render-ready tessellation: triangle mesh + feature/boundary edges, split into
 /// **sharp** edges (real corners — always drawn) and **tangent** edges (smooth
 /// curvature lines between near-coplanar faces — hidden by default, SolidWorks-style).
@@ -85,6 +107,35 @@ pub fn extrude_solid_with_overlap(
     build_solid(outer, holes, basis, start, length).map(KSolid)
 }
 
+/// [`extrude_solid`] with exact-arc annotations: [`ArcSpan`] edge runs are built
+/// as true circular arcs, so the swept solid has exact cylindrical faces (and a
+/// far smaller B-rep than a 100-facet prism). Falls back to lines if the arc
+/// path fails.
+pub fn extrude_solid_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    distance: f64,
+) -> Option<KSolid> {
+    build_solid_arcs(outer, holes, outer_arcs, hole_arcs, basis, 0.0, distance).map(KSolid)
+}
+
+/// [`extrude_solid_with_overlap`] with exact-arc annotations — see [`extrude_solid_arcs`].
+pub fn extrude_solid_with_overlap_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    distance: f64,
+    back: f64,
+) -> Option<KSolid> {
+    let (start, length) = if distance >= 0.0 { (-back, distance + back) } else { (distance - back, -distance + back) };
+    build_solid_arcs(outer, holes, outer_arcs, hole_arcs, basis, start, length).map(KSolid)
+}
+
 /// Boolean union of two solids (boss added to an existing body).
 pub fn union(a: &KSolid, b: &KSolid) -> Option<KSolid> {
     union_tol(a, b, TOL)
@@ -120,6 +171,19 @@ pub fn difference_tol(a: &KSolid, b: &KSolid, tol: f64) -> Option<KSolid> {
 /// single bad contour can't bring the whole app down.
 fn guard<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(None)
+}
+
+/// True if the kernel can actually triangulate the solid. A boolean on NURBS
+/// (exact-arc) surfaces can "succeed" yet return a shape whose triangulation
+/// panics or comes out empty — such a result is unusable downstream (it renders
+/// as nothing), so callers must treat it as a failed operation and fall back.
+pub fn solid_renderable(s: &KSolid) -> bool {
+    guard(|| {
+        let mut poly = s.0.triangulation(0.1).to_polygon();
+        poly.triangulate();
+        Some(poly.faces().tri_faces().len() >= 4)
+    })
+    .unwrap_or(false)
 }
 
 /// Sanitize a polygon loop so truck accepts it as a *simple* wire: drop
@@ -158,6 +222,121 @@ fn clean_loop(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
         }
     }
     out
+}
+
+/// Convert a polyline loop with [`ArcSpan`] annotations into boundary segments:
+/// each span collapses to one exact `Arc`, everything else stays `Line`s. `None`
+/// if the annotations don't fit the loop (malformed/overlapping spans) — the
+/// caller then falls back to the all-lines path.
+fn ring_to_segs(pts: &[[f64; 2]], arcs: &[ArcSpan]) -> Option<Vec<PathSeg>> {
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+    // Which span (if any) owns each edge.
+    let mut owner = vec![usize::MAX; n];
+    for (si, s) in arcs.iter().enumerate() {
+        if s.count == 0 || s.count > n || s.first_edge >= n {
+            return None;
+        }
+        for k in 0..s.count {
+            let e = (s.first_edge + k) % n;
+            if owner[e] != usize::MAX {
+                return None; // overlapping spans — shouldn't happen
+            }
+            owner[e] = si;
+        }
+    }
+
+    // A loop that is entirely one circle: two half arcs (a wire can't be a
+    // single closed edge).
+    if arcs.len() == 1 && arcs[0].count == n {
+        if n < 4 {
+            return None;
+        }
+        let h = n / 2;
+        return Some(vec![
+            PathSeg::Arc { a: pts[0], b: pts[h], transit: pts[h / 2] },
+            PathSeg::Arc { a: pts[h], b: pts[0], transit: pts[h + (n - h) / 2] },
+        ]);
+    }
+
+    // Walk the loop starting at a run boundary so no span is cut in half. A
+    // loop with no boundary at all is all lines (a full-cover single span was
+    // handled above), so any start works.
+    let start = (0..n).find(|&i| owner[i] != owner[(i + n - 1) % n]).unwrap_or(0);
+    let dist = |p: [f64; 2], q: [f64; 2]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+    let mut segs = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let e = (start + i) % n;
+        if owner[e] == usize::MAX {
+            let (a, b) = (pts[e], pts[(e + 1) % n]);
+            if dist(a, b) > 1e-9 {
+                segs.push(PathSeg::Line(a, b));
+            }
+            i += 1;
+            continue;
+        }
+        let s = &arcs[owner[e]];
+        if e != s.first_edge {
+            return None; // walk desynced from the span table — bail to lines
+        }
+        let a = pts[s.first_edge];
+        let b = pts[(s.first_edge + s.count) % n];
+        if dist(a, b) < 1e-6 {
+            return None; // near-closed partial arc — ambiguous, use lines
+        }
+        let transit = if s.count >= 2 {
+            // An interior tessellation vertex — exactly on the source circle.
+            pts[(s.first_edge + s.count / 2) % n]
+        } else {
+            // Single edge: project the chord midpoint out onto the circle.
+            let m = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+            let (dx, dy) = (m[0] - s.center[0], m[1] - s.center[1]);
+            let d = (dx * dx + dy * dy).sqrt();
+            if d < 1e-9 {
+                return None;
+            }
+            [s.center[0] + dx / d * s.radius, s.center[1] + dy / d * s.radius]
+        };
+        // Nearly-collinear a/transit/b would make the arc constructor blow up —
+        // such a sliver of circle is indistinguishable from its chord anyway.
+        let sagitta = {
+            let (ux, uy) = (b[0] - a[0], b[1] - a[1]);
+            let l = (ux * ux + uy * uy).sqrt().max(1e-12);
+            ((transit[0] - a[0]) * uy - (transit[1] - a[1]) * ux).abs() / l
+        };
+        if sagitta < 1e-7 {
+            segs.push(PathSeg::Line(a, b));
+        } else {
+            segs.push(PathSeg::Arc { a, b, transit });
+        }
+        i += s.count;
+    }
+    (segs.len() >= 2).then_some(segs)
+}
+
+/// Reverse a boundary path in place (opposite winding): segment order flips and
+/// each segment swaps its endpoints; arc transit points are direction-free.
+fn reverse_segs(segs: &mut [PathSeg]) {
+    segs.reverse();
+    for s in segs.iter_mut() {
+        match s {
+            PathSeg::Line(a, b) => std::mem::swap(a, b),
+            PathSeg::Arc { a, b, .. } => std::mem::swap(a, b),
+        }
+    }
+}
+
+/// The polyline vertices of a seg path's start points (used for winding tests).
+fn seg_starts(segs: &[PathSeg]) -> Vec<[f64; 2]> {
+    segs.iter()
+        .map(|s| match s {
+            PathSeg::Line(a, _) => *a,
+            PathSeg::Arc { a, .. } => *a,
+        })
+        .collect()
 }
 
 /// Boolean cut: subtract a swept region from `base`.
@@ -207,6 +386,42 @@ pub fn cut_tol(
         truck_shapeops::and(&base.0, &tool, tol)
     })
     .map(KSolid)
+}
+
+/// [`cut_tol`] with exact-arc annotations: the cut tool's arc runs become true
+/// cylindrical faces (an exact drilled hole instead of a faceted one). Falls
+/// back to the all-lines tool if the arc path fails.
+pub fn cut_tol_arcs(
+    base: &KSolid,
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    distance: f64,
+    back: f64,
+    tol: f64,
+) -> Option<KSolid> {
+    let depth = distance.abs();
+    if depth < 1e-9 {
+        return None;
+    }
+    let eps = 0.05 + depth * 0.02;
+    let b = back.max(0.0);
+    let (start_offset, length) = if distance >= 0.0 {
+        (-(eps + b), depth + 2.0 * eps + b)
+    } else {
+        (-(depth + eps), depth + 2.0 * eps + b)
+    };
+    let mut tool = build_solid_arcs(outer, holes, outer_arcs, hole_arcs, basis, start_offset, length)?;
+    guard(move || {
+        tool.not(); // invert all faces → complement region
+        truck_shapeops::and(&base.0, &tool, tol)
+    })
+    .map(KSolid)
+    // NURBS booleans can return an untessellatable shape — count that as failure
+    // so the caller's fallback ladder (nudge/tolerance/faceted tool) kicks in.
+    .filter(solid_renderable)
 }
 
 /// Signed area of a 2D polygon (positive ⇒ counter-clockwise).
@@ -278,6 +493,21 @@ pub fn revolve_solid(
     angle: f64,
 ) -> Option<KSolid> {
     build_revolve_solid(outer, holes, basis, axis_pt, axis_dir, angle).map(KSolid)
+}
+
+/// [`revolve_solid`] with exact-arc annotations — see [`extrude_solid_arcs`].
+pub fn revolve_solid_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    axis_pt: [f64; 2],
+    axis_dir: [f64; 2],
+    angle: f64,
+) -> Option<KSolid> {
+    build_revolve_solid_arcs(outer, holes, outer_arcs, hole_arcs, basis, axis_pt, axis_dir, angle)
+        .map(KSolid)
 }
 
 /// Mesh form of [`revolve_solid`] — for the mesh-boolean (Manifold) path, exactly as
@@ -746,6 +976,128 @@ pub fn mesh_tessellation(mesh: TriMesh) -> Tessellation {
 // Internals
 // ---------------------------------------------------------------------------
 
+/// Build the profile's wires (outer CCW, holes CW) from annotated rings: arc
+/// spans become **exact circular-arc edges**, everything else line edges.
+/// `None` if any ring's annotations are unusable — the caller then falls back
+/// to the all-lines path.
+fn profile_wires(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    to_p3: &impl Fn(&[f64; 2]) -> Point3,
+) -> Option<Vec<truck_modeling::Wire>> {
+    let mk = |pts: &[[f64; 2]], arcs: &[ArcSpan], ccw: bool| -> Option<truck_modeling::Wire> {
+        let mut segs = ring_to_segs(pts, arcs)?;
+        // Winding from the source polyline (robust even when a full circle
+        // collapses to two arc segments).
+        if (signed_area(pts) > 0.0) != ccw {
+            reverse_segs(&mut segs);
+        }
+        let starts = seg_starts(&segs);
+        let verts: Vec<_> = starts.iter().map(|p| builder::vertex(to_p3(p))).collect();
+        let m = segs.len();
+        let mut w = truck_modeling::Wire::new();
+        for (i, s) in segs.iter().enumerate() {
+            let (v0, v1) = (&verts[i], &verts[(i + 1) % m]);
+            w.push_back(match s {
+                PathSeg::Line(..) => builder::line(v0, v1),
+                PathSeg::Arc { transit, .. } => builder::circle_arc(v0, v1, to_p3(transit)),
+            });
+        }
+        Some(w)
+    };
+    let empty: &[ArcSpan] = &[];
+    let mut wires = vec![mk(outer, outer_arcs, true)?];
+    for (hi, h) in holes.iter().enumerate() {
+        if h.len() < 3 {
+            continue;
+        }
+        let arcs = hole_arcs.get(hi).map_or(empty, |v| v.as_slice());
+        wires.push(mk(h, arcs, false)?);
+    }
+    Some(wires)
+}
+
+/// [`build_solid`] with exact-arc annotations: try the arc-edge wire path first
+/// (true cylindrical side faces), falling back to the sanitized all-lines path
+/// if the annotations don't apply or the kernel rejects the exact wires.
+fn build_solid_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    start_offset: f64,
+    length: f64,
+) -> Option<truck_modeling::Solid> {
+    let any_arcs = !outer_arcs.is_empty() || hole_arcs.iter().any(|h| !h.is_empty());
+    if any_arcs && outer.len() >= 3 && length.abs() >= 1e-9 {
+        let origin = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+        let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+        let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+        let n = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
+        let base = origin + n * start_offset;
+        let solid = guard(|| {
+            let to_p3 = |uv: &[f64; 2]| {
+                let p = base + u * uv[0] + v * uv[1];
+                Point3::new(p.x, p.y, p.z)
+            };
+            let wires = profile_wires(outer, holes, outer_arcs, hole_arcs, &to_p3)?;
+            let face = builder::try_attach_plane(&wires).ok()?;
+            Some(builder::tsweep(&face, n * length))
+        });
+        if solid.is_some() {
+            return solid;
+        }
+    }
+    build_solid(outer, holes, basis, start_offset, length)
+}
+
+/// [`build_revolve_solid`] with exact-arc annotations — see [`build_solid_arcs`].
+fn build_revolve_solid_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    axis_pt: [f64; 2],
+    axis_dir: [f64; 2],
+    angle: f64,
+) -> Option<truck_modeling::Solid> {
+    let any_arcs = !outer_arcs.is_empty() || hole_arcs.iter().any(|h| !h.is_empty());
+    if any_arcs && outer.len() >= 3 && angle.abs() >= 1e-6 {
+        let origin = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+        let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+        let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+        let ao = origin + u * axis_pt[0] + v * axis_pt[1];
+        let axis_origin = Point3::new(ao.x, ao.y, ao.z);
+        let adir = u * axis_dir[0] + v * axis_dir[1];
+        let alen = (adir.x * adir.x + adir.y * adir.y + adir.z * adir.z).sqrt();
+        if alen >= 1e-9 {
+            let axis = adir / alen;
+            let solid = guard(|| {
+                let to_p3 = |uv: &[f64; 2]| {
+                    let p = origin + u * uv[0] + v * uv[1];
+                    Point3::new(p.x, p.y, p.z)
+                };
+                let wires = profile_wires(outer, holes, outer_arcs, hole_arcs, &to_p3)?;
+                let face = builder::try_attach_plane(&wires).ok()?;
+                let mut solid = builder::rsweep(&face, axis_origin, axis, truck_modeling::Rad(angle));
+                // Same inside-out fix as the all-lines revolve path.
+                if solid_signed_volume(&solid) < 0.0 {
+                    solid.not();
+                }
+                Some(solid)
+            });
+            if solid.is_some() {
+                return solid;
+            }
+        }
+    }
+    build_revolve_solid(outer, holes, basis, axis_pt, axis_dir, angle)
+}
+
 /// Build a prism solid from a region (outer loop + holes): place it at
 /// `origin + normal*start_offset`, attach a planar face (outer CCW, holes CW),
 /// and translational-sweep it by `normal*length`.
@@ -1187,6 +1539,108 @@ mod tests {
         (0..n).map(|k| { let a = std::f64::consts::TAU * k as f64 / n as f64; [cx + r * a.cos(), cy + r * a.sin(), cz] }).collect()
     }
 
+    /// Full-circle [`ArcSpan`] over an `n`-gon polyline (what the sketch layer
+    /// produces for a plain circle region).
+    fn full_span(cx: f64, cy: f64, r: f64, n: usize) -> Vec<ArcSpan> {
+        vec![ArcSpan { first_edge: 0, count: n, center: [cx, cy], radius: r }]
+    }
+
+    #[test]
+    fn exact_arc_extrude_is_a_true_cylinder() {
+        // The same 64-gon profile, extruded with and without arc annotations. The
+        // annotated one must produce a compact exact B-rep (two cylindrical side
+        // faces + caps), not one wall face per polyline facet.
+        let poly = circle(0.0, 0.0, 5.0, 64);
+        let faceted = extrude_solid(&poly, &[], &xy_plane(), 10.0).expect("prism");
+        let exact = extrude_solid_arcs(&poly, &[], &full_span(0.0, 0.0, 5.0, 64), &[], &xy_plane(), 10.0)
+            .expect("exact cylinder");
+        let count = |s: &KSolid| export_step(s).map_or(usize::MAX, |st| st.matches("FACE_SURFACE").count());
+        let (fa, ex) = (count(&faceted), count(&exact));
+        assert!(ex <= 6, "exact cylinder should have a handful of faces, got {ex}");
+        assert!(fa >= 60, "sanity: faceted prism should have ~66 faces, got {fa}");
+        // And the volume is still a cylinder's.
+        let vol = mesh_vol(&tessellate(&exact, 0.02).mesh);
+        let want = std::f64::consts::PI * 25.0 * 10.0;
+        assert!((vol - want).abs() / want < 0.01, "cylinder volume {vol:.2}, want {want:.2}");
+    }
+
+    #[test]
+    fn exact_arc_hole_gives_an_exact_bore() {
+        // A plate with a circular hole: the hole's arc annotation must survive as
+        // exact cylindrical bore faces.
+        let hole = circle(0.0, 0.0, 2.0, 48);
+        let solid = extrude_solid_arcs(
+            &rect(-10.0, -10.0, 10.0, 10.0),
+            &[hole],
+            &[],
+            &[full_span(0.0, 0.0, 2.0, 48)],
+            &xy_plane(),
+            5.0,
+        )
+        .expect("plate with bore");
+        let step = export_step(&solid).expect("step");
+        let faces = step.matches("FACE_SURFACE").count();
+        assert!(faces <= 12, "plate+bore should be ~8 faces, got {faces}");
+        let vol = mesh_vol(&tessellate(&solid, 0.02).mesh);
+        let want = 20.0 * 20.0 * 5.0 - std::f64::consts::PI * 4.0 * 5.0;
+        assert!((vol - want).abs() / want < 0.01, "bore volume {vol:.2}, want {want:.2}");
+    }
+
+    #[test]
+    fn partial_arc_span_builds_a_half_round() {
+        // A semicircular profile: 33 rim samples (32 arc edges) closed by one
+        // chord edge. The span covers only the rim edges.
+        let n = 33;
+        let mut poly: Vec<[f64; 2]> = (0..n)
+            .map(|k| {
+                let a = -std::f64::consts::FRAC_PI_2 + std::f64::consts::PI * k as f64 / (n - 1) as f64;
+                [3.0 * a.cos(), 3.0 * a.sin()]
+            })
+            .collect();
+        poly.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-12 && (a[1] - b[1]).abs() < 1e-12);
+        let spans = vec![ArcSpan { first_edge: 0, count: n - 1, center: [0.0, 0.0], radius: 3.0 }];
+        let solid = extrude_solid_arcs(&poly, &[], &spans, &[], &xy_plane(), 4.0).expect("half round");
+        let step = export_step(&solid).expect("step");
+        let faces = step.matches("FACE_SURFACE").count();
+        assert!(faces <= 6, "half-round should be ~4 faces, got {faces}");
+        let vol = mesh_vol(&tessellate(&solid, 0.02).mesh);
+        let want = 0.5 * std::f64::consts::PI * 9.0 * 4.0;
+        assert!((vol - want).abs() / want < 0.01, "half-round volume {vol:.2}, want {want:.2}");
+    }
+
+    #[test]
+    fn exact_arc_cut_bores_a_hole() {
+        // Cut a round hole through a block with the arc-annotated tool.
+        let block = extrude_solid(&rect(-10.0, -10.0, 10.0, 10.0), &[], &xy_plane(), 5.0).unwrap();
+        let hole = circle(0.0, 0.0, 2.0, 48);
+        let cut = cut_tol_arcs(&block, &hole, &[], &full_span(0.0, 0.0, 2.0, 48), &[], &xy_plane(), 5.0, 0.0, TOL)
+            .expect("cut with exact tool");
+        let vol = mesh_vol(&tessellate(&cut, 0.02).mesh);
+        let want = 20.0 * 20.0 * 5.0 - std::f64::consts::PI * 4.0 * 5.0;
+        assert!((vol - want).abs() / want < 0.01, "cut volume {vol:.2}, want {want:.2}");
+    }
+
+    #[test]
+    fn exact_arc_revolve_makes_a_torus() {
+        // Revolve an arc-annotated circle profile around the Y axis → a torus with
+        // exact cross-section: V = 2π²·R·r².
+        let prof = circle(20.0, 0.0, 2.0, 48);
+        let torus = revolve_solid_arcs(
+            &prof,
+            &[],
+            &full_span(20.0, 0.0, 2.0, 48),
+            &[],
+            &xy_plane(),
+            [0.0, 0.0],
+            [0.0, 1.0],
+            std::f64::consts::TAU,
+        )
+        .expect("exact torus");
+        let vol = mesh_vol(&tessellate(&torus, 0.02).mesh);
+        let want = 2.0 * std::f64::consts::PI.powi(2) * 20.0 * 4.0;
+        assert!((vol - want).abs() / want < 0.02, "torus volume {vol:.2}, want {want:.2}");
+    }
+
     #[test]
     fn step_and_stl_export_are_well_formed() {
         let cyl = extrude_solid(&circle(0.0, 0.0, 5.0, 32), &[], &plane_at(0.0), 10.0).unwrap();
@@ -1494,3 +1948,4 @@ mod tests {
         assert!(out.is_empty(), "a long straight floating path is a stray, not a loop");
     }
 }
+

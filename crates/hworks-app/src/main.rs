@@ -24,9 +24,10 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Document, FeatureId, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
-    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tool_mesh, difference, extrude_solid, extrude_solid_with_overlap,
-    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid, revolve_tool_mesh, round_mesh,
-    take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
+    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
+    extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
+    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, round_mesh,
+    solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
 /// Gizmo group rendered ON TOP of the solid (depth-biased), for the extrude preview,
@@ -9686,7 +9687,26 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
     let mut failures: Vec<String> = Vec::new();
     let mut body: Option<KSolid> = None;
     let end = doc.rollback.min(doc.features.len());
-    for feature in &doc.features[..end] {
+    // Exact-arc (NURBS) profiles are only safe for the LAST solid feature: truck's
+    // booleans panic against a NURBS-faced *base*, so any body that will receive
+    // further features must stay faceted. A NURBS *tool* against a faceted base is
+    // the proven-good direction, and the strategy ladders still guard the attempt.
+    let is_solid_feature = |k: &FeatureKind| {
+        matches!(k, FeatureKind::Extrude { .. } | FeatureKind::Cut { .. } | FeatureKind::Revolve { .. })
+    };
+    let last_solid = doc.features[..end].iter().rposition(|f| is_solid_feature(&f.kind));
+    // Strip the exact-arc annotations unless this is the last solid feature with a
+    // single profile (multiple profiles boolean against each other in sequence, so
+    // all but the final result would become a NURBS base).
+    let gate_arcs = |merged: &mut Vec<hworks_sketch::Region>, fi: usize| {
+        if Some(fi) != last_solid || merged.len() != 1 {
+            for r in merged.iter_mut() {
+                r.outer_arcs.clear();
+                r.hole_arcs.clear();
+            }
+        }
+    };
+    for (fi, feature) in doc.features[..end].iter().enumerate() {
         match &feature.kind {
             FeatureKind::Plane(_) => {}
             FeatureKind::Sketch { .. } => {} // 2D only — no solid contribution
@@ -9701,13 +9721,18 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 // Merge adjacent contours into single profiles first (a dumbbell of
                 // two circles + connecting band becomes one outline), so each piece
                 // extrudes as one solid without a coincident-face boolean.
-                let merged = merge_regions(&chosen_regions(&all, regions));
+                let mut merged = merge_regions(&chosen_regions(&all, regions));
+                gate_arcs(&mut merged, fi);
                 for r in &merged {
                     let next = match &body {
                         Some(b) => boss_union(b, r, &basis, *distance, *back),
                         // First feature: Direction 2 extends the prism the other way.
-                        None if *back > 0.0 => extrude_solid_with_overlap(&r.outer, &r.holes, &basis, *distance, *back),
-                        None => extrude_solid(&r.outer, &r.holes, &basis, *distance),
+                        None if *back > 0.0 => extrude_solid_with_overlap_arcs(
+                            &r.outer, &r.holes, &kernel_spans(&r.outer_arcs), &kernel_hole_spans(r), &basis, *distance, *back,
+                        ),
+                        None => extrude_solid_arcs(
+                            &r.outer, &r.holes, &kernel_spans(&r.outer_arcs), &kernel_hole_spans(r), &basis, *distance,
+                        ),
                     };
                     if let Some(s) = next {
                         body = Some(s);
@@ -9731,7 +9756,8 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 let n = Vec3::new(resolved.normal[0] as f32, resolved.normal[1] as f32, resolved.normal[2] as f32);
                 // Merge adjacent contours into single profiles first (same reason as
                 // the boss), then cut each from the current body.
-                let merged = merge_regions(&chosen_regions(&all, regions));
+                let mut merged = merge_regions(&chosen_regions(&all, regions));
+                gate_arcs(&mut merged, fi);
                 for r in &merged {
                     let Some(b) = &body else { break };
                     // Pick the cut direction from the *current* body, so it stays
@@ -9750,11 +9776,20 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 let all = sketch.regions();
                 let resolved = match &body { Some(b) => reproject_plane(plane, b), None => plane.clone() };
                 let basis = basis_from_ref(&resolved);
-                for r in &merge_regions(&chosen_regions(&all, regions)) {
-                    let solid = revolve_solid(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle);
+                let mut merged = merge_regions(&chosen_regions(&all, regions));
+                gate_arcs(&mut merged, fi);
+                for r in &merged {
+                    let solid = revolve_solid_arcs(
+                        &r.outer, &r.holes, &kernel_spans(&r.outer_arcs), &kernel_hole_spans(r),
+                        &basis, *axis_pt, *axis_dir, *angle,
+                    );
                     let next = match (&body, solid) {
                         // Boss adds the swept solid; cut subtracts it from the body.
-                        (Some(b), Some(s)) => if *cut { difference(b, &s) } else { union(b, &s) },
+                        // An untessellatable NURBS boolean result counts as failure
+                        // (the mesh path then retries this feature).
+                        (Some(b), Some(s)) => {
+                            (if *cut { difference(b, &s) } else { union(b, &s) }).filter(solid_renderable)
+                        }
                         (None, Some(s)) => (!*cut).then_some(s), // first feature: a boss *is* the body
                         (_, None) => None,
                     };
@@ -10847,6 +10882,25 @@ fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, samples: &[Vec3]) -
     }
 }
 
+/// Convert a region's sketch-layer exact-arc annotations into the kernel's type
+/// (the two crates don't depend on each other, so the span structs are twins).
+fn kernel_spans(spans: &[hworks_sketch::ArcSpan]) -> Vec<hworks_geometry::ArcSpan> {
+    spans
+        .iter()
+        .map(|s| hworks_geometry::ArcSpan {
+            first_edge: s.first_edge,
+            count: s.count,
+            center: s.center,
+            radius: s.radius,
+        })
+        .collect()
+}
+
+/// The per-hole arc annotations of a region, in the kernel's type.
+fn kernel_hole_spans(r: &hworks_sketch::Region) -> Vec<Vec<hworks_geometry::ArcSpan>> {
+    r.hole_arcs.iter().map(|h| kernel_spans(h)).collect()
+}
+
 /// Resolve the selected-contour indices against a sketch's regions. An empty
 /// selection means "all regions"; out-of-range indices are skipped (the sketch
 /// may have changed since the feature was created).
@@ -10902,6 +10956,12 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
     // A directed edge whose reverse also appears is internal (between two selected
     // faces) → drop it. The survivors are the union boundary.
     let present: HashSet<(usize, usize)> = edges.iter().copied().collect();
+    // Nothing cancels ⇒ no two regions are adjacent ⇒ nothing to merge. Return
+    // the inputs as-is (keeping their exact-arc annotations, which re-tracing
+    // the loops below would discard).
+    if !edges.iter().any(|&(a, b)| present.contains(&(b, a))) {
+        return regions.iter().map(|r| (*r).clone()).collect();
+    }
     let mut next: HashMap<usize, usize> = HashMap::new();
     for &(a, b) in &edges {
         if !present.contains(&(b, a)) {
@@ -10978,7 +11038,9 @@ fn nest_loops(loops: Vec<Vec<[f64; 2]>>) -> Vec<hworks_sketch::Region> {
             .filter(|&k| depth[k] == depth[i] + 1 && contains(i, k))
             .map(|k| loops[k].clone())
             .collect();
-        out.push(hworks_sketch::Region { outer: loops[i].clone(), holes });
+        // Merged outlines re-trace the loops, so per-edge arc annotations no
+        // longer apply — leave them empty (the kernel then uses line edges).
+        out.push(hworks_sketch::Region { outer: loops[i].clone(), holes, ..Default::default() });
     }
     out
 }
@@ -11004,17 +11066,30 @@ fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, dist
         (0.2, ROBUST_OVERLAP, 1.0e-3),
         (0.5, 0.5, 1.0e-3),
     ];
+    let (outer_arcs, hole_arcs) = (kernel_spans(&r.outer_arcs), kernel_hole_spans(r));
     let mut extruded_ok = false;
     for (k, &(nudge, overlap, tol)) in strategies.iter().enumerate() {
-        let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
         // Direction 2 (`back`) extends the prism the opposite way; it shares the same side
         // as the union overlap, so burying by at least `back` gives the both-directions boss.
-        let Some(boss) = extrude_solid_with_overlap(&outer, &r.holes, basis, distance, overlap.max(back)) else {
+        // A nudged (inflated) profile no longer lies on its source circles, so only the
+        // un-nudged strategies use the exact-arc annotations.
+        let boss = if nudge > 0.0 {
+            extrude_solid_with_overlap(&inflate_loop(&r.outer, nudge), &r.holes, basis, distance, overlap.max(back))
+        } else {
+            extrude_solid_with_overlap_arcs(&r.outer, &r.holes, &outer_arcs, &hole_arcs, basis, distance, overlap.max(back))
+        };
+        let Some(boss) = boss else {
             continue;
         };
         extruded_ok = true;
         // Try both operand orders — truck's `or` is order-sensitive on awkward faces.
         if let Some(s) = union_tol(body, &boss, tol).or_else(|| union_tol(&boss, body, tol)) {
+            // A NURBS (exact-arc) boolean can "succeed" but be untessellatable —
+            // treat that as a failure so the next strategy (faceted) gets a shot.
+            if !solid_renderable(&s) {
+                info!("Boss union: strategy {k} result won't tessellate — trying the next.");
+                continue;
+            }
             if k > 0 {
                 info!("Boss union: used fallback strategy {k} (coincident/awkward faces).");
             }
@@ -11054,9 +11129,22 @@ fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance
         (0.0, ROBUST_TOL),
         (COINCIDENT_NUDGE, ROBUST_TOL),
     ];
+    let (outer_arcs, hole_arcs) = (kernel_spans(&r.outer_arcs), kernel_hole_spans(r));
     for (k, &(nudge, tol)) in strategies.iter().enumerate() {
-        let outer = if nudge > 0.0 { inflate_loop(&r.outer, nudge) } else { r.outer.clone() };
-        if let Some(s) = cut_tol(body, &outer, &r.holes, basis, distance, back, tol) {
+        // As in `boss_union`: a nudged profile is off its source circles, so the
+        // exact-arc annotations only apply to the un-nudged strategies.
+        let s = if nudge > 0.0 {
+            cut_tol(body, &inflate_loop(&r.outer, nudge), &r.holes, basis, distance, back, tol)
+        } else {
+            cut_tol_arcs(body, &r.outer, &r.holes, &outer_arcs, &hole_arcs, basis, distance, back, tol)
+        };
+        if let Some(s) = s {
+            // The body may carry NURBS (exact-arc) faces, and a boolean against
+            // them can "succeed" untessellatable — count that as a miss.
+            if !solid_renderable(&s) {
+                info!("Cut: strategy {k} result won't tessellate — trying the next.");
+                continue;
+            }
             if k > 0 {
                 info!("Cut: used fallback strategy {k} (truck's boolean is finicky here).");
             }
@@ -14257,8 +14345,8 @@ mod tests {
     #[test]
     fn disjoint_contours_stay_separate_when_merged() {
         use hworks_sketch::Region;
-        let a = Region { outer: rect(0.0, 0.0, 2.0, 2.0), holes: vec![] };
-        let b = Region { outer: rect(5.0, 0.0, 7.0, 2.0), holes: vec![] };
+        let a = Region { outer: rect(0.0, 0.0, 2.0, 2.0), holes: vec![], ..Default::default() };
+        let b = Region { outer: rect(5.0, 0.0, 7.0, 2.0), holes: vec![], ..Default::default() };
         let merged = merge_regions(&[&a, &b]);
         assert_eq!(merged.len(), 2, "disjoint contours must stay two outlines");
     }
@@ -14474,7 +14562,7 @@ mod tests {
             })
             .collect();
         let top = PlaneBasis { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
-        let region = Region { outer: circle, holes: vec![] };
+        let region = Region { outer: circle, holes: vec![], ..Default::default() };
         // The exact union fails in truck; boss_union must recover via the nudge.
         let solid = boss_union(&wedge, &region, &top, 2.0, 0.0).expect("coincident cylinder boss should union");
         let edges = tessellate(&solid, 0.05).edges.len();
