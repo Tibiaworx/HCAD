@@ -1156,13 +1156,73 @@ pub fn point_in_poly(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
 // ---------------------------------------------------------------------------
 // Constraint solver (M2)
 //
-// All point coordinates are unknowns x ∈ ℝ²ᴺ. Each constraint is a residual
-// fᵢ(x) = 0. We drive ‖f‖ → 0 with damped Gauss-Newton (Levenberg-Marquardt),
-// seeded from the current positions so the solution stays near where the user
-// drew. Under-constrained DOF are harmless: the damping keeps unconstrained
-// points near where they already are (which is exactly what dragging wants).
-// See DESIGN.md §5.
+// Point coordinates and circle radii are the unknowns x ∈ ℝ²ᴺ⁺ᴷ. Each
+// constraint contributes residuals fᵢ(x) = 0 with hand-written analytic
+// derivatives (each residual touches at most a handful of variables, so this
+// is far cheaper than finite differencing). We drive ‖f‖ → 0 with damped
+// Gauss-Newton (Levenberg-Marquardt), seeded from the current positions so
+// the solution stays near where the user drew. Radii solve in two stages —
+// pinned first, freed only if the constraints can't be met by moving points —
+// so circles keep their size unless a resize is genuinely required (e.g. a
+// tangent line whose endpoints are locked). Under-constrained DOF are
+// harmless: the damping keeps unconstrained points near where they already
+// are (which is exactly what dragging wants). See DESIGN.md §5.
 // ---------------------------------------------------------------------------
+
+/// Layout of the solver's variable vector: point coordinates first
+/// (x[2i], x[2i+1]), then one radius variable per circle entity — radii are
+/// real unknowns, so tangency and driving-radius dimensions can co-solve with
+/// positions instead of being patched in afterwards.
+struct VarLayout {
+    npoints: usize,
+    /// (circle entity index, centre point index), in entity order; the k-th
+    /// entry's radius lives at variable `2*npoints + k`.
+    circles: Vec<(usize, usize)>,
+}
+
+impl VarLayout {
+    fn new(sketch: &Sketch) -> Self {
+        let circles = sketch
+            .entities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                SketchEntity::Circle { center, .. } => Some((i, *center)),
+                _ => None,
+            })
+            .collect();
+        VarLayout { npoints: sketch.points.len(), circles }
+    }
+
+    fn nvars(&self) -> usize {
+        2 * self.npoints + self.circles.len()
+    }
+
+    /// Radius variable index for the circle centred at point `center` (the
+    /// first such circle, matching how constraints reference circles), if any.
+    fn radius_var(&self, center: usize) -> Option<usize> {
+        self.circles.iter().position(|&(_, c)| c == center).map(|k| 2 * self.npoints + k)
+    }
+}
+
+/// Write one residual row: its value plus the sparse gradient entries.
+/// Gradients accumulate, so a variable a row touches twice (e.g. a line
+/// constrained against its own endpoint) sums correctly.
+fn put_row(
+    r: &mut DVector<f64>,
+    jac: &mut Option<&mut DMatrix<f64>>,
+    k: &mut usize,
+    val: f64,
+    grads: &[(usize, f64)],
+) {
+    r[*k] = val;
+    if let Some(j) = jac.as_deref_mut() {
+        for &(c, g) in grads {
+            j[(*k, c)] += g;
+        }
+    }
+    *k += 1;
+}
 
 impl Sketch {
     /// Solve all constraints, moving points to satisfy them.
@@ -1172,51 +1232,91 @@ impl Sketch {
 
     /// Solve constraints while holding the listed points fixed (used for dragging:
     /// the dragged point is pinned to the cursor and everything else follows).
+    ///
+    /// Two stages: first with every circle radius **pinned** (points move, sizes
+    /// don't — the everyday case), then, only if the constraints can't be met that
+    /// way, again with the radii **free** — so tangency/radius relations resize a
+    /// circle exactly when that's the only way to satisfy them.
     pub fn solve_with_fixed(&mut self, fixed_points: &[usize]) {
+        let layout = VarLayout::new(self);
         let n = self.points.len();
-        let m = self.residual_len();
-        if n == 0 || m == 0 {
+        let m = self.residual_len(&layout);
+        if layout.nvars() == 0 || m == 0 {
             self.apply_equal_radius(); // radius relations don't need a point solve
             return;
         }
-        let nvars = 2 * n;
 
-        // Free-variable indices (everything except the pinned points' x/y). Points
-        // flagged `fixed` (projected from the 3D body) are always pinned, on top of
-        // any caller-supplied pins (e.g. the point being dragged).
-        let mut is_fixed = vec![false; nvars];
+        // Pinned point variables: points flagged `fixed` (projected from the 3D
+        // body) plus any caller-supplied pins (e.g. the point being dragged).
+        let mut pinned = vec![false; layout.nvars()];
         for (i, p) in self.points.iter().enumerate() {
             if p.fixed {
-                is_fixed[2 * i] = true;
-                is_fixed[2 * i + 1] = true;
+                pinned[2 * i] = true;
+                pinned[2 * i + 1] = true;
             }
         }
         for &pi in fixed_points {
             if pi < n {
-                is_fixed[2 * pi] = true;
-                is_fixed[2 * pi + 1] = true;
+                pinned[2 * pi] = true;
+                pinned[2 * pi + 1] = true;
             }
         }
-        let free: Vec<usize> = (0..nvars).filter(|i| !is_fixed[*i]).collect();
-        if free.is_empty() {
-            return;
-        }
 
-        // Seed from current positions.
-        let mut x = DVector::<f64>::zeros(nvars);
+        // Seed from current positions and radii.
+        let mut x = DVector::<f64>::zeros(layout.nvars());
         for (i, p) in self.points.iter().enumerate() {
             x[2 * i] = p.x;
             x[2 * i + 1] = p.y;
         }
+        for (k, &(ei, _)) in layout.circles.iter().enumerate() {
+            if let Some(SketchEntity::Circle { radius, .. }) = self.entities.get(ei) {
+                x[2 * n + k] = *radius;
+            }
+        }
 
+        // Stage 1: radii pinned — only point variables move.
+        let point_free: Vec<usize> = (0..2 * n).filter(|&i| !pinned[i]).collect();
+        if !point_free.is_empty() {
+            self.lm_minimize(&layout, &mut x, &point_free, m);
+        }
+        // Stage 2: if moving points alone couldn't satisfy everything, free the
+        // radii too (least-change resize).
+        if !layout.circles.is_empty() && self.eval(&layout, &x, &mut None).norm() > 1e-7 {
+            let free: Vec<usize> = (0..layout.nvars()).filter(|&i| !pinned[i]).collect();
+            if !free.is_empty() {
+                self.lm_minimize(&layout, &mut x, &free, m);
+            }
+        }
+
+        // Only accept the result if it's all finite — an over/under-constrained solve
+        // can diverge to NaN/∞, and a NaN coordinate poisons everything downstream
+        // (dimension values, radii) and even crashes egui's number widgets.
+        if x.iter().all(|v| v.is_finite()) {
+            for (i, p) in self.points.iter_mut().enumerate() {
+                p.x = x[2 * i];
+                p.y = x[2 * i + 1];
+            }
+            for (k, &(ei, _)) in layout.circles.iter().enumerate() {
+                if let Some(SketchEntity::Circle { radius, .. }) = self.entities.get_mut(ei) {
+                    *radius = x[2 * n + k].abs().max(1e-4);
+                }
+            }
+        }
+
+        self.apply_equal_radius();
+    }
+
+    /// Damped Gauss-Newton (Levenberg-Marquardt) over the `free` variable subset,
+    /// updating `x` in place.
+    fn lm_minimize(&self, layout: &VarLayout, x: &mut DVector<f64>, free: &[usize], m: usize) {
         let mut lambda = 1e-3_f64;
         for _ in 0..100 {
-            let r = self.residuals(&x);
+            let mut jac = DMatrix::<f64>::zeros(m, layout.nvars());
+            let r = self.eval(layout, x, &mut Some(&mut jac));
             let cost = r.norm_squared();
             if r.norm() < 1e-10 {
                 break;
             }
-            let jac = self.jacobian(&x, m);
             let jf = jac.select_columns(free.iter());
             let jtj = jf.transpose() * &jf;
             let jtr = jf.transpose() * &r;
@@ -1234,8 +1334,8 @@ impl Sketch {
                     for (k, &vi) in free.iter().enumerate() {
                         x_new[vi] += dxf[k];
                     }
-                    if self.residuals(&x_new).norm_squared() < cost {
-                        x = x_new;
+                    if self.eval(layout, &x_new, &mut None).norm_squared() < cost {
+                        *x = x_new;
                         lambda = (lambda * 0.5).max(1e-9);
                         improved = true;
                         break;
@@ -1250,18 +1350,6 @@ impl Sketch {
                 break; // converged or stuck
             }
         }
-
-        // Only accept the result if it's all finite — an over/under-constrained solve
-        // can diverge to NaN/∞, and a NaN coordinate poisons everything downstream
-        // (dimension values, radii) and even crashes egui's number widgets.
-        if x.iter().all(|v| v.is_finite()) {
-            for (i, p) in self.points.iter_mut().enumerate() {
-                p.x = x[2 * i];
-                p.y = x[2 * i + 1];
-            }
-        }
-
-        self.apply_equal_radius();
     }
 
     /// Enforce radius relations after the point solve (radius isn't a solver
@@ -1329,9 +1417,11 @@ impl Sketch {
         }
     }
 
-    /// Total number of scalar residual equations across all constraints.
-    fn residual_len(&self) -> usize {
-        self.constraints
+    /// Total number of scalar residual equations: all constraints plus one
+    /// implicit arc-consistency equation per arc entity.
+    fn residual_len(&self, layout: &VarLayout) -> usize {
+        let from_constraints: usize = self
+            .constraints
             .iter()
             .map(|c| match c {
                 Constraint::Coincident(..) => 2,
@@ -1348,156 +1438,287 @@ impl Sketch {
                 | Constraint::PointOnCircle { .. }
                 | Constraint::PointOnLine { .. }
                 | Constraint::PointOnArc { .. } => 1,
-                // Enforced after the solve (radius / slot width aren't point variables).
-                Constraint::EqualRadius { .. } | Constraint::Radius { .. } | Constraint::SlotWidth { .. } => 0,
+                // A driving radius solves only if its circle (radius variable) exists.
+                Constraint::Radius { center, .. } => layout.radius_var(*center).map_or(0, |_| 1),
+                // Enforced after the solve: EqualRadius keeps its "a drives b"
+                // semantics; slot width isn't a solver variable.
+                Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => 0,
             })
-            .sum()
+            .sum();
+        let arcs = self.entities.iter().filter(|e| matches!(e, SketchEntity::Arc { .. })).count();
+        from_constraints + arcs
     }
 
-    /// Evaluate the residual vector f(x).
-    fn residuals(&self, x: &DVector<f64>) -> DVector<f64> {
-        let mut r = DVector::zeros(self.residual_len());
-        let mut k = 0;
+    /// Evaluate the residual vector f(x) and, when `jac` is given, fill its
+    /// analytic Jacobian ∂f/∂x alongside. Row order matches [`residual_len`]:
+    /// constraints first, then one arc-consistency row per arc entity.
+    fn eval(&self, layout: &VarLayout, x: &DVector<f64>, jac: &mut Option<&mut DMatrix<f64>>) -> DVector<f64> {
+        let mut r = DVector::zeros(self.residual_len(layout));
+        let mut k = 0usize;
+        let px = |i: usize| x[2 * i];
+        let py = |i: usize| x[2 * i + 1];
+        // Sign of a value, treating exactly-zero as positive so an |·| residual
+        // still has a usable descent direction right at the kink.
+        let sgn = |v: f64| if v < 0.0 { -1.0 } else { 1.0 };
+
         for c in &self.constraints {
             match c {
                 Constraint::Coincident(a, b) => {
                     let (a, b) = (*a, *b);
-                    r[k] = x[2 * a] - x[2 * b];
-                    r[k + 1] = x[2 * a + 1] - x[2 * b + 1];
-                    k += 2;
+                    put_row(&mut r, jac, &mut k, px(a) - px(b), &[(2 * a, 1.0), (2 * b, -1.0)]);
+                    put_row(&mut r, jac, &mut k, py(a) - py(b), &[(2 * a + 1, 1.0), (2 * b + 1, -1.0)]);
                 }
                 Constraint::Horizontal(a, b) => {
-                    r[k] = x[2 * *a + 1] - x[2 * *b + 1];
-                    k += 1;
+                    let (a, b) = (*a, *b);
+                    put_row(&mut r, jac, &mut k, py(a) - py(b), &[(2 * a + 1, 1.0), (2 * b + 1, -1.0)]);
                 }
                 Constraint::Vertical(a, b) => {
-                    r[k] = x[2 * *a] - x[2 * *b];
-                    k += 1;
+                    let (a, b) = (*a, *b);
+                    put_row(&mut r, jac, &mut k, px(a) - px(b), &[(2 * a, 1.0), (2 * b, -1.0)]);
                 }
                 Constraint::Distance { a, b, value, axis, .. } => {
                     let (a, b) = (*a, *b);
-                    let dx = x[2 * a] - x[2 * b];
-                    let dy = x[2 * a + 1] - x[2 * b + 1];
-                    let measured = match axis {
-                        DimAxis::Aligned => (dx * dx + dy * dy).sqrt(),
-                        DimAxis::Horizontal => dx.abs(),
-                        DimAxis::Vertical => dy.abs(),
-                    };
-                    r[k] = measured - *value;
-                    k += 1;
+                    let (dx, dy) = (px(a) - px(b), py(a) - py(b));
+                    match axis {
+                        DimAxis::Aligned => {
+                            let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+                            put_row(&mut r, jac, &mut k, len - *value, &[
+                                (2 * a, dx / len),
+                                (2 * a + 1, dy / len),
+                                (2 * b, -dx / len),
+                                (2 * b + 1, -dy / len),
+                            ]);
+                        }
+                        DimAxis::Horizontal => {
+                            let s = sgn(dx);
+                            put_row(&mut r, jac, &mut k, dx.abs() - *value, &[(2 * a, s), (2 * b, -s)]);
+                        }
+                        DimAxis::Vertical => {
+                            let s = sgn(dy);
+                            put_row(&mut r, jac, &mut k, dy.abs() - *value, &[(2 * a + 1, s), (2 * b + 1, -s)]);
+                        }
+                    }
                 }
                 Constraint::Midpoint { mid, a, b } => {
                     let (mid, a, b) = (*mid, *a, *b);
-                    r[k] = x[2 * mid] - 0.5 * (x[2 * a] + x[2 * b]);
-                    r[k + 1] = x[2 * mid + 1] - 0.5 * (x[2 * a + 1] + x[2 * b + 1]);
-                    k += 2;
+                    put_row(&mut r, jac, &mut k, px(mid) - 0.5 * (px(a) + px(b)), &[
+                        (2 * mid, 1.0),
+                        (2 * a, -0.5),
+                        (2 * b, -0.5),
+                    ]);
+                    put_row(&mut r, jac, &mut k, py(mid) - 0.5 * (py(a) + py(b)), &[
+                        (2 * mid + 1, 1.0),
+                        (2 * a + 1, -0.5),
+                        (2 * b + 1, -0.5),
+                    ]);
                 }
                 Constraint::Parallel(a, b, c, d) => {
-                    let (d1x, d1y) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
-                    let (d2x, d2y) = (x[2 * *d] - x[2 * *c], x[2 * *d + 1] - x[2 * *c + 1]);
-                    r[k] = d1x * d2y - d1y * d2x; // cross product → 0 when parallel
-                    k += 1;
+                    let (a, b, c, d) = (*a, *b, *c, *d);
+                    let (d1x, d1y) = (px(b) - px(a), py(b) - py(a));
+                    let (d2x, d2y) = (px(d) - px(c), py(d) - py(c));
+                    // cross product → 0 when parallel
+                    put_row(&mut r, jac, &mut k, d1x * d2y - d1y * d2x, &[
+                        (2 * a, -d2y),
+                        (2 * a + 1, d2x),
+                        (2 * b, d2y),
+                        (2 * b + 1, -d2x),
+                        (2 * c, d1y),
+                        (2 * c + 1, -d1x),
+                        (2 * d, -d1y),
+                        (2 * d + 1, d1x),
+                    ]);
                 }
                 Constraint::Perpendicular(a, b, c, d) => {
-                    let (d1x, d1y) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
-                    let (d2x, d2y) = (x[2 * *d] - x[2 * *c], x[2 * *d + 1] - x[2 * *c + 1]);
-                    r[k] = d1x * d2x + d1y * d2y; // dot product → 0 when perpendicular
-                    k += 1;
+                    let (a, b, c, d) = (*a, *b, *c, *d);
+                    let (d1x, d1y) = (px(b) - px(a), py(b) - py(a));
+                    let (d2x, d2y) = (px(d) - px(c), py(d) - py(c));
+                    // dot product → 0 when perpendicular
+                    put_row(&mut r, jac, &mut k, d1x * d2x + d1y * d2y, &[
+                        (2 * a, -d2x),
+                        (2 * a + 1, -d2y),
+                        (2 * b, d2x),
+                        (2 * b + 1, d2y),
+                        (2 * c, -d1x),
+                        (2 * c + 1, -d1y),
+                        (2 * d, d1x),
+                        (2 * d + 1, d1y),
+                    ]);
                 }
                 Constraint::Equal(a, b, c, d) => {
-                    let l1 = ((x[2 * *b] - x[2 * *a]).powi(2) + (x[2 * *b + 1] - x[2 * *a + 1]).powi(2)).sqrt();
-                    let l2 = ((x[2 * *d] - x[2 * *c]).powi(2) + (x[2 * *d + 1] - x[2 * *c + 1]).powi(2)).sqrt();
-                    r[k] = l1 - l2;
-                    k += 1;
+                    let (a, b, c, d) = (*a, *b, *c, *d);
+                    let (d1x, d1y) = (px(b) - px(a), py(b) - py(a));
+                    let (d2x, d2y) = (px(d) - px(c), py(d) - py(c));
+                    let l1 = (d1x * d1x + d1y * d1y).sqrt().max(1e-12);
+                    let l2 = (d2x * d2x + d2y * d2y).sqrt().max(1e-12);
+                    put_row(&mut r, jac, &mut k, l1 - l2, &[
+                        (2 * a, -d1x / l1),
+                        (2 * a + 1, -d1y / l1),
+                        (2 * b, d1x / l1),
+                        (2 * b + 1, d1y / l1),
+                        (2 * c, d2x / l2),
+                        (2 * c + 1, d2y / l2),
+                        (2 * d, -d2x / l2),
+                        (2 * d + 1, -d2y / l2),
+                    ]);
                 }
                 Constraint::Tangent { a, b, center, radius } => {
                     let (a, b, c) = (*a, *b, *center);
-                    let (dx, dy) = (x[2 * b] - x[2 * a], x[2 * b + 1] - x[2 * a + 1]);
-                    let len = (dx * dx + dy * dy).sqrt();
-                    // Perpendicular distance from the circle centre to the line.
-                    let cross = dx * (x[2 * c + 1] - x[2 * a + 1]) - dy * (x[2 * c] - x[2 * a]);
-                    let dist = if len > 1e-9 { cross.abs() / len } else { 0.0 };
-                    r[k] = dist - *radius;
-                    k += 1;
+                    let (dx, dy) = (px(b) - px(a), py(b) - py(a));
+                    let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+                    let cross = dx * (py(c) - py(a)) - dy * (px(c) - px(a));
+                    let s = cross / len; // signed perpendicular distance centre↔line
+                    let sg = sgn(s);
+                    // Live radius: the solver variable when the circle exists,
+                    // falling back to the constraint's baked value.
+                    let rvar = layout.radius_var(c);
+                    let rad = rvar.map_or(*radius, |v| x[v]);
+                    // ∂|s|/∂q = sg · (∂cross/∂q − s·∂len/∂q) / len
+                    let dcross = [
+                        (2 * a, py(b) - py(c)),
+                        (2 * a + 1, px(c) - px(b)),
+                        (2 * b, py(c) - py(a)),
+                        (2 * b + 1, px(a) - px(c)),
+                        (2 * c, -dy),
+                        (2 * c + 1, dx),
+                    ];
+                    let dlen = [-dx / len, -dy / len, dx / len, dy / len, 0.0, 0.0];
+                    let mut grads: Vec<(usize, f64)> = dcross
+                        .iter()
+                        .zip(dlen.iter())
+                        .map(|(&(col, dc), &dl)| (col, sg * (dc - s * dl) / len))
+                        .collect();
+                    if let Some(v) = rvar {
+                        grads.push((v, -1.0));
+                    }
+                    put_row(&mut r, jac, &mut k, s.abs() - rad, &grads);
                 }
                 Constraint::Angle { a, b, c, d, value, .. } => {
                     // Signed angle from line (a→b) to line (c→d) should equal `value`.
-                    let (v1x, v1y) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
-                    let (v2x, v2y) = (x[2 * *d] - x[2 * *c], x[2 * *d + 1] - x[2 * *c + 1]);
+                    let (a, b, c, d) = (*a, *b, *c, *d);
+                    let (v1x, v1y) = (px(b) - px(a), py(b) - py(a));
+                    let (v2x, v2y) = (px(d) - px(c), py(d) - py(c));
                     let cross = v1x * v2y - v1y * v2x;
                     let dot = v1x * v2x + v1y * v2y;
-                    let ang = cross.atan2(dot);
-                    let diff = ang - *value;
-                    r[k] = diff.sin().atan2(diff.cos()); // wrap to (-π, π]
-                    k += 1;
+                    let diff = cross.atan2(dot) - *value;
+                    let l1 = (v1x * v1x + v1y * v1y).max(1e-12);
+                    let l2 = (v2x * v2x + v2y * v2y).max(1e-12);
+                    // θ = θ(v2) − θ(v1); ∂θ/∂v1 = (v1y, −v1x)/|v1|², ∂θ/∂v2 = (−v2y, v2x)/|v2|².
+                    put_row(&mut r, jac, &mut k, diff.sin().atan2(diff.cos()), &[
+                        (2 * a, -v1y / l1),
+                        (2 * a + 1, v1x / l1),
+                        (2 * b, v1y / l1),
+                        (2 * b + 1, -v1x / l1),
+                        (2 * c, v2y / l2),
+                        (2 * c + 1, -v2x / l2),
+                        (2 * d, -v2y / l2),
+                        (2 * d + 1, v2x / l2),
+                    ]);
                 }
                 Constraint::PointLineDistance { p, a, b, value, .. } => {
                     // Perpendicular distance from point p to the line (a,b) → value.
-                    let (px, py) = (x[2 * *p], x[2 * *p + 1]);
-                    let (dx, dy) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
-                    let len = (dx * dx + dy * dy).sqrt();
-                    let cross = dx * (py - x[2 * *a + 1]) - dy * (px - x[2 * *a]);
-                    let dist = if len > 1e-9 { cross.abs() / len } else { 0.0 };
-                    r[k] = dist - *value;
-                    k += 1;
+                    let (p, a, b) = (*p, *a, *b);
+                    let (dx, dy) = (px(b) - px(a), py(b) - py(a));
+                    let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+                    let cross = dx * (py(p) - py(a)) - dy * (px(p) - px(a));
+                    let s = cross / len;
+                    let sg = sgn(s);
+                    let dcross = [
+                        (2 * a, py(b) - py(p)),
+                        (2 * a + 1, px(p) - px(b)),
+                        (2 * b, py(p) - py(a)),
+                        (2 * b + 1, px(a) - px(p)),
+                        (2 * p, -dy),
+                        (2 * p + 1, dx),
+                    ];
+                    let dlen = [-dx / len, -dy / len, dx / len, dy / len, 0.0, 0.0];
+                    let grads: Vec<(usize, f64)> = dcross
+                        .iter()
+                        .zip(dlen.iter())
+                        .map(|(&(col, dc), &dl)| (col, sg * (dc - s * dl) / len))
+                        .collect();
+                    put_row(&mut r, jac, &mut k, s.abs() - *value, &grads);
                 }
                 Constraint::PointOnLine { p, a, b } => {
-                    // Perpendicular distance from point p to the line (a,b) → zero.
-                    let (px, py) = (x[2 * *p], x[2 * *p + 1]);
-                    let (dx, dy) = (x[2 * *b] - x[2 * *a], x[2 * *b + 1] - x[2 * *a + 1]);
-                    let len = (dx * dx + dy * dy).sqrt();
-                    let cross = dx * (py - x[2 * *a + 1]) - dy * (px - x[2 * *a]);
-                    r[k] = if len > 1e-9 { cross / len } else { 0.0 };
-                    k += 1;
+                    // Signed perpendicular distance from point p to the line (a,b) → zero.
+                    let (p, a, b) = (*p, *a, *b);
+                    let (dx, dy) = (px(b) - px(a), py(b) - py(a));
+                    let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+                    let cross = dx * (py(p) - py(a)) - dy * (px(p) - px(a));
+                    let s = cross / len;
+                    let dcross = [
+                        (2 * a, py(b) - py(p)),
+                        (2 * a + 1, px(p) - px(b)),
+                        (2 * b, py(p) - py(a)),
+                        (2 * b + 1, px(a) - px(p)),
+                        (2 * p, -dy),
+                        (2 * p + 1, dx),
+                    ];
+                    let dlen = [-dx / len, -dy / len, dx / len, dy / len, 0.0, 0.0];
+                    let grads: Vec<(usize, f64)> = dcross
+                        .iter()
+                        .zip(dlen.iter())
+                        .map(|(&(col, dc), &dl)| (col, (dc - s * dl) / len))
+                        .collect();
+                    put_row(&mut r, jac, &mut k, s, &grads);
                 }
                 Constraint::PointOnArc { p, cx, cy, radius } => {
                     // Distance from p to the baked arc centre equals its radius.
-                    let (ddx, ddy) = (x[2 * *p] - *cx, x[2 * *p + 1] - *cy);
-                    r[k] = (ddx * ddx + ddy * ddy).sqrt() - *radius;
-                    k += 1;
+                    let p = *p;
+                    let (ddx, ddy) = (px(p) - *cx, py(p) - *cy);
+                    let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-12);
+                    put_row(&mut r, jac, &mut k, d - *radius, &[(2 * p, ddx / d), (2 * p + 1, ddy / d)]);
                 }
                 Constraint::PointOnCircle { p, center } => {
-                    // Distance from p to the centre equals the circle's current radius.
-                    let dx = x[2 * *p] - x[2 * *center];
-                    let dy = x[2 * *p + 1] - x[2 * *center + 1];
-                    let dist = (dx * dx + dy * dy).sqrt();
-                    // Radius is a parameter (read from the entity), not a point variable.
-                    let radius = self
-                        .entities
-                        .iter()
-                        .find_map(|e| match e {
-                            SketchEntity::Circle { center: cc, radius, .. } if cc == center => Some(*radius),
-                            _ => None,
-                        })
-                        .unwrap_or(dist); // circle gone → no-op residual
-                    r[k] = dist - radius;
-                    k += 1;
+                    // Distance from p to the centre equals the circle's radius (a
+                    // solver variable, so the point and the size can co-solve).
+                    let (p, c) = (*p, *center);
+                    let (dx, dy) = (px(p) - px(c), py(p) - py(c));
+                    let d = (dx * dx + dy * dy).sqrt().max(1e-12);
+                    match layout.radius_var(c) {
+                        Some(rv) => put_row(&mut r, jac, &mut k, d - x[rv], &[
+                            (2 * p, dx / d),
+                            (2 * p + 1, dy / d),
+                            (2 * c, -dx / d),
+                            (2 * c + 1, -dy / d),
+                            (rv, -1.0),
+                        ]),
+                        // Circle gone → no-op residual (keeps the row count stable).
+                        None => put_row(&mut r, jac, &mut k, 0.0, &[]),
+                    }
                 }
-                // Not point residuals — enforced separately after the solve.
-                Constraint::EqualRadius { .. } | Constraint::Radius { .. } | Constraint::SlotWidth { .. } => {}
+                Constraint::Radius { center, value, .. } => {
+                    // Driving radius dimension on the circle's radius variable.
+                    if let Some(rv) = layout.radius_var(*center) {
+                        put_row(&mut r, jac, &mut k, x[rv] - value.max(1e-4), &[(rv, 1.0)]);
+                    }
+                }
+                // Enforced after the solve: EqualRadius keeps its "a drives b"
+                // semantics; slot width isn't a solver variable.
+                Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => {}
+            }
+        }
+
+        // Implicit arc consistency: both endpoints the same distance from the
+        // centre (an arc's radius is |centre→a|; without this a solve could pull
+        // the other endpoint off the arc).
+        for e in &self.entities {
+            if let SketchEntity::Arc { center, a, b, .. } = e {
+                let (c, a, b) = (*center, *a, *b);
+                let (dax, day) = (px(a) - px(c), py(a) - py(c));
+                let (dbx, dby) = (px(b) - px(c), py(b) - py(c));
+                let la = (dax * dax + day * day).sqrt().max(1e-12);
+                let lb = (dbx * dbx + dby * dby).sqrt().max(1e-12);
+                put_row(&mut r, jac, &mut k, la - lb, &[
+                    (2 * a, dax / la),
+                    (2 * a + 1, day / la),
+                    (2 * b, -dbx / lb),
+                    (2 * b + 1, -dby / lb),
+                    (2 * c, -dax / la + dbx / lb),
+                    (2 * c + 1, -day / la + dby / lb),
+                ]);
             }
         }
         r
-    }
-
-    /// Finite-difference Jacobian (m residuals × 2N variables). Constraints here
-    /// are simple, so numeric differentiation is accurate and fast enough.
-    fn jacobian(&self, x: &DVector<f64>, m: usize) -> DMatrix<f64> {
-        let nvars = x.len();
-        let eps = 1e-7;
-        let r0 = self.residuals(x);
-        let mut jac = DMatrix::zeros(m, nvars);
-        let mut xp = x.clone();
-        for j in 0..nvars {
-            let old = xp[j];
-            xp[j] = old + eps;
-            let r1 = self.residuals(&xp);
-            xp[j] = old;
-            for i in 0..m {
-                jac[(i, j)] = (r1[i] - r0[i]) / eps;
-            }
-        }
-        jac
     }
 }
 
@@ -1915,6 +2136,144 @@ mod tests {
         let smallest = regions.iter().map(|r| area(&r.outer)).fold(f64::INFINITY, f64::min);
         let quarter = std::f64::consts::PI * 2.0 * 2.0 / 4.0; // πr²/4 with r=2
         assert!((smallest - quarter).abs() < 0.3, "pie area {smallest}, expected ~{quarter}");
+    }
+
+    #[test]
+    fn tangent_resizes_the_circle_when_the_line_is_locked() {
+        // The line can't move (fixed endpoints) and neither can the centre, so the
+        // ONLY way to satisfy tangency is to grow the circle: r 2 → 3.
+        let mut s = Sketch::default();
+        let center = s.add_fixed_point(0.0, 0.0);
+        s.add_circle(center, 2.0);
+        let a = s.add_fixed_point(-5.0, 3.0);
+        let b = s.add_fixed_point(5.0, 3.0);
+        s.constraints.push(Constraint::Tangent { a, b, center, radius: 2.0 });
+        s.solve();
+        let r = s
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .unwrap();
+        assert!((r - 3.0).abs() < 1e-5, "circle should grow to touch the line, radius was {r}");
+    }
+
+    #[test]
+    fn tangent_moves_the_line_when_it_can_and_keeps_the_radius() {
+        // Same setup but the line is free: the cheap fix is moving the line, so the
+        // radius must NOT change (stage 1 satisfies everything with points alone).
+        let mut s = Sketch::default();
+        let center = s.add_fixed_point(0.0, 0.0);
+        s.add_circle(center, 2.0);
+        let a = s.add_point(-5.0, 3.0);
+        let b = s.add_point(5.0, 3.0);
+        s.constraints.push(Constraint::Horizontal(a, b));
+        s.constraints.push(Constraint::Tangent { a, b, center, radius: 2.0 });
+        s.solve();
+        let r = s
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .unwrap();
+        assert!((r - 2.0).abs() < 1e-6, "radius should stay 2, was {r}");
+        let (dx, dy) = (s.points[b].x - s.points[a].x, s.points[b].y - s.points[a].y);
+        let len = (dx * dx + dy * dy).sqrt();
+        let cross = dx * (0.0 - s.points[a].y) - dy * (0.0 - s.points[a].x);
+        assert!((cross.abs() / len - 2.0).abs() < 1e-5, "line should touch the circle");
+    }
+
+    #[test]
+    fn radius_dimension_pulls_a_rim_point_along() {
+        // A driving radius dim resizes the circle in-solve, and a point constrained
+        // onto the rim rides out with it.
+        let mut s = Sketch::default();
+        let center = s.add_fixed_point(0.0, 0.0);
+        s.add_circle(center, 2.0);
+        let p = s.add_point(2.0, 0.0);
+        s.constraints.push(Constraint::PointOnCircle { p, center });
+        s.constraints.push(Constraint::Radius { center, value: 6.0, diameter: false });
+        s.solve();
+        let r = s
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .unwrap();
+        assert!((r - 6.0).abs() < 1e-6, "radius should be driven to 6, was {r}");
+        let d = (s.points[p].x.powi(2) + s.points[p].y.powi(2)).sqrt();
+        assert!((d - 6.0).abs() < 1e-4, "rim point should follow the radius out: {d}");
+    }
+
+    #[test]
+    fn arc_endpoints_stay_equidistant_from_the_center() {
+        // The implicit arc-consistency residual pulls a stray endpoint back onto
+        // the arc's radius (|c→a| = |c→b|).
+        let mut s = Sketch::default();
+        let c = s.add_fixed_point(0.0, 0.0);
+        let a = s.add_fixed_point(2.0, 0.0);
+        let b = s.add_point(0.0, 3.0); // off the r=2 arc
+        s.add_arc(c, a, b, true, false);
+        s.solve();
+        let lb = (s.points[b].x.powi(2) + s.points[b].y.powi(2)).sqrt();
+        assert!((lb - 2.0).abs() < 1e-5, "arc endpoint should sit at r=2, was {lb}");
+    }
+
+    #[test]
+    fn horizontal_axis_distance_solves_from_a_zero_gap() {
+        // dx starts at exactly 0 — the |dx| kink — and must still open to 10.
+        let mut s = Sketch::default();
+        let a = s.add_fixed_point(0.0, 0.0);
+        let b = s.add_point(0.0, 5.0);
+        s.constraints.push(Constraint::Distance { a, b, value: 10.0, offset: 0.5, axis: DimAxis::Horizontal });
+        s.solve();
+        let dx = (s.points[a].x - s.points[b].x).abs();
+        assert!((dx - 10.0).abs() < 1e-4, "horizontal extent was {dx}");
+    }
+
+    #[test]
+    fn a_large_sketch_solves_accurately() {
+        // A ladder of 40 dimensioned, constrained rectangles sharing corners —
+        // ~320 variables. Checks the analytic-Jacobian solver converges on a
+        // sketch this size (and prints how long it took under --nocapture).
+        let mut s = Sketch::default();
+        let mut prev_right = None::<(usize, usize)>; // (bottom, top) of the shared edge
+        for i in 0..40 {
+            let x0 = i as f64 * 2.1; // slightly off the 2.0 the dims will enforce
+            let (p0, p3) = match prev_right {
+                Some((b, t)) => (b, t),
+                None => (s.add_point(x0, 0.0), s.add_point(x0, 1.0)),
+            };
+            let p1 = s.add_point(x0 + 2.1, 0.05);
+            let p2 = s.add_point(x0 + 2.1, 1.05);
+            s.add_line(p0, p1, false);
+            s.add_line(p1, p2, false);
+            s.add_line(p2, p3, false);
+            if prev_right.is_none() {
+                s.add_line(p3, p0, false);
+            }
+            s.constraints.push(Constraint::Horizontal(p0, p1));
+            s.constraints.push(Constraint::Vertical(p1, p2));
+            s.constraints.push(Constraint::Horizontal(p3, p2));
+            s.constraints.push(Constraint::Distance { a: p0, b: p1, value: 2.0, offset: 0.5, axis: DimAxis::Aligned });
+            s.constraints.push(Constraint::Distance { a: p1, b: p2, value: 1.0, offset: 0.5, axis: DimAxis::Aligned });
+            prev_right = Some((p1, p2));
+        }
+        let t0 = std::time::Instant::now();
+        s.solve();
+        println!("large sketch ({} points, {} constraints) solved in {:?}", s.points.len(), s.constraints.len(), t0.elapsed());
+        // Every bay must come out exactly 2 × 1.
+        for i in 0..40 {
+            let (p0, p1) = (2 * i, 2 * i + 2);
+            let w = ((s.points[p1].x - s.points[p0].x).powi(2) + (s.points[p1].y - s.points[p0].y).powi(2)).sqrt();
+            assert!((w - 2.0).abs() < 1e-5, "bay {i} width {w}");
+        }
     }
 
     #[test]
