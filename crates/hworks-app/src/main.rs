@@ -3043,7 +3043,9 @@ fn ui_system(
             // degrees of freedom remain, red = conflicting relations.
             if let Some((_, rep)) = &session.dof_cache {
                 let (txt, col) = if rep.over_defined {
-                    ("Over defined — conflicting relations".to_string(), egui::Color32::from_rgb(235, 90, 90))
+                    let n = rep.conflicting.len();
+                    (format!("Over defined — {n} conflicting relation{} (shown red)", if n == 1 { "" } else { "s" }),
+                     egui::Color32::from_rgb(235, 90, 90))
                 } else if rep.dof == 0 {
                     ("Fully defined".to_string(), egui::Color32::from_rgb(110, 220, 130))
                 } else {
@@ -12562,9 +12564,19 @@ fn draw_sketch(
     }
 
     // Dimensions: an offset dimension line + extension lines (offset is draggable).
-    let dim_col = Color::srgb(0.55, 0.85, 1.0);
+    // A dimension that participates in an over-defined *conflict* draws red
+    // (SolidWorks-style), so the user can see exactly which relations clash.
+    let base_dim_col = Color::srgb(0.55, 0.85, 1.0);
+    let conflict_col = Color::srgb(1.0, 0.3, 0.3);
+    let conflicting: &[usize] = session
+        .dof_cache
+        .as_ref()
+        .filter(|(fp, _)| *fp == sketch_fingerprint(&session.sketch))
+        .map(|(_, rep)| rep.conflicting.as_slice())
+        .unwrap_or(&[]);
     let pt = |i: usize| session.sketch.points.get(i).copied().map(|p| Vec2::new(p.x as f32, p.y as f32));
-    for c in &session.sketch.constraints {
+    for (ci, c) in session.sketch.constraints.iter().enumerate() {
+        let dim_col = if conflicting.contains(&ci) { conflict_col } else { base_dim_col };
         match c {
             hworks_sketch::Constraint::Distance { a, b, offset, axis, .. } => {
                 if let (Some(a2), Some(b2)) = (pt(*a), pt(*b)) {
@@ -12634,7 +12646,7 @@ fn draw_sketch(
     if let Some(i) = session.dim_first {
         if let Some(p) = session.sketch.points.get(i) {
             let iso = Isometry3d::new(ap.to_world(Vec2::new(p.x as f32, p.y as f32)), plane_rot);
-            gizmos.circle(iso, 0.18 * ms, dim_col);
+            gizmos.circle(iso, 0.18 * ms, base_dim_col);
         }
     }
     // Indicator that the Dimension tool has a first line picked (for a line-to-line / angle

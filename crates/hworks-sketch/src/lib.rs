@@ -1311,6 +1311,10 @@ pub struct DofReport {
     pub over_defined: bool,
     /// Per-point: true ⇒ the point can still move (draw it "under-defined").
     pub free_points: Vec<bool>,
+    /// Indices (into `constraints`) of the constraints participating in a
+    /// conflict — those left carrying a nonzero residual at the least-squares
+    /// solution. Empty unless `over_defined`. Draw these red.
+    pub conflicting: Vec<usize>,
 }
 
 /// Layout of the solver's variable vector: point coordinates first
@@ -1523,12 +1527,12 @@ impl Sketch {
         }
         let free: Vec<usize> = (0..nvars).filter(|&i| movable[i]).collect();
         if free.is_empty() {
-            return DofReport { dof: 0, over_defined: false, free_points: vec![false; n] };
+            return DofReport { dof: 0, over_defined: false, free_points: vec![false; n], conflicting: Vec::new() };
         }
         let m = self.residual_len(&layout);
         if m == 0 {
             // Nothing constrains anything — every movable variable is a DOF.
-            return DofReport { dof: free.len(), over_defined: false, free_points: free_of(&movable) };
+            return DofReport { dof: free.len(), over_defined: false, free_points: free_of(&movable), conflicting: Vec::new() };
         }
 
         let mut x = DVector::<f64>::zeros(nvars);
@@ -1564,8 +1568,23 @@ impl Sketch {
             }
         }
         // Conflicting (over-defined) constraints: the solved sketch still can't
-        // reach zero residual.
-        DofReport { dof, over_defined: r.norm() > 1.0e-5, free_points: free_of(&var_can_move) }
+        // reach zero residual. At the least-squares solution Jᵀr = 0, so the
+        // leftover residual lands entirely on the mutually-inconsistent rows —
+        // map each significantly-nonzero row back to its constraint. (A *redundant*
+        // but consistent over-constraint has zero residual, so it isn't flagged.)
+        let over_defined = r.norm() > 1.0e-5;
+        let mut conflicting = Vec::new();
+        if over_defined {
+            let mut k = 0usize;
+            for (ci, c) in self.constraints.iter().enumerate() {
+                let rows = Self::constraint_rows(c, &layout);
+                if (0..rows).any(|j| r[k + j].abs() > 1.0e-4) {
+                    conflicting.push(ci);
+                }
+                k += rows;
+            }
+        }
+        DofReport { dof, over_defined, free_points: free_of(&var_can_move), conflicting }
     }
 
     /// Enforce radius relations after the point solve (radius isn't a solver
@@ -1633,34 +1652,36 @@ impl Sketch {
         }
     }
 
+    /// How many scalar residual rows a single constraint contributes (in the same
+    /// order [`eval`] emits them). Zero ⇒ enforced outside the point solve.
+    fn constraint_rows(c: &Constraint, layout: &VarLayout) -> usize {
+        match c {
+            Constraint::Coincident(..) | Constraint::Midpoint { .. } => 2,
+            Constraint::Horizontal(..)
+            | Constraint::Vertical(..)
+            | Constraint::Distance { .. }
+            | Constraint::Parallel(..)
+            | Constraint::Perpendicular(..)
+            | Constraint::Equal(..)
+            | Constraint::Tangent { .. }
+            | Constraint::Angle { .. }
+            | Constraint::PointLineDistance { .. }
+            | Constraint::PointOnCircle { .. }
+            | Constraint::PointOnLine { .. }
+            | Constraint::PointOnArc { .. } => 1,
+            // A driving radius solves only if its circle (radius variable) exists.
+            Constraint::Radius { center, .. } => layout.radius_var(*center).map_or(0, |_| 1),
+            // Enforced after the solve: EqualRadius keeps its "a drives b"
+            // semantics; slot width isn't a solver variable.
+            Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => 0,
+        }
+    }
+
     /// Total number of scalar residual equations: all constraints plus one
     /// implicit arc-consistency equation per arc entity.
     fn residual_len(&self, layout: &VarLayout) -> usize {
-        let from_constraints: usize = self
-            .constraints
-            .iter()
-            .map(|c| match c {
-                Constraint::Coincident(..) => 2,
-                Constraint::Midpoint { .. } => 2,
-                Constraint::Horizontal(..)
-                | Constraint::Vertical(..)
-                | Constraint::Distance { .. }
-                | Constraint::Parallel(..)
-                | Constraint::Perpendicular(..)
-                | Constraint::Equal(..)
-                | Constraint::Tangent { .. }
-                | Constraint::Angle { .. }
-                | Constraint::PointLineDistance { .. }
-                | Constraint::PointOnCircle { .. }
-                | Constraint::PointOnLine { .. }
-                | Constraint::PointOnArc { .. } => 1,
-                // A driving radius solves only if its circle (radius variable) exists.
-                Constraint::Radius { center, .. } => layout.radius_var(*center).map_or(0, |_| 1),
-                // Enforced after the solve: EqualRadius keeps its "a drives b"
-                // semantics; slot width isn't a solver variable.
-                Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => 0,
-            })
-            .sum();
+        let from_constraints: usize =
+            self.constraints.iter().map(|c| Self::constraint_rows(c, layout)).sum();
         let arcs = self.entities.iter().filter(|e| matches!(e, SketchEntity::Arc { .. })).count();
         from_constraints + arcs
     }
@@ -2510,6 +2531,46 @@ mod tests {
         s.solve();
         let rep = s.dof_report();
         assert!(rep.over_defined, "two different lengths on one line must flag a conflict");
+        // Both conflicting distances are named; nothing else exists to name.
+        assert_eq!(rep.conflicting, vec![0, 1], "both distance dims are the conflict");
+    }
+
+    #[test]
+    fn conflict_pins_the_bad_dimension_not_the_satisfied_ones() {
+        // A horizontal line anchored at the origin, correctly dimensioned to 4,
+        // plus a redundant-and-wrong 6 mm on the same span. The good relations
+        // (anchor, horizontal, the 4mm) must stay clean; only the 6mm is flagged.
+        let mut s = Sketch::default();
+        let o = s.ensure_origin();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(4.0, 0.0);
+        s.constraints.push(Constraint::Coincident(a, o)); // 0
+        s.constraints.push(Constraint::Horizontal(a, b)); // 1
+        s.constraints.push(Constraint::Distance { a, b, value: 4.0, offset: 0.5, axis: DimAxis::Aligned }); // 2
+        s.constraints.push(Constraint::Distance { a, b, value: 6.0, offset: 0.5, axis: DimAxis::Aligned }); // 3
+        s.solve();
+        let rep = s.dof_report();
+        assert!(rep.over_defined);
+        // Both length dims carry residual (LS splits the error), but the anchor and
+        // horizontal are perfectly satisfied and must NOT be flagged.
+        assert!(!rep.conflicting.contains(&0), "origin anchor is fine");
+        assert!(!rep.conflicting.contains(&1), "horizontal is fine");
+        assert!(rep.conflicting.contains(&2) && rep.conflicting.contains(&3), "the two lengths conflict");
+    }
+
+    #[test]
+    fn redundant_but_consistent_is_not_a_conflict() {
+        // Two Horizontal relations on the same line are redundant but satisfiable:
+        // zero residual, so NOT flagged over-defined.
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(4.0, 1.0);
+        s.constraints.push(Constraint::Horizontal(a, b));
+        s.constraints.push(Constraint::Horizontal(a, b));
+        s.solve();
+        let rep = s.dof_report();
+        assert!(!rep.over_defined, "redundant-but-consistent must not read as a conflict");
+        assert!(rep.conflicting.is_empty());
     }
 
     #[test]

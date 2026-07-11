@@ -37,9 +37,15 @@ drifted positionally.
   to the last solid feature; widen `gate_arcs` when the kernel (or an OCC backend) can
   take it.
 
-## Over-defined diagnostics
+## Over-defined diagnostics — done
 
-The sketch status line reports "Over defined — conflicting relations" (from the residual
-of the solved system), but doesn't say **which** constraints conflict. Find a minimal
-inconsistent subset (e.g. greedily drop rows and re-check residual) and highlight those
-dimensions/relations red in the viewport and panel.
+`DofReport::conflicting` lists the constraints participating in a conflict: at the
+least-squares solution Jᵀr = 0, so the leftover residual lands entirely on the
+mutually-inconsistent rows, and mapping significant residual rows back to their
+constraint identifies them (no extra solves). Redundant-but-consistent over-constraints
+have zero residual and are correctly not flagged. Conflicting **dimensions** draw red in
+the viewport and the status line counts them.
+
+**Remaining:** geometric relations (horizontal/parallel/etc.) that conflict have no
+viewport glyph, so they contribute to the count but don't individually show red — only
+dimensions do. A relations list in the panel with per-row red marking would close that.
