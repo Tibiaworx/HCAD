@@ -727,6 +727,10 @@ struct SketchSession {
     plane: Option<ActivePlane>,
     tool: Tool,
     construction: bool,
+    /// Cached constraint-status report, keyed by the sketch fingerprint so it's
+    /// recomputed only when the sketch actually changes. Drives the
+    /// fully/under/over-defined status line and the point coloring.
+    dof_cache: Option<(u64, hworks_sketch::DofReport)>,
     /// Line-tool variant: when set, a line grows symmetrically from its first click
     /// (the click is the midpoint), with a Midpoint relation pinning the centre.
     line_midpoint: bool,
@@ -3034,6 +3038,20 @@ fn ui_system(
         } else if in_sketch {
             // Sketch panel: edit dimensions / relations, then Apply to re-solve.
             ui.heading("Sketch");
+
+            // Constraint status, SolidWorks-style: green = fully defined, blue =
+            // degrees of freedom remain, red = conflicting relations.
+            if let Some((_, rep)) = &session.dof_cache {
+                let (txt, col) = if rep.over_defined {
+                    ("Over defined — conflicting relations".to_string(), egui::Color32::from_rgb(235, 90, 90))
+                } else if rep.dof == 0 {
+                    ("Fully defined".to_string(), egui::Color32::from_rgb(110, 220, 130))
+                } else {
+                    (format!("Under defined — {} DOF", rep.dof), egui::Color32::from_rgb(110, 170, 255))
+                };
+                ui.label(egui::RichText::new(txt).color(col).strong())
+                    .on_hover_text("Blue points can still move. Anchor the sketch to the origin point and dimension it to fully define it.");
+            }
 
             // Live dimension entry while drawing a line/circle.
             if let Some(start) = session.pending {
@@ -5696,6 +5714,22 @@ fn sketch_interaction(
     mut ui_state: ResMut<UiState>,
     time: Res<Time>,
 ) {
+    // Keep the active sketch anchored and its status fresh. The origin anchor (a
+    // fixed point at 0,0, SolidWorks-style) is what makes "fully defined" reachable:
+    // relative constraints alone always leave rigid-body freedom. The DOF report is
+    // recomputed only when the sketch fingerprint changes.
+    if session.plane.is_some() {
+        session.sketch.ensure_origin();
+        // Skip the (eigen-decomposition) status refresh mid-drag — positions churn
+        // every frame there; the report refreshes on release.
+        if session.drag.is_none() {
+            let fp = sketch_fingerprint(&session.sketch);
+            if session.dof_cache.as_ref().map_or(true, |(f, _)| *f != fp) {
+                session.dof_cache = Some((fp, session.sketch.dof_report()));
+            }
+        }
+    }
+
     let Ok(window) = windows.single() else { return };
     let Ok((camera, cam_gt, mut cam_tf, mut orbit)) = cam_q.single_mut() else { return };
     let Some(ray) = cursor_ray(window, camera, cam_gt) else { return };
@@ -9625,8 +9659,9 @@ fn handle_exit_sketch(
             ui_state.selected = Some(i);
         }
         _ => {
-            // A brand-new sketch with geometry becomes a standalone Sketch feature.
-            if !session.sketch.entities.is_empty() {
+            // A brand-new sketch with geometry becomes a standalone Sketch feature
+            // (the ever-present origin anchor alone doesn't count as geometry).
+            if session.sketch.has_geometry() {
                 history.snapshot(&doc.0);
                 let sketch = session.sketch.clone();
                 doc.0.add_feature(FeatureKind::Sketch { sketch, plane: plane_ref(&ap) });
@@ -12325,9 +12360,26 @@ fn draw_sketch(
         }
     }
 
-    for p in &session.sketch.points {
-        // Locked (body-projected) points are amber; ordinary sketch points use point_col.
-        let col = if p.fixed { Color::srgb(1.0, 0.65, 0.1) } else { point_col };
+    // Constraint-status point coloring (SolidWorks-style): a point that can still
+    // move draws blue; a fully defined one draws in the normal point colour.
+    // Locked (body-projected) points stay amber. The cached report is used only
+    // while it matches the current sketch (it can lag an edit by a frame).
+    let free_of = session
+        .dof_cache
+        .as_ref()
+        .filter(|(fp, rep)| {
+            *fp == sketch_fingerprint(&session.sketch) && rep.free_points.len() == session.sketch.points.len()
+        })
+        .map(|(_, rep)| &rep.free_points);
+    let under_col = Color::srgb(0.35, 0.65, 1.0);
+    for (i, p) in session.sketch.points.iter().enumerate() {
+        let col = if p.fixed {
+            Color::srgb(1.0, 0.65, 0.1)
+        } else if free_of.is_some_and(|f| f[i]) {
+            under_col
+        } else {
+            point_col
+        };
         draw_marker(&mut gizmos, ap, Vec2::new(p.x as f32, p.y as f32), col, ms);
     }
 

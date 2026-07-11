@@ -267,6 +267,42 @@ pub struct Sketch {
 }
 
 impl Sketch {
+    /// Ensure the sketch has its **origin anchor**: a fixed point at (0,0) with a
+    /// `Point` entity, SolidWorks-style. Every constraint except the anchor is
+    /// *relative* (a fully dimensioned rectangle can still slide and spin as a
+    /// rigid body), so snapping/dimensioning to this point is what lets a sketch
+    /// on a datum plane become fully defined. Idempotent; returns the point index.
+    pub fn ensure_origin(&mut self) -> usize {
+        if let Some(i) = self.origin_point() {
+            return i;
+        }
+        let at = self.add_fixed_point(0.0, 0.0);
+        self.entities.push(SketchEntity::Point { at });
+        at
+    }
+
+    /// The origin anchor's point index, if the sketch has one: a `Point` entity
+    /// whose point is fixed at exactly (0,0).
+    pub fn origin_point(&self) -> Option<usize> {
+        self.entities.iter().find_map(|e| match e {
+            SketchEntity::Point { at } => {
+                let p = self.points.get(*at)?;
+                (p.fixed && p.x == 0.0 && p.y == 0.0).then_some(*at)
+            }
+            _ => None,
+        })
+    }
+
+    /// True if the sketch holds any user geometry beyond the origin anchor —
+    /// the "is there anything worth keeping?" test.
+    pub fn has_geometry(&self) -> bool {
+        let origin = self.origin_point();
+        self.entities.iter().any(|e| match e {
+            SketchEntity::Point { at } => Some(*at) != origin,
+            _ => true,
+        })
+    }
+
     /// Add a free point and return its index (the solver's future unknown).
     pub fn add_point(&mut self, x: f64, y: f64) -> usize {
         self.points.push(Point2 { x, y, fixed: false });
@@ -1265,6 +1301,18 @@ pub fn point_in_poly(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
 // are (which is exactly what dragging wants). See DESIGN.md §5.
 // ---------------------------------------------------------------------------
 
+/// Constraint state of a sketch, for SolidWorks-style status feedback.
+#[derive(Debug, Clone, Default)]
+pub struct DofReport {
+    /// Degrees of freedom remaining (0 ⇒ fully defined). Each unconstrained
+    /// point contributes 2; an undimensioned circle radius contributes 1.
+    pub dof: usize,
+    /// Constraints conflict — the solver cannot satisfy them all at once.
+    pub over_defined: bool,
+    /// Per-point: true ⇒ the point can still move (draw it "under-defined").
+    pub free_points: Vec<bool>,
+}
+
 /// Layout of the solver's variable vector: point coordinates first
 /// (x[2i], x[2i+1]), then one radius variable per circle entity — radii are
 /// real unknowns, so tangency and driving-radius dimensions can co-solve with
@@ -1446,6 +1494,78 @@ impl Sketch {
                 break; // converged or stuck
             }
         }
+    }
+
+    /// Analyze the sketch's constraint state for SolidWorks-style feedback:
+    /// how many degrees of freedom remain, whether constraints conflict, and
+    /// which points can still move. Call on a *solved* sketch.
+    ///
+    /// The remaining freedom is the null space of the constraint Jacobian at
+    /// the current solution: rank comes from the eigenvalues of JᵀJ, and a
+    /// point is "free" (draw it blue) if some null-space direction moves it.
+    pub fn dof_report(&self) -> DofReport {
+        let layout = VarLayout::new(self);
+        let n = self.points.len();
+        let nvars = layout.nvars();
+        let free_of = |var_can_move: &[bool]| -> Vec<bool> {
+            (0..n).map(|i| var_can_move[2 * i] || var_can_move[2 * i + 1]).collect()
+        };
+        if nvars == 0 {
+            return DofReport::default();
+        }
+        // Free variables: everything except body-projected (fixed) points.
+        let mut movable = vec![true; nvars];
+        for (i, p) in self.points.iter().enumerate() {
+            if p.fixed {
+                movable[2 * i] = false;
+                movable[2 * i + 1] = false;
+            }
+        }
+        let free: Vec<usize> = (0..nvars).filter(|&i| movable[i]).collect();
+        if free.is_empty() {
+            return DofReport { dof: 0, over_defined: false, free_points: vec![false; n] };
+        }
+        let m = self.residual_len(&layout);
+        if m == 0 {
+            // Nothing constrains anything — every movable variable is a DOF.
+            return DofReport { dof: free.len(), over_defined: false, free_points: free_of(&movable) };
+        }
+
+        let mut x = DVector::<f64>::zeros(nvars);
+        for (i, p) in self.points.iter().enumerate() {
+            x[2 * i] = p.x;
+            x[2 * i + 1] = p.y;
+        }
+        for (k, &(ei, _)) in layout.circles.iter().enumerate() {
+            if let Some(SketchEntity::Circle { radius, .. }) = self.entities.get(ei) {
+                x[2 * n + k] = *radius;
+            }
+        }
+        let mut jac = DMatrix::<f64>::zeros(m, nvars);
+        let r = self.eval(&layout, &x, &mut Some(&mut jac));
+        let jf = jac.select_columns(free.iter());
+        // Null space of J from the near-zero eigenvalues of JᵀJ (symmetric,
+        // always full decomposition — unlike a compact SVD it can't hide null
+        // directions when the system is wide).
+        let eig = (jf.transpose() * &jf).symmetric_eigen();
+        let emax = eig.eigenvalues.iter().cloned().fold(0.0_f64, f64::max);
+        let tol = (emax * 1.0e-9).max(1.0e-12);
+        let mut var_can_move = vec![false; nvars];
+        let mut dof = 0usize;
+        for (k, &ev) in eig.eigenvalues.iter().enumerate() {
+            if ev.abs() < tol {
+                dof += 1;
+                let v = eig.eigenvectors.column(k);
+                for (j, &col) in free.iter().enumerate() {
+                    if v[j].abs() > 1.0e-6 {
+                        var_can_move[col] = true;
+                    }
+                }
+            }
+        }
+        // Conflicting (over-defined) constraints: the solved sketch still can't
+        // reach zero residual.
+        DofReport { dof, over_defined: r.norm() > 1.0e-5, free_points: free_of(&var_can_move) }
     }
 
     /// Enforce radius relations after the point solve (radius isn't a solver
@@ -2331,6 +2451,96 @@ mod tests {
         s.solve();
         let dx = (s.points[a].x - s.points[b].x).abs();
         assert!((dx - 10.0).abs() < 1e-4, "horizontal extent was {dx}");
+    }
+
+    #[test]
+    fn a_dimensioned_rectangle_without_an_anchor_keeps_rigid_body_freedom() {
+        // H/V + two driving dims pin the shape, but nothing pins it to the plane:
+        // 3 DOF remain (translate ×2, and the H/V pair leaves… no rotation here,
+        // so exactly 2) — the point is it is NOT fully defined and all points stay free.
+        let mut s = Sketch::default();
+        let p0 = s.add_point(0.0, 0.0);
+        let p1 = s.add_point(2.0, 0.0);
+        let p2 = s.add_point(2.0, 1.0);
+        let p3 = s.add_point(0.0, 1.0);
+        s.constraints.push(Constraint::Horizontal(p0, p1));
+        s.constraints.push(Constraint::Horizontal(p3, p2));
+        s.constraints.push(Constraint::Vertical(p1, p2));
+        s.constraints.push(Constraint::Vertical(p0, p3));
+        s.constraints.push(Constraint::Distance { a: p0, b: p1, value: 2.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.constraints.push(Constraint::Distance { a: p1, b: p2, value: 1.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.solve();
+        let rep = s.dof_report();
+        assert_eq!(rep.dof, 2, "un-anchored rectangle should have exactly its translation DOF");
+        assert!(!rep.over_defined);
+        assert!(rep.free_points.iter().all(|&f| f), "every point can still translate");
+    }
+
+    #[test]
+    fn anchoring_to_the_origin_fully_defines_the_rectangle() {
+        // Same rectangle, but one corner coincident with the fixed origin anchor:
+        // zero DOF, every point fully defined (black).
+        let mut s = Sketch::default();
+        let origin = s.ensure_origin();
+        let p0 = s.add_point(0.1, 0.1);
+        let p1 = s.add_point(2.0, 0.0);
+        let p2 = s.add_point(2.0, 1.0);
+        let p3 = s.add_point(0.0, 1.0);
+        s.constraints.push(Constraint::Horizontal(p0, p1));
+        s.constraints.push(Constraint::Horizontal(p3, p2));
+        s.constraints.push(Constraint::Vertical(p1, p2));
+        s.constraints.push(Constraint::Vertical(p0, p3));
+        s.constraints.push(Constraint::Distance { a: p0, b: p1, value: 2.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.constraints.push(Constraint::Distance { a: p1, b: p2, value: 1.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.constraints.push(Constraint::Coincident(p0, origin));
+        s.solve();
+        let rep = s.dof_report();
+        assert_eq!(rep.dof, 0, "anchored + dimensioned rectangle is fully defined");
+        assert!(!rep.over_defined);
+        assert!(rep.free_points.iter().all(|&f| !f), "no point should be free");
+    }
+
+    #[test]
+    fn conflicting_dimensions_report_over_defined() {
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(2.0, 0.0);
+        s.constraints.push(Constraint::Distance { a, b, value: 2.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.constraints.push(Constraint::Distance { a, b, value: 3.0, offset: 0.5, axis: DimAxis::Aligned });
+        s.solve();
+        let rep = s.dof_report();
+        assert!(rep.over_defined, "two different lengths on one line must flag a conflict");
+    }
+
+    #[test]
+    fn an_undimensioned_circle_radius_counts_as_freedom() {
+        // Circle centred on the origin anchor: only the radius is free → 1 DOF.
+        let mut s = Sketch::default();
+        let origin = s.ensure_origin();
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 2.0);
+        s.constraints.push(Constraint::Coincident(c, origin));
+        s.solve();
+        let rep = s.dof_report();
+        assert_eq!(rep.dof, 1, "free radius is the one remaining DOF");
+        // Dimension the radius → fully defined.
+        s.constraints.push(Constraint::Radius { center: c, value: 2.0, diameter: false });
+        s.solve();
+        assert_eq!(s.dof_report().dof, 0, "radius dim completes the definition");
+    }
+
+    #[test]
+    fn ensure_origin_is_idempotent_and_detected() {
+        let mut s = Sketch::default();
+        assert!(!s.has_geometry());
+        let o1 = s.ensure_origin();
+        let o2 = s.ensure_origin();
+        assert_eq!(o1, o2, "second call must find the first anchor");
+        assert_eq!(s.origin_point(), Some(o1));
+        assert!(!s.has_geometry(), "the anchor alone isn't user geometry");
+        let p = s.add_point(1.0, 1.0);
+        s.entities.push(SketchEntity::Point { at: p });
+        assert!(s.has_geometry(), "a real point entity is geometry");
     }
 
     #[test]
