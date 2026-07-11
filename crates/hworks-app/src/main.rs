@@ -5895,14 +5895,7 @@ fn sketch_interaction(
         // replace each tessellation-fit (centre, radius) with the true value so concentric
         // bosses snap exactly. A fit circle is refined to the nearest matching exact one.
         let exact = exact_plane_circles(&doc.0, &ap);
-        let refine = |c: Vec2, r: f32| -> (Vec2, f32) {
-            exact
-                .iter()
-                .copied()
-                .filter(|(ec, _)| ec.distance(c) <= (r * 0.05).max(0.1))
-                .min_by(|a, b| a.0.distance(c).total_cmp(&b.0.distance(c)))
-                .unwrap_or((c, r))
-        };
+        let refine = |c: Vec2, r: f32| refine_circle(&exact, c, r);
         // Vertices already accounted for by a detected circular edge (full circle or
         // arc), so its many tessellation segments aren't each emitted as straight points.
         let mut circle_verts: Vec<Vec3> = Vec::new();
@@ -10817,18 +10810,35 @@ fn sketch_footprint_samples(plane: &PlaneRef, regs: &[hworks_sketch::Region]) ->
     out
 }
 
+/// Replace a tessellation-fitted circle `(c, r)` with the exact source circle it matches,
+/// if any. A match must agree in **centre AND radius** — concentric features (a boss with
+/// a bore) produce several exact circles at the same centre, so matching by centre alone
+/// could hand a hole reference the boss's radius. Ties break to the closest combined fit.
+fn refine_circle(exact: &[(Vec2, f32)], c: Vec2, r: f32) -> (Vec2, f32) {
+    let tol = (r * 0.05).max(0.1);
+    exact
+        .iter()
+        .copied()
+        .filter(|(ec, er)| ec.distance(c) <= tol && (er - r).abs() <= tol)
+        .min_by(|a, b| {
+            (a.0.distance(c) + (a.1 - r).abs()).total_cmp(&(b.0.distance(c) + (b.1 - r).abs()))
+        })
+        .unwrap_or((c, r))
+}
+
 /// Exact `(centre_uv, radius)` of every body circular edge lying in the sketch plane `ap`,
-/// read from the *source* sketch circles in the timeline. The B-rep tessellates circles to
-/// polygons, so a tessellation fit only approximates the radius (~sagitta); this recovers
-/// the true value so a concentric boss snaps exactly and joins without a micro-step.
+/// read from the *source* sketch entities in the timeline (circles, arcs, and slot end
+/// caps). The B-rep tessellates circles to polygons, so a tessellation fit only
+/// approximates the radius (~sagitta); this recovers the true value so a concentric boss
+/// snaps exactly and joins without a micro-step.
 fn exact_plane_circles(doc: &Document, ap: &ActivePlane) -> Vec<(Vec2, f32)> {
     let mut out = Vec::new();
     let n_unit = ap.n.normalize_or_zero();
     let end = doc.rollback.min(doc.features.len());
     for f in &doc.features[..end] {
-        let (sketch, plane, dist) = match &f.kind {
-            FeatureKind::Extrude { sketch, plane, distance, .. } => (sketch, plane, *distance as f32),
-            FeatureKind::Cut { sketch, plane, distance, .. } => (sketch, plane, *distance as f32),
+        let (sketch, plane, dist, back) = match &f.kind {
+            FeatureKind::Extrude { sketch, plane, distance, back, .. } => (sketch, plane, *distance as f32, *back as f32),
+            FeatureKind::Cut { sketch, plane, distance, back, .. } => (sketch, plane, *distance as f32, *back as f32),
             _ => continue,
         };
         let fo = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
@@ -10839,19 +10849,47 @@ fn exact_plane_circles(doc: &Document, ap: &ActivePlane) -> Vec<(Vec2, f32)> {
         if fnormal.dot(n_unit).abs() < 0.999 {
             continue;
         }
+        // Prism cap planes: both sweep ends, and the Direction-2 (`back`) ends when set.
+        let offs = [0.0_f32, dist, -dist, -back, dist + back, -dist - back];
+        // Exact circle sources in the sketch: circle entities, arc entities (radius
+        // |centre→a|), and a slot's two semicircular end caps.
+        let mut push = |center_uv: Vec2, radius: f32| {
+            if radius <= 1e-4 {
+                return;
+            }
+            let cbase = fo + fu * center_uv.x + fv * center_uv.y;
+            for off in offs {
+                let c3 = cbase + fnormal * off;
+                if (c3 - ap.origin).dot(ap.n).abs() < 0.02 {
+                    let d = c3 - ap.origin;
+                    let uv = Vec2::new(d.dot(ap.u), d.dot(ap.v));
+                    if !out.iter().any(|(c, r): &(Vec2, f32)| c.distance(uv) < 1e-4 && (r - radius).abs() < 1e-4) {
+                        out.push((uv, radius));
+                    }
+                }
+            }
+        };
+        let pt = |i: usize| sketch.points.get(i).map(|p| Vec2::new(p.x as f32, p.y as f32));
         for ent in &sketch.entities {
-            if let SketchEntity::Circle { center, radius, construction: false } = ent {
-                if let Some(cp) = sketch.points.get(*center) {
-                    let cbase = fo + fu * cp.x as f32 + fv * cp.y as f32;
-                    // Circular edges live at both ends of the prism (boss/cut).
-                    for off in [0.0_f32, dist, -dist] {
-                        let c3 = cbase + fnormal * off;
-                        if (c3 - ap.origin).dot(ap.n).abs() < 0.02 {
-                            let d = c3 - ap.origin;
-                            out.push((Vec2::new(d.dot(ap.u), d.dot(ap.v)), *radius as f32));
+            match ent {
+                SketchEntity::Circle { center, radius, construction: false } => {
+                    if let Some(c) = pt(*center) {
+                        push(c, *radius as f32);
+                    }
+                }
+                SketchEntity::Arc { center, a, construction: false, .. } => {
+                    if let (Some(c), Some(pa)) = (pt(*center), pt(*a)) {
+                        push(c, c.distance(pa));
+                    }
+                }
+                SketchEntity::Slot { a, b, radius, construction: false, .. } => {
+                    for &i in [a, b] {
+                        if let Some(c) = pt(i) {
+                            push(c, *radius as f32);
                         }
                     }
                 }
+                _ => {}
             }
         }
     }
@@ -14352,6 +14390,55 @@ mod tests {
             hi = hi.max(p[2]);
         }
         hi - lo
+    }
+
+    #[test]
+    fn refine_circle_disambiguates_concentric_features() {
+        // A boss (r=25) with a concentric bore (r=15): two exact circles at the SAME
+        // centre. A slightly-off fit of the bore must refine to the bore's radius,
+        // never the boss's — centre-only matching got this wrong.
+        let exact = vec![(Vec2::ZERO, 25.0_f32), (Vec2::ZERO, 15.0_f32)];
+        let (c, r) = refine_circle(&exact, Vec2::new(0.02, -0.01), 15.03);
+        assert_eq!(r, 15.0, "bore fit must take the bore radius");
+        assert_eq!(c, Vec2::ZERO);
+        let (_, r) = refine_circle(&exact, Vec2::new(0.01, 0.0), 24.98);
+        assert_eq!(r, 25.0, "boss fit must take the boss radius");
+        // A fit that matches nothing stays untouched.
+        let (c, r) = refine_circle(&exact, Vec2::new(9.0, 0.0), 5.0);
+        assert_eq!((c, r), (Vec2::new(9.0, 0.0), 5.0));
+    }
+
+    #[test]
+    fn exact_plane_circles_reads_true_radii_from_the_timeline() {
+        // A cylinder (r=50) extruded 50 up from the Top plane. On a sketch plane at
+        // its top cap, the exact reference circle must be (0,0) with radius exactly 50.
+        let mut doc = Document::with_default_planes();
+        let mut s = Sketch::default();
+        let c = s.add_point(0.0, 0.0);
+        s.add_circle(c, 50.0);
+        let top = PlaneRef {
+            origin: [0.0, 0.0, 0.0],
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 0.0, -1.0],
+            normal: [0.0, 1.0, 0.0],
+            datum: true,
+        };
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: 50.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let cap = ActivePlane {
+            name: "Face".into(),
+            origin: Vec3::new(0.0, 50.0, 0.0),
+            u: Vec3::X,
+            v: Vec3::NEG_Z,
+            n: Vec3::Y,
+            datum: false,
+        };
+        let circles = exact_plane_circles(&doc, &cap);
+        assert_eq!(circles.len(), 1, "one exact circle on the cap plane: {circles:?}");
+        assert!(circles[0].0.length() < 1e-4, "centred on the axis");
+        assert_eq!(circles[0].1, 50.0, "radius is the exact sketch value");
+        // A fitted circle with tessellation error snaps to it exactly.
+        let (rc, rr) = refine_circle(&circles, Vec2::new(0.03, -0.02), 49.97);
+        assert_eq!((rc, rr), (Vec2::ZERO, 50.0));
     }
 
     #[test]
