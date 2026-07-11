@@ -580,7 +580,29 @@ fn edge_is_picked(topo: &Topo, e: &TopoEdge, picked: &[Vec<[f64; 3]>]) -> bool {
     let mid = scale(add(topo.verts[e.a], topo.verts[e.b]), 0.5);
     let tol2 = 1.0e-4; // 0.01 units
     picked.iter().any(|poly| {
-        poly.windows(2).any(|w| pt_seg_dist2(mid, w[0], w[1]) < tol2)
+        if poly.windows(2).any(|w| pt_seg_dist2(mid, w[0], w[1]) < tol2) {
+            return true;
+        }
+        // Wrap heal: older documents stored a closed loop WITHOUT repeating its first point, so
+        // the closing segment is missing — that one edge never rounds (a notch on the body, and
+        // its seam detours as a chevron). If the polyline's end gap is on the scale of its own
+        // segments it was meant as a loop: test the closing pair too. (A straight 2-point pick
+        // "wraps" onto its own segment reversed — harmless.)
+        if poly.len() >= 3 {
+            let (first, last) = (poly[0], poly[poly.len() - 1]);
+            let gd = sub(last, first);
+            let gap2 = dot(gd, gd);
+            if gap2 > tol2 {
+                let mut seg2: Vec<f64> = poly.windows(2).map(|w| { let d = sub(w[1], w[0]); dot(d, d) }).collect();
+                seg2.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med2 = seg2[seg2.len() / 2];
+                // gap ≤ ~1.75× the median segment length (compared squared).
+                if gap2 <= med2 * 3.1 {
+                    return pt_seg_dist2(mid, last, first) < tol2;
+                }
+            }
+        }
+        false
     })
 }
 
@@ -616,11 +638,14 @@ fn bevel_prep(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Option<BevelP
 
 /// The selectable feature edges from a prepared bevel: the inset boundary segment along each
 /// selected model edge (a fillet's tangent edges / a chamfer's hard edges), one per adjacent
-/// face. Follows the rounded body and chains up for picking.
-fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>) -> Vec<[[f32; 3]; 2]> {
+/// face. Follows the rounded body and chains up for picking. Each segment carries the normal of
+/// the flat face it borders — the segment is only valid while the final surface UNDER it still
+/// faces that way (a later cut whose wall merely grazes the line must not keep it alive).
+fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>) -> Vec<([[f32; 3]; 2], [f32; 3])> {
     let f32a = |p: V3| [p[0] as f32, p[1] as f32, p[2] as f32];
     let mut out = Vec::new();
     for fi in 0..topo.faces.len() {
+        let n = f32a(topo.faces[fi].normal);
         for lp in &topo.faces[fi].loops {
             let m = lp.len();
             for k in 0..m {
@@ -628,7 +653,7 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
                 if topo.edge_between(a, b).is_some_and(|ei| selected[ei]) {
                     let pa = corner.get(&(a, fi)).copied().unwrap_or(topo.verts[a]);
                     let pb = corner.get(&(b, fi)).copied().unwrap_or(topo.verts[b]);
-                    out.push([f32a(pa), f32a(pb)]);
+                    out.push(([f32a(pa), f32a(pb)], n));
                 }
             }
         }
@@ -640,6 +665,31 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
 /// cylinder strip per selected edge, and a fanned patch per corner. `None` if the result isn't
 /// watertight (a partial-vertex T-junction the prototype can't split → caller falls back to CSG).
 fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64, seg: usize) -> Option<TriMesh> {
+    // The surgery insets flat faces and stitches arc strips + corner patches — sound on real
+    // (flat-face) corners, but on a TESSELLATED CURVED wall (a chain of near-tangent micro-facets,
+    // e.g. a cylinder rim) the per-facet strips and corner patches crease into sliver geometry
+    // that still closes watertight — a striped, notched surface. Detect that regime and decline:
+    // a selected edge sharing an endpoint with a near-tangent (facet-seam) edge is running across
+    // a curved wall, and the CSG round handles those smoothly.
+    let cos_facet = 20.0_f64.to_radians().cos();
+    for (ei, e) in topo.edges.iter().enumerate() {
+        if !selected[ei] {
+            continue;
+        }
+        for &v in &[e.a, e.b] {
+            for &oi in &topo.vert_edges[v] {
+                if oi == ei || selected[oi] {
+                    continue;
+                }
+                let o = &topo.edges[oi];
+                if o.faces.len() == 2
+                    && dot(topo.faces[o.faces[0]].normal, topo.faces[o.faces[1]].normal) > cos_facet
+                {
+                    return None;
+                }
+            }
+        }
+    }
     let verts = &topo.verts;
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
     let mut b = Build::new();
@@ -769,7 +819,7 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
 /// empty = every edge.
 pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Vec<[[f32; 3]; 2]> {
     match bevel_prep(mesh, r, picked) {
-        Some((topo, selected, corner)) => emit_feature_edges(&topo, &selected, &corner),
+        Some((topo, selected, corner)) => emit_feature_edges(&topo, &selected, &corner).into_iter().map(|(e, _)| e).collect(),
         None => Vec::new(),
     }
 }
@@ -784,8 +834,10 @@ pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f6
 
 /// Both the surgery mesh and the selectable feature edges from a **single** topology pass — what
 /// the app's regen wants. The mesh is `None` when the surgery can't close (caller falls back to
-/// CSG), but the edges are still returned: they sit at the same contact lines either way.
-pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> (Option<TriMesh>, Vec<[[f32; 3]; 2]>) {
+/// CSG), but the edges are still returned: they sit at the same contact lines either way. Each
+/// edge carries the bordering flat face's normal, so a later cut can invalidate seams whose
+/// supporting surface is gone even when the cut's own wall grazes the line (see the app's clip).
+pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> (Option<TriMesh>, Vec<([[f32; 3]; 2], [f32; 3])>) {
     match bevel_prep(mesh, r, picked) {
         Some((topo, selected, corner)) => {
             let edges = emit_feature_edges(&topo, &selected, &corner);
@@ -1025,10 +1077,13 @@ mod tests {
         let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], 12.0]).collect();
         rim.push(rim[0]);
         let picked = vec![rim];
-        // The bevel resolves a clean cylinder-boss rim fillet (watertight), and either way the
-        // topology-only feature edges are emitted so the rounded rim is selectable.
-        let body2 = bevel_mesh_selected(&body, 0.7, 3, &picked).expect("cyl-boss rim fillets");
-        assert!(is_watertight(&body2));
+        // A rim on a tessellated CURVED wall must DECLINE the mesh surgery (its per-facet strips
+        // crease into a striped, notched surface) — the caller then uses the smooth CSG round.
+        // Either way the topology-only feature edges are emitted so the rounded rim is selectable.
+        assert!(
+            bevel_mesh_selected(&body, 0.7, 3, &picked).is_none(),
+            "curved-wall rim must decline surgery (creased strips) and fall back to CSG"
+        );
         let top_edges = bevel_feature_edges(&body, 0.7, &picked);
         assert!(top_edges.len() > 30, "rim tangent edges emitted");
 
@@ -1049,8 +1104,9 @@ mod tests {
 
     #[test]
     fn fillet_cylinder_top_rim() {
-        // A cylinder (32-gon prism). Fillet its top circular rim and check the bevel succeeds
-        // and emits feature edges following the circle (so they're selectable).
+        // A cylinder (32-gon prism). A rim on a tessellated curved wall must DECLINE the mesh
+        // surgery (per-facet strips crease into a striped/notched surface) so the caller uses the
+        // smooth CSG round — but the feature edges are still emitted so the rim stays selectable.
         let n = 32;
         let circ: Vec<[f64; 2]> = (0..n)
             .map(|i| {
@@ -1063,8 +1119,10 @@ mod tests {
         let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], 6.0]).collect();
         rim.push(rim[0]);
         let picked = vec![rim];
-        let body = bevel_mesh_selected(&cyl, 0.5, 3, &picked).expect("cylinder rim fillets");
-        assert!(is_watertight(&body), "cylinder rim fillet must be closed");
+        assert!(
+            bevel_mesh_selected(&cyl, 0.5, 3, &picked).is_none(),
+            "curved-wall rim must decline surgery and fall back to CSG"
+        );
         // Two tangent circles (top-flat↔torus and torus↔side), ~32 segments each.
         let edges = bevel_feature_edges(&cyl, 0.5, &picked);
         assert!(edges.len() > 30, "should emit a ring of tangent edges, got {}", edges.len());

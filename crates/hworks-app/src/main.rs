@@ -651,6 +651,10 @@ struct Part {
     edges: Vec<[[f32; 3]; 2]>,
     /// Smooth/tangent edges (curvature lines) — hidden unless the user shows them.
     tangent_edges: Vec<[[f32; 3]; 2]>,
+    /// Fillet/chamfer boundary seams (from the bevel engine, clipped to the final surface).
+    /// A round body's rim keeps these as its only edges, so they draw like real edges and are
+    /// always selectable — unlike `tangent_edges`, which on the exact path is every facet line.
+    seam_edges: Vec<[[f32; 3]; 2]>,
 }
 
 /// A picked model edge (or edge loop) in view mode: the ordered world-space
@@ -5670,9 +5674,8 @@ fn hover_body_edge(
         .ok()
         .zip(cam_q.single().ok())
         .and_then(|(w, (cam, gt))| w.cursor_position().map(|c| (c, cam, gt)))
-        .and_then(|(cursor, cam, gt)| pick_edge(&part.edges, cam, gt, cursor, EDGE_PICK_PX))
-        .map(|si| edge_loop(&part.edges, si))
-        .filter(|(chain, _)| chain.len() >= 2);
+        // Same pools as the click: sharp edges, then a round body's tangent fillet seams.
+        .and_then(|(cursor, cam, gt)| pick_edge_loop_any(&part, cam, gt, cursor, EDGE_PICK_PX));
     ui_state.hover_edge_loop = hit;
 }
 
@@ -5704,14 +5707,13 @@ fn sketch_interaction(
         && buttons.just_pressed(MouseButton::Left)
     {
         if let Some(cursor) = window.cursor_position() {
-            if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
-                // Loop-snap: one click on a face-perimeter edge grabs the whole closed loop, so
-                // the bevel gets a complete corner-closed set (and rounds the full rim at once).
-                let (chain, closed) = edge_loop(&part.edges, si);
-                if chain.len() >= 2 {
-                    toggle_fillet_edge(&mut ui_state, &chain);
-                    edge_sel.set(chain, closed);
-                }
+            // Loop-snap: one click on a face-perimeter edge grabs the whole closed loop, so
+            // the bevel gets a complete corner-closed set (and rounds the full rim at once).
+            // Both pools are pickable here — sharp corners AND the tangent seams a previous
+            // fillet left on a round body (so a rounded edge can be rounded again).
+            if let Some((chain, closed)) = pick_edge_loop_any(&part, camera, cam_gt, cursor, EDGE_PICK_PX) {
+                toggle_fillet_edge(&mut ui_state, &chain, closed);
+                edge_sel.set(chain, closed);
             }
         }
         return;
@@ -6373,13 +6375,21 @@ fn sketch_interaction(
             // A click near a body edge selects that edge/loop (and flashes its key
             // points) instead of starting a sketch. Edges are thin, faces are wide,
             // so clicking the open part of a face still enters sketch mode below.
-            if !part.edges.is_empty() {
+            if !part.edges.is_empty() || !part.seam_edges.is_empty() || !part.tangent_edges.is_empty() {
                 if let Some(cursor) = window.cursor_position() {
-                    if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
-                        let (chain, closed) = edge_loop(&part.edges, si);
-                        if chain.len() >= 2 {
-                            edge_sel.set(chain, closed);
-                            return;
+                    if let Some((chain, closed)) = pick_edge_loop_any(&part, camera, cam_gt, cursor, EDGE_PICK_PX) {
+                        edge_sel.set(chain, closed);
+                        return;
+                    }
+                    // Tangent curvature lines are selectable too, but only while they're drawn
+                    // ("Tangent edges" on) — an invisible line must never steal a sketch-on-face click.
+                    if ui_state.show_tangent_edges {
+                        if let Some(si) = pick_edge(&part.tangent_edges, camera, cam_gt, cursor, EDGE_PICK_PX) {
+                            let (chain, closed) = edge_loop(&part.tangent_edges, si);
+                            if chain.len() >= 2 {
+                                edge_sel.set(chain, closed);
+                                return;
+                            }
                         }
                     }
                 }
@@ -8605,11 +8615,16 @@ fn fillet_edge_key(poly: &[[f64; 3]]) -> ([i64; 3], [i64; 3]) {
 
 /// Add a body edge (its world-space polyline) to the fillet set, or remove it if the same
 /// edge is clicked again. Refreshes the preview.
-fn toggle_fillet_edge(ui_state: &mut UiState, chain: &[Vec3]) {
-    // NOTE: keep the polyline OPEN (don't append the first point). The bevel reconstructs loop
-    // closure itself; a duplicated seam point makes its mesh surgery fail and fall back to the coarse
-    // CSG round. The *highlight* closes the loop visually on its own (see draw_edge_selection).
-    let poly: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+fn toggle_fillet_edge(ui_state: &mut UiState, chain: &[Vec3], closed: bool) {
+    // A closed loop is stored with its first point REPEATED, so the closing segment is explicit.
+    // Without it the bevel never sees the loop's last edge: one rim edge stays square (a notch)
+    // and its seam detours around the corner (the "chevron sticking out"), and the missing edge
+    // makes the mesh surgery fail → coarse CSG fallback. The duplicated point is safe for the
+    // engine (`rim_pick_from_tessellation_closes_the_loop` pins this).
+    let mut poly: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+    if closed && poly.len() >= 3 {
+        poly.push(poly[0]);
+    }
     let key = fillet_edge_key(&poly);
     let before = ui_state.fillet_edges.len();
     ui_state.fillet_edges.retain(|e| fillet_edge_key(e) != key);
@@ -9816,7 +9831,7 @@ fn point_tri_dist(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
 /// straddles the boundary). The robust test is the edge **midpoint's distance to the nearest mesh
 /// triangle**: a normal fillet chord's midpoint sits a hair off the curved surface, while a void
 /// chord's midpoint is millimetres into open space. Triangles are spatial-hashed by bounding box.
-fn clip_edges_to_mesh(edges: &[[[f32; 3]; 2]], mesh: &TriMesh, rel: f32) -> Vec<[[f32; 3]; 2]> {
+fn clip_edges_to_mesh(edges: &[([[f32; 3]; 2], [f32; 3])], mesh: &TriMesh, rel: f32) -> Vec<[[f32; 3]; 2]> {
     use std::collections::HashMap;
     if mesh.positions.is_empty() || edges.is_empty() || mesh.indices.len() < 3 {
         return Vec::new();
@@ -9853,7 +9868,12 @@ fn clip_edges_to_mesh(edges: &[[[f32; 3]; 2]], mesh: &TriMesh, rel: f32) -> Vec<
             }
         }
     }
-    let on_surface = |p: [f32; 3]| -> bool {
+    // A point is SUPPORTED when a nearby triangle both touches it (within tol) AND faces the way
+    // the seam's own flat face faced at emission. Distance alone is not enough: a later cut whose
+    // wall/floor happens to graze the old seam line (a slot bottom coincident with a fillet-base
+    // ring, a bore wall under a crossing chord) keeps stale seams alive — but those surfaces face
+    // a completely different way, so the normal test kills them.
+    let supported = |p: [f32; 3], n_seam: [f32; 3]| -> bool {
         let (gx, gy, gz) = gq(p);
         for dx in -1..=1 {
             for dy in -1..=1 {
@@ -9862,7 +9882,11 @@ fn clip_edges_to_mesh(edges: &[[[f32; 3]; 2]], mesh: &TriMesh, rel: f32) -> Vec<
                         for &ti in ts {
                             let t = &mesh.indices[ti * 3..ti * 3 + 3];
                             if point_tri_dist(p, pos(t[0]), pos(t[1]), pos(t[2])) <= tol {
-                                return true;
+                                let tn = mesh.normals[t[0] as usize]; // flat normal, same on all 3
+                                let dot = tn[0] * n_seam[0] + tn[1] * n_seam[1] + tn[2] * n_seam[2];
+                                if dot > 0.7 {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -9871,30 +9895,27 @@ fn clip_edges_to_mesh(edges: &[[[f32; 3]; 2]], mesh: &TriMesh, rel: f32) -> Vec<
         }
         false
     };
-    // Classify each bevel chord by which of {endpoint A, endpoint B, midpoint} lie on the final
-    // surface — a threshold-free discriminator (the earlier length cap was fragile because the
-    // legit/stray length ratio varies per model):
-    //   • legit chord:      both ends + midpoint on-surface        → keep
-    //   • straddling (break): exactly ONE end on-surface           → keep (reaches the cut edge)
-    //   • void-spanner (stray): both ends on-surface but MIDPOINT off (its body crosses the gap) → drop
-    //   • fully void:        nothing on-surface                    → drop
+    // Classify each bevel chord by which of {endpoint A, endpoint B, midpoint} are supported:
+    //   • legit chord:      midpoint supported                       → keep
+    //   • straddling (break): exactly ONE end supported              → keep (reaches the cut edge)
+    //   • void/grazing span: nothing (or only a foreign face) nearby → drop
     edges
         .iter()
-        .copied()
-        .filter(|e| {
+        .filter(|(e, n)| {
             let mid = [(e[0][0] + e[1][0]) * 0.5, (e[0][1] + e[1][1]) * 0.5, (e[0][2] + e[1][2]) * 0.5];
-            let (a_on, b_on) = (on_surface(e[0]), on_surface(e[1]));
-            on_surface(mid) || (a_on != b_on)
+            let (a_on, b_on) = (supported(e[0], *n), supported(e[1], *n));
+            supported(mid, *n) || (a_on != b_on)
         })
+        .map(|(e, _)| *e)
         .collect()
 }
 
 /// Rebuild the mesh-kernel body, plus the selectable feature edges emitted by the *last*
 /// bevel (fillet/chamfer) if it's still the final body operation — those tangent/hard edges
 /// are otherwise invisible to angle-based edge extraction, so we plumb them out explicitly.
-fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
+fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32; 3])>)> {
     let mut body: Option<TriMesh> = None;
-    let mut bevel_edges: Vec<[[f32; 3]; 2]> = Vec::new();
+    let mut bevel_edges: Vec<([[f32; 3]; 2], [f32; 3])> = Vec::new();
     let end = doc.rollback.min(doc.features.len());
     for feature in &doc.features[..end] {
         match &feature.kind {
@@ -10155,15 +10176,14 @@ fn do_regenerate(
         }
         match mesh {
             Some((m, bevel_edges)) if !m.positions.is_empty() => {
-                let mut tess = mesh_tessellation(m);
+                let tess = mesh_tessellation(m);
                 // The face-boundary detector already reports every real (sharp) edge, including a
-                // chamfer's flat-face boundaries. The bevel's own edges are only needed for the
-                // *tangent* boundary of a fillet (a rounded edge, which the face detector merges away
-                // and SolidWorks hides by default). Put them in the TANGENT set — hidden unless
-                // "Tangent edges" is on — so the default view is clean (no bevel-seam strays). Clip to
+                // chamfer's flat-face boundaries. The bevel's own edges cover the *tangent* boundary
+                // of a fillet (a rounded edge, which the face detector merges away). They go in the
+                // dedicated SEAM set: drawn like real edges (a filleted rim keeps its boundary ring)
+                // and always selectable, without dragging in the exact path's facet lines. Clip to
                 // the final surface first so a later cut doesn't leave them floating in the void.
-                let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
-                tess.tangent_edges.extend(kept);
+                part.seam_edges = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
                 part.mesh = Some(tess.mesh.clone());
                 part.edges = tess.edges.clone();
                 part.tangent_edges = tess.tangent_edges.clone();
@@ -10179,6 +10199,7 @@ fn do_regenerate(
                 part.mesh = None;
                 part.edges.clear();
                 part.tangent_edges.clear();
+                part.seam_edges.clear();
             }
         }
         return;
@@ -10206,6 +10227,7 @@ fn do_regenerate(
                 part.mesh = Some(tess.mesh.clone());
                 part.edges = tess.edges.clone();
                 part.tangent_edges = tess.tangent_edges.clone();
+                part.seam_edges.clear(); // exact path has no bevels (fillet forces the mesh path)
                 spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
                 part.solid = Some(solid);
             }
@@ -10214,6 +10236,7 @@ fn do_regenerate(
                 part.mesh = None;
                 part.edges.clear();
                 part.tangent_edges.clear();
+                part.seam_edges.clear();
             }
         }
         return;
@@ -10225,9 +10248,9 @@ fn do_regenerate(
         .unwrap_or(None);
     match mesh_body {
         Some((mesh, bevel_edges)) if !mesh.positions.is_empty() => {
-            let mut tess = mesh_tessellation(mesh);
-            let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
-            tess.tangent_edges.extend(kept); // fillet tangent boundaries → hidden unless Tangent edges on
+            let tess = mesh_tessellation(mesh);
+            // Fillet boundary seams → the dedicated seam set (drawn like real edges, selectable).
+            part.seam_edges = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
             part.mesh = Some(tess.mesh.clone());
             part.edges = tess.edges.clone();
             part.tangent_edges = tess.tangent_edges.clone();
@@ -10253,6 +10276,7 @@ fn do_regenerate(
                     part.mesh = Some(tess.mesh.clone());
                     part.edges = tess.edges.clone();
                     part.tangent_edges = tess.tangent_edges.clone();
+                    part.seam_edges.clear();
                     spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
                     part.solid = Some(solid);
                 }
@@ -10261,6 +10285,7 @@ fn do_regenerate(
                     part.mesh = None;
                     part.edges.clear();
                     part.tangent_edges.clear();
+                    part.seam_edges.clear();
                 }
             }
         }
@@ -11379,7 +11404,13 @@ fn draw_body_edges(
     for e in &part.edges {
         gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), col);
     }
-    // Tangent/curvature edges only when the user asks (drawn lighter to read as soft).
+    // Fillet/chamfer boundary seams draw like real edges — a filleted rim keeps its visible,
+    // selectable boundary ring (on a round body they're often its ONLY edges).
+    for e in &part.seam_edges {
+        gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), col);
+    }
+    // Tangent/curvature edges only when the user asks (drawn lighter to read as soft) —
+    // on the exact path this set is every facet line of a curved wall, so it stays opt-in.
     if ui_state.show_tangent_edges {
         let tcol = Color::srgb(0.45, 0.47, 0.52);
         for e in &part.tangent_edges {
@@ -13276,6 +13307,29 @@ fn pick_face_point(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cu
     })
 }
 
+/// Pick an edge loop for fillet/chamfer from BOTH selectable pools: sharp edges first (they win
+/// any tie), then the fillet-boundary seams. The seam pool is what a fillet leaves behind on a
+/// round body — its boundary meets the walls smoothly, so it's no longer a sharp edge, and without
+/// this fallback a rounded rim could never be picked again for a second fillet/chamfer. The loop
+/// is walked inside whichever pool the hit came from.
+fn pick_edge_loop_any(
+    part: &Part,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    cursor: Vec2,
+    thresh: f32,
+) -> Option<(Vec<Vec3>, bool)> {
+    if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, thresh) {
+        let (chain, closed) = edge_loop(&part.edges, si);
+        if chain.len() >= 2 {
+            return Some((chain, closed));
+        }
+    }
+    let si = pick_edge(&part.seam_edges, camera, cam_gt, cursor, thresh)?;
+    let (chain, closed) = edge_loop(&part.seam_edges, si);
+    (chain.len() >= 2).then_some((chain, closed))
+}
+
 fn pick_edge(
     edges: &[[[f32; 3]; 2]],
     camera: &Camera,
@@ -13672,6 +13726,240 @@ mod tests {
         assert!(vol < outer_area * height * 0.7, "shell should be hollow, got {vol:.1}");
     }
 
+    /// A rim picked the way the APP picks it (from the tessellated body, chained by `edge_loop`)
+    /// must fillet completely: every rim edge selected, mesh surgery (no CSG fallback), and the
+    /// seam edges forming complete degree-2 rings on the ideal circles — no notch, no chevron, no
+    /// break. Covers BOTH the new store format (closed loop = first point repeated) and the heal
+    /// for old documents (open-stored loop, closing pair matched by the wrap in `edge_is_picked`).
+    #[test]
+    fn rim_pick_from_tessellation_closes_the_loop() {
+        let basis = PlaneBasis { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let (rad, h, fr) = (12.0_f64, 9.2_f64, 1.0_f64);
+        let n = 48;
+        let circ: Vec<[f64; 2]> = (0..n).map(|i| { let a = std::f64::consts::TAU * i as f64 / n as f64; [rad * a.cos(), rad * a.sin()] }).collect();
+        let cyl = extrude_tool_mesh(&circ, &[], &basis, 0.0, h).expect("cylinder");
+        let tess0 = mesh_tessellation(cyl.clone());
+        let rim_seed = tess0
+            .edges
+            .iter()
+            .position(|e| (e[0][2] - h as f32).abs() < 1e-3 && (e[1][2] - h as f32).abs() < 1e-3)
+            .expect("find a top-rim segment");
+        let (chain, closed) = edge_loop(&tess0.edges, rim_seed);
+        assert!(closed && chain.len() >= n - 2, "rim should chain into a closed loop");
+        let open: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+        let mut shut = open.clone();
+        shut.push(shut[0]); // what toggle_fillet_edge now stores for a closed pick
+        let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
+        for (label, picked) in [("open (old doc, wrap-healed)", vec![open]), ("closed (new store)", vec![shut])] {
+            let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
+            // A rim on a tessellated curved wall must DECLINE the mesh surgery (its per-facet
+            // strips crease into a striped/notched surface) and take the smooth CSG round instead.
+            assert!(beveled.is_none(), "{label}: curved-wall rim must decline surgery");
+            assert_eq!(fe.len(), 2 * n, "{label}: expected two complete {n}-segment seam rings, got {}", fe.len());
+            let body = round_mesh(&cyl, fr, &picked).expect("CSG round");
+            let tess = mesh_tessellation(body);
+            // The CSG body must be SMOOTH: sharp edges ≈ the untouched bottom rim plus a few CSG
+            // tessellation creases (~2n). The failure mode this guards is the creased/striped
+            // surgery output, which shows up as ~20n sharp edges — an order of magnitude apart.
+            assert!(
+                tess.edges.len() <= n * 3,
+                "{label}: body should be smooth (~{n} bottom-rim edges), got {} sharp edges",
+                tess.edges.len()
+            );
+            let kept = clip_edges_to_mesh(&fe, &tess.mesh, 0.01);
+            assert_eq!(kept.len(), fe.len(), "{label}: no seam segment should be clipped off-surface");
+            // Every seam vertex has degree 2 (two closed rings — no dangling break, no junction).
+            use std::collections::HashMap;
+            let q = |p: [f32; 3]| ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64);
+            let mut deg: HashMap<(i64, i64, i64), usize> = HashMap::new();
+            for s in &kept {
+                *deg.entry(q(s[0])).or_default() += 1;
+                *deg.entry(q(s[1])).or_default() += 1;
+            }
+            assert!(deg.values().all(|&d| d == 2), "{label}: seam rings must be closed (all degree 2)");
+            // And every vertex sits on one of the two ideal circles (no chevron poking out).
+            let worst = kept
+                .iter()
+                .flat_map(|s| s.iter())
+                .map(|p| {
+                    let rxy = (p[0] as f64).hypot(p[1] as f64);
+                    let cap = ((rxy - (rad - fr)).powi(2) + (p[2] as f64 - h).powi(2)).sqrt();
+                    let wall = ((rxy - rad).powi(2) + (p[2] as f64 - (h - fr)).powi(2)).sqrt();
+                    cap.min(wall)
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(worst < 0.05, "{label}: seam deviates {worst:.3} from the ideal rings");
+        }
+    }
+
+    /// A slot cut through a filleted rim must CLIP the fillet's seam rings at the cut: no seam
+    /// segment may float across the void (the "edge lines extend past the cut" bug).
+    #[test]
+    fn cut_through_fillet_clips_the_seam_rings() {
+        let basis = PlaneBasis { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let (rad, h, fr) = (6.0_f64, 9.0_f64, 1.0_f64);
+        let n = 128;
+        let circ: Vec<[f64; 2]> = (0..n).map(|i| { let a = std::f64::consts::TAU * i as f64 / n as f64; [rad * a.cos(), rad * a.sin()] }).collect();
+        let cyl = extrude_tool_mesh(&circ, &[], &basis, 0.0, h).expect("cylinder");
+        let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], h]).collect();
+        rim.push(rim[0]);
+        let picked = vec![rim];
+        // Fillet the rim exactly like regen: surgery (declines on curved walls) → CSG round.
+        let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, ((fr * 6.0) as usize).clamp(3, 12), &picked);
+        let body = beveled.unwrap_or_else(|| round_mesh(&cyl, fr, &picked).expect("csg round"));
+        // Slot cut straight through the top, like the user's Cut-Extrude2: a 4-wide rectangle
+        // across the whole diameter, 5.2 deep from the top.
+        let slot = extrude_tool_mesh(
+            &[[-rad - 1.0, -2.0], [rad + 1.0, -2.0], [rad + 1.0, 2.0], [-rad - 1.0, 2.0]],
+            &[],
+            &basis,
+            h - 5.2,
+            h + 1.0 - (h - 5.2),
+        )
+        .expect("slot tool");
+        let cut = mesh_difference(&body, &slot);
+        let tess = mesh_tessellation(cut);
+        let kept = clip_edges_to_mesh(&fe, &tess.mesh, 0.01);
+        // No kept segment's midpoint may sit inside the slot mouth (|y| < 2 − margin, above the
+        // slot floor): those spans float across the void.
+        let floaters = kept
+            .iter()
+            .filter(|s| {
+                let my = (s[0][1] + s[1][1]) * 0.5;
+                let mz = (s[0][2] + s[1][2]) * 0.5;
+                (my.abs() as f64) < 1.7 && (mz as f64) > h - 5.2 + 0.3
+            })
+            .count();
+        assert_eq!(floaters, 0, "{floaters} seam segment(s) float across the slot void (of {} kept)", kept.len());
+        // Sanity: plenty of the ring survives outside the cut.
+        assert!(kept.len() > n, "most of the seam rings should survive, got {}", kept.len());
+    }
+
+    /// Reproduce the filleted-cylinder seam artifacts (break + chevron poking out of the rim):
+    ///   cargo test -p hworks-app --release diag_cylinder_fillet_seams -- --ignored --nocapture
+    /// Mirrors the app's regen exactly: 48-gon extrude → bevel (surgery or CSG fallback) →
+    /// mesh_tessellation → clip_edges_to_mesh, then audits the surviving seam chains.
+    #[test]
+    #[ignore]
+    fn diag_cylinder_fillet_seams() {
+        // With HCAD_FILE set: replay the REAL document through regenerate_mesh and audit its body +
+        // seams (watertightness, edge counts, seam degrees) instead of the synthetic cylinder.
+        if let Ok(path) = std::env::var("HCAD_FILE") {
+            let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let (mesh, bevel_edges) = regenerate_mesh(&doc).expect("regen");
+            eprintln!("body: {} verts / {} tris, bevel_edges={}", mesh.positions.len(), mesh.indices.len() / 3, bevel_edges.len());
+            let tess = mesh_tessellation(mesh);
+            eprintln!("tess: sharp={} tangent={}", tess.edges.len(), tess.tangent_edges.len());
+            let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+            use std::collections::HashMap;
+            let q = |p: [f32; 3]| ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64);
+            let mut deg: HashMap<(i64, i64, i64), usize> = HashMap::new();
+            for s in &kept {
+                *deg.entry(q(s[0])).or_default() += 1;
+                *deg.entry(q(s[1])).or_default() += 1;
+            }
+            let dangles = deg.values().filter(|&&d| d == 1).count();
+            let junctions = deg.values().filter(|&&d| d > 2).count();
+            eprintln!("seams: kept={} dropped={} dangling={dangles} junctions={junctions}", kept.len(), bevel_edges.len() - kept.len());
+            // True floaters among the kept: midpoint far (>3× clip tol) from EVERY mesh triangle.
+            let m = &tess.mesh;
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &m.positions {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+            let tol = (diag * 0.01).max(1.0e-4);
+            let dist_to_mesh = |p: [f32; 3]| -> f32 {
+                let mut best = f32::MAX;
+                for t in m.indices.chunks_exact(3) {
+                    let d = point_tri_dist(p, m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+                    best = best.min(d);
+                }
+                best
+            };
+            let mut floaters = 0;
+            for s in &kept {
+                let mid = [(s[0][0] + s[1][0]) * 0.5, (s[0][1] + s[1][1]) * 0.5, (s[0][2] + s[1][2]) * 0.5];
+                let d = dist_to_mesh(mid);
+                if d > tol * 3.0 {
+                    floaters += 1;
+                    if floaters <= 8 {
+                        eprintln!("  floater: mid=({:.2},{:.2},{:.2}) dist={d:.3} (tol {tol:.3})", mid[0], mid[1], mid[2]);
+                    }
+                }
+            }
+            eprintln!("floaters among kept: {floaters}");
+            return;
+        }
+        let basis = PlaneBasis { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let (rad, h, fr) = (
+            std::env::var("DIAG_R").ok().and_then(|v| v.parse().ok()).unwrap_or(25.0_f64),
+            std::env::var("DIAG_H").ok().and_then(|v| v.parse().ok()).unwrap_or(5.7_f64),
+            std::env::var("DIAG_FR").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0_f64),
+        );
+        let n: usize = std::env::var("DIAG_N").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        let circ: Vec<[f64; 2]> = (0..n).map(|i| { let a = std::f64::consts::TAU * i as f64 / n as f64; [rad * a.cos(), rad * a.sin()] }).collect();
+        let cyl = extrude_tool_mesh(&circ, &[], &basis, 0.0, h).expect("cylinder");
+        // Pick the rim the way the APP does: from the tessellated body's sharp edges, chained by
+        // edge_loop — not the synthetic profile polygon. The tessellation roundtrips the mesh
+        // through Manifold (rewelds/reorders), so this chain is what a real click yields.
+        let tess0 = mesh_tessellation(cyl.clone());
+        let rim_seed = tess0
+            .edges
+            .iter()
+            .position(|e| (e[0][2] - h as f32).abs() < 1e-3 && (e[1][2] - h as f32).abs() < 1e-3)
+            .expect("find a top-rim segment");
+        let (chain, closed) = edge_loop(&tess0.edges, rim_seed);
+        eprintln!("picked rim: {} pts, closed={closed}", chain.len());
+        let picked: Vec<Vec<[f64; 3]>> = vec![chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect()];
+        let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
+        for round in 0..10 {
+            let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
+            let path = if round >= 5 || beveled.is_none() { "CSG-fallback" } else { "surgery" };
+            // Rounds 5+ force the CSG fallback to audit the seams against ITS surface too.
+            let body = if round >= 5 {
+                round_mesh(&cyl, fr, &picked).expect("csg round")
+            } else {
+                beveled.unwrap_or_else(|| round_mesh(&cyl, fr, &picked).expect("csg round"))
+            };
+            let tess = mesh_tessellation(body);
+            let kept = clip_edges_to_mesh(&fe, &tess.mesh, 0.01);
+            // Audit the surviving seam network: vertex degrees (a clean pair of rings = all degree
+            // 2), and each vertex's deviation from the two ideal circles (cap ring |xy| = R − r at
+            // z = h; wall ring |xy| = R at z = h − r).
+            use std::collections::HashMap;
+            let q = |p: [f32; 3]| ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64);
+            let mut deg: HashMap<(i64, i64, i64), usize> = HashMap::new();
+            for s in &kept {
+                *deg.entry(q(s[0])).or_default() += 1;
+                *deg.entry(q(s[1])).or_default() += 1;
+            }
+            let dangles = deg.values().filter(|&&d| d == 1).count();
+            let junctions = deg.values().filter(|&&d| d > 2).count();
+            let worst = kept
+                .iter()
+                .flat_map(|s| s.iter())
+                .map(|p| {
+                    let rxy = (p[0] as f64).hypot(p[1] as f64);
+                    let cap = ((rxy - (rad - fr)).powi(2) + (p[2] as f64 - h).powi(2)).sqrt();
+                    let wall = ((rxy - rad).powi(2) + (p[2] as f64 - (h - fr)).powi(2)).sqrt();
+                    cap.min(wall)
+                })
+                .fold(0.0_f64, f64::max);
+            eprintln!(
+                "round {round}: path={path} emitted={} kept={} dropped={} dangling-ends={dangles} junctions={junctions} worst-deviation={worst:.3} body-sharp={} body-tris={}",
+                fe.len(),
+                kept.len(),
+                fe.len() - kept.len(),
+                tess.edges.len(),
+                tess.mesh.indices.len() / 3,
+            );
+        }
+    }
+
     /// report watertightness + edge topology. Ignored by default — run with the path:
     ///   cargo test -p hworks-app check_hcad_manifold -- --ignored --nocapture
     #[test]
@@ -13845,7 +14133,7 @@ mod tests {
         let mid = |e: &[[f32;3];2]| [(e[0][0]+e[1][0])*0.5,(e[0][1]+e[1][1])*0.5,(e[0][2]+e[1][2])*0.5];
         let (mut off_either, mut off_mid, mut off_all3) = (0,0,0);
         let mut lens: Vec<f32> = Vec::new();
-        for e in &bevel_edges {
+        for (e, _n) in &bevel_edges {
             let (da, db, dm) = (near_vert(e[0]), near_vert(e[1]), near_vert(mid(e)));
             if da > tol || db > tol { off_either += 1; }
             if dm > tol { off_mid += 1; }
