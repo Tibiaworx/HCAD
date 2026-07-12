@@ -731,6 +731,12 @@ struct SketchSession {
     /// recomputed only when the sketch actually changes. Drives the
     /// fully/under/over-defined status line and the point coloring.
     dof_cache: Option<(u64, hworks_sketch::DofReport)>,
+    /// Cached `sketch.regions()` result, keyed by the sketch fingerprint. The
+    /// region builder re-runs the whole planar arrangement, and several per-frame
+    /// paths (region fills, hit tests, panel counts) need the same answer — this
+    /// makes all but the first call after an edit free. Interior mutability so
+    /// read-only systems can refresh it via [`SketchSession::cached_regions`].
+    regions_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<Vec<hworks_sketch::Region>>)>>,
     /// Line-tool variant: when set, a line grows symmetrically from its first click
     /// (the click is the midpoint), with a Midpoint relation pinning the centre.
     line_midpoint: bool,
@@ -901,6 +907,25 @@ struct SketchSession {
     /// Edited dimensions / added relations are staged until Apply re-solves.
     needs_apply: bool,
     sketch: Sketch,
+}
+
+impl SketchSession {
+    /// The active sketch's regions, computed at most once per sketch edit: the
+    /// result is cached keyed by the sketch fingerprint, so every per-frame
+    /// caller after the first gets the shared `Arc` back for free. Always
+    /// consistent with the current sketch (a stale cache recomputes inline).
+    fn cached_regions(&self) -> std::sync::Arc<Vec<hworks_sketch::Region>> {
+        let fp = sketch_fingerprint(&self.sketch);
+        let mut guard = self.regions_cache.lock().unwrap();
+        if let Some((cached_fp, regions)) = &*guard {
+            if *cached_fp == fp {
+                return regions.clone();
+            }
+        }
+        let regions = std::sync::Arc::new(self.sketch.regions());
+        *guard = Some((fp, regions.clone()));
+        regions
+    }
 }
 
 /// Undo/redo stacks of whole-document snapshots.
@@ -1290,7 +1315,7 @@ fn ui_system(
     }
 
     let in_sketch = session.plane.is_some();
-    let has_profile = !session.sketch.regions().is_empty();
+    let has_profile = !session.cached_regions().is_empty();
     // A standalone Sketch feature is selected → it can be extruded from the Features tab.
     let selected_sketch = ui_state.selected.filter(|&i| {
         matches!(doc.0.features.get(i).map(|f| &f.kind), Some(FeatureKind::Sketch { .. }))
@@ -2990,7 +3015,7 @@ fn ui_system(
 
             // Selected Contours — the closed regions this op will use (empty = all).
             egui::CollapsingHeader::new("Selected Contours").default_open(true).show(ui, |ui| {
-                let nreg = session.sketch.regions().len();
+                let nreg = session.cached_regions().len();
                 let picked: Vec<usize> =
                     session.selected_contours.iter().copied().filter(|&i| i < nreg).collect();
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -3925,7 +3950,7 @@ fn ui_system(
                     ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "○ profile open");
                 }
                 ui.separator();
-                let nreg = session.sketch.regions().len();
+                let nreg = session.cached_regions().len();
                 if nreg > 0 {
                     let picked = session.selected_contours.iter().filter(|&&i| i < nreg).count();
                     let sel = if picked == 0 { format!("all {nreg}") } else { format!("{picked}/{nreg}") };
@@ -5450,12 +5475,12 @@ fn sketch_fingerprint(s: &Sketch) -> u64 {
     h
 }
 
-/// Index of the sketch region whose interior (inside the outer loop, outside any
-/// hole) contains `uv`.
-fn region_at(sketch: &Sketch, uv: Vec2) -> Option<usize> {
+/// Index of the region (in a precomputed `regions()` list) whose interior — inside
+/// the outer loop, outside any hole — contains `uv`. Takes the list rather than the
+/// sketch so callers can use the session's cached regions.
+fn region_at(regions: &[hworks_sketch::Region], uv: Vec2) -> Option<usize> {
     let p = [uv.x as f64, uv.y as f64];
-    sketch
-        .regions()
+    regions
         .iter()
         .position(|r| point_in_poly(p, &r.outer) && !r.holes.iter().any(|h| point_in_poly(p, h)))
 }
@@ -6596,7 +6621,7 @@ fn sketch_interaction(
                         // a constraint; clicking *inside* a closed area selects that
                         // contour; a looser grab still catches a nearby line otherwise.
                         let on_entity = nearest_entity(&session.sketch, uv, snap * 0.6);
-                        let region = region_at(&session.sketch, uv);
+                        let region = region_at(&session.cached_regions(), uv);
                         let near_entity = nearest_entity(&session.sketch, uv, snap * 1.5);
                         // While a boss/cut PropertyManager is open the click is
                         // unambiguously a *contour* pick, so a region always wins over a
@@ -7208,7 +7233,7 @@ fn pattern_instances(session: &SketchSession, seeds: &[usize]) -> Result<Vec<Xf>
             }
         }
         PatternMode::Fill => {
-            let regions = session.sketch.regions();
+            let regions = session.cached_regions();
             let Some(&bi) = session.selected_contours.first() else {
                 return Err("Fill: click inside a closed region to choose the boundary to fill.".into());
             };
@@ -9396,7 +9421,7 @@ fn do_solid_op(
     let Some(op) = session.op_request.take() else { return };
     let Some(ap) = session.plane.clone() else { return };
 
-    let region_count = session.sketch.regions().len();
+    let region_count = session.cached_regions().len();
     if region_count == 0 {
         warn!("Need a closed profile (a loop of lines, or a circle) to extrude.");
         return;
@@ -12446,7 +12471,7 @@ fn draw_sketch(
     // Highlight the Selected Contours — outer + holes. Explicitly-picked contours
     // are bright green; if none are picked, every region is shown dim (it's the
     // "all contours" default that an extrude/cut would use).
-    let regions = session.sketch.regions();
+    let regions = session.cached_regions();
     if !regions.is_empty() {
         let picked: Vec<usize> =
             session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
@@ -13023,7 +13048,7 @@ fn draw_sketch(
 
     // ---- Boss/Cut preview: direction arrow + ghost extrusion of the contours ----
     if let Some(op) = &ui_state.pending {
-        let regions = session.sketch.regions();
+        let regions = session.cached_regions();
         let picked: Vec<usize> =
             session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
         let indices: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
@@ -13206,7 +13231,7 @@ fn segment_screen_dist(
 /// Centroid (in plane uv) of the contours a pending extrude would use — the base
 /// of the direction arrow.
 fn contours_centroid(session: &SketchSession) -> Option<Vec2> {
-    let regions = session.sketch.regions();
+    let regions = session.cached_regions();
     if regions.is_empty() {
         return None;
     }

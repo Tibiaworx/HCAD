@@ -1041,14 +1041,70 @@ fn intersect_param(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> Op
 /// Split every segment at all its intersections with the others, so the result is
 /// a planar set of segments that only meet at shared endpoints. Split pieces
 /// inherit the parent segment's source-curve tag.
+///
+/// A uniform grid over the sketch bounding box culls the pair tests: each segment
+/// is registered in the cells its bounding box covers and only tested against
+/// segments sharing a cell — O(n·local density) instead of the all-pairs O(n²)
+/// that made dense sketches (every circle is 128 segments) crawl.
 fn split_at_intersections(segs: &[TagSeg]) -> Vec<TagSeg> {
+    let n = segs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Sketch bounds + average segment length → a cell size that keeps the
+    // per-cell population small for typical (curve-tessellation) segments.
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    let mut len_sum = 0.0;
+    for (a, b, _) in segs {
+        for k in 0..2 {
+            lo[k] = lo[k].min(a[k]).min(b[k]);
+            hi[k] = hi[k].max(a[k]).max(b[k]);
+        }
+        len_sum += dist2(*a, *b);
+    }
+    let (ex, ey) = ((hi[0] - lo[0]).max(1e-9), (hi[1] - lo[1]).max(1e-9));
+    let cell = (len_sum / n as f64).max(ex.max(ey) * 1e-4).max(1e-9);
+    let cols = ((ex / cell).ceil() as usize).clamp(1, 1024);
+    let rows = ((ey / cell).ceil() as usize).clamp(1, 1024);
+    let (csx, csy) = (ex / cols as f64, ey / rows as f64);
+    let cell_of = |x: f64, y: f64| -> (usize, usize) {
+        (
+            (((x - lo[0]) / csx) as usize).min(cols - 1),
+            (((y - lo[1]) / csy) as usize).min(rows - 1),
+        )
+    };
+    let span = |a: &[f64; 2], b: &[f64; 2]| {
+        let (c0, r0) = cell_of(a[0].min(b[0]), a[1].min(b[1]));
+        let (c1, r1) = cell_of(a[0].max(b[0]), a[1].max(b[1]));
+        (c0, r0, c1, r1)
+    };
+    let mut grid: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+    for (i, (a, b, _)) in segs.iter().enumerate() {
+        let (c0, r0, c1, r1) = span(a, b);
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                grid[r * cols + c].push(i as u32);
+            }
+        }
+    }
+
+    // `stamp[j] == i` ⇒ j was already tested against the current segment i
+    // (segments sharing several cells would otherwise be tested repeatedly).
+    let mut stamp = vec![u32::MAX; n];
     let mut out = Vec::new();
     for (i, (a, b, tag)) in segs.iter().enumerate() {
         let mut ts = vec![0.0, 1.0];
-        for (j, (c, d, _)) in segs.iter().enumerate() {
-            if i != j {
-                if let Some(t) = intersect_param(*a, *b, *c, *d) {
-                    ts.push(t);
+        let (c0, r0, c1, r1) = span(a, b);
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                for &j in &grid[r * cols + c] {
+                    let j = j as usize;
+                    if j != i && stamp[j] != i as u32 {
+                        stamp[j] = i as u32;
+                        if let Some(t) = intersect_param(*a, *b, segs[j].0, segs[j].1) {
+                            ts.push(t);
+                        }
+                    }
                 }
             }
         }
@@ -1074,7 +1130,21 @@ fn split_at_intersections(segs: &[TagSeg]) -> Vec<TagSeg> {
 /// by intersecting sketch geometry.
 fn trace_minimal_faces(segs: &[TagSeg]) -> Vec<(Vec<[f64; 2]>, Vec<Option<CurveTag>>)> {
     use std::collections::{HashMap, HashSet};
-    let key = |p: [f64; 2]| ((p[0] * 1.0e6).round() as i64, (p[1] * 1.0e6).round() as i64);
+    // Weld coincident vertices on a grid that scales with the sketch, so the same
+    // intersection point computed from different segment pairs fuses at any model
+    // scale. (A fixed 1e-6 weld over-merged metre-scale sketches and could fail to
+    // fuse micro-scale ones.) 1e-8 of the diagonal matches the old absolute grid
+    // at the typical ~100mm sketch size.
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for (a, b, _) in segs {
+        for k in 0..2 {
+            lo[k] = lo[k].min(a[k]).min(b[k]);
+            hi[k] = hi[k].max(a[k]).max(b[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt();
+    let weld = (diag * 1.0e-8).max(1.0e-12);
+    let key = move |p: [f64; 2]| ((p[0] / weld).round() as i64, (p[1] / weld).round() as i64);
     let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
     let mut pos: Vec<[f64; 2]> = Vec::new();
 
@@ -2716,6 +2786,89 @@ mod tests {
                 let d = (p[0] * p[0] + p[1] * p[1]).sqrt();
                 assert!((d - 2.0).abs() < 1e-9, "span vertex off the circle: {d}");
             }
+        }
+    }
+
+    #[test]
+    fn grid_split_matches_brute_force() {
+        // The grid-accelerated splitter must produce byte-identical output to the
+        // all-pairs reference on an awkward mix of long lines and short segments.
+        let brute = |segs: &[TagSeg]| -> Vec<TagSeg> {
+            let mut out = Vec::new();
+            for (i, (a, b, tag)) in segs.iter().enumerate() {
+                let mut ts = vec![0.0, 1.0];
+                for (j, (c, d, _)) in segs.iter().enumerate() {
+                    if i != j {
+                        if let Some(t) = intersect_param(*a, *b, *c, *d) {
+                            ts.push(t);
+                        }
+                    }
+                }
+                ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let mut prev = ts[0];
+                for &t in &ts[1..] {
+                    if t - prev > 1e-7 {
+                        let (p, q) = (lerp2(*a, *b, prev), lerp2(*a, *b, t));
+                        if dist2(p, q) > 1e-7 {
+                            out.push((p, q, *tag));
+                        }
+                        prev = t;
+                    }
+                }
+            }
+            out
+        };
+        // Deterministic pseudo-random segments: a few long diagonals crossing a
+        // cloud of short ones (the circle-tessellation shape of real sketches).
+        let mut segs: Vec<TagSeg> = Vec::new();
+        let mut rng = 0x12345678u64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng >> 33) as f64) / ((1u64 << 31) as f64) // 0..1
+        };
+        for _ in 0..12 {
+            segs.push(([next() * 100.0, next() * 100.0], [next() * 100.0, next() * 100.0], None));
+        }
+        for _ in 0..300 {
+            let (x, y, a) = (next() * 100.0, next() * 100.0, next() * std::f64::consts::TAU);
+            segs.push(([x, y], [x + 2.0 * a.cos(), y + 2.0 * a.sin()], None));
+        }
+        let (fast, slow) = (split_at_intersections(&segs), brute(&segs));
+        assert_eq!(fast.len(), slow.len(), "same number of split pieces");
+        for (f, s) in fast.iter().zip(slow.iter()) {
+            assert_eq!((f.0, f.1), (s.0, s.1), "identical split geometry");
+        }
+    }
+
+    #[test]
+    fn dense_sketch_regions_stay_fast() {
+        // 24 overlapping circles (each 128 arrangement segments). Mostly a timing
+        // probe (printed under --nocapture); asserts only that regions come out.
+        let mut s = Sketch::default();
+        for i in 0..24 {
+            let a = std::f64::consts::TAU * i as f64 / 24.0;
+            let c = s.add_point(30.0 * a.cos(), 30.0 * a.sin());
+            s.add_circle(c, 12.0);
+        }
+        let t0 = std::time::Instant::now();
+        let regions = s.regions();
+        println!("dense sketch: {} regions in {:?}", regions.len(), t0.elapsed());
+        assert!(!regions.is_empty());
+    }
+
+    #[test]
+    fn tiny_and_huge_sketches_still_form_regions() {
+        // The weld grid is bbox-relative now — regions must close at extreme scales
+        // where a fixed 1e-6 weld either over-merged or failed to fuse.
+        for scale in [1.0e-3, 1.0, 1.0e4] {
+            let mut s = Sketch::default();
+            add_rect(&mut s, 0.0, 0.0, 10.0 * scale, 10.0 * scale);
+            let c = s.add_point(5.0 * scale, 5.0 * scale);
+            s.add_circle(c, 2.0 * scale);
+            let regions = s.regions();
+            let primary: Vec<&Region> = regions.iter().filter(|r| !r.nested).collect();
+            assert_eq!(primary.len(), 1, "scale {scale}: rectangle-with-hole closes");
+            assert_eq!(primary[0].holes.len(), 1, "scale {scale}: hole survives");
         }
     }
 
