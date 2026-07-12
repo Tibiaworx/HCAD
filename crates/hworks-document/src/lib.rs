@@ -140,6 +140,11 @@ pub struct LoftProfile {
 pub struct Feature {
     pub id: FeatureId,
     pub kind: FeatureKind,
+    /// Visual-only visibility toggle (hide/show for planes, sketches, reference
+    /// images — features whose viewport presence is decorative). Hidden features
+    /// still regenerate: this never changes the solid.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// The whole part: an ordered timeline plus a rollback position.
@@ -188,7 +193,7 @@ impl Document {
     pub fn add_feature(&mut self, kind: FeatureKind) -> FeatureId {
         let id = FeatureId(self.next_id);
         self.next_id += 1;
-        self.features.push(Feature { id, kind });
+        self.features.push(Feature { id, kind, hidden: false });
         self.rollback = self.features.len();
         id
     }
@@ -254,6 +259,16 @@ impl Document {
     pub fn planes(&self) -> impl Iterator<Item = (&FeatureId, &Plane)> {
         self.features.iter().filter_map(|f| match &f.kind {
             FeatureKind::Plane(p) => Some((&f.id, p)),
+            _ => None,
+        })
+    }
+
+    /// Like [`planes`] but with each plane's hide/show state, so drawing and
+    /// viewport picking can skip hidden planes (a hidden plane must be neither
+    /// visible nor clickable, while keeping every plane's tree order stable).
+    pub fn planes_vis(&self) -> impl Iterator<Item = (&FeatureId, &Plane, bool)> {
+        self.features.iter().filter_map(|f| match &f.kind {
+            FeatureKind::Plane(p) => Some((&f.id, p, f.hidden)),
             _ => None,
         })
     }

@@ -319,6 +319,21 @@ enum OpKind {
     RevolveCut,
 }
 
+/// Hide/show eye toggle for a feature-tree row, using the project's SVG icons
+/// (icons/visable.svg / invisable.svg, embedded in the binary). Returns true on
+/// click. Only offered on visual-only features — planes, sketches, reference
+/// images; hiding a solid feature in a boolean chain wouldn't mean anything.
+fn eye_button(ui: &mut egui::Ui, hidden: bool) -> bool {
+    let src = if hidden {
+        egui::include_image!("../../../icons/invisable.svg")
+    } else {
+        egui::include_image!("../../../icons/visable.svg")
+    };
+    ui.add(egui::Button::image(egui::Image::new(src).fit_to_exact_size(egui::vec2(20.0, 11.0))).frame(false))
+        .on_hover_text(if hidden { "Show" } else { "Hide" })
+        .clicked()
+}
+
 /// An action chosen from a feature-tree right-click menu (applied after the
 /// tree's immutable borrow ends).
 #[derive(Clone, Copy)]
@@ -1265,9 +1280,16 @@ fn ui_system(
     edge_sel: Res<EdgeSelection>,
     time: Res<Time>,
     mut logo_tex: Local<Option<egui::TextureHandle>>,
+    mut image_loaders: Local<bool>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
+
+    // Register egui's image loaders once (SVG support for the hide/show eye icons).
+    if !*image_loaders {
+        egui_extras::install_image_loaders(ctx);
+        *image_loaders = true;
+    }
 
     // The first time the Text tool is active, register the system fonts with egui so the
     // font dropdown can render each name in its own typeface. `set_fonts` only applies on
@@ -3481,6 +3503,8 @@ fn ui_system(
             ui.separator();
 
             let mut action: Option<TreeAction> = None;
+            // Deferred hide/show toggle (the feature loop holds a borrow of the list).
+            let mut toggle_hidden: Option<usize> = None;
             // Rows of solid features, with their on-screen rects, for the rollback bar.
             let mut feat_rows: Vec<(usize, egui::Rect)> = Vec::new();
 
@@ -3489,15 +3513,32 @@ fn ui_system(
                 // select/show it; double-click (or right-click → Sketch) to sketch on it — works
                 // even with a body present, so you can cut/revolve through the part's centre.
                 // Snapshot (order, name, feature index, offset) so the borrow ends before we mutate.
-                let plane_rows: Vec<(usize, String, Option<usize>, Option<PlaneOffset>)> = doc
+                let plane_rows: Vec<(usize, String, Option<usize>, Option<PlaneOffset>, bool)> = doc
                     .0
                     .planes()
                     .enumerate()
-                    .map(|(order, (id, p))| (order, p.name.clone(), doc.0.features.iter().position(|f| f.id == *id), p.offset.clone()))
+                    .map(|(order, (id, p))| {
+                        let fi = doc.0.features.iter().position(|f| f.id == *id);
+                        let hidden = fi.map_or(false, |i| doc.0.features[i].hidden);
+                        (order, p.name.clone(), fi, p.offset.clone(), hidden)
+                    })
                     .collect();
-                for (order, name, feat_idx, offset) in plane_rows {
+                for (order, name, feat_idx, offset, hidden) in plane_rows {
                     let sel = ui_state.selected_plane == Some(order);
-                    let resp = ui.selectable_label(sel, egui::RichText::new(format!("▱  {name} Plane")).weak());
+                    let resp = ui.horizontal(|ui| {
+                        // Eye toggle first, then the row label (hidden rows read dimmer).
+                        if let Some(fi) = feat_idx {
+                            if eye_button(ui, hidden) {
+                                doc.0.features[fi].hidden = !hidden;
+                            }
+                        }
+                        let mut rt = egui::RichText::new(format!("▱  {name} Plane")).weak();
+                        if hidden {
+                            rt = rt.color(egui::Color32::from_gray(90));
+                        }
+                        ui.selectable_label(sel, rt)
+                    })
+                    .inner;
                     if resp.clicked() {
                         ui_state.selected_plane = if sel { None } else { Some(order) };
                         ui_state.selected = None;
@@ -3507,6 +3548,12 @@ fn ui_system(
                         ui_state.sketch_plane_request = Some(order);
                     }
                     resp.context_menu(|ui| {
+                        if ui.button(if hidden { "Show" } else { "Hide" }).clicked() {
+                            if let Some(fi) = feat_idx {
+                                doc.0.features[fi].hidden = !hidden;
+                            }
+                            ui.close();
+                        }
                         if ui.button("Sketch on plane").clicked() {
                             ui_state.selected_plane = Some(order);
                             ui_state.sketch_plane_request = Some(order);
@@ -3569,7 +3616,14 @@ fn ui_system(
                             // While the Loft PM is open, a sketch row is highlighted if already a
                             // profile; clicking adds it (or removes it) from the loft's ordered list.
                             let in_loft = ui_state.loft_spec.as_ref().is_some_and(|v| v.iter().any(|(x, _)| *x == i));
-                            let resp = ui.selectable_label(selected || in_loft, styled(label));
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    if eye_button(ui, f.hidden) {
+                                        toggle_hidden = Some(i);
+                                    }
+                                    ui.selectable_label(selected || in_loft, styled(label))
+                                })
+                                .inner;
                             if resp.clicked() {
                                 if let Some(v) = ui_state.loft_spec.as_mut() {
                                     if let Some(pos) = v.iter().position(|(x, _)| *x == i) {
@@ -3796,11 +3850,22 @@ fn ui_system(
                             resp.rect
                         }
                         FeatureKind::RefImage { width, height, .. } => {
-                            let resp = ui.selectable_label(selected, styled(format!("Picture  ({width:.0}×{height:.0})")));
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    if eye_button(ui, f.hidden) {
+                                        toggle_hidden = Some(i);
+                                    }
+                                    ui.selectable_label(selected, styled(format!("Picture  ({width:.0}×{height:.0})")))
+                                })
+                                .inner;
                             if resp.clicked() {
                                 action = Some(TreeAction::EditImage(i));
                             }
                             resp.context_menu(|ui| {
+                                if ui.button(if f.hidden { "Show picture" } else { "Hide picture" }).clicked() {
+                                    toggle_hidden = Some(i);
+                                    ui.close();
+                                }
                                 if ui.button("Edit picture").clicked() {
                                     action = Some(TreeAction::EditImage(i));
                                     ui.close();
@@ -3814,6 +3879,9 @@ fn ui_system(
                         }
                     };
                     feat_rows.push((i, row));
+                }
+                if let Some(i) = toggle_hidden {
+                    doc.0.features[i].hidden = !doc.0.features[i].hidden;
                 }
 
                 // ---- Draggable rollback bar, in the tree (SolidWorks-style) ----
@@ -6408,7 +6476,8 @@ fn sketch_interaction(
         }
         if just_pressed {
             let mut best: Option<(f32, ActivePlane, String)> = None;
-            for (_id, p) in doc.0.planes() {
+            // Hidden planes are invisible, so they must not be clickable either.
+            for (_id, p, _) in doc.0.planes_vis().filter(|(_, _, h)| !h) {
                 let ap = ActivePlane::from_doc(p);
                 if let Some((t, uv)) = ray_plane(&ap, &ray) {
                     let half = ui_state.plane_size.max(1.0) * 0.5;
@@ -6461,7 +6530,8 @@ fn sketch_interaction(
             // Reference planes — only while starting the part (they're hidden once
             // a body exists, so you sketch on faces from then on).
             if part.solid.is_none() {
-                for (_id, p) in doc.0.planes() {
+                // Hidden planes are invisible, so they must not be clickable either.
+                for (_id, p, _) in doc.0.planes_vis().filter(|(_, _, h)| !h) {
                     let ap = ActivePlane::from_doc(p);
                     if let Some((t, uv)) = ray_plane(&ap, &ray) {
                         let half = ui_state.plane_size.max(1.0) * 0.5;
@@ -11698,6 +11768,7 @@ fn orbit_camera(
 // ---------------------------------------------------------------------------
 
 /// Reference-plane visibility, SolidWorks-style:
+///   * a plane hidden via its tree eye toggle → always hidden (the toggle wins);
 ///   * while actively sketching → all hidden (the sketch grid stands in);
 ///   * a datum plane selected in the tree → show just that one (so you can pick it to sketch on,
 ///     even with a body present — needed for e.g. a revolve cut through the centre);
@@ -11707,12 +11778,15 @@ fn update_plane_visibility(
     part: Res<Part>,
     session: Res<SketchSession>,
     ui_state: Res<UiState>,
+    doc: Res<DocRes>,
     mut planes: Query<(&mut Visibility, &RefPlaneIdx)>,
 ) {
     let sketching = session.plane.is_some();
     let show_all = part.solid.is_none() && ui_state.selected_plane.is_none();
+    let hidden_by_user: Vec<bool> = doc.0.planes_vis().map(|(_, _, h)| h).collect();
     for (mut vis, idx) in &mut planes {
-        let want = if sketching {
+        let user_hidden = hidden_by_user.get(idx.0).copied().unwrap_or(false);
+        let want = if user_hidden || sketching {
             Visibility::Hidden
         } else if ui_state.selected_plane == Some(idx.0) || show_all {
             Visibility::Visible
@@ -11913,10 +11987,12 @@ fn update_ref_images(
                 m.base_color.set_alpha(a);
             }
         }
-        // Show only when relevant: sketching on this image's plane, or its PM is open.
+        // Show only when relevant: sketching on this image's plane, or its PM is open —
+        // and never when the user hid it via the tree's eye toggle (the toggle wins,
+        // except while the PM is open to place/calibrate it).
         let pm_open = ui_state.image_edit.and_then(|i| doc.0.features.get(i)).map(|f| f.id.0) == Some(r.id.0);
         let sketching_here = editing_plane.as_ref().is_some_and(|sp| planes_coincident(sp, &ap));
-        let want = if pm_open || sketching_here { Visibility::Visible } else { Visibility::Hidden };
+        let want = if pm_open || (sketching_here && !f.hidden) { Visibility::Visible } else { Visibility::Hidden };
         if *vis != want {
             *vis = want;
         }
@@ -12134,8 +12210,10 @@ fn draw_feature_previews(
         return;
     }
     if let Some(i) = ui_state.selected {
-        if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(i).map(|f| &f.kind) {
-            draw_stored_sketch(&mut gizmos, sketch, plane, Color::srgb(0.95, 0.9, 0.3), None);
+        if let Some(f) = doc.0.features.get(i) {
+            if let (FeatureKind::Sketch { sketch, plane }, false) = (&f.kind, f.hidden) {
+                draw_stored_sketch(&mut gizmos, sketch, plane, Color::srgb(0.95, 0.9, 0.3), None);
+            }
         }
     }
 }
@@ -12155,6 +12233,9 @@ fn draw_selected_feature(
     }
     let Some(i) = ui_state.selected else { return };
     let Some(f) = doc.0.features.get(i) else { return };
+    if f.hidden {
+        return; // eye-toggled off — no profile outline either
+    }
     let (sketch, plane) = match &f.kind {
         FeatureKind::Sketch { sketch, plane }
         | FeatureKind::Extrude { sketch, plane, .. }
