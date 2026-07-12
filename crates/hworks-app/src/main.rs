@@ -13051,22 +13051,72 @@ fn draw_sketch(
         let regions = session.cached_regions();
         let picked: Vec<usize> =
             session.selected_contours.iter().copied().filter(|&i| i < regions.len()).collect();
-        let indices: Vec<usize> = if picked.is_empty() { (0..regions.len()).collect() } else { picked };
+        // "All contours" default skips nested disks (they'd double-draw over the
+        // region that owns them as a hole) — same rule the regen applies.
+        let indices: Vec<usize> = if picked.is_empty() {
+            regions.iter().enumerate().filter(|(_, r)| !r.nested).map(|(i, _)| i).collect()
+        } else {
+            picked
+        };
         // A boss goes out along +normal by default; a cut goes in (−normal, into the
         // material). Reverse flips either one.
         if matches!(op.kind, OpKind::Revolve | OpKind::RevolveCut) {
-            // Revolve preview: highlight the axis line (the picked line) the profile will spin
-            // around. No linear ghost — the sweep is rotational. A cut axis reads red.
-            if let Some((p, d)) = revolve_axis(&session) {
-                let a = Vec2::new(p[0] as f32, p[1] as f32);
-                let dir = Vec2::new(d[0] as f32, d[1] as f32).normalize_or_zero();
-                let half = (ms.max(2.0)) * 1.5;
-                let col = if matches!(op.kind, OpKind::RevolveCut) {
-                    Color::srgba(1.0, 0.45, 0.4, 0.9)
-                } else {
-                    Color::srgba(0.4, 0.85, 0.95, 0.9)
-                };
-                overlay.line(ap.to_world(a - dir * half), ap.to_world(a + dir * half), col);
+            // Revolve preview: highlight the axis line, then ghost the profile swept
+            // around it — rotated profile copies (the last one bright, where the sweep
+            // ends) plus the circular paths of sampled profile vertices. A cut reads red.
+            let cut = matches!(op.kind, OpKind::RevolveCut);
+            let Some((p, d)) = revolve_axis(&session) else { return };
+            let a2 = Vec2::new(p[0] as f32, p[1] as f32);
+            let dir2d = Vec2::new(d[0] as f32, d[1] as f32).normalize_or_zero();
+            let half = (ms.max(2.0)) * 1.5;
+            let axis_col = if cut { Color::srgba(1.0, 0.45, 0.4, 0.9) } else { Color::srgba(0.4, 0.85, 0.95, 0.9) };
+            overlay.line(ap.to_world(a2 - dir2d * half), ap.to_world(a2 + dir2d * half), axis_col);
+
+            // World-space axis (point + unit direction) and Rodrigues rotation about it.
+            let ao = ap.to_world(a2);
+            let k = (ap.u * dir2d.x + ap.v * dir2d.y).normalize_or_zero();
+            if k == Vec3::ZERO {
+                return;
+            }
+            let rot = |w: Vec3, th: f32| {
+                let dl = w - ao;
+                ao + dl * th.cos() + k.cross(dl) * th.sin() + k * k.dot(dl) * (1.0 - th.cos())
+            };
+            let angle = op.depth.clamp(1.0, 360.0).to_radians() * if op.reverse { -1.0 } else { 1.0 };
+            let ghost = if cut { Color::srgba(1.0, 0.4, 0.35, 0.6) } else { Color::srgba(0.95, 0.85, 0.25, 0.6) };
+            let far = if cut { Color::srgb(1.0, 0.75, 0.2) } else { Color::srgba(0.95, 0.85, 0.25, 0.95) };
+            // One profile copy every ~30° of sweep; the vertex paths step every ~15°.
+            let copies = ((angle.abs().to_degrees() / 30.0).ceil() as usize).clamp(1, 12);
+            let path_segs = ((angle.abs().to_degrees() / 15.0).ceil() as usize).clamp(2, 24);
+            for &i in &indices {
+                for loop_pts in std::iter::once(&regions[i].outer).chain(regions[i].holes.iter()) {
+                    let m = loop_pts.len();
+                    if m < 2 {
+                        continue;
+                    }
+                    let wpt = |j: usize| {
+                        let q = loop_pts[j % m];
+                        ap.to_world(Vec2::new(q[0] as f32, q[1] as f32))
+                    };
+                    // Rotated profile copies; the final one (bright) is where the sweep ends.
+                    for s in 1..=copies {
+                        let th = angle * s as f32 / copies as f32;
+                        let col = if s == copies { far } else { ghost };
+                        for j in 0..m {
+                            overlay.line(rot(wpt(j), th), rot(wpt(j + 1), th), col);
+                        }
+                    }
+                    // Circular paths of sampled profile vertices, 0 → angle.
+                    for j in (0..m).step_by((m / 12).max(1)) {
+                        let w0 = wpt(j);
+                        let mut prev = w0;
+                        for s in 1..=path_segs {
+                            let cur = rot(w0, angle * s as f32 / path_segs as f32);
+                            overlay.line(prev, cur, ghost);
+                            prev = cur;
+                        }
+                    }
+                }
             }
             return;
         }
