@@ -351,16 +351,21 @@ fn slerp(a: V3, b: V3, t: f64) -> V3 {
     norm(add(scale(a, ((1.0 - t) * om).sin() / s), scale(b, (t * om).sin() / s)))
 }
 
-/// Solve the 3×3 system `M x = rhs` by Cramer's rule (rows of `M` are `m0,m1,m2`).
+/// Solve the 3×3 system `M x = rhs` by Cramer's rule, where **rows** of `M` are `m0,m1,m2` —
+/// i.e. `dot(m0, x) = rhs[0]`, `dot(m1, x) = rhs[1]`, `dot(m2, x) = rhs[2]`. (Every caller wants
+/// this "3 planes through a point, each at a prescribed signed distance" form — the row-based
+/// system — not "x is the combination of m0,m1,m2 that sums to rhs", which is what a naive
+/// per-component `dot(rhs, cross(...))` formula actually computes; that reads deceptively close
+/// to right since it *is* valid Cramer's rule, just for a transposed system.) The standard
+/// closed form for the row-based solve is `x = Σᵢ rhs[i]·(the other two rows' cross product) /
+/// det`, cyclically: `rhs[0]·(m1×m2) + rhs[1]·(m2×m0) + rhs[2]·(m0×m1)`.
 fn solve3(m0: V3, m1: V3, m2: V3, rhs: V3) -> Option<V3> {
     let det = dot(m0, cross(m1, m2));
     if det.abs() < 1e-9 {
         return None;
     }
-    let dx = dot(rhs, cross(m1, m2));
-    let dy = dot(m0, cross(rhs, m2));
-    let dz = dot(m0, cross(m1, rhs));
-    Some([dx / det, dy / det, dz / det])
+    let x = add(add(scale(cross(m1, m2), rhs[0]), scale(cross(m2, m0), rhs[1])), scale(cross(m0, m1), rhs[2]));
+    Some(scale(x, 1.0 / det))
 }
 
 /// The rolling-ball centre for a 3-face convex corner: the point at signed distance `-r` from
@@ -526,6 +531,17 @@ pub fn edge_sign(topo: &Topo, e: &TopoEdge) -> i32 {
 /// from the face-A corner to the face-B corner, lying on the edge's fillet cylinder. Both the
 /// edge strip and the corner patch call this, so their shared boundary is bit-identical and
 /// welds without cracks. `None` if the edge is flat/degenerate at this vertex.
+///
+/// At a vertex where *another* selected edge also converges (e.g. two perpendicular fillet
+/// edges meeting at a box corner), the far face's inset corner (`cb`) is a **mitred** point —
+/// pulled along this edge's own direction by that other edge's setback, not by anything to do
+/// with this edge's cylinder. Interpolating "along" linearly from `ca` to that drifted `cb`
+/// smears the whole strip sideways along the edge, so it bulges past the true wall (the "block"
+/// artifact). Since `o` sits exactly at `vi`'s own along-position by construction, every
+/// *interior* sample is built at `along = 0` — a pure radial fan pinned at this vertex — so
+/// the cylinder stays correct along the edge's length; only the very last band (bridging to the
+/// mitred `cb`, needed so the flat far face still welds without a crack) absorbs the drift, and
+/// it does that over a short, local hop instead of the whole strip.
 fn edge_end_ring(topo: &Topo, e: &TopoEdge, vi: usize, cpt: &dyn Fn(usize, usize) -> V3, r: f64, seg: usize) -> Option<Vec<V3>> {
     let (fa, fb) = (e.faces[0], e.faces[1]);
     let (na, nb) = (topo.faces[fa].normal, topo.faces[fb].normal);
@@ -535,30 +551,32 @@ fn edge_end_ring(topo: &Topo, e: &TopoEdge, vi: usize, cpt: &dyn Fn(usize, usize
     }
     let t = norm(sub(topo.verts[e.b], topo.verts[e.a]));
     // Axis line of the fillet cylinder: at signed distance σ·r from both faces, parallel to t.
+    // `off` only depends on the two face normals and the edge direction (not on a position), so
+    // it's valid at either endpoint — anchor `o` at `vi` itself (not always `e.a`), so `dot(off,
+    // t) == 0` really does put `o` at exactly *this* vertex's along-position, matching the
+    // interior sweep below. (Anchoring at `e.a` unconditionally — the previous bug — silently
+    // relied on the old along-interpolation to drag the far end's ring back to vertex `e.b`; once
+    // the interior sweep stopped interpolating along, that made the `e.b` ring collapse onto
+    // `e.a`'s position instead.)
     let off = solve3(na, nb, t, [sigma * r, sigma * r, 0.0])?;
-    let o = add(topo.verts[e.a], off);
-    // Radial direction + along-axis coordinate of each face's corner point at this vertex.
-    let radial = |p: V3| -> (V3, f64) {
-        let along = dot(sub(p, o), t);
-        let rp = sub(sub(p, o), scale(t, along));
-        (norm(rp), along)
-    };
+    let o = add(topo.verts[vi], off);
+    // Radial direction of each face's corner point at this vertex (its along-component is
+    // discarded for the interior sweep — see the doc comment above).
+    let radial = |p: V3| -> V3 { norm(sub(sub(p, o), scale(t, dot(sub(p, o), t)))) };
     let (ca, cb) = (cpt(vi, fa), cpt(vi, fb));
-    let (da, aa) = radial(ca);
-    let (db, ab) = radial(cb);
+    let (da, db) = (radial(ca), radial(cb));
     let mut pts = Vec::with_capacity(seg + 1);
     for j in 0..=seg {
-        // Pin the two ends to the exact corner points so the flat-face seam can't crack; only
-        // interior arc points come from the cylinder formula (cylinder & patch share these).
+        // Pin the two ends to the exact corner points so the flat-face seam can't crack; every
+        // interior arc point sweeps radially at along=0 (this vertex's own cross-section).
         if j == 0 {
             pts.push(ca);
         } else if j == seg {
             pts.push(cb);
         } else {
             let p = j as f64 / seg as f64;
-            let along = aa + (ab - aa) * p;
             let d = slerp(da, db, p);
-            pts.push(add(add(o, scale(t, along)), scale(d, r)));
+            pts.push(add(o, scale(d, r)));
         }
     }
     Some(pts)
@@ -874,6 +892,30 @@ mod tests {
 
     fn xy() -> PlaneBasis {
         PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] }
+    }
+
+    #[test]
+    fn solve3_solves_the_row_based_system() {
+        // dot(m_i, x) = rhs[i] for each row — NOT "x is the combination of m0,m1,m2 summing to
+        // rhs" (a different, transposed system that a naive per-axis formula can silently solve
+        // instead — the bug that broke edge_end_ring's axis offset and corner_centre's sphere).
+        let (m0, m1, m2) = ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]);
+        let rhs = [-2.0, -2.0, 0.0];
+        let x = solve3(m0, m1, m2, rhs).expect("non-degenerate axis-aligned system");
+        assert!((x[0] - 0.0).abs() < 1e-9, "x={x:?}");
+        assert!((x[1] - -2.0).abs() < 1e-9, "x={x:?}");
+        assert!((x[2] - -2.0).abs() < 1e-9, "x={x:?}");
+        for (m, r) in [(m0, rhs[0]), (m1, rhs[1]), (m2, rhs[2])] {
+            assert!((dot(m, x) - r).abs() < 1e-9, "dot({m:?}, {x:?}) should be {r}, was {}", dot(m, x));
+        }
+
+        // A non-axis-aligned, less trivial case — three mutually skew-ish planes.
+        let (m0, m1, m2) = ([1.0, 0.2, 0.0], [0.1, 1.0, 0.3], [0.0, -0.2, 1.0]);
+        let rhs = [3.0, -1.5, 2.0];
+        let x = solve3(m0, m1, m2, rhs).expect("well-conditioned system");
+        for (m, r) in [(m0, rhs[0]), (m1, rhs[1]), (m2, rhs[2])] {
+            assert!((dot(m, x) - r).abs() < 1e-6, "dot({m:?}, {x:?}) should be {r}, was {}", dot(m, x));
+        }
     }
 
     #[test]
@@ -1248,6 +1290,39 @@ mod tests {
                     assert!((hi - 3.5).abs() < 1e-6, "inset hi on axis {axis}: {hi}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn top_perimeter_fillet_never_bulges_past_the_walls() {
+        // Regression for saved files/fillererror.hcad: filleting all 4 edges of a box's top-face
+        // perimeter (two pairs of PARALLEL selected edges meeting at right angles) produced a
+        // "block" — a chunk of the surgery mesh sticking out past the box's own flat side walls,
+        // well inside the fillet's vertical band, not just near the rounded corners. Root cause
+        // was two bugs: `solve3` solved the wrong (transposed) 3x3 system, so `edge_end_ring`'s
+        // cylinder-axis anchor `o` landed off-axis; and `edge_end_ring` anchored `o` at the
+        // edge's `e.a` endpoint unconditionally instead of the vertex (`vi`) actually being
+        // built, which (once `solve3` was fixed) collapsed the far end's ring onto the near
+        // end's position. Every vertex of the beveled result must stay within (or on) the box's
+        // original bounding box — a fillet only ever removes material, never adds it.
+        let (x0, x1) = (10.300506591787663, 30.300506591807387);
+        let (z0, z1) = (7.451744079581647, 27.451744079596413);
+        let outer = [[x0, -z0], [x1, -z0], [x1, -z1], [x0, -z1]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] };
+        let dist = 10.874906539916992;
+        let mesh = crate::extrude_tool_mesh(&outer, &[], &basis, 0.0, dist).unwrap();
+
+        let radius = 4.893707752227783;
+        let top_rim = vec![vec![[x1, dist, z1], [x1, dist, z0], [x0, dist, z0], [x0, dist, z1]]];
+        let seg = 12;
+        let beveled = bevel_mesh_selected(&mesh, radius, seg, &top_rim).expect("top-rim fillet builds");
+        assert!(is_watertight(&beveled), "beveled box must stay a closed surface");
+
+        let tol = 1.0e-4;
+        for p in &beveled.positions {
+            assert!(p[0] as f64 <= x1 + tol && p[0] as f64 >= x0 - tol, "x={} outside [{x0},{x1}]", p[0]);
+            assert!(p[2] as f64 <= z1 + tol && p[2] as f64 >= z0 - tol, "z={} outside [{z0},{z1}] — the block bug", p[2]);
+            assert!(p[1] as f64 <= dist as f64 + tol && p[1] as f64 >= -tol, "y={} outside [0,{dist}]", p[1]);
         }
     }
 }

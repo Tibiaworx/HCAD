@@ -1,0 +1,144 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (4),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 10.300506591787663,
+                            y: -7.451744079581647,
+                            fixed: false,
+                        ),
+                        (
+                            x: 30.300506591807387,
+                            y: -7.451744079584288,
+                            fixed: false,
+                        ),
+                        (
+                            x: 30.300506591811907,
+                            y: -27.451744079596413,
+                            fixed: false,
+                        ),
+                        (
+                            x: 10.300506591783144,
+                            y: -27.451744079599052,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Line(
+                            a: 1,
+                            b: 2,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 2,
+                            b: 3,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 3,
+                            b: 4,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 4,
+                            b: 1,
+                            construction: false,
+                            reference: false,
+                        ),
+                    ],
+                    constraints: [
+                        Horizontal(1, 2),
+                        Horizontal(4, 3),
+                        Vertical(2, 3),
+                        Vertical(1, 4),
+                        Distance(
+                            a: 2,
+                            b: 3,
+                            value: 20.0,
+                            offset: 6.9806976318359375,
+                            axis: Aligned,
+                        ),
+                        Equal(2, 3, 1, 2),
+                    ],
+                ),
+                regions: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 10.874906539916992,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+        (
+            id: (5),
+            kind: Fillet(
+                radius: 4.893707752227783,
+                edges: [
+                    [
+                        (30.300506591796875, 10.874906539916992, 27.451744079589844),
+                        (30.300506591796875, 10.874906539916992, 7.451744079589844),
+                        (10.300506591796875, 10.874906539916992, 7.451744079589844),
+                        (10.300506591796875, 10.874906539916992, 27.451744079589844),
+                    ],
+                ],
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 5,
+    next_id: 6,
+)
