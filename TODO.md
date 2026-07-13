@@ -49,3 +49,45 @@ the viewport and the status line counts them.
 **Remaining:** geometric relations (horizontal/parallel/etc.) that conflict have no
 viewport glyph, so they contribute to the count but don't individually show red — only
 dimensions do. A relations list in the panel with per-row red marking would close that.
+
+## Mesh-surgery fillet: corner patch isn't a true sphere
+
+**Symptom.** Filleting a box's top-face perimeter (`saved files/fillererror.hcad`,
+`fillererror2.hcad`): the straight edges round correctly, but the corners where two
+fillets meet look wrong — a flat/pinched patch instead of a smooth continuation of the
+round.
+
+**Root cause.** `corner_centre()` in `bevel.rs` — a correct 3-face inscribed-sphere
+solver — exists but is **never called**. `run_surgery`'s corner-patch step (§3) instead
+fans triangles to the boundary loop's flat *vector average*, which sits inside the true
+rounded volume rather than on its surface (a flat average of points spread around a
+sphere is not itself on that sphere) — hence the pinch.
+
+**Why it's still open (2026-07).** Two attempted fixes both caused real regressions
+(watertightness holes in previously-working cases — whole-cube fillet, an L-prism's
+concave edge, cut-after-bevel):
+1. Matching the boundary onto the analytically-correct corner sphere: the boundary
+   loop's non-apex points don't actually lie on one shared sphere in general — how many
+   "mitred" (off-sphere) points a vertex's boundary contains depends on how many
+   *selected* edges converge there (0 for an all-edges-sharp vertex — never reached; 1 for
+   a corner where exactly 2 selected edges meet a 3rd unselected face; more when 3+ edges
+   are all selected, e.g. a fully-rounded cube). A validation tuned for the 1-outlier case
+   broke on the 3-selected-edge case.
+2. Pushing the flat apex outward along the corner's averaged face normal, plus a
+   subdivided (2-band) dome: also broke the 3-selected-edges case — some generated
+   points collapsed onto each other (duplicate positions → degenerate/non-manifold
+   triangles at the weld step).
+
+Both attempts are reverted; `run_surgery`'s corner patch is back to the original flat
+fan (safe, watertight, just visually pinched at the corner).
+
+**Path to a real fix.** Handle vertex valence explicitly rather than one generic
+formula: classify each corner-patch vertex by how many of its incident edges are
+selected (exactly 2 vs 3+) and build the boundary/dome differently per case, instead of
+assuming a single "N boundary points, at most one mitred" shape. Test against *all* of
+`bevel_cube_is_watertight_and_unsharp`, `bevel_l_prism_with_concave_edge_is_watertight`,
+`cut_after_bevel_reaches_full_depth`, AND the two saved top-rim-fillet files before
+calling it done — any fix must keep every one of those watertight.
+
+**Workaround today.** None needed structurally (the flat-fan corner is watertight and
+correct in extent, just not perfectly round) — cosmetic only.
