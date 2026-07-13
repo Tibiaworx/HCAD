@@ -492,6 +492,74 @@ fn orient_consistently(verts: &[V3], tris: &mut [[usize; 3]]) {
     }
 }
 
+/// Ear-clip triangulate a simple (possibly concave) planar polygon lying in the plane with
+/// normal `n`. Returns vertex-index triples wound the same way as the input loop. Handles the
+/// concave notch a terminal-edge splice cuts into a face (see `run_surgery` step 1). Degenerate
+/// leftovers that can't be clipped fall back to a fan, so the caller always gets a full cover.
+fn ear_clip(pts: &[V3], n: V3) -> Vec<[usize; 3]> {
+    let m = pts.len();
+    if m < 3 {
+        return Vec::new();
+    }
+    // 2D basis in the plane: (u, w, n) right-handed, so a CCW-about-n loop is CCW in (u, w).
+    let seed = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let u = norm(sub(seed, scale(n, dot(seed, n))));
+    let w = cross(n, u);
+    let p2: Vec<[f64; 2]> = pts.iter().map(|&p| [dot(p, u), dot(p, w)]).collect();
+    let x2 = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let mut area2 = 0.0;
+    for i in 0..m {
+        let (a, b) = (p2[i], p2[(i + 1) % m]);
+        area2 += a[0] * b[1] - b[0] * a[1];
+    }
+    // Clip in CCW order regardless of the input's winding; un-flip the output at the end.
+    let flip = area2 < 0.0;
+    let mut idx: Vec<usize> = (0..m).collect();
+    if flip {
+        idx.reverse();
+    }
+    let eps = area2.abs() * 1e-9 + 1e-12;
+    let mut out: Vec<[usize; 3]> = Vec::new();
+    while idx.len() > 3 {
+        let k = idx.len();
+        let mut clipped = false;
+        for i in 0..k {
+            let (ia, ib, ic) = (idx[(i + k - 1) % k], idx[i], idx[(i + 1) % k]);
+            let (a, b, c) = (p2[ia], p2[ib], p2[ic]);
+            if x2(a, b, c) <= eps {
+                continue; // reflex or degenerate corner — not an ear
+            }
+            let contains_other = idx.iter().any(|&j| {
+                j != ia
+                    && j != ib
+                    && j != ic
+                    && x2(a, b, p2[j]) >= -eps
+                    && x2(b, c, p2[j]) >= -eps
+                    && x2(c, a, p2[j]) >= -eps
+            });
+            if contains_other {
+                continue;
+            }
+            out.push([ia, ib, ic]);
+            idx.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            break; // pathological input — close the remainder as a fan below
+        }
+    }
+    for i in 1..idx.len().saturating_sub(1) {
+        out.push([idx[0], idx[i], idx[i + 1]]);
+    }
+    if flip {
+        for t in &mut out {
+            t.swap(1, 2);
+        }
+    }
+    out
+}
+
 /// Direction a model edge is traversed within face `fi`'s CCW boundary loop (so the face
 /// interior is on its left). `None` if the edge isn't on that face's boundary.
 fn loop_dir(topo: &Topo, fi: usize, a: usize, b: usize) -> Option<V3> {
@@ -714,13 +782,96 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
     let mut b = Build::new();
 
-    // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset corner.
+    // 0) Terminal-edge splices. At a vertex where exactly ONE selected edge ends (its other
+    //    incident edges all sharp, all bordering one shared untouched face `fs`), the fillet
+    //    arc's end ring lies entirely IN `fs`'s plane whenever the edge meets that face
+    //    squarely (the overwhelmingly common case — any box edge). The old approach left `fs`
+    //    covering its full original polygon and stretched a separate, coplanar corner-patch
+    //    membrane over the arc↔corner region to close the mesh — topologically watertight but
+    //    geometrically a double-covered sheet (renders as self-clipping at the fillet's ends).
+    //    The right shape: `fs` itself gets the quarter-arc NOTCH cut out of its outline — the
+    //    ring replaces the original corner vertex in its boundary loop — so the region is
+    //    covered exactly once and the fillet strip welds edge-to-edge into the face. This is
+    //    what Blender's bevel does for terminal edges (its faces are rebuilt polygons, so the
+    //    notch falls out naturally there). Non-square meetings (oblique corner: ring not in
+    //    fs's plane) keep the membrane fallback.
+    let mut splices: HashMap<usize, (usize, Vec<V3>)> = HashMap::new(); // vertex → (face, arc ring)
+    for vi in 0..topo.verts.len() {
+        let inc = &topo.vert_edges[vi];
+        let sel: Vec<usize> = inc.iter().copied().filter(|&ei| selected[ei]).collect();
+        if sel.len() != 1 {
+            continue;
+        }
+        let e = &topo.edges[sel[0]];
+        if e.faces.len() != 2 {
+            continue;
+        }
+        let (fa, fb) = (e.faces[0], e.faces[1]);
+        let mut others: Vec<usize> = topo.vert_faces[vi].iter().copied().filter(|&f| f != fa && f != fb).collect();
+        others.sort_unstable();
+        others.dedup();
+        if others.len() != 1 {
+            continue; // not a clean 3-face corner — membrane fallback
+        }
+        let fs = others[0];
+        if topo.faces[fs].loops.len() != 1 {
+            continue; // faces with holes would need bridged triangulation — fallback
+        }
+        if inc.iter().any(|&ei| ei != sel[0] && !topo.edges[ei].faces.contains(&fs)) {
+            continue; // a sharp edge here not bordering fs — not the simple terminal shape
+        }
+        let Some(ring) = edge_end_ring(topo, e, vi, &cpt, r, seg) else { continue };
+        // The whole ring must lie in fs's plane, or the notch wouldn't be flat.
+        let n = topo.faces[fs].normal;
+        let v = verts[vi];
+        let eps = 1e-6 * r.max(1e-6);
+        if ring.iter().any(|&p| dot(sub(p, v), n).abs() > eps) {
+            continue;
+        }
+        splices.insert(vi, (fs, ring));
+    }
+
+    // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset
+    //    corner — except spliced faces, whose boundary loop gets the arc notch cut in and is
+    //    re-triangulated (ear clip; the notch makes the polygon concave).
     for fi in 0..topo.faces.len() {
-        for &ti in &topo.faces[fi].tris {
-            let t = topo.tris[ti];
-            let a = b.v(cpt(t[0], fi));
-            let c = b.v(cpt(t[1], fi));
-            let d = b.v(cpt(t[2], fi));
+        let f = &topo.faces[fi];
+        let has_splice = f.loops.len() == 1
+            && f.loops[0].iter().any(|w| splices.get(w).is_some_and(|(sf, _)| *sf == fi));
+        if !has_splice {
+            for &ti in &f.tris {
+                let t = topo.tris[ti];
+                let a = b.v(cpt(t[0], fi));
+                let c = b.v(cpt(t[1], fi));
+                let d = b.v(cpt(t[2], fi));
+                b.tri(a, c, d);
+            }
+            continue;
+        }
+        let lp = &f.loops[0];
+        let m = lp.len();
+        let mut poly: Vec<V3> = Vec::new();
+        for i in 0..m {
+            let wv = lp[i];
+            match splices.get(&wv) {
+                Some((sf, ring)) if *sf == fi => {
+                    // Orient the ring so it continues from the loop's incoming edge.
+                    let prev = verts[lp[(i + m - 1) % m]];
+                    let d_first = pt_seg_dist2(ring[0], prev, verts[wv]);
+                    let d_last = pt_seg_dist2(ring[ring.len() - 1], prev, verts[wv]);
+                    if d_first <= d_last {
+                        poly.extend(ring.iter().copied());
+                    } else {
+                        poly.extend(ring.iter().rev().copied());
+                    }
+                }
+                _ => poly.push(cpt(wv, fi)),
+            }
+        }
+        for t in ear_clip(&poly, f.normal) {
+            let a = b.v(poly[t[0]]);
+            let c = b.v(poly[t[1]]);
+            let d = b.v(poly[t[2]]);
             b.tri(a, c, d);
         }
     }
@@ -772,8 +923,24 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
             continue;
         }
         let (f1, f2) = (e.faces[0], e.faces[1]);
-        let r0 = [cpt(e.a, f1), cpt(e.a, f2)];
-        let r1 = [cpt(e.b, f1), cpt(e.b, f2)];
+        // At a spliced end, the spliced face's rebuilt outline already runs through the
+        // touched face's corner exactly, so both sides agree there — collapse that end to
+        // the touched face's corner instead of bridging a gap that no longer exists.
+        let end_ring = |vi: usize| -> [V3; 2] {
+            if let Some((sf, _)) = splices.get(&vi) {
+                if *sf == f1 {
+                    let p = cpt(vi, f2);
+                    return [p, p];
+                }
+                if *sf == f2 {
+                    let p = cpt(vi, f1);
+                    return [p, p];
+                }
+            }
+            [cpt(vi, f1), cpt(vi, f2)]
+        };
+        let r0 = end_ring(e.a);
+        let r1 = end_ring(e.b);
         let gap = |p: V3, q: V3| dot(sub(p, q), sub(p, q)) > 1e-14;
         if !gap(r0[0], r0[1]) && !gap(r1[0], r1[1]) {
             continue; // both ends already agree — the ordinary case, nothing to add
@@ -791,6 +958,9 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
         let inc = &topo.vert_edges[vi];
         if !inc.iter().any(|&ei| selected[ei]) {
             continue; // wholly sharp vertex: untouched
+        }
+        if splices.contains_key(&vi) {
+            continue; // terminal-edge splice: the notched face already covers this corner
         }
         let mut arcs: Vec<(usize, usize, Vec<V3>)> = Vec::new();
         for &ei in inc {
@@ -1493,11 +1663,40 @@ mod tests {
             edges.push(vec![[cx, 0.0, cz], [cx, dist, cz]]);
         }
         assert_eq!(edges.len(), 12, "sanity: a box has 12 edges");
+        let box_vol = (x1 - x0) * (z1 - z0) * dist;
         for chain in &edges {
             let picked = vec![chain.clone()];
             let beveled = bevel_mesh_selected(&mesh, r, seg, &picked);
             assert!(beveled.is_some(), "single-edge fillet declined surgery for {chain:?}");
-            assert!(is_watertight(&beveled.unwrap()), "single-edge fillet result not watertight for {chain:?}");
+            let beveled = beveled.unwrap();
+            assert!(is_watertight(&beveled), "single-edge fillet result not watertight for {chain:?}");
+
+            // The filleted edge's two END CORNERS must be gone from the mesh: the untouched
+            // side face at each end gets the quarter-arc NOTCH spliced into its outline
+            // (replacing that corner), so nothing references the original corner any more.
+            // The old membrane approach kept the corner AND laid a coplanar patch over the
+            // same region — topologically closed but visibly self-clipping at the ends.
+            for end in [&chain[0], &chain[chain.len() - 1]] {
+                let stale = beveled.positions.iter().any(|p| {
+                    (p[0] as f64 - end[0]).abs() < 1e-6
+                        && (p[1] as f64 - end[1]).abs() < 1e-6
+                        && (p[2] as f64 - end[2]).abs() < 1e-6
+                });
+                assert!(!stale, "original corner {end:?} still present — the coplanar double-cover is back");
+            }
+
+            // Volume: exactly a quarter-round groove removed along the full edge length
+            // (the polygonal arc under-fills the true circle slightly; 2% covers it).
+            let edge_len = {
+                let (a, b) = (chain[0], chain[chain.len() - 1]);
+                dot(sub(b, a), sub(b, a)).sqrt()
+            };
+            let removed = (1.0 - std::f64::consts::PI / 4.0) * r * r * edge_len;
+            let vol = mesh_volume(&beveled);
+            assert!(
+                (vol - (box_vol - removed)).abs() < removed * 0.05,
+                "volume {vol:.2} should be box {box_vol:.2} minus groove {removed:.2} for {chain:?}"
+            );
         }
     }
 
