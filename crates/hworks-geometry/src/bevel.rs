@@ -816,14 +816,47 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
         if n < 3 {
             continue;
         }
-        let mut cen = [0.0; 3];
-        for p in &boundary {
-            cen = add(cen, *p);
-        }
-        let apex = b.v(scale(cen, 1.0 / n as f64));
-        let ring: Vec<usize> = boundary.iter().map(|&p| b.v(p)).collect();
-        for i in 0..n {
-            b.tri(ring[i], ring[(i + 1) % n], apex);
+
+        // Prefer fanning from a genuine point already ON the boundary — specifically
+        // the one point *shared* between this vertex's two rounded (selected-edge)
+        // arcs, when there are exactly two — rather than the whole loop's flat vector
+        // average. The average is dragged inward by every arc simultaneously (a point
+        // spread around a curved boundary averages to somewhere *inside* the volume
+        // that boundary bounds), which is exactly the reported "corners aren't clipped
+        // right": a visibly pinched, flat patch instead of a rounded one. A point that
+        // is already part of a real rounded arc has no such problem — it's already on
+        // the correct surface. This is a conservative, low-risk fix (Blender's own
+        // bevel handles this exact "two rounded edges meeting through a straight/sharp
+        // run" case specially too — see TODO.md): it changes *which* vertex is used as
+        // the fan's centre, never invents a new position, so it can't introduce a new
+        // degenerate/duplicate vertex the way earlier fuller attempts did.
+        let full_arcs: Vec<usize> = (0..arcs.len()).filter(|&i| arcs[i].2.len() > 2).collect();
+        let shared_apex = (full_arcs.len() == 2).then(|| (arcs[full_arcs[0]].0, arcs[full_arcs[0]].1, arcs[full_arcs[1]].0, arcs[full_arcs[1]].1)).and_then(|(a0, a1, b0, b1)| {
+            let shared_face = if a0 == b0 || a0 == b1 { a0 } else if a1 == b0 || a1 == b1 { a1 } else { return None };
+            let target = cpt(vi, shared_face);
+            boundary.iter().position(|&p| dot(sub(p, target), sub(p, target)) < 1e-14)
+        });
+
+        match shared_apex {
+            Some(m) => {
+                let ring: Vec<usize> = boundary.iter().map(|&p| b.v(p)).collect();
+                for step in 1..n - 1 {
+                    let i = (m + step) % n;
+                    let j = (m + step + 1) % n;
+                    b.tri(ring[m], ring[i], ring[j]);
+                }
+            }
+            None => {
+                let mut cen = [0.0; 3];
+                for p in &boundary {
+                    cen = add(cen, *p);
+                }
+                let apex = b.v(scale(cen, 1.0 / n as f64));
+                let ring: Vec<usize> = boundary.iter().map(|&p| b.v(p)).collect();
+                for i in 0..n {
+                    b.tri(ring[i], ring[(i + 1) % n], apex);
+                }
+            }
         }
     }
 
@@ -1325,6 +1358,67 @@ mod tests {
             assert!(p[0] as f64 <= x1 + tol && p[0] as f64 >= x0 - tol, "x={} outside [{x0},{x1}]", p[0]);
             assert!(p[2] as f64 <= z1 + tol && p[2] as f64 >= z0 - tol, "z={} outside [{z0},{z1}] — the block bug", p[2]);
             assert!(p[1] as f64 <= dist as f64 + tol && p[1] as f64 >= -tol, "y={} outside [0,{dist}]", p[1]);
+        }
+    }
+
+    #[test]
+    fn weld_corner_fans_from_a_real_arc_point_not_a_synthetic_average() {
+        // Follow-up to the block-bulge fix (fillererror.hcad / fillererror2.hcad):
+        // straight edges rounded correctly, but the corners where two fillets meet
+        // read as pinched/flat ("not clipped right"). Root cause: the corner patch
+        // fanned to the boundary loop's flat *vector average*, a synthetic point
+        // pulled inside the true rounded volume (a point spread around a curved
+        // boundary averages to somewhere inside what it bounds) — matching
+        // Blender's bevel design (bmesh_bevel.cc), a vertex where exactly two
+        // rounded edges meet (with only sharp edges between them) needs NO new
+        // interior point at all; fan from the real point they share instead. This
+        // means the corner-patch geometry must use ONLY positions that already
+        // exist on one of the two edges' own arcs — no extra, pulled-in vertex.
+        let (x0, x1) = (10.300506591787663, 30.300506591807387);
+        let (z0, z1) = (7.451744079581647, 27.451744079596413);
+        let outer = [[x0, -z0], [x1, -z0], [x1, -z1], [x0, -z1]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] };
+        let dist = 10.874906539916992;
+        let mesh = crate::extrude_tool_mesh(&outer, &[], &basis, 0.0, dist).unwrap();
+        let radius = 4.893707752227783;
+        let top_rim = vec![vec![[x1, dist, z1], [x1, dist, z0], [x0, dist, z0], [x0, dist, z1]]];
+        let seg = 12;
+
+        // Independently recompute the exact set of points the two rounded edges at
+        // the (x1, dist, z1) corner are allowed to produce, using the same
+        // lower-level machinery the fix itself uses.
+        let (topo, selected, corner) = bevel_prep(&mesh, radius, &top_rim).expect("prep succeeds");
+        let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(topo.verts[vi]) };
+        let vi = topo
+            .verts
+            .iter()
+            .position(|&v| (v[0] - x1).abs() < 1e-6 && (v[1] - dist).abs() < 1e-6 && (v[2] - z1).abs() < 1e-6)
+            .expect("corner vertex exists");
+        let mut allowed: Vec<V3> = Vec::new();
+        for &ei in &topo.vert_edges[vi] {
+            let e = &topo.edges[ei];
+            if selected[ei] {
+                if let Some(ring) = edge_end_ring(&topo, e, vi, &cpt, radius, seg) {
+                    allowed.extend(ring);
+                }
+            } else {
+                allowed.push(cpt(vi, e.faces[0]));
+                allowed.push(cpt(vi, e.faces[1]));
+            }
+        }
+
+        let beveled = bevel_mesh_selected(&mesh, radius, seg, &top_rim).expect("top-rim fillet builds");
+        let near_corner: Vec<[f32; 3]> = beveled
+            .positions
+            .iter()
+            .copied()
+            .filter(|p| (p[0] as f64 - x1).abs() < radius && (p[1] as f64 - dist).abs() < radius && (p[2] as f64 - z1).abs() < radius)
+            .collect();
+        assert!(near_corner.len() > 4, "expected several corner-area vertices, found {}", near_corner.len());
+        for p in &near_corner {
+            let pd = [p[0] as f64, p[1] as f64, p[2] as f64];
+            let closest = allowed.iter().map(|&a| dot(sub(a, pd), sub(a, pd))).fold(f64::INFINITY, f64::min).sqrt();
+            assert!(closest < 1.0e-4, "corner-area vertex {pd:?} isn't one of the two edges' own arc points (closest match {closest:.4} away) — a synthetic averaged vertex is back");
         }
     }
 }
