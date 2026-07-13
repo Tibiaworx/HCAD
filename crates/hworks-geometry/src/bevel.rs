@@ -378,6 +378,52 @@ fn corner_centre(v: V3, na: V3, nb: V3, nc: V3, r: f64, sign: f64) -> Option<V3>
     Some(add(v, x))
 }
 
+/// Fill a spherical-triangle corner boundary (all `boundary` points lying on the sphere of
+/// radius `rad` centred at `center`) with a smooth dome: concentric rings slerped from the
+/// boundary toward a pole on the sphere, capped by a fan. Every generated point lies *exactly*
+/// on the sphere, so the corner reads as a true sphere cap — Blender's `tri_corner` /
+/// `snap_to_superellipsoid` case for the circular profile (a pure radial projection). The
+/// outermost ring IS the passed boundary, so it welds to the adjoining edge strips by position
+/// identity — no cracks. Emits into `b`; winding is fixed globally by `Build::finish`, so
+/// triangle order here is free.
+fn emit_sphere_dome(b: &mut Build, boundary: &[V3], center: V3, rad: f64, bands: usize) {
+    let n = boundary.len();
+    let dirs: Vec<V3> = boundary.iter().map(|&p| norm(sub(p, center))).collect();
+    // Pole = the sphere point in the mean boundary direction (the dome's apex, inside the
+    // spherical triangle since it spans well under a hemisphere).
+    let mut pole_dir = [0.0; 3];
+    for &d in &dirs {
+        pole_dir = add(pole_dir, d);
+    }
+    pole_dir = norm(pole_dir);
+    let on_sphere = |d: V3| add(center, scale(d, rad));
+
+    // ring[0] = the boundary itself (shared with the edge strips); ring[k] slerps each
+    // boundary direction a fraction k/bands toward the pole, staying on the sphere.
+    let mut rings: Vec<Vec<usize>> = Vec::with_capacity(bands.max(1));
+    rings.push(boundary.iter().map(|&p| b.v(p)).collect());
+    for k in 1..bands {
+        let t = k as f64 / bands as f64;
+        rings.push(dirs.iter().map(|&d| b.v(on_sphere(slerp(d, pole_dir, t)))).collect());
+    }
+    // Quad strips between consecutive concentric rings.
+    for k in 0..rings.len() - 1 {
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (a0, a1) = (rings[k][i], rings[k][j]);
+            let (b0, b1) = (rings[k + 1][i], rings[k + 1][j]);
+            b.tri(a0, a1, b1);
+            b.tri(a0, b1, b0);
+        }
+    }
+    // Cap the innermost ring with a fan to the single pole vertex.
+    let pole = b.v(on_sphere(pole_dir));
+    let inner = rings.last().unwrap();
+    for i in 0..n {
+        b.tri(inner[i], inner[(i + 1) % n], pole);
+    }
+}
+
 /// Output-mesh accumulator: collects raw triangles, then welds + orients into a `TriMesh`.
 struct Build {
     pos: Vec<V3>,
@@ -1080,6 +1126,49 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
             continue;
         }
 
+        // Domed corner (Blender's tri_corner idea, adapted): a clean 3-face corner where ALL
+        // incident edges are rounded (boundary is three arcs, no sharp-edge corner points).
+        // The flat-centroid fan below drops its apex to the boundary's vector *average*, which
+        // sits well inside the rounded volume — the visible "pinch". Instead dome it: the
+        // corner's symmetry centre is the inscribed-sphere centre (equidistant from the three
+        // faces), and pushing the interior out onto a sphere through the boundary's mean
+        // distance gives a smoothly bulging cap that welds to the three edge arcs at its rim.
+        // (Not a *perfect* rolling-ball octant — the edge arcs trace their own cylinders and
+        // bulge slightly off any single corner sphere; a true octant needs the strips to stop
+        // short of the vertex, a larger rework — but strictly rounder than the flat fan, and
+        // watertight by construction since only the boundary ring is shared.)
+        let all_rounded = arcs.iter().all(|(_, _, p)| p.len() > 2);
+        let dome = (all_rounded && topo.vert_faces[vi].len() == 3)
+            .then(|| {
+                let fs = &topo.vert_faces[vi];
+                let (n1, n2, n3) = (topo.faces[fs[0]].normal, topo.faces[fs[1]].normal, topo.faces[fs[2]].normal);
+                // Prefer the sign whose centre sits on the *interior* side (nearer the boundary
+                // centroid than the raw vertex is) — convex vs concave corner.
+                let mut bc = [0.0; 3];
+                for p in &boundary {
+                    bc = add(bc, *p);
+                }
+                bc = scale(bc, 1.0 / boundary.len() as f64);
+                [-1.0_f64, 1.0]
+                    .into_iter()
+                    .filter_map(|sign| corner_centre(verts[vi], n1, n2, n3, r, sign))
+                    .map(|c| {
+                        let rad = boundary.iter().map(|&p| dot(sub(p, c), sub(p, c)).sqrt()).sum::<f64>() / boundary.len() as f64;
+                        (c, rad, dot(sub(bc, c), sub(bc, c)))
+                    })
+                    // The correct centre is the one the boundary is centred ON (the sphere the
+                    // cap wraps around): the nearer centre→boundary-centroid. Its opposite-sign
+                    // twin sits far on the other side of the part and would fling the pole out.
+                    .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+                    .filter(|&(_, rad, _)| rad > 1e-6)
+                    .map(|(c, rad, _)| (c, rad))
+            })
+            .flatten();
+        if let Some((center, rad)) = dome {
+            emit_sphere_dome(&mut b, &boundary, center, rad, (seg / 2).max(1));
+            continue;
+        }
+
         // Prefer fanning from a genuine point already ON the boundary — specifically
         // the one point *shared* between this vertex's two rounded (selected-edge)
         // arcs, when there are exactly two — rather than the whole loop's flat vector
@@ -1298,6 +1387,40 @@ mod tests {
                 .fold(f64::INFINITY, f64::min);
             assert!(min_d > 0.2, "corner {corner:?} should be rounded away (min dist {min_d})");
         }
+    }
+
+    #[test]
+    fn cube_corner_domes_out_instead_of_pinching_flat() {
+        // A fully-rounded cube: each corner is a 3-edge convex corner. The old flat fan dropped
+        // the corner apex to the boundary's vector *average* — pulled well inside the rounded
+        // volume, the visible pinch. The dome (Blender's tri_corner idea) pushes the corner
+        // interior out onto a cap wrapping the corner's symmetry centre (r,r,r). Concretely:
+        // every corner-area vertex must stay at least ~r from that centre — the three inset
+        // face corners sit at exactly r, the edge arcs bulge past it, and the domed interior
+        // rides out on the fitted cap; only a collapsed flat fan puts a vertex nearer (its
+        // apex sat at ~0.8·r from the centre).
+        let side = 8.0;
+        let sq = [[0.0, 0.0], [side, 0.0], [side, side], [0.0, side]];
+        let cube = extrude_tool_mesh(&sq, &[], &xy(), 0.0, side).unwrap();
+        let r = 1.5;
+        let seg = 8;
+        let rounded = bevel_mesh(&cube, r, seg).expect("cube bevels");
+        assert!(is_watertight(&rounded));
+
+        let center = [r, r, r];
+        let corner_dists: Vec<f64> = rounded
+            .positions
+            .iter()
+            // Genuinely in the origin corner's octant and inset off every flat face.
+            .filter(|p| (0..3).all(|k| (p[k] as f64) < r + 1e-4) && (0..3).all(|k| (p[k] as f64) > 1e-4))
+            .map(|p| {
+                let d = [p[0] as f64 - center[0], p[1] as f64 - center[1], p[2] as f64 - center[2]];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            })
+            .collect();
+        assert!(corner_dists.len() > 6, "expected a dome of corner vertices, found {}", corner_dists.len());
+        let min_d = corner_dists.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(min_d > r * 0.9, "corner vertices should ride out on the cap (min dist {min_d:.3} from centre, r={r}) — a flat fan collapses the apex to ~0.8·r");
     }
 
     #[test]
