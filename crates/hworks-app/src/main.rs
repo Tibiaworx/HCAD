@@ -15093,18 +15093,12 @@ mod tests {
         assert!(lo[2] >= z0 as f32 - tol && hi[2] <= z1 as f32 + tol, "z out of [{z0},{z1}] — the block bug: {lo:?}..{hi:?}");
     }
 
-    #[test]
-    fn single_edge_fillet_through_the_real_regen_pipeline() {
-        // saved files/fillererror3.hcad, replayed through the actual document/regen path — a
-        // small box (5.7 x 3.6 x 2.9 mm), ONE top edge filleted at r=1.3064mm (the exact
-        // screenshot: "Edges to fillet (1)"). This always declined the surgery bevel path
-        // (silently falling back to a CSG round that produced a self-intersecting "bowtie"
-        // through the whole box) — see bevel.rs's single_edge_fillet_* tests for the root
-        // cause and fix (a sharp edge leading from a moved corner to an untouched face had two
-        // different endpoint positions depending which face you asked — a real crack the
-        // corner patch alone never propagated along). The saved file itself has no Fillet
-        // feature (it was saved mid-PropertyManager, before OK), so it's added here to match
-        // the screenshot exactly.
+    /// The fillererror3.hcad box replayed through the real regen path, filleted with the
+    /// given picked chains, then checked: manifold, in-bounds, and — the wing/bowtie class
+    /// of bug — no vertex still at any of the box's ORIGINAL top corners (a correct fillet
+    /// of any top edge removes the corners it touches; overlapping membrane/fan geometry
+    /// left them in place).
+    fn fillererror3_box_filleted(radius: f64, edges: Vec<Vec<[f64; 3]>>, gone_corners: &[[f64; 3]]) {
         let (x0, x1) = (0.0_f64, 5.708608627319336);
         let (z0, z1) = (0.0_f64, 3.6159682273864746);
         let dist = 2.903108596801758_f64;
@@ -15121,12 +15115,9 @@ mod tests {
 
         let mut doc = Document::with_default_planes();
         doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Fillet { radius, edges });
 
-        let radius = 1.3064;
-        let one_edge = vec![vec![[x0, dist, z0], [x1, dist, z0]]];
-        doc.add_feature(FeatureKind::Fillet { radius, edges: one_edge });
-
-        let (mesh, _tangent_edges) = regenerate_mesh(&doc).expect("mesh regen with a single-edge fillet should produce a body");
+        let (mesh, _tangent_edges) = regenerate_mesh(&doc).expect("mesh regen with a fillet should produce a body");
         assert!(!mesh.positions.is_empty(), "fillet must not empty out the body");
         assert!(hworks_geometry::is_manifold(&mesh), "beveled body must stay a closed, 2-manifold surface");
 
@@ -15139,8 +15130,47 @@ mod tests {
             }
         }
         eprintln!("bbox lo={lo:?} hi={hi:?}  (box was x[{x0},{x1}] y[0,{dist}] z[{z0},{z1}])");
-        assert!(lo[0] >= x0 as f32 - tol && hi[0] <= x1 as f32 + tol, "x out of [{x0},{x1}]: {lo:?}..{hi:?} — the bowtie bug");
-        assert!(lo[1] >= -tol && hi[1] <= dist as f32 + tol, "y out of [0,{dist}]: {lo:?}..{hi:?} — the bowtie bug");
-        assert!(lo[2] >= z0 as f32 - tol && hi[2] <= z1 as f32 + tol, "z out of [{z0},{z1}]: {lo:?}..{hi:?} — the bowtie bug");
+        assert!(lo[0] >= x0 as f32 - tol && hi[0] <= x1 as f32 + tol, "x out of [{x0},{x1}]: {lo:?}..{hi:?}");
+        assert!(lo[1] >= -tol && hi[1] <= dist as f32 + tol, "y out of [0,{dist}]: {lo:?}..{hi:?}");
+        assert!(lo[2] >= z0 as f32 - tol && hi[2] <= z1 as f32 + tol, "z out of [{z0},{z1}]: {lo:?}..{hi:?}");
+        for c in gone_corners {
+            let stale = mesh.positions.iter().any(|p| {
+                (p[0] as f64 - c[0]).abs() < 1e-5 && (p[1] as f64 - c[1]).abs() < 1e-5 && (p[2] as f64 - c[2]).abs() < 1e-5
+            });
+            assert!(!stale, "original corner {c:?} still present — leftover membrane/fan geometry (the wing artifact)");
+        }
+    }
+
+    #[test]
+    fn single_edge_fillet_through_the_real_regen_pipeline() {
+        // fillererror3's box with ONE top edge filleted (the terminal-splice case): both of
+        // that edge's end corners must be notched away.
+        let (x1, dist) = (5.708608627319336, 2.903108596801758);
+        fillererror3_box_filleted(
+            1.3064,
+            vec![vec![[0.0, dist, 0.0], [x1, dist, 0.0]]],
+            &[[0.0, dist, 0.0], [x1, dist, 0.0]],
+        );
+    }
+
+    #[test]
+    fn top_rim_loop_fillet_through_the_real_regen_pipeline() {
+        // The EXACT committed feature from saved files/fillererror3.hcad: the whole top rim
+        // as one closed picked chain (first point repeated), r≈0.95. Every corner is a WELD
+        // (two rounded edges + one sharp vertical edge), which used to leave "wing" fins —
+        // strips ending on mismatched per-edge arcs, papered over by a fan. All four original
+        // top corners must be gone from the mesh.
+        let (x1, z1, dist) = (5.708608627319336, 3.6159682273864746, 2.903108596801758);
+        fillererror3_box_filleted(
+            0.949999988079071,
+            vec![vec![
+                [x1, dist, z1],
+                [x1, dist, 0.0],
+                [0.0, dist, 0.0],
+                [0.0, dist, z1],
+                [x1, dist, z1],
+            ]],
+            &[[x1, dist, z1], [x1, dist, 0.0], [0.0, dist, 0.0], [0.0, dist, z1]],
+        );
     }
 }

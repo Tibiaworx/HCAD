@@ -12,7 +12,7 @@
 #![allow(dead_code)] // work-in-progress prototype — items wired up in later steps
 
 use crate::TriMesh;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 type V3 = [f64; 3];
 
@@ -831,6 +831,54 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
         splices.insert(vi, (fs, ring));
     }
 
+    // 0.5) Weld corners — Blender's M_NONE case: exactly TWO selected edges meet at this
+    //    vertex, and their end rings are pinned to the same two mitred face corners (the
+    //    shared face's corner and the far point where the other two faces meet). Each ring's
+    //    INTERIOR points sit on its own edge's cylinder cross-section, and the two cylinders
+    //    disagree in between — so ending each strip on its own ring leaves a twisted gap that
+    //    a fanned patch can only paper over (the "wing" fins reported against
+    //    fillererror3.hcad's top-rim fillet). Blender's answer: no corner geometry at all —
+    //    blend the two rings point-by-point (mid_v3_v3v3 in bmesh_bevel.cc) and terminate
+    //    BOTH strips on the single shared blended arc. Bit-identical shared points ⇒ the two
+    //    strips join seamlessly around the corner; the corner patch is skipped entirely.
+    let mut ring_override: HashMap<(usize, usize), Vec<V3>> = HashMap::new(); // (edge, vertex) → ring
+    let mut welded: HashSet<usize> = HashSet::new();
+    for vi in 0..topo.verts.len() {
+        if splices.contains_key(&vi) {
+            continue;
+        }
+        let sel: Vec<usize> = topo.vert_edges[vi].iter().copied().filter(|&ei| selected[ei]).collect();
+        if sel.len() != 2 {
+            continue;
+        }
+        let (e1, e2) = (&topo.edges[sel[0]], &topo.edges[sel[1]]);
+        let (Some(r1), Some(r2)) = (
+            edge_end_ring(topo, e1, vi, &cpt, r, seg),
+            edge_end_ring(topo, e2, vi, &cpt, r, seg),
+        ) else {
+            continue;
+        };
+        let d2 = |p: V3, q: V3| dot(sub(p, q), sub(p, q));
+        // Orient ring 2 to run the same way as ring 1, then require both endpoints to
+        // genuinely coincide (they're the same mitred corners, computed from the same
+        // offset intersections — anything else isn't a weldable corner; fall back).
+        let flipped = d2(r2[0], r1[0]) > d2(r2[r2.len() - 1], r1[0]);
+        let r2o: Vec<V3> = if flipped { r2.iter().rev().copied().collect() } else { r2.clone() };
+        let tol2 = (1.0e-6 * (1.0 + r)).powi(2);
+        if d2(r2o[0], r1[0]) > tol2 || d2(r2o[r2o.len() - 1], r1[r1.len() - 1]) > tol2 {
+            continue;
+        }
+        let blended: Vec<V3> = r1.iter().zip(&r2o).map(|(&p, &q)| scale(add(p, q), 0.5)).collect();
+        // Store each edge's override in that edge's OWN ring orientation (edge 2 saw the
+        // blend through its possibly-reversed lens), or its strip would twist.
+        ring_override.insert((sel[0], vi), blended.clone());
+        ring_override.insert(
+            (sel[1], vi),
+            if flipped { blended.iter().rev().copied().collect() } else { blended },
+        );
+        welded.insert(vi);
+    }
+
     // 1) Flat faces: reuse the original triangulation with each vertex moved to its inset
     //    corner — except spliced faces, whose boundary loop gets the arc notch cut in and is
     //    re-triangulated (ear clip; the notch makes the polygon concave).
@@ -876,16 +924,24 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
         }
     }
 
-    // 2) Edge strips: only for selected edges. Connect the end ring at v0 to the end ring at v1.
+    // 2) Edge strips: only for selected edges. Connect the end ring at v0 to the end ring at
+    //    v1 — a welded corner's shared blended arc overrides the edge's own ring there, so
+    //    the two strips meeting at that corner share bit-identical end geometry.
     for (ei, e) in topo.edges.iter().enumerate() {
         if !selected[ei] {
             continue;
         }
-        let r0 = match edge_end_ring(topo, e, e.a, &cpt, r, seg) {
+        let ring_at = |vi: usize| -> Option<Vec<V3>> {
+            if let Some(o) = ring_override.get(&(ei, vi)) {
+                return Some(o.clone());
+            }
+            edge_end_ring(topo, e, vi, &cpt, r, seg)
+        };
+        let r0 = match ring_at(e.a) {
             Some(p) => p,
             None => continue,
         };
-        let r1 = match edge_end_ring(topo, e, e.b, &cpt, r, seg) {
+        let r1 = match ring_at(e.b) {
             Some(p) => p,
             None => continue,
         };
@@ -961,6 +1017,9 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
         }
         if splices.contains_key(&vi) {
             continue; // terminal-edge splice: the notched face already covers this corner
+        }
+        if welded.contains(&vi) {
+            continue; // weld corner: both strips share the blended arc — nothing to patch
         }
         let mut arcs: Vec<(usize, usize, Vec<V3>)> = Vec::new();
         for &ei in inc {
@@ -1566,18 +1625,17 @@ mod tests {
     }
 
     #[test]
-    fn weld_corner_fans_from_a_real_arc_point_not_a_synthetic_average() {
-        // Follow-up to the block-bulge fix (fillererror.hcad / fillererror2.hcad):
-        // straight edges rounded correctly, but the corners where two fillets meet
-        // read as pinched/flat ("not clipped right"). Root cause: the corner patch
-        // fanned to the boundary loop's flat *vector average*, a synthetic point
-        // pulled inside the true rounded volume (a point spread around a curved
-        // boundary averages to somewhere inside what it bounds) — matching
-        // Blender's bevel design (bmesh_bevel.cc), a vertex where exactly two
-        // rounded edges meet (with only sharp edges between them) needs NO new
-        // interior point at all; fan from the real point they share instead. This
-        // means the corner-patch geometry must use ONLY positions that already
-        // exist on one of the two edges' own arcs — no extra, pulled-in vertex.
+    fn weld_corner_uses_the_blended_shared_profile() {
+        // A corner where exactly two rounded edges meet (a box's top-rim fillet —
+        // fillererror.hcad / fillererror2 / fillererror3 loop-picks) is Blender's M_NONE
+        // "weld" case: each edge's own end ring sits on its own cylinder's cross-section,
+        // and the two cross-sections DISAGREE between the shared mitred endpoints — so
+        // terminating each strip on its own ring leaves a twisted gap that a fanned patch
+        // could only paper over (the reported "wing" fins). The correct construction
+        // (bmesh_bevel.cc, mid_v3_v3v3) terminates BOTH strips on the single point-by-point
+        // BLEND of the two rings, with no corner patch at all. So: every mesh vertex near
+        // the corner must lie on {the blended arc} ∪ {the two strips' own geometry},
+        // and the fanned patch's old apex points must not exist.
         let (x0, x1) = (10.300506591787663, 30.300506591807387);
         let (z0, z1) = (7.451744079581647, 27.451744079596413);
         let outer = [[x0, -z0], [x1, -z0], [x1, -z1], [x0, -z1]];
@@ -1588,9 +1646,10 @@ mod tests {
         let top_rim = vec![vec![[x1, dist, z1], [x1, dist, z0], [x0, dist, z0], [x0, dist, z1]]];
         let seg = 12;
 
-        // Independently recompute the exact set of points the two rounded edges at
-        // the (x1, dist, z1) corner are allowed to produce, using the same
-        // lower-level machinery the fix itself uses.
+        // Independently recompute the allowed positions at the (x1, dist, z1) corner with
+        // the same low-level machinery: the two edges' own rings (strip interior columns
+        // still use them away from the corner), their point-by-point blend (the shared
+        // terminal arc), and the sharp vertical edge's corners.
         let (topo, selected, corner) = bevel_prep(&mesh, radius, &top_rim).expect("prep succeeds");
         let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(topo.verts[vi]) };
         let vi = topo
@@ -1598,17 +1657,28 @@ mod tests {
             .iter()
             .position(|&v| (v[0] - x1).abs() < 1e-6 && (v[1] - dist).abs() < 1e-6 && (v[2] - z1).abs() < 1e-6)
             .expect("corner vertex exists");
+        let mut rings: Vec<Vec<V3>> = Vec::new();
         let mut allowed: Vec<V3> = Vec::new();
         for &ei in &topo.vert_edges[vi] {
             let e = &topo.edges[ei];
             if selected[ei] {
-                if let Some(ring) = edge_end_ring(&topo, e, vi, &cpt, radius, seg) {
-                    allowed.extend(ring);
-                }
+                let ring = edge_end_ring(&topo, e, vi, &cpt, radius, seg).expect("selected edge has a ring");
+                allowed.extend(ring.iter().copied());
+                rings.push(ring);
             } else {
                 allowed.push(cpt(vi, e.faces[0]));
                 allowed.push(cpt(vi, e.faces[1]));
             }
+        }
+        assert_eq!(rings.len(), 2, "a weld corner has exactly two rounded edges");
+        let d2 = |p: V3, q: V3| dot(sub(p, q), sub(p, q));
+        let r2o: Vec<V3> = if d2(rings[1][0], rings[0][0]) <= d2(rings[1][seg], rings[0][0]) {
+            rings[1].clone()
+        } else {
+            rings[1].iter().rev().copied().collect()
+        };
+        for (p, q) in rings[0].iter().zip(&r2o) {
+            allowed.push(scale(add(*p, *q), 0.5)); // the blended shared arc
         }
 
         let beveled = bevel_mesh_selected(&mesh, radius, seg, &top_rim).expect("top-rim fillet builds");
@@ -1622,7 +1692,7 @@ mod tests {
         for p in &near_corner {
             let pd = [p[0] as f64, p[1] as f64, p[2] as f64];
             let closest = allowed.iter().map(|&a| dot(sub(a, pd), sub(a, pd))).fold(f64::INFINITY, f64::min).sqrt();
-            assert!(closest < 1.0e-4, "corner-area vertex {pd:?} isn't one of the two edges' own arc points (closest match {closest:.4} away) — a synthetic averaged vertex is back");
+            assert!(closest < 1.0e-4, "corner-area vertex {pd:?} isn't ring/blend/corner geometry (closest {closest:.4}) — stray corner-patch geometry is back");
         }
     }
 
