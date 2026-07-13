@@ -368,11 +368,13 @@ fn solve3(m0: V3, m1: V3, m2: V3, rhs: V3) -> Option<V3> {
     Some(scale(x, 1.0 / det))
 }
 
-/// The rolling-ball centre for a 3-face convex corner: the point at signed distance `-r` from
-/// each incident face plane (through `v`, outward normal `nf`). It lies on all three incident
-/// edge cylinders' axes, so the corner sphere blends smoothly into each. `None` if degenerate.
-fn corner_centre(v: V3, na: V3, nb: V3, nc: V3, r: f64) -> Option<V3> {
-    let x = solve3(na, nb, nc, [-r, -r, -r])?;
+/// The rolling-ball centre for a 3-face corner: the point at signed distance `sign*r` from each
+/// incident face plane (through `v`, outward normal `nf`) — `sign=-1` for a convex corner (the
+/// sphere sits in the material, inscribed against the outward faces), `sign=+1` for a concave one
+/// (the sphere sits in the open notch). It lies on all three incident edge cylinders' axes, so
+/// the corner sphere blends smoothly into each. `None` if degenerate.
+fn corner_centre(v: V3, na: V3, nb: V3, nc: V3, r: f64, sign: f64) -> Option<V3> {
+    let x = solve3(na, nb, nc, [sign * r, sign * r, sign * r])?;
     Some(add(v, x))
 }
 

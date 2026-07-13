@@ -15040,4 +15040,56 @@ mod tests {
         ];
         assert_eq!(chain_flash_points(&loop_pts, true).len(), 4, "loop quarter points");
     }
+
+    #[test]
+    fn top_rim_fillet_through_the_real_regen_pipeline_stays_in_bounds() {
+        // saved files/fillererror2.hcad, replayed through the actual document/regen path (not a
+        // hand-built mesh) — a box extruded from a datum-plane sketch, then its top-face rim
+        // filleted. Every vertex of the regenerated body must stay within the box's own
+        // pre-fillet bounding box: a fillet only removes material, it can't add any.
+        let (x0, x1) = (0.0_f64, 40.284645080566406);
+        let (z0, z1) = (0.0_f64, 38.863014221191406);
+        let dist = 26.026290893554688_f64;
+        // Matches the saved file's plane exactly: u=+X, v=-Z, normal=+Y (extrudes up the world
+        // Y axis, world z = -py) — NOT the xy() helper (which extrudes along Z).
+        let top = PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: true };
+        let mut s = Sketch::default();
+        let p0 = s.add_point(x0, -z0);
+        let p1 = s.add_point(x1, -z0);
+        let p2 = s.add_point(x1, -z1);
+        let p3 = s.add_point(x0, -z1);
+        s.add_line(p0, p1, false);
+        s.add_line(p1, p2, false);
+        s.add_line(p2, p3, false);
+        s.add_line(p3, p0, false);
+
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
+
+        let radius = 7.78000020980835;
+        let top_rim = vec![vec![
+            [x0, dist, z1], [x1, dist, z1], [x1, dist, z0], [x0, dist, z0],
+        ]];
+        doc.add_feature(FeatureKind::Fillet { radius, edges: top_rim });
+
+        // regenerate() is the EXACT-kernel path, which explicitly skips Fillet ("needs the mesh
+        // kernel") — a document containing one actually renders through regenerate_mesh(), so
+        // that's what must be tested here, or the fillet is silently never applied.
+        let (mesh, _tangent_edges) = regenerate_mesh(&doc).expect("mesh regen with a top-rim fillet should produce a body");
+        assert!(!mesh.positions.is_empty(), "fillet must not empty out the body");
+        assert!(hworks_geometry::is_manifold(&mesh), "beveled body must stay a closed, 2-manifold surface (a failed corner patch leaves a hole)");
+
+        let tol = 1.0e-3_f32;
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &mesh.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        eprintln!("bbox lo={lo:?} hi={hi:?}  (box was x[{x0},{x1}] y[0,{dist}] z[{z0},{z1}])");
+        assert!(lo[0] >= x0 as f32 - tol && hi[0] <= x1 as f32 + tol, "x out of [{x0},{x1}]: {lo:?}..{hi:?}");
+        assert!(lo[1] >= -tol && hi[1] <= dist as f32 + tol, "y out of [0,{dist}]: {lo:?}..{hi:?}");
+        assert!(lo[2] >= z0 as f32 - tol && hi[2] <= z1 as f32 + tol, "z out of [{z0},{z1}] — the block bug: {lo:?}..{hi:?}");
+    }
 }
