@@ -2386,9 +2386,9 @@ fn ui_system(
             }
             ui.label(
                 egui::RichText::new(if n_edges == 0 {
-                    "Click one or more edges on the body to pick which to round."
+                    "Click an edge on the body to pick it — Ctrl+click grabs a whole edge loop."
                 } else {
-                    "Click more edges to add, or a picked edge again to remove."
+                    "Click more edges to add (Ctrl+click for a loop), or a picked edge again to remove."
                 })
                 .weak()
                 .small(),
@@ -2470,7 +2470,7 @@ fn ui_system(
                 ui_state.fillet_edges.remove(i);
                 ui_state.chamfer_shown = None;
             }
-            ui.label(egui::RichText::new("Click edges on the body to bevel them.").weak().small());
+            ui.label(egui::RichText::new("Click edges on the body to bevel them — Ctrl+click grabs a whole edge loop.").weak().small());
             ui.separator();
             let has_edges = !ui_state.fillet_edges.is_empty();
             if commit && !has_edges {
@@ -5781,6 +5781,7 @@ fn hover_body_edge(
     cam_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     part: Res<Part>,
     session: Res<SketchSession>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut ui_state: ResMut<UiState>,
 ) {
     let picking = ui_state.pending_fillet.is_some() || ui_state.pending_chamfer.is_some();
@@ -5790,13 +5791,15 @@ fn hover_body_edge(
         }
         return;
     }
+    // Match the click exactly: plain hover previews the single edge; Ctrl previews the loop.
+    let loop_snap = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let hit = windows
         .single()
         .ok()
         .zip(cam_q.single().ok())
         .and_then(|(w, (cam, gt))| w.cursor_position().map(|c| (c, cam, gt)))
         // Same pools as the click: sharp edges, then a round body's tangent fillet seams.
-        .and_then(|(cursor, cam, gt)| pick_edge_loop_any(&part, cam, gt, cursor, EDGE_PICK_PX));
+        .and_then(|(cursor, cam, gt)| pick_edge_loop_any(&part, cam, gt, cursor, EDGE_PICK_PX, loop_snap));
     ui_state.hover_edge_loop = hit;
 }
 
@@ -5806,6 +5809,7 @@ fn hover_body_edge(
 
 fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     blocking: Res<UiBlocking>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
@@ -5844,11 +5848,13 @@ fn sketch_interaction(
         && buttons.just_pressed(MouseButton::Left)
     {
         if let Some(cursor) = window.cursor_position() {
-            // Loop-snap: one click on a face-perimeter edge grabs the whole closed loop, so
-            // the bevel gets a complete corner-closed set (and rounds the full rim at once).
-            // Both pools are pickable here — sharp corners AND the tangent seams a previous
-            // fillet left on a round body (so a rounded edge can be rounded again).
-            if let Some((chain, closed)) = pick_edge_loop_any(&part, camera, cam_gt, cursor, EDGE_PICK_PX) {
+            // A plain click picks the SINGLE edge under the cursor (the smooth chain,
+            // stopping at sharp corners) — Ctrl+click loop-snaps to the whole closed
+            // planar loop (a face's perimeter in one click, for rounding a full rim).
+            // Both pools are pickable here — sharp corners AND the tangent seams a
+            // previous fillet left on a round body (so a rounded edge can round again).
+            let loop_snap = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+            if let Some((chain, closed)) = pick_edge_loop_any(&part, camera, cam_gt, cursor, EDGE_PICK_PX, loop_snap) {
                 toggle_fillet_edge(&mut ui_state, &chain, closed);
                 edge_sel.set(chain, closed);
             }
@@ -6508,7 +6514,9 @@ fn sketch_interaction(
             // so clicking the open part of a face still enters sketch mode below.
             if !part.edges.is_empty() || !part.seam_edges.is_empty() || !part.tangent_edges.is_empty() {
                 if let Some(cursor) = window.cursor_position() {
-                    if let Some((chain, closed)) = pick_edge_loop_any(&part, camera, cam_gt, cursor, EDGE_PICK_PX) {
+                    // View-mode edge selection keeps the loop-snap (grabbing a whole rim in
+                    // one click is what you want when inspecting / measuring a feature).
+                    if let Some((chain, closed)) = pick_edge_loop_any(&part, camera, cam_gt, cursor, EDGE_PICK_PX, true) {
                         edge_sel.set(chain, closed);
                         return;
                     }
@@ -13678,21 +13686,28 @@ fn pick_face_point(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cu
 /// round body — its boundary meets the walls smoothly, so it's no longer a sharp edge, and without
 /// this fallback a rounded rim could never be picked again for a second fillet/chamfer. The loop
 /// is walked inside whichever pool the hit came from.
+/// Pick the body edge under the cursor from either edge pool (sharp edges first, then a
+/// round body's tangent fillet seams). `loop_snap` chooses the expansion: `true` grabs the
+/// smallest closed planar loop through the clicked edge (a face's whole perimeter in one
+/// click); `false` grabs just the single edge (the maximal smooth chain, stopping at sharp
+/// corners) — SolidWorks-style single-edge picking.
 fn pick_edge_loop_any(
     part: &Part,
     camera: &Camera,
     cam_gt: &GlobalTransform,
     cursor: Vec2,
     thresh: f32,
+    loop_snap: bool,
 ) -> Option<(Vec<Vec3>, bool)> {
+    let expand = if loop_snap { edge_loop } else { edge_chain };
     if let Some(si) = pick_edge(&part.edges, camera, cam_gt, cursor, thresh) {
-        let (chain, closed) = edge_loop(&part.edges, si);
+        let (chain, closed) = expand(&part.edges, si);
         if chain.len() >= 2 {
             return Some((chain, closed));
         }
     }
     let si = pick_edge(&part.seam_edges, camera, cam_gt, cursor, thresh)?;
-    let (chain, closed) = edge_loop(&part.seam_edges, si);
+    let (chain, closed) = expand(&part.seam_edges, si);
     (chain.len() >= 2).then_some((chain, closed))
 }
 
