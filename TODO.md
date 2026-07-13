@@ -94,3 +94,29 @@ natural next target before attempting the fully general case.
 Test against *all* of `bevel_cube_is_watertight_and_unsharp`,
 `bevel_l_prism_with_concave_edge_is_watertight`, `cut_after_bevel_reaches_full_depth`,
 AND the two saved top-rim-fillet files before calling any N≥3 fix done.
+
+## Mesh-surgery fillet: single-edge fillets always failed — fixed
+
+**Symptom.** Filleting just ONE edge of a box (`saved files/fillererror3.hcad`) declined
+the surgery path and silently fell back to CSG, which produced a self-intersecting
+"bowtie" mesh slicing through the whole part. Confirmed (via a clean worktree at commit
+`30ba3ad`) this predates this session entirely — **every** single-edge fillet, on any
+box, at any size, has always hit this.
+
+**Root cause.** A face only insets near a *selected* edge on its own boundary; a face
+untouched by any selected edge is left exactly as it was. So at a vertex where some
+other, possibly distant, selected edge moved a *different* face's own corner, a sharp
+(unselected) edge leading toward the untouched face ends up with two different endpoint
+positions depending which of its two faces you ask — a real crack. The corner patch
+never fixes this: it only runs at the vertex that moved, and never propagates that
+movement along the sharp edge to whichever vertex — possibly far away — doesn't.
+
+**Fixed (2026-07).** For every sharp edge, check whether its two bordering faces' own
+corner positions agree at each endpoint; when they don't, stitch the two faces' corner
+positions together as a trivial one-segment "edge strip" (the same triangle pattern
+already used for rounded edges, just without an arc). When one end already agrees (the
+ordinary case for virtually every untouched edge), that half degenerates to a zero-area
+triangle the mesh builder already filters out; when both ends agree, nothing is emitted.
+No new vertex position is ever introduced. Verified: all 12 single-edge fillets on a test
+box now succeed (was 0/12); `fillererror3.hcad`'s exact geometry builds watertight and
+manifold both directly and through the real `regenerate_mesh` pipeline.
