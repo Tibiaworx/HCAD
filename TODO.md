@@ -50,44 +50,47 @@ the viewport and the status line counts them.
 viewport glyph, so they contribute to the count but don't individually show red — only
 dimensions do. A relations list in the panel with per-row red marking would close that.
 
-## Mesh-surgery fillet: corner patch isn't a true sphere
+## Mesh-surgery fillet: corner patch isn't a true sphere — 2-edge case fixed
 
 **Symptom.** Filleting a box's top-face perimeter (`saved files/fillererror.hcad`,
 `fillererror2.hcad`): the straight edges round correctly, but the corners where two
 fillets meet look wrong — a flat/pinched patch instead of a smooth continuation of the
 round.
 
-**Root cause.** `corner_centre()` in `bevel.rs` — a correct 3-face inscribed-sphere
-solver — exists but is **never called**. `run_surgery`'s corner-patch step (§3) instead
-fans triangles to the boundary loop's flat *vector average*, which sits inside the true
-rounded volume rather than on its surface (a flat average of points spread around a
-sphere is not itself on that sphere) — hence the pinch.
+**Root cause.** `run_surgery`'s corner-patch step fanned triangles to the boundary
+loop's flat *vector average* — a synthetic point pulled inside the true rounded volume
+(an average of points spread around a curve sits inside what the curve bounds) — hence
+the pinch.
 
-**Why it's still open (2026-07).** Two attempted fixes both caused real regressions
-(watertightness holes in previously-working cases — whole-cube fillet, an L-prism's
-concave edge, cut-after-bevel):
-1. Matching the boundary onto the analytically-correct corner sphere: the boundary
-   loop's non-apex points don't actually lie on one shared sphere in general — how many
-   "mitred" (off-sphere) points a vertex's boundary contains depends on how many
-   *selected* edges converge there (0 for an all-edges-sharp vertex — never reached; 1 for
-   a corner where exactly 2 selected edges meet a 3rd unselected face; more when 3+ edges
-   are all selected, e.g. a fully-rounded cube). A validation tuned for the 1-outlier case
-   broke on the 3-selected-edge case.
-2. Pushing the flat apex outward along the corner's averaged face normal, plus a
-   subdivided (2-band) dome: also broke the 3-selected-edges case — some generated
-   points collapsed onto each other (duplicate positions → degenerate/non-manifold
-   triangles at the weld step).
+**Fixed (2026-07) for the 2-edge case** — researched Blender's `bmesh_bevel.cc`
+(`source/blender/bmesh/tools/`) for how it handles this. Key finding: a vertex where
+exactly **two** edges are beveled (any number of sharp/unselected edges may run between
+them) is Blender's `M_NONE` ("weld") case — it needs **no interior corner mesh at all**;
+the two edges' own profiles already share a common point (the far face's corner) and
+that's sufficient. Ported that specifically: when a corner's boundary walk contains
+exactly two rounded (multi-point) arcs, fan from the real, already-computed point they
+share (both arcs' `cpt()` value for that shared face is identical by construction)
+instead of a synthetic average. No new vertex position is ever introduced for this case
+— proven by `weld_corner_fans_from_a_real_arc_point_not_a_synthetic_average`, which
+independently recomputes the two edges' allowed arc points and asserts every
+corner-area mesh vertex matches one exactly.
 
-Both attempts are reverted; `run_surgery`'s corner patch is back to the original flat
-fan (safe, watertight, just visually pinched at the corner).
+**Still open: 3+ edges selected at one vertex** (e.g. a fully-rounded cube corner, or
+any corner where 3+ fillets converge). Two earlier attempts at a general fix (matching
+the boundary onto an analytically-correct corner sphere; pushing the flat apex outward
+plus a subdivided dome) both caused watertightness regressions there — a vertex's
+boundary can contain a variable number of "mitred" (off-sphere) points depending on how
+many edges are selected, and neither attempt modeled that correctly. Both were reverted;
+this case still falls through to the old flat-fan (safe, watertight, just visually
+pinched). Blender's own general answer (`adj_vmesh`, for the true N≥3 case) is a
+Catmull-Clark-style recursive subdivision from a coarse control mesh, snapping the
+boundary onto the true profile curve at each level, with an empirically-tuned
+"fullness" constant positioning the initial interior pole — a substantially bigger port
+than the 2-edge case; Blender also has an *exact* analytic shortcut specifically for 3
+orthogonal edges (`tri_corner_adj_vmesh`, snapping onto a unit sphere octant via
+`corner_centre()`, which already exists in our code and is unused) that would be the
+natural next target before attempting the fully general case.
 
-**Path to a real fix.** Handle vertex valence explicitly rather than one generic
-formula: classify each corner-patch vertex by how many of its incident edges are
-selected (exactly 2 vs 3+) and build the boundary/dome differently per case, instead of
-assuming a single "N boundary points, at most one mitred" shape. Test against *all* of
-`bevel_cube_is_watertight_and_unsharp`, `bevel_l_prism_with_concave_edge_is_watertight`,
-`cut_after_bevel_reaches_full_depth`, AND the two saved top-rim-fillet files before
-calling it done — any fix must keep every one of those watertight.
-
-**Workaround today.** None needed structurally (the flat-fan corner is watertight and
-correct in extent, just not perfectly round) — cosmetic only.
+Test against *all* of `bevel_cube_is_watertight_and_unsharp`,
+`bevel_l_prism_with_concave_edge_is_watertight`, `cut_after_bevel_reaches_full_depth`,
+AND the two saved top-rim-fillet files before calling any N≥3 fix done.
