@@ -1,0 +1,121 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                        (
+                            x: 5.708608627319336,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                        (
+                            x: 5.708608627319336,
+                            y: -3.6159682273864746,
+                            fixed: false,
+                        ),
+                        (
+                            x: 0.0,
+                            y: -3.6159682273864746,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Line(
+                            a: 1,
+                            b: 2,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 2,
+                            b: 3,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 3,
+                            b: 4,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 4,
+                            b: 1,
+                            construction: false,
+                            reference: false,
+                        ),
+                    ],
+                    constraints: [
+                        Horizontal(1, 2),
+                        Horizontal(4, 3),
+                        Vertical(2, 3),
+                        Vertical(1, 4),
+                    ],
+                ),
+                regions: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 2.903108596801758,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 4,
+    next_id: 4,
+)

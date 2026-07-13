@@ -750,6 +750,40 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
         }
     }
 
+    // 2.5) Sharp-edge transition wedges: a face only insets near a SELECTED edge on its OWN
+    //    boundary — a face with none gets left completely alone (`cpt` returns the vertex
+    //    unchanged). So at a vertex where a face's OWN corner *did* move (some OTHER, possibly
+    //    distant, selected edge touches this vertex on a different face) but a SHARP edge here
+    //    leads toward a face that never moved, the two faces sharing that sharp edge disagree
+    //    about where their common corner sits — the sharp edge's own two endpoints are the SAME
+    //    two points from each face's perspective (a==a, b==b), but its "F1 side" and "F2 side"
+    //    positions can differ. That's a real crack, not just a cosmetic seam: this is exactly
+    //    why every single-selected-edge fillet has silently been falling back to CSG (a genuine,
+    //    pre-existing gap the corner patch alone can't close, since patching only ever runs at
+    //    the vertex that moved — never propagates along the untouched edge to whichever vertex,
+    //    possibly far away, doesn't). Close it here: treat the sharp edge as a trivial two-point
+    //    "ring" per endpoint (the two faces' own corner positions) and stitch them exactly like
+    //    a one-segment edge strip — same triangle pattern as step 2, just without any arc, since
+    //    a sharp edge has none. When one end already agrees (the overwhelmingly common case —
+    //    every ordinary untouched edge), that half degenerates to a zero-area triangle and
+    //    `Build::finish` drops it automatically; nothing is emitted when both ends agree.
+    for (ei, e) in topo.edges.iter().enumerate() {
+        if selected[ei] || e.faces.len() != 2 {
+            continue;
+        }
+        let (f1, f2) = (e.faces[0], e.faces[1]);
+        let r0 = [cpt(e.a, f1), cpt(e.a, f2)];
+        let r1 = [cpt(e.b, f1), cpt(e.b, f2)];
+        let gap = |p: V3, q: V3| dot(sub(p, q), sub(p, q)) > 1e-14;
+        if !gap(r0[0], r0[1]) && !gap(r1[0], r1[1]) {
+            continue; // both ends already agree — the ordinary case, nothing to add
+        }
+        let (q0, q1) = (b.v(r0[0]), b.v(r1[0]));
+        let (p0, p1) = (b.v(r0[1]), b.v(r1[1]));
+        b.tri(q0, p0, p1);
+        b.tri(q0, p1, q1);
+    }
+
     // 3) Corner patches: at any vertex touching ≥1 selected edge, chain ALL incident edges into
     //    one boundary loop and fan it. A selected edge contributes its rounded arc; a sharp edge
     //    contributes its two face corners joined through the original vertex (the end-cap).
@@ -1420,5 +1454,66 @@ mod tests {
             let closest = allowed.iter().map(|&a| dot(sub(a, pd), sub(a, pd))).fold(f64::INFINITY, f64::min).sqrt();
             assert!(closest < 1.0e-4, "corner-area vertex {pd:?} isn't one of the two edges' own arc points (closest match {closest:.4} away) — a synthetic averaged vertex is back");
         }
+    }
+
+    #[test]
+    fn single_edge_fillet_succeeds_via_surgery_on_every_box_edge() {
+        // Regression for saved files/fillererror3.hcad: filleting a SINGLE edge of a box
+        // always declined the surgery path (silently falling back to CSG, which produced
+        // a self-intersecting "bowtie" mesh for this exact box+radius) — for every edge, on
+        // any box, at any size, since bevel.rs was first introduced. Root cause: a face
+        // only insets near a SELECTED edge on its own boundary; a face with no selected
+        // edge anywhere on it is left completely alone. So at a vertex where some OTHER,
+        // possibly distant, selected edge moved a DIFFERENT face's corner, a SHARP edge
+        // here leading toward the untouched face has two different endpoint positions
+        // depending which of its two faces you ask — a real crack, not just a seam. The
+        // corner patch alone can't fix this: it only ever runs at the vertex that moved,
+        // never propagates along the untouched sharp edge to its other end. Fixed by
+        // treating every sharp edge with a real gap at either end as a trivial one-segment
+        // "edge strip" (its two faces' own corner positions, no arc) stitched exactly like
+        // a rounded edge's strip — using only already-computed positions, so it can't
+        // introduce a new, badly-placed vertex.
+        let (x0, x1) = (0.0_f64, 40.0);
+        let (z0, z1) = (0.0_f64, 40.0);
+        let dist = 26.0_f64;
+        let outer = [[x0, -z0], [x1, -z0], [x1, -z1], [x0, -z1]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] };
+        let mesh = crate::extrude_tool_mesh(&outer, &[], &basis, 0.0, dist).unwrap();
+        let r = 5.0;
+        let seg = 8;
+
+        let corners = [(x0, z0), (x1, z0), (x1, z1), (x0, z1)];
+        let mut edges: Vec<Vec<[f64; 3]>> = Vec::new();
+        for i in 0..4 {
+            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+            edges.push(vec![[a.0, 0.0, a.1], [b.0, 0.0, b.1]]);
+            edges.push(vec![[a.0, dist, a.1], [b.0, dist, b.1]]);
+        }
+        for &(cx, cz) in &corners {
+            edges.push(vec![[cx, 0.0, cz], [cx, dist, cz]]);
+        }
+        assert_eq!(edges.len(), 12, "sanity: a box has 12 edges");
+        for chain in &edges {
+            let picked = vec![chain.clone()];
+            let beveled = bevel_mesh_selected(&mesh, r, seg, &picked);
+            assert!(beveled.is_some(), "single-edge fillet declined surgery for {chain:?}");
+            assert!(is_watertight(&beveled.unwrap()), "single-edge fillet result not watertight for {chain:?}");
+        }
+    }
+
+    #[test]
+    fn single_edge_fillet_on_fillererror3_box() {
+        // The exact geometry from saved files/fillererror3.hcad.
+        let (x0, x1) = (0.0_f64, 5.708608627319336);
+        let (z0, z1) = (0.0_f64, 3.6159682273864746);
+        let dist = 2.903108596801758_f64;
+        let outer = [[x0, -z0], [x1, -z0], [x1, -z1], [x0, -z1]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0] };
+        let mesh = crate::extrude_tool_mesh(&outer, &[], &basis, 0.0, dist).unwrap();
+        let r = 1.3064;
+        let seg = 8;
+        let picked = vec![vec![[x0, dist, z0], [x1, dist, z0]]];
+        let beveled = bevel_mesh_selected(&mesh, r, seg, &picked).expect("fillererror3's box+radius should surgery-bevel");
+        assert!(is_watertight(&beveled));
     }
 }

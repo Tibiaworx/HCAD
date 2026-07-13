@@ -15092,4 +15092,55 @@ mod tests {
         assert!(lo[1] >= -tol && hi[1] <= dist as f32 + tol, "y out of [0,{dist}]: {lo:?}..{hi:?}");
         assert!(lo[2] >= z0 as f32 - tol && hi[2] <= z1 as f32 + tol, "z out of [{z0},{z1}] — the block bug: {lo:?}..{hi:?}");
     }
+
+    #[test]
+    fn single_edge_fillet_through_the_real_regen_pipeline() {
+        // saved files/fillererror3.hcad, replayed through the actual document/regen path — a
+        // small box (5.7 x 3.6 x 2.9 mm), ONE top edge filleted at r=1.3064mm (the exact
+        // screenshot: "Edges to fillet (1)"). This always declined the surgery bevel path
+        // (silently falling back to a CSG round that produced a self-intersecting "bowtie"
+        // through the whole box) — see bevel.rs's single_edge_fillet_* tests for the root
+        // cause and fix (a sharp edge leading from a moved corner to an untouched face had two
+        // different endpoint positions depending which face you asked — a real crack the
+        // corner patch alone never propagated along). The saved file itself has no Fillet
+        // feature (it was saved mid-PropertyManager, before OK), so it's added here to match
+        // the screenshot exactly.
+        let (x0, x1) = (0.0_f64, 5.708608627319336);
+        let (z0, z1) = (0.0_f64, 3.6159682273864746);
+        let dist = 2.903108596801758_f64;
+        let top = PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: true };
+        let mut s = Sketch::default();
+        let p0 = s.add_point(x0, -z0);
+        let p1 = s.add_point(x1, -z0);
+        let p2 = s.add_point(x1, -z1);
+        let p3 = s.add_point(x0, -z1);
+        s.add_line(p0, p1, false);
+        s.add_line(p1, p2, false);
+        s.add_line(p2, p3, false);
+        s.add_line(p3, p0, false);
+
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
+
+        let radius = 1.3064;
+        let one_edge = vec![vec![[x0, dist, z0], [x1, dist, z0]]];
+        doc.add_feature(FeatureKind::Fillet { radius, edges: one_edge });
+
+        let (mesh, _tangent_edges) = regenerate_mesh(&doc).expect("mesh regen with a single-edge fillet should produce a body");
+        assert!(!mesh.positions.is_empty(), "fillet must not empty out the body");
+        assert!(hworks_geometry::is_manifold(&mesh), "beveled body must stay a closed, 2-manifold surface");
+
+        let tol = 1.0e-3_f32;
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &mesh.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        eprintln!("bbox lo={lo:?} hi={hi:?}  (box was x[{x0},{x1}] y[0,{dist}] z[{z0},{z1}])");
+        assert!(lo[0] >= x0 as f32 - tol && hi[0] <= x1 as f32 + tol, "x out of [{x0},{x1}]: {lo:?}..{hi:?} — the bowtie bug");
+        assert!(lo[1] >= -tol && hi[1] <= dist as f32 + tol, "y out of [0,{dist}]: {lo:?}..{hi:?} — the bowtie bug");
+        assert!(lo[2] >= z0 as f32 - tol && hi[2] <= z1 as f32 + tol, "z out of [{z0},{z1}]: {lo:?}..{hi:?} — the bowtie bug");
+    }
 }
