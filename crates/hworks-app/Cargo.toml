@@ -15,6 +15,7 @@ bevy_egui = "0.39"
 # SVG image loader for egui (the feature-tree hide/show eye icons).
 egui_extras = { version = "0.33", default-features = false, features = ["svg"] }
 ron = "0.8"
+serde = { version = "1", features = ["derive"] }
 rfd = "0.15"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
 winit = "0.30"

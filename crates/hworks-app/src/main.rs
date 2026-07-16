@@ -128,7 +128,19 @@ fn main() {
         .init_resource::<Part>()
         // Seamless on by default — build with the robust mesh kernel so shared/coincident
         // walls fuse without a seam. Toggle off in the toolbar for exact B-rep faces.
-        .insert_resource(UiState { seamless: true, plane_size: PLANE_SIZE, ..Default::default() })
+        .insert_resource({
+            // Restore persisted preferences (units, camera, mouse scheme, seamless, edges).
+            let s = load_settings();
+            UiState {
+                seamless: s.seamless,
+                unit: s.unit,
+                show_tangent_edges: s.show_tangent_edges,
+                perspective: s.perspective,
+                mouse_scheme: s.mouse_scheme,
+                plane_size: PLANE_SIZE,
+                ..Default::default()
+            }
+        })
         .init_resource::<UiBlocking>()
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
@@ -177,7 +189,7 @@ fn main() {
                     draw_measure,
                     draw_body_edges,
                     draw_feature_previews,
-                    (draw_selected_feature, draw_sketch),
+                    (draw_selected_feature, draw_sketch, persist_settings),
                     tick_edge_flash,
                     draw_edge_selection,
                 ),
@@ -336,7 +348,7 @@ fn eye_button(ui: &mut egui::Ui, hidden: bool) -> bool {
 }
 
 /// Mouse view-control preset: how orbit and pan map onto the mouse.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum MouseScheme {
     /// HCAD native: right-drag orbits, middle-drag pans.
     #[default]
@@ -345,6 +357,71 @@ enum MouseScheme {
     Blender,
     /// SolidWorks-style: middle-drag orbits, Ctrl+middle pans.
     SolidWorks,
+}
+
+/// User preferences persisted across sessions — `%APPDATA%\HCAD\settings.ron`. Every field has a
+/// serde default so adding a preference later still loads old files.
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+struct Settings {
+    #[serde(default)]
+    unit: Unit,
+    #[serde(default = "default_true")]
+    seamless: bool,
+    #[serde(default)]
+    show_tangent_edges: bool,
+    #[serde(default)]
+    perspective: bool,
+    #[serde(default)]
+    mouse_scheme: MouseScheme,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `%APPDATA%\HCAD\settings.ron` (falls back to the exe's directory if APPDATA is unset).
+fn settings_path() -> std::path::PathBuf {
+    std::env::var("APPDATA")
+        .map(|d| std::path::PathBuf::from(d).join("HCAD"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("settings.ron")
+}
+
+fn load_settings() -> Settings {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|t| ron::from_str(&t).ok())
+        .unwrap_or_else(|| Settings { seamless: true, ..Default::default() })
+}
+
+impl Settings {
+    fn from_ui(ui: &UiState) -> Self {
+        Settings {
+            unit: ui.unit,
+            seamless: ui.seamless,
+            show_tangent_edges: ui.show_tangent_edges,
+            perspective: ui.perspective,
+            mouse_scheme: ui.mouse_scheme,
+        }
+    }
+}
+
+/// Persist preferences whenever one changes (compared against the last write — cheap).
+fn persist_settings(ui_state: Res<UiState>, mut last: Local<Option<Settings>>) {
+    let cur = Settings::from_ui(&ui_state);
+    if last.as_ref() == Some(&cur) {
+        return;
+    }
+    let path = settings_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = ron::ser::to_string_pretty(&cur, ron::ser::PrettyConfig::default()) {
+        if let Err(e) = std::fs::write(&path, text) {
+            warn!("Could not save settings to {}: {e}", path.display());
+        }
+    }
+    *last = Some(cur);
 }
 
 /// An action chosen from a feature-tree right-click menu (applied after the
@@ -373,7 +450,7 @@ enum ViewAction {
 
 /// Display units. The model is always stored in millimetres; this only affects what's shown and
 /// typed (1 in = 25.4 mm).
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 enum Unit {
     #[default]
     Mm,
