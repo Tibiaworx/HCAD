@@ -2150,6 +2150,60 @@ mod tests {
     }
 
     #[test]
+    fn triangle_closing_line_down_an_edge_does_not_collapse() {
+        // Replay of a logged in-app collapse: a triangle drawn on a face — diagonal from a fixed
+        // corner, a near-horizontal top (endpoint pinned to the vertical reference edge), then the
+        // closing line down the edge back to the corner, which picks up Vertical(3,1). All
+        // constraints are satisfied at solve start, yet the solver dragged p3 onto the fixed
+        // corner (len → 0) and the closing line vanished.
+        let mut s = Sketch::default();
+        let _o = s.add_fixed_point(0.0, 0.0); // origin anchor (p0)
+        let p1 = s.add_fixed_point(4.542434, -1.4000483); // corner (weld target)
+        let p2 = s.add_point(5.3438325, -0.72046757);
+        let p3 = s.add_point(4.542382, -0.7304754);
+        let r4 = s.add_fixed_point(4.542382, -1.4000483); // projected edge (vertical)
+        let r5 = s.add_fixed_point(4.542382, -0.6804316);
+        s.add_line(p1, p2, false); // diagonal
+        s.add_line(p2, p3, false); // top
+        s.add_reference_line(r4, r5);
+        s.constraints.push(Constraint::Horizontal(p2, p3));
+        s.constraints.push(Constraint::PointOnLine { p: p3, a: r4, b: r5 });
+        s.solve(); // settle after line 2 (this matched the app: p2/p3 → y≈-0.725)
+        s.add_line(p3, p1, false); // closing line down the edge
+        s.constraints.push(Constraint::Vertical(p3, p1));
+        s.solve();
+        let (a, b) = (s.points[p3], s.points[p1]);
+        let len = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+        assert!(
+            len > 0.3,
+            "closing line collapsed: p3=({:.4},{:.4}) p1=({:.4},{:.4}) len={len:.4}",
+            a.x, a.y, b.x, b.y
+        );
+    }
+
+    #[test]
+    fn line_drawn_along_an_edge_survives_the_solve() {
+        // "Run a line down an edge": a drawn line whose BOTH endpoints are bound (PointOnLine) to
+        // the same reference edge. Each point is free to slide along the edge, so the solver must
+        // not collapse the two onto each other (a zero-length line that vanishes) or NaN them.
+        let mut s = Sketch::default();
+        let ra = s.add_fixed_point(0.0, 0.0);
+        let rb = s.add_fixed_point(10.0, 0.0);
+        s.add_reference_line(ra, rb);
+        let p0 = s.add_point(2.0, 0.05); // drawn start, a hair off the edge
+        let p1 = s.add_point(8.0, -0.03); // drawn end
+        s.add_line(p0, p1, false);
+        s.constraints.push(Constraint::PointOnLine { p: p0, a: ra, b: rb });
+        s.constraints.push(Constraint::PointOnLine { p: p1, a: ra, b: rb });
+        s.solve();
+        let (a, b) = (s.points[p0], s.points[p1]);
+        assert!(a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite(), "endpoints NaN: a={a:?} b={b:?}");
+        assert!(a.y.abs() < 1e-3 && b.y.abs() < 1e-3, "endpoints left the edge: a={a:?} b={b:?}");
+        let len = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+        assert!(len > 1.0, "the line collapsed (length {len:.4}) — it would vanish");
+    }
+
+    #[test]
     fn point_line_distance_drives_a_gap() {
         // A horizontal reference edge along y=0; drive a free point to 5 above it.
         let mut s = Sketch::default();

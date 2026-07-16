@@ -969,7 +969,147 @@ pub fn mesh_tessellation(mesh: TriMesh) -> Tessellation {
     // the angle detector (with its spur/gap cleanup) only if Manifold can't ingest the mesh.
     let (edges, tangent_edges) = mesh_bool::feature_edges_by_face(&mesh, 25.0, 8.0)
         .unwrap_or_else(|| feature_edges_opts(&mesh, 30.0, 2.0e-4, true));
+    // CSG re-tessellation leaves occasional micro-facet boundaries — tiny OPEN scraps of edge
+    // floating on an otherwise smooth surface. Drop those; small CLOSED loops (a real tiny
+    // hole's rim) are kept.
+    let edges = prune_tiny_open_fragments(edges);
     Tessellation { mesh, edges, tangent_edges }
+}
+
+/// Remove connected edge fragments that are both SHORT (total length under ~1.5% of the edge
+/// set's bounding diagonal) and OPEN (have dangling ends). Real feature edges on a closed solid
+/// either form loops or join a larger network; a stubby open scrap is boolean-tessellation noise.
+fn prune_tiny_open_fragments(edges: Vec<[[f32; 3]; 2]>) -> Vec<[[f32; 3]; 2]> {
+    use std::collections::HashMap;
+    if edges.len() < 2 {
+        return edges;
+    }
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for e in &edges {
+        for p in e {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let weld = (diag * 1.0e-5).max(1.0e-6);
+    let key = |p: [f32; 3]| ((p[0] / weld).round() as i64, (p[1] / weld).round() as i64, (p[2] / weld).round() as i64);
+    // Vertex ids, then union-find the segments into connected components.
+    let mut ids: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let segs: Vec<(usize, usize, f32)> = edges
+        .iter()
+        .map(|e| {
+            let n = ids.len();
+            let a = *ids.entry(key(e[0])).or_insert(n);
+            let n = ids.len();
+            let b = *ids.entry(key(e[1])).or_insert(n);
+            let d = ((e[0][0] - e[1][0]).powi(2) + (e[0][1] - e[1][1]).powi(2) + (e[0][2] - e[1][2]).powi(2)).sqrt();
+            (a, b, d)
+        })
+        .collect();
+    let mut uf: Vec<usize> = (0..ids.len()).collect();
+    fn find(uf: &mut [usize], mut x: usize) -> usize {
+        while uf[x] != x {
+            uf[x] = uf[uf[x]];
+            x = uf[x];
+        }
+        x
+    }
+    for &(a, b, _) in &segs {
+        let (ra, rb) = (find(&mut uf, a), find(&mut uf, b));
+        if ra != rb {
+            uf[ra] = rb;
+        }
+    }
+    // Per component: total length + whether any vertex dangles (degree 1 = open).
+    let mut total: HashMap<usize, f32> = HashMap::new();
+    let mut deg: HashMap<usize, usize> = HashMap::new();
+    for &(a, b, d) in &segs {
+        *total.entry(find(&mut uf, a)).or_default() += d;
+        *deg.entry(a).or_default() += 1;
+        *deg.entry(b).or_default() += 1;
+    }
+    let mut open: HashMap<usize, bool> = HashMap::new();
+    for (&v, &dg) in &deg {
+        if dg == 1 {
+            open.insert(find(&mut uf, v), true);
+        }
+    }
+    let min_len = diag * 0.015;
+    // Segment count per component (a real curved rim is dozens of segments; boolean junk is 3-6).
+    let mut nsegs: HashMap<usize, usize> = HashMap::new();
+    for &(a, _, _) in &segs {
+        *nsegs.entry(find(&mut uf, a)).or_default() += 1;
+    }
+    // Pass 1: drop whole components that are tiny — open scraps, and closed MICRO-LOOPS (3-6
+    // segment triangles left where a flush boss meets a wall, under fillet ears, etc.). A real
+    // small feature's rim is both longer and far denser in segments.
+    let mut keep: Vec<bool> = edges
+        .iter()
+        .zip(&segs)
+        .map(|(_, &(a, _, _))| {
+            let root = find(&mut uf, a);
+            let is_open = open.get(&root).copied().unwrap_or(false);
+            let len = total.get(&root).copied().unwrap_or(0.0);
+            let n = nsegs.get(&root).copied().unwrap_or(0);
+            let junk_open = is_open && len < min_len;
+            let junk_loop = !is_open && n <= 6 && len < diag * 0.025;
+            !(junk_open || junk_loop)
+        })
+        .collect();
+    // Pass 2: trim short DANGLING SPUR CHAINS off larger networks — walk inward from each
+    // degree-1 endpoint through degree-2 vertices; if the chain ends (junction/loop) within
+    // `min_len`, the whole stub is tessellation noise hanging off a real edge. Iterate so
+    // nested stubs unwind.
+    let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (si, &(a, b, _)) in segs.iter().enumerate() {
+        adj.entry(a).or_default().push(si);
+        adj.entry(b).or_default().push(si);
+    }
+    loop {
+        let mut deg_now: HashMap<usize, usize> = HashMap::new();
+        for (si, &(a, b, _)) in segs.iter().enumerate() {
+            if keep[si] {
+                *deg_now.entry(a).or_default() += 1;
+                *deg_now.entry(b).or_default() += 1;
+            }
+        }
+        let mut cut_any = false;
+        for (&v, &dg) in &deg_now {
+            if dg != 1 {
+                continue;
+            }
+            // Walk the chain from this dangling end.
+            let (mut cur, mut chain, mut len) = (v, Vec::new(), 0.0_f32);
+            loop {
+                let Some(&si) = adj.get(&cur).and_then(|es| es.iter().find(|&&si| keep[si] && !chain.contains(&si))) else { break };
+                let (a, b, d) = segs[si];
+                chain.push(si);
+                len += d;
+                cur = if a == cur { b } else { a };
+                if len >= min_len || deg_now.get(&cur).copied().unwrap_or(0) != 2 {
+                    break;
+                }
+            }
+            if len < min_len && !chain.is_empty() {
+                for si in chain {
+                    keep[si] = false;
+                }
+                cut_any = true;
+            }
+        }
+        if !cut_any {
+            break;
+        }
+    }
+    edges
+        .into_iter()
+        .zip(keep)
+        .filter(|&(_, k)| k)
+        .map(|(e, _)| e)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

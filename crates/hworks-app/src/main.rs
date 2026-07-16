@@ -1062,8 +1062,15 @@ fn setup(
     // Overlay gizmos draw in front of the solid so the extrude preview/arrow and the
     // cut-depth indicator are visible through the model.
     gizmo_store.config_mut::<OverlayGizmos>().0.depth_bias = -1.0;
-    // Drawn sketch lines are a touch thicker than the grid/markers for visibility.
-    gizmo_store.config_mut::<ProfileGizmos>().0.line.width = 3.2;
+    // Drawn sketch lines are a touch thicker than the grid/markers for visibility, and get a
+    // forward depth bias so an active-sketch line drawn ON a body edge renders in FRONT of that
+    // black edge (which itself is nudged toward the camera). Without this, a line "run down an
+    // edge" snaps into place and then vanishes under the coincident edge.
+    {
+        let cfg = &mut gizmo_store.config_mut::<ProfileGizmos>().0;
+        cfg.line.width = 3.2;
+        cfg.depth_bias = -0.4;
+    }
 
     // Reference-plane quads (Front/Top/Right, plus any the user creates later) are spawned by
     // `sync_ref_planes` from the document — keeping one source of truth so New Part / added planes
@@ -1284,6 +1291,17 @@ fn ui_system(
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
+
+    // While a 3D gizmo arrow is being dragged, drop egui keyboard focus: a focused DragValue
+    // (e.g. the PM's depth field) keeps its own text buffer and COMMITS the stale value when
+    // focus later drops — snapping an arrow-dragged depth back to where it started.
+    if session.arrow_drag || session.arrow_drag2 {
+        ctx.memory_mut(|m| {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        });
+    }
 
     // Register egui's image loaders once (SVG support for the hide/show eye icons).
     if !*image_loaders {
@@ -3181,6 +3199,27 @@ fn ui_system(
                     ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "up to date");
                 }
             });
+            // Rescue an over-defined sketch: strip redundant/legacy auto-relations while keeping
+            // dimensions, structural joins, and one positional pin per point. Old builds captured
+            // alignment guides as relations and doubled circle+arc pins — this heals such files.
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("Clean relations")
+                    .on_hover_text(
+                        "Remove redundant auto-relations (duplicate circle/arc pins, cross-point \
+                         align captures from older versions). Keeps dimensions, coincident joins, \
+                         and each line's own horizontal/vertical.",
+                    )
+                    .clicked()
+                {
+                    let removed = clean_redundant_relations(&mut session.sketch);
+                    if removed > 0 {
+                        session.dirty = true;
+                        session.needs_apply = true;
+                    }
+                    info!("Clean relations: removed {removed} redundant constraint(s).");
+                }
+            });
             ui.separator();
 
             // All driving dimensions (distance / radius / angle / point-line), each with a
@@ -4850,27 +4889,6 @@ fn get_or_add_point(sketch: &mut Sketch, uv: Vec2, snap: f32) -> usize {
 /// alignment (`v`) becomes `Vertical(p, anchor)`, a shared-Y alignment (`h`) becomes
 /// `Horizontal(p, anchor)`, so the "even with that point" alignment survives later edits — exactly
 /// like clicking an inference in SolidWorks. Skips self / duplicate / stale-index anchors.
-fn capture_inference(sketch: &mut Sketch, p: usize, v: Option<usize>, h: Option<usize>) {
-    let n = sketch.points.len();
-    let has = |sk: &Sketch, vert: bool, a: usize, b: usize| {
-        sk.constraints.iter().any(|c| match c {
-            Constraint::Vertical(x, y) if vert => (*x == a && *y == b) || (*x == b && *y == a),
-            Constraint::Horizontal(x, y) if !vert => (*x == a && *y == b) || (*x == b && *y == a),
-            _ => false,
-        })
-    };
-    if let Some(a) = v {
-        if a != p && a < n && p < n && !has(sketch, true, p, a) {
-            sketch.constraints.push(Constraint::Vertical(p, a));
-        }
-    }
-    if let Some(a) = h {
-        if a != p && a < n && p < n && !has(sketch, false, p, a) {
-            sketch.constraints.push(Constraint::Horizontal(p, a));
-        }
-    }
-}
-
 /// SolidWorks-style inferencing: when the cursor lines up with existing geometry, nudge it onto
 /// the alignment and report dotted guide segments (uv→uv) explaining the snap. Priority, highest
 /// first: horizontal/vertical alignment with an existing point (the dotted "even with" line you
@@ -5049,11 +5067,46 @@ fn snap_drag_target(session: &SketchSession, i: usize, uv: Vec2) -> Vec2 {
     best.map(|(p, _)| p).unwrap_or(uv)
 }
 
+/// Points that exist ONLY as endpoints of projected reference lines — internal plumbing, not user
+/// geometry. They sit within a whisker of the real projected corner point but are NOT it (edge
+/// tessellation vs corner projection differ by microns): welding a drawn endpoint onto one, then
+/// relating it to the true corner, created a Coincident between two fixed points that can never
+/// meet — an infeasible system the solver mangled ("the triangle snapped out of existence").
+fn ref_only_points(sketch: &Sketch) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let mut in_ref: HashSet<usize> = HashSet::new();
+    let mut in_real: HashSet<usize> = HashSet::new();
+    for (i, e) in sketch.entities.iter().enumerate() {
+        if let SketchEntity::Line { a, b, reference: true, .. } = e {
+            in_ref.insert(*a);
+            in_ref.insert(*b);
+        } else {
+            for p in entity_points(sketch, i) {
+                in_real.insert(p);
+            }
+        }
+    }
+    in_ref.retain(|p| !in_real.contains(p));
+    in_ref
+}
+
 /// Like `get_or_add_point`, but if the position coincides with a body-projected
 /// reference snap point (a corner/centre), the new point is *locked* there — so the
 /// endpoint stays constrained to that 3D feature through later solves.
 fn get_or_add_point_ref(session: &mut SketchSession, uv: Vec2, snap: f32) -> usize {
-    if let Some(i) = nearest_point(&session.sketch, uv, snap) {
+    // Weld to the nearest point that ISN'T reference-line plumbing (see ref_only_points).
+    let skip = ref_only_points(&session.sketch);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, p) in session.sketch.points.iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        let d = Vec2::new(p.x as f32, p.y as f32).distance(uv);
+        if d <= snap && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    if let Some((i, _)) = best {
         return i;
     }
     let tol = (snap * 0.25).max(1e-3);
@@ -5065,10 +5118,111 @@ fn get_or_add_point_ref(session: &mut SketchSession, uv: Vec2, snap: f32) -> usi
     }
 }
 
+/// Place a **circle's centre** point. Like `get_or_add_point_ref`, but it never welds onto a point
+/// that is *already another circle's centre*: two circles sharing a centre point also share every
+/// centre-keyed constraint (Radius/Diameter/Concentric) and collapse to one radius in the solver —
+/// which is exactly why "a circle inside a circle" vanished. Instead give the new circle its own
+/// centre at the same spot and a Coincident (concentric) constraint, SolidWorks-style. Reusing a
+/// non-circle point (the origin anchor, a line endpoint) is still fine — those don't carry radii.
+fn add_circle_center(session: &mut SketchSession, uv: Vec2, snap: f32) -> usize {
+    if let Some(existing) = nearest_point(&session.sketch, uv, snap) {
+        let is_circle_center = session
+            .sketch
+            .entities
+            .iter()
+            .any(|e| matches!(e, SketchEntity::Circle { center, .. } if *center == existing));
+        if is_circle_center {
+            let p = session.sketch.points[existing];
+            let new = session.sketch.add_point(p.x, p.y);
+            session.sketch.constraints.push(Constraint::Coincident(new, existing));
+            return new;
+        }
+    }
+    get_or_add_point_ref(session, uv, snap)
+}
+
+/// Strip redundant / legacy auto-relations from a sketch, returning how many were removed.
+/// Heals files saved by older builds that (a) captured the dotted alignment guides as permanent
+/// cross-point Horizontal/Vertical relations and (b) double-pinned snapped endpoints with BOTH a
+/// parametric PointOnCircle and an absolute-coordinate PointOnArc of the same rim — the arc pin
+/// freezes the old position/radius and fights every later edit (the "collapse / wonky" solves).
+/// Kept: dimensions, coincident joins, midpoints, one positional pin per point, and each line's
+/// OWN horizontal/vertical (the pair being that line's endpoints).
+fn clean_redundant_relations(sketch: &mut Sketch) -> usize {
+    use std::collections::HashSet;
+    let before = sketch.constraints.len();
+    // Points already pinned to a sketch circle (parametric — follows edits).
+    let circle_pinned: HashSet<usize> = sketch
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            Constraint::PointOnCircle { p, .. } => Some(*p),
+            _ => None,
+        })
+        .collect();
+    // Points pinned onto a (projected) line: an exact H/V on the same line conflicts with the
+    // pin's micron-scale tilt — their only common solution is a single point, so the solver
+    // collapses the line onto it (or shoots it off along the extrapolation).
+    let line_pinned: HashSet<usize> = sketch
+        .constraints
+        .iter()
+        .filter_map(|c| match c {
+            Constraint::PointOnLine { p, .. } => Some(*p),
+            _ => None,
+        })
+        .collect();
+    // Endpoint pairs of actual sketch lines — their own H/V relations are the wanted ones.
+    let line_pairs: HashSet<(usize, usize)> = sketch
+        .entities
+        .iter()
+        .filter_map(|e| match e {
+            SketchEntity::Line { a, b, .. } => Some(((*a).min(*b), (*a).max(*b))),
+            _ => None,
+        })
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    sketch.constraints.retain(|c| {
+        // Exact duplicates of any kind: keep the first occurrence only.
+        if !seen.insert(format!("{c:?}")) {
+            return false;
+        }
+        match c {
+            // Stale absolute-arc pin duplicating a parametric circle pin on the same point.
+            Constraint::PointOnArc { p, .. } if circle_pinned.contains(p) => false,
+            // Cross-point align captures (guides are snap-only now); a line's own H/V stays —
+            // unless an endpoint is pinned onto a projected line (the pin + exact axis conflict).
+            Constraint::Horizontal(a, b) | Constraint::Vertical(a, b) => {
+                line_pairs.contains(&((*a).min(*b), (*a).max(*b)))
+                    && !line_pinned.contains(a)
+                    && !line_pinned.contains(b)
+            }
+            _ => true,
+        }
+    });
+    before - sketch.constraints.len()
+}
+
 /// If point `p` sits on a sketch circle's rim (e.g. a line endpoint just snapped to it),
 /// record a point-on-circle relation so the endpoint follows later radius/centre edits.
 /// `tol` should be a hair under the snap distance so only genuine rim landings qualify.
 fn maybe_add_point_on_circle(sketch: &mut Sketch, p: usize, tol: f32) {
+    // A fixed (body-projected) point can't move — relating it does nothing at best, and at worst
+    // creates an unsatisfiable constraint (two pinned points that don't quite coincide).
+    if sketch.points.get(p).map_or(true, |q| q.fixed) {
+        return;
+    }
+    // One curve constraint per point: if `p` is already pinned to a line/arc/circle, don't stack
+    // another (a snapped endpoint used to collect PointOnCircle + PointOnArc for the same rim —
+    // 2 curve equations + an axis relation on a 2-DOF point = over-defined, solver goes wonky).
+    let pinned = sketch.constraints.iter().any(|c| match c {
+        Constraint::PointOnLine { p: q, .. }
+        | Constraint::PointOnArc { p: q, .. }
+        | Constraint::PointOnCircle { p: q, .. } => *q == p,
+        _ => false,
+    });
+    if pinned {
+        return;
+    }
     let pp = sketch.points[p];
     let on = sketch.entities.iter().find_map(|e| match e {
         SketchEntity::Circle { center, radius, .. } if *center != p => {
@@ -5102,6 +5256,11 @@ enum LineHit {
 /// survives later edits/moves. A span landing slides along the line (`PointOnLine`); a
 /// snap/end/mid landing is pinned (`Coincident` / `Midpoint`). `tol` ≈ a hair under snap.
 fn maybe_add_point_on_sketch_line(sketch: &mut Sketch, p: usize, tol: f32) {
+    // Never relate a fixed point (see maybe_add_point_on_circle) — a Coincident between two
+    // pinned-but-not-identical points is permanently infeasible and poisons every later solve.
+    if sketch.points.get(p).map_or(true, |q| q.fixed) {
+        return;
+    }
     let pp = Vec2::new(sketch.points[p].x as f32, sketch.points[p].y as f32);
     let mut hit: Option<LineHit> = None;
     for e in &sketch.entities {
@@ -5215,8 +5374,12 @@ fn maybe_add_point_on_edge(session: &mut SketchSession, p: usize, edge: Option<E
     if session.sketch.points.get(p).map_or(true, |pt| pt.fixed) {
         return;
     }
+    // One curve constraint per point (see maybe_add_point_on_circle): a sketch-circle pin and its
+    // body-edge (arc) twin describe the same rim — adding both over-defines the endpoint.
     let already = |c: &Constraint| match c {
-        Constraint::PointOnLine { p: q, .. } | Constraint::PointOnArc { p: q, .. } => *q == p,
+        Constraint::PointOnLine { p: q, .. }
+        | Constraint::PointOnArc { p: q, .. }
+        | Constraint::PointOnCircle { p: q, .. } => *q == p,
         _ => false,
     };
     if session.sketch.constraints.iter().any(already) {
@@ -6074,8 +6237,13 @@ fn sketch_interaction(
         snaps.extend_from_slice(&session.reference_points);
         // Every existing sketch point (line endpoints, circle centres) is a snap
         // target — so a circle placed on a line's end shares its exact coordinates.
-        for p in &session.sketch.points {
-            snaps.push(Vec2::new(p.x as f32, p.y as f32));
+        // EXCEPT reference-line plumbing endpoints: they shadow the true projected
+        // corner by microns, and welding onto one poisons the constraint system.
+        let skip = ref_only_points(&session.sketch);
+        for (i, p) in session.sketch.points.iter().enumerate() {
+            if !skip.contains(&i) {
+                snaps.push(Vec2::new(p.x as f32, p.y as f32));
+            }
         }
         // The sketch origin (0,0) — on a datum plane this is the part's centre. Snapping to it
         // lets you put a circle's centre or a revolve axis exactly on centreline, so a revolve
@@ -6200,10 +6368,19 @@ fn sketch_interaction(
         session.tool == Tool::Line || (session.tool == Tool::Slot && session.pending_b.is_none());
     if square_tool {
         if let (Some(start), Some(cur)) = (session.pending, session.cursor_uv) {
-            // Strong targets win over the square snap so connections aren't pulled off.
+            // Strong targets win over the square snap so connections aren't pulled off. Two
+            // signals: the cursor ALREADY snapped to something this frame (it moved off the raw
+            // position — a point, corner, line span, rim), OR it's sitting ON a hovered body edge.
+            // The second matters when TRACING ALONG an edge: the cursor is already on the edge, so
+            // the snap doesn't move it — a movement-only test misses that and the 90° square snap
+            // yanks the line off a slanted edge (the triangle-edge bug).
             let near = |p: Vec2, t: f32| p.distance(cur) <= t;
             let strong = snap * 0.6;
-            let on_strong = nearest_point(&session.sketch, cur, strong).is_some()
+            let snapped_to_target = session.cursor_raw_uv.map_or(false, |raw| raw.distance(cur) > 1e-4)
+                || session.cursor_edge.is_some()
+                || session.hover_edge.is_some_and(|es| edge_snap_point(es, cur).distance(cur) <= strong);
+            let on_strong = snapped_to_target
+                || nearest_point(&session.sketch, cur, strong).is_some()
                 || session.reference_points.iter().any(|r| near(*r, strong))
                 || session.inference_points.iter().any(|r| near(*r, strong))
                 || session.reference_circles.iter().any(|(c, r)| (cur.distance(*c) - *r).abs() <= strong)
@@ -6263,9 +6440,20 @@ fn sketch_interaction(
     );
     if drawing_tool && !session.hide_inference {
         if let Some(cur) = session.cursor_uv {
+            // A cursor that ALREADY snapped to a real target this frame (point, corner, body edge,
+            // line span, circle rim — the cursor moved off the raw position) must not be re-nudged
+            // by the alignment guides: yanking a corner-snapped endpoint onto some point's X/Y
+            // alignment is how a line aimed at a corner ended up rotated 90° off. Sitting ON a
+            // hovered edge counts too — tracing along an edge doesn't move the cursor, so the
+            // movement test alone misses it.
+            let snapped_to_target = session.cursor_raw_uv.map_or(false, |raw| raw.distance(cur) > 1e-4)
+                || session.cursor_edge.is_some()
+                || session.hover_edge.is_some_and(|es| edge_snap_point(es, cur).distance(cur) <= snap * 0.6);
             let coincident = nearest_point(&session.sketch, cur, snap * 0.5).is_some()
                 || session.reference_points.iter().any(|r| r.distance(cur) <= snap * 0.5);
-            if coincident {
+            if snapped_to_target && !coincident {
+                // Keep the snap; no guides, no alignment nudge.
+            } else if coincident {
                 session.infer_badges.push(InferBadge::Coincident);
             } else {
                 let inf = infer_cursor(&session, cur, session.pending, snap * 0.8);
@@ -6999,6 +7187,32 @@ fn sketch_interaction(
     if session.drag.is_none() && session.dirty {
         session.sketch.solve();
         session.dirty = false;
+        // Anomaly trap (silent in normal use): if the most recent line COLLAPSED in the solve,
+        // dump the full sketch state to run.log so the failure is replayable from the field —
+        // this is how the tilted-edge-pin vs exact-Vertical conflict was found.
+        if let Some(SketchEntity::Line { a, b, .. }) = session
+            .sketch
+            .entities
+            .iter()
+            .rev()
+            .find(|e| matches!(e, SketchEntity::Line { reference: false, .. }))
+        {
+            if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
+                let len = ((pa.x - pb.x).powi(2) + (pa.y - pb.y).powi(2)).sqrt();
+                if len < 1.0e-3 {
+                    warn!("sketch anomaly: last line collapsed to len={len:.6} — dumping state");
+                    for (i, p) in session.sketch.points.iter().enumerate() {
+                        warn!("  P{i}: ({:.6},{:.6}) fixed={}", p.x, p.y, p.fixed);
+                    }
+                    for (i, e) in session.sketch.entities.iter().enumerate() {
+                        warn!("  E{i}: {e:?}");
+                    }
+                    for (i, c) in session.sketch.constraints.iter().enumerate() {
+                        warn!("  C{i}: {c:?}");
+                    }
+                }
+            }
+        }
     }
 
     // ---- Per-operation sketch undo: snapshot a *settled* change ----
@@ -8565,16 +8779,13 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 let a = get_or_add_point_ref(session, start, snap);
                 let b = get_or_add_point_ref(session, uv, snap);
                 session.sketch.add_line(a, b, session.construction);
-                // Capture the SolidWorks-style inference alignments as real relations: the cursor
-                // endpoint `b` against this frame's inference, the start `a` against the snapshot
-                // taken at its (first) click.
-                let (sv, sh) = session.start_infer;
-                capture_inference(&mut session.sketch, a, sv, sh);
-                capture_inference(&mut session.sketch, b, session.infer_v, session.infer_h);
+                // The dotted "even with another point" guides are inference only — they snap the
+                // cursor onto the alignment but do NOT create a relation (SolidWorks-style). Auto-
+                // capturing them piled up Horizontal/Vertical constraints between arbitrary point
+                // pairs and quickly over-defined the sketch (relations collapsing / going wonky).
+                // A line's OWN axis-alignment and perpendicular joints are still captured below —
+                // those are the standard, wanted auto-relations.
                 session.start_infer = (None, None);
-                // Persist the square/perpendicular relation the 90° snap implied, so resizing
-                // keeps the sketch square (the shared point already keeps lines connected).
-                add_square_relations(&mut session.sketch, a, b);
                 // If either endpoint landed on a circle rim, link it parametrically.
                 let tol = (snap * 0.6).max(1e-3);
                 maybe_add_point_on_circle(&mut session.sketch, a, tol);
@@ -8589,6 +8800,23 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 maybe_add_point_on_edge(session, a, start_edge);
                 let end_edge = session.cursor_edge;
                 maybe_add_point_on_edge(session, b, end_edge);
+                // Persist the square/perpendicular relation the 90° snap implied, so resizing
+                // keeps the sketch square — but ONLY when neither endpoint is pinned to a
+                // curve/edge. A projected edge is never *exactly* axis-aligned (tessellation
+                // tilts it by microns), so PointOnLine + an exact Vertical intersect at a single
+                // point: the solver slides the endpoint there — collapsing the line onto the
+                // corner or shooting it past the body. The edge pin alone defines the direction.
+                let pinned = |sk: &Sketch, p: usize| {
+                    sk.constraints.iter().any(|c| match c {
+                        Constraint::PointOnLine { p: q, .. }
+                        | Constraint::PointOnArc { p: q, .. }
+                        | Constraint::PointOnCircle { p: q, .. } => *q == p,
+                        _ => false,
+                    })
+                };
+                if !pinned(&session.sketch, a) && !pinned(&session.sketch, b) {
+                    add_square_relations(&mut session.sketch, a, b);
+                }
                 session.dirty = true;
                 // A construction line is a one-shot: revert to the regular line tool after
                 // drawing one (re-pick "Construction Line" for another).
@@ -8606,7 +8834,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             if let Some(p1) = session.pending.take() {
                 let center = (p1 + uv) * 0.5;
                 let radius = ((uv - p1).length() * 0.5).max(0.01);
-                let c = get_or_add_point(&mut session.sketch, center, snap);
+                let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
             } else {
@@ -8617,7 +8845,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
         Tool::Circle => {
             if let Some(center) = session.pending.take() {
                 let radius = snap_radius(center.distance(uv), &session.reference_circles, snap);
-                let c = get_or_add_point_ref(session, center, snap);
+                let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
             } else {
@@ -10137,32 +10365,38 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                         // ring of edges. The dip is bounded by how deep the body sits below
                         // the boss's base plane, so it can't poke out the far side.
                         Some(b) => {
-                            let (blo, bhi) = mesh_bbox(&b);
                             let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
-                            let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
-                            // Depth of the body behind the base plane (along −normal).
-                            let corners = [
-                                Vec3::new(blo.x, blo.y, blo.z), Vec3::new(bhi.x, bhi.y, bhi.z),
-                                Vec3::new(blo.x, blo.y, bhi.z), Vec3::new(bhi.x, bhi.y, blo.z),
-                                Vec3::new(blo.x, bhi.y, blo.z), Vec3::new(bhi.x, blo.y, bhi.z),
-                                Vec3::new(blo.x, bhi.y, bhi.z), Vec3::new(bhi.x, blo.y, blo.z),
-                            ];
-                            let behind = corners.iter().map(|c| (o - *c).dot(n)).fold(0.0_f32, f32::max);
-                            // ~1mm is plenty to bury the join in well-formed triangles; never
-                            // dip past the body's far side.
-                            let overlap = ((behind * 0.5).min(1.0).max(0.05)).min(behind.max(0.0)) as f64;
+                            // Bury the JOIN — the end of the prism that meets existing material —
+                            // so the union has no coplanar seam. WHICH side of the base plane has
+                            // material varies (behind for a boss stacked on a top face; past the
+                            // plane for one on a thin feature's wall; NEITHER for a boss bridging
+                            // a slot), and a global bbox reads it wrong on thin bodies — the old
+                            // bbox estimate grew this boss by a full 1.0 out its exposed tip. So
+                            // PROBE locally at the footprint centroid, just off the plane on the
+                            // join side, and dip only as deep as there is actual material; flush
+                            // (no dip) when the join side is open air — the mesh kernel unions
+                            // touching solids fine (that's the Seamless premise).
+                            let cen = sketch_footprint_world(&plane, r.outer.iter());
+                            let dip_dir = if *distance >= 0.0 { -n } else { n };
+                            let mut overlap = 0.0_f64;
+                            for d in [1.0_f32, 0.5, 0.25, 0.1] {
+                                if point_inside_mesh(&b, cen + dip_dir * d) {
+                                    overlap = d as f64 * 0.9; // stay inside what we probed
+                                    break;
+                                }
+                            }
                             // Direction 2 (`back`) extends the prism the opposite way — the same
                             // side as the body dip — so burying the join by at least `back` gives
                             // the both-directions extrude. Unlike the auto-dip it's NOT clamped to
                             // the body depth: the user asked for that length, even through the back.
                             let dip = overlap.max(*back);
-                            // Dip into the body on the side AWAY from the sketch plane so the
-                            // plane-side face stays flush: a normal (+) boss dips below the plane;
-                            // a reversed (−) boss keeps its top at the plane and dips its tip down.
+                            // Bury the join-side end; the exposed tip stays EXACTLY at the asked
+                            // depth: a normal (+) boss dips below the plane; a reversed (−) boss
+                            // keeps its tip at `distance` and dips past the plane into the body.
                             let (start, length) = if *distance >= 0.0 {
                                 (-dip, distance + dip)
                             } else {
-                                (distance - dip, -distance + dip)
+                                (*distance, -distance + dip)
                             };
                             Some(
                                 make_prism(&r.outer, &r.holes, start, length)
@@ -12575,13 +12809,14 @@ fn draw_sketch(
                 gizmos.line(ap.to_world(a), ap.to_world(b), col);
             }
         };
-        // Every detected region is shown so you can see what's enclosed; explicitly
-        // picked contours read brighter (blue), the rest dim green. (Picking some no
-        // longer hides the others — that made an enclosed area look un-closed.)
+        // Every detected region is shown so you can see what's enclosed; explicitly picked
+        // contours read in the shared SELECTION ACCENT (orange — same as selected edges and
+        // features) with a strong fill, the rest dim green. (Picking some no longer hides the
+        // others — that made an enclosed area look un-closed.)
         for (i, r) in regions.iter().enumerate() {
             let sel = picked.contains(&i);
             let (line_col, fill) = if sel {
-                (Color::srgb(0.45, 0.85, 1.0), Color::srgba(0.4, 0.8, 1.0, 0.32))
+                (Color::srgb(1.0, 0.7, 0.1), Color::srgba(1.0, 0.65, 0.15, 0.4))
             } else {
                 (Color::srgba(0.2, 1.0, 0.45, 0.5), Color::srgba(0.2, 1.0, 0.45, 0.12))
             };
@@ -14173,6 +14408,115 @@ mod tests {
         }
     }
 
+    /// Replay of the logged "line down the edge shoots off / collapses": the projected reference
+    /// edge is tilted by microns (tessellation), so PointOnLine + an exact Vertical share exactly
+    /// ONE solution — the solver slid the endpoint there. The cleanup must drop the axis relation
+    /// wherever an endpoint is line-pinned, after which the solve keeps the line's length.
+    #[test]
+    fn line_pinned_to_tilted_edge_survives_after_cleanup() {
+        let mut s = Sketch::default();
+        let _o = s.add_fixed_point(0.0, 0.0);
+        let p1 = s.add_point(4.542434, -1.400048); // bottom corner (free, pinned to edge)
+        let r2 = s.add_fixed_point(4.542158, 2.399952); // projected edge — tilted 276 µm over its run
+        let r3 = s.add_fixed_point(4.542434, -1.400048);
+        let p4 = s.add_fixed_point(4.542434, -1.399122); // old corner weld nearby
+        let p5 = s.add_point(4.542434, -0.741); // upper endpoint of the drawn line
+        s.add_reference_line(r2, r3);
+        s.add_line(p1, p4, false);
+        s.add_line(p1, p5, false); // the "line down the edge"
+        s.constraints.push(Constraint::PointOnLine { p: p1, a: r2, b: r3 });
+        s.constraints.push(Constraint::Vertical(p1, p4)); // exact axis vs tilted pin → conflict
+        s.constraints.push(Constraint::Vertical(p1, p5));
+        s.constraints.push(Constraint::PointOnLine { p: p5, a: r2, b: r3 });
+        let removed = clean_redundant_relations(&mut s);
+        assert!(removed >= 2, "cleanup should drop the axis relations on line-pinned endpoints (removed {removed})");
+        s.solve();
+        let (a, b) = (s.points[p1], s.points[p5]);
+        let len = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+        assert!(a.x.is_finite() && b.y.is_finite(), "NaN after solve");
+        assert!(len > 0.5, "line still collapsed/shot off: p1=({:.4},{:.4}) p5=({:.4},{:.4}) len={len:.4}", a.x, a.y, b.x, b.y);
+    }
+
+    /// Replay of the logged triangle collapse: the closing line's corner click sat nearest a
+    /// REFERENCE-LINE endpoint (projected edge plumbing, fixed) rather than the projected corner
+    /// point (also fixed, microns away). Welding onto the plumbing point then relating it to the
+    /// corner created Coincident(fixed, fixed) — infeasible — and the solve dragged the triangle
+    /// flat. The weld must skip reference-line-only points and pick the real corner.
+    #[test]
+    fn endpoint_weld_skips_reference_line_plumbing() {
+        let mut s = SketchSession::default();
+        s.snap_dist = 0.09;
+        // The projected corner point (what earlier clicks created)…
+        let corner = s.sketch.add_fixed_point(4.542434, -1.3936961);
+        // …and a projected reference edge whose lower endpoint shadows it by ~6 microns-scale.
+        let r4 = s.sketch.add_fixed_point(4.542158, 2.399952);
+        let r5 = s.sketch.add_fixed_point(4.542434, -1.400048);
+        s.sketch.add_reference_line(r4, r5);
+        // A line already uses the corner (so it's "real" geometry, not plumbing).
+        let p2 = s.sketch.add_point(5.42283, -0.5843668);
+        s.sketch.add_line(corner, p2, false);
+        // The user's closing click, nearer the plumbing endpoint than the corner:
+        let w = get_or_add_point_ref(&mut s, Vec2::new(4.542, -1.4024), 0.09);
+        assert_eq!(w, corner, "weld must pick the projected corner, not the reference-line endpoint (got point {w})");
+        // And the relation helpers must never touch fixed points at all.
+        let before = s.sketch.constraints.len();
+        maybe_add_point_on_sketch_line(&mut s.sketch, r5, 0.05);
+        maybe_add_point_on_circle(&mut s.sketch, r5, 0.05);
+        assert_eq!(s.sketch.constraints.len(), before, "no relations may be attached to fixed points");
+    }
+
+    /// `clean_redundant_relations` heals the circincirc.hcad pattern: an endpoint double-pinned
+    /// (parametric PointOnCircle + stale absolute PointOnArc) plus a cross-point Horizontal from
+    /// the old guide capture. It keeps the circle pin and the line's OWN vertical, drops the rest.
+    #[test]
+    fn clean_relations_drops_arc_twin_and_cross_point_aligns() {
+        let mut s = Sketch::default();
+        let o = s.add_fixed_point(0.0, 0.0);
+        let a = s.add_point(0.0, -3.9); // line start
+        let b = s.add_point(0.0, -3.0); // endpoint snapped onto the circle rim
+        let stray = s.add_fixed_point(2.0, -3.0); // unrelated point b once "aligned" with
+        s.add_circle(o, 3.0);
+        s.add_line(a, b, false);
+        s.constraints.push(Constraint::Vertical(a, b)); // the line's own — keep
+        s.constraints.push(Constraint::PointOnCircle { p: b, center: o }); // keep
+        s.constraints.push(Constraint::PointOnArc { p: b, cx: 0.0, cy: 0.0, radius: 3.0 }); // stale twin — drop
+        s.constraints.push(Constraint::Horizontal(b, stray)); // old guide capture — drop
+        s.constraints.push(Constraint::Vertical(a, b)); // exact duplicate — drop
+        let removed = clean_redundant_relations(&mut s);
+        assert_eq!(removed, 3, "expected 3 removals, got {removed}: {:?}", s.constraints);
+        assert!(s.constraints.iter().any(|c| matches!(c, Constraint::Vertical(x, y) if (*x == a && *y == b) || (*x == b && *y == a))));
+        assert!(s.constraints.iter().any(|c| matches!(c, Constraint::PointOnCircle { p, .. } if *p == b)));
+        assert!(!s.constraints.iter().any(|c| matches!(c, Constraint::PointOnArc { .. } | Constraint::Horizontal(..))));
+    }
+
+    /// Drawing a second circle concentric-ish with the first (a "circle inside a circle") must
+    /// create a SECOND circle entity with its own centre point — not silently reuse the first
+    /// circle's centre (which makes them share centre-keyed constraints and collapse to one).
+    #[test]
+    fn concentric_circle_gets_its_own_centre_point() {
+        let mut s = SketchSession::default();
+        s.snap_dist = SNAP;
+        s.tool = Tool::Circle;
+        // Circle 1: centre near origin, radius ~8.5 (two clicks).
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(8.5, 0.0));
+        // Circle 2: centre a hair off the same origin (within snap → would weld), radius ~3.
+        place_point(&mut s, Vec2::new(0.02, 0.0));
+        place_point(&mut s, Vec2::new(3.0, 0.0));
+        let circles: Vec<(usize, f64)> = s
+            .sketch
+            .entities
+            .iter()
+            .filter_map(|e| match e {
+                SketchEntity::Circle { center, radius, .. } => Some((*center, *radius)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(circles.len(), 2, "both circles must exist, got {circles:?}");
+        assert_ne!(circles[0].0, circles[1].0, "the two circles must have DISTINCT centre points (not welded)");
+        assert!((circles[0].1 - 8.5).abs() < 0.2 && (circles[1].1 - 3.0).abs() < 0.2, "radii preserved: {circles:?}");
+    }
+
     /// A slot cut through a filleted rim must CLIP the fillet's seam rings at the cut: no seam
     /// segment may float across the void (the "edge lines extend past the cut" bug).
     #[test]
@@ -14216,6 +14560,51 @@ mod tests {
         assert!(kept.len() > n, "most of the seam rings should survive, got {}", kept.len());
     }
 
+    /// What does the LAST feature actually add? Regen with and without it and diff the bboxes.
+    ///   HCAD_FILE="…\part.hcad" cargo test -p hworks-app --release diag_last_feature_delta -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_last_feature_delta() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (full, _) = regenerate_mesh(&doc).expect("full regen");
+        let mut prev_doc = doc.clone();
+        prev_doc.rollback = prev_doc.features.len().saturating_sub(1);
+        let (prev, _) = regenerate_mesh(&prev_doc).expect("prev regen");
+        let bbox = |m: &TriMesh| {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &m.positions {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            (lo, hi)
+        };
+        let (plo, phi) = bbox(&prev);
+        let (flo, fhi) = bbox(&full);
+        eprintln!("prev bbox: lo=({:.3},{:.3},{:.3}) hi=({:.3},{:.3},{:.3})", plo[0], plo[1], plo[2], phi[0], phi[1], phi[2]);
+        eprintln!("full bbox: lo=({:.3},{:.3},{:.3}) hi=({:.3},{:.3},{:.3})", flo[0], flo[1], flo[2], fhi[0], fhi[1], fhi[2]);
+        // The material the last feature added, isolated: full − prev.
+        let added = mesh_difference(&full, &prev);
+        if !added.positions.is_empty() {
+            let (alo, ahi) = bbox(&added);
+            eprintln!(
+                "added material bbox: lo=({:.3},{:.3},{:.3}) hi=({:.3},{:.3},{:.3}) spans=({:.3},{:.3},{:.3})",
+                alo[0], alo[1], alo[2], ahi[0], ahi[1], ahi[2],
+                ahi[0] - alo[0], ahi[1] - alo[1], ahi[2] - alo[2]
+            );
+        } else {
+            eprintln!("added material: none (difference empty)");
+        }
+        if let Some(f) = doc.features.last() {
+            eprintln!("last feature: {:?}", match &f.kind {
+                FeatureKind::Extrude { distance, back, plane, .. } => format!("Extrude d={distance} back={back} origin={:?} normal={:?}", plane.origin, plane.normal),
+                other => format!("{other:?}").chars().take(80).collect::<String>(),
+            });
+        }
+    }
+
     /// Reproduce the filleted-cylinder seam artifacts (break + chevron poking out of the rim):
     ///   cargo test -p hworks-app --release diag_cylinder_fillet_seams -- --ignored --nocapture
     /// Mirrors the app's regen exactly: 48-gon extrude → bevel (surgery or CSG fallback) →
@@ -14242,6 +14631,35 @@ mod tests {
             let dangles = deg.values().filter(|&&d| d == 1).count();
             let junctions = deg.values().filter(|&&d| d > 2).count();
             eprintln!("seams: kept={} dropped={} dangling={dangles} junctions={junctions}", kept.len(), bevel_edges.len() - kept.len());
+            // Component analysis of the SHARP set: sizes and where the small ones sit.
+            {
+                use std::collections::HashMap as HM;
+                let q2 = |p: [f32; 3]| ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64);
+                let mut ids: HM<(i64, i64, i64), usize> = HM::new();
+                let segs: Vec<(usize, usize, f32)> = tess.edges.iter().map(|e| {
+                    let n = ids.len();
+                    let a = *ids.entry(q2(e[0])).or_insert(n);
+                    let n = ids.len();
+                    let b = *ids.entry(q2(e[1])).or_insert(n);
+                    let d = ((e[0][0]-e[1][0]).powi(2)+(e[0][1]-e[1][1]).powi(2)+(e[0][2]-e[1][2]).powi(2)).sqrt();
+                    (a, b, d)
+                }).collect();
+                let mut uf: Vec<usize> = (0..ids.len()).collect();
+                fn f(uf: &mut [usize], mut x: usize) -> usize { while uf[x] != x { uf[x] = uf[uf[x]]; x = uf[x]; } x }
+                for &(a, b, _) in &segs { let (ra, rb) = (f(&mut uf, a), f(&mut uf, b)); if ra != rb { uf[ra] = rb; } }
+                let mut comp: HM<usize, (usize, f32, [f32;3])> = HM::new();
+                for (si, &(a, _, d)) in segs.iter().enumerate() {
+                    let root = f(&mut uf, a);
+                    let e = comp.entry(root).or_insert((0, 0.0, tess.edges[si][0]));
+                    e.0 += 1; e.1 += d;
+                }
+                let mut list: Vec<(usize, f32, [f32;3])> = comp.values().copied().collect();
+                list.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+                eprintln!("sharp components: {} total", list.len());
+                for (n, len, at) in list.iter().take(12) {
+                    eprintln!("  comp: segs={n} len={len:.3} at=({:.2},{:.2},{:.2})", at[0], at[1], at[2]);
+                }
+            }
             // True floaters among the kept: midpoint far (>3× clip tol) from EVERY mesh triangle.
             let m = &tess.mesh;
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
