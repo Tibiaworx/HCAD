@@ -432,8 +432,9 @@ enum TreeAction {
     Edit(usize),
     /// Reopen a sketch that holds a Text entity, straight into the Text tool with it selected.
     EditText(usize),
-    /// Reopen a Fillet/Chamfer in its PropertyManager (radius/distance + picked edges loaded).
-    EditBevel(usize),
+    /// Reopen a Fillet/Chamfer/Mirror/Thread/Loft in its PropertyManager with the stored
+    /// parameters loaded; OK updates the feature in place.
+    EditPm(usize),
     ExtrudeBoss(usize),
     ExtrudeCut(usize),
     Delete(usize),
@@ -579,7 +580,7 @@ struct UiState {
     /// Timeline index of the Fillet/Chamfer being EDITED via its PM (tree double-click / Edit).
     /// While set, the doc is rolled back to just before it (so the preview builds on the
     /// pre-bevel body) and OK updates the feature in place instead of appending a new one.
-    editing_bevel: Option<usize>,
+    editing_feature: Option<usize>,
     /// Set with `edit_sketch_request` to reopen a Text feature straight into the Text tool with the
     /// text entity selected and its parameters loaded into the PM. Consumed by `handle_edit_sketch`.
     edit_as_text: bool,
@@ -2598,7 +2599,7 @@ fn ui_system(
                 ui_state.fillet_edges.clear();
                 // Cancelling an EDIT restores the timeline (the doc was rolled back to preview
                 // against the pre-fillet body) — the original fillet reappears untouched.
-                if ui_state.editing_bevel.take().is_some() {
+                if ui_state.editing_feature.take().is_some() {
                     doc.0.rollback = doc.0.features.len();
                 }
                 ui_state.regen = true; // rebuild without the preview
@@ -2680,7 +2681,7 @@ fn ui_system(
                 ui_state.chamfer_shown = None;
                 ui_state.fillet_edges.clear();
                 // Cancelling an EDIT restores the timeline (see the fillet cancel above).
-                if ui_state.editing_bevel.take().is_some() {
+                if ui_state.editing_feature.take().is_some() {
                     doc.0.rollback = doc.0.features.len();
                 }
                 ui_state.regen = true;
@@ -2717,6 +2718,10 @@ fn ui_system(
             } else if cancel {
                 ui_state.pending_mirror = None;
                 ui_state.mirror_shown = None;
+                // Cancelling an EDIT restores the timeline (rolled back for the preview).
+                if ui_state.editing_feature.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                }
                 ui_state.regen = true;
             } else {
                 ui_state.pending_mirror = Some(which);
@@ -2797,6 +2802,10 @@ fn ui_system(
                 }
             } else if cancel {
                 ui_state.pending_thread = None;
+                // Cancelling an EDIT restores the timeline (rolled back for the ghost preview).
+                if ui_state.editing_feature.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                }
                 ui_state.regen = true;
             } else {
                 ui_state.pending_thread = Some(spec);
@@ -3091,10 +3100,26 @@ fn ui_system(
                     })
                     .collect();
                 if built.len() >= 2 {
-                    doc.0.add_feature(FeatureKind::Loft { profiles: built, cut: ui_state.loft_cut });
+                    history.snapshot(&doc.0);
+                    // Editing an existing loft (tree → Edit): update it in place.
+                    if let Some(i) = ui_state.editing_feature.take() {
+                        if let Some(f) = doc.0.features.get_mut(i) {
+                            f.kind = FeatureKind::Loft { profiles: built, cut: ui_state.loft_cut };
+                            doc.0.rollback = doc.0.features.len();
+                            ui_state.selected = Some(i);
+                        }
+                    } else {
+                        doc.0.add_feature(FeatureKind::Loft { profiles: built, cut: ui_state.loft_cut });
+                    }
                     ui_state.regen = true;
                 }
                 keep = false;
+            }
+            // Leaving the PM without committing while EDITING a loft → restore the timeline
+            // (it was rolled back so profiles previewed against the pre-loft body).
+            if !keep && ui_state.editing_feature.take().is_some() {
+                doc.0.rollback = doc.0.features.len();
+                ui_state.regen = true;
             }
             ui_state.loft_spec = if keep { Some(profiles) } else { None };
         }
@@ -4008,11 +4033,11 @@ fn ui_system(
                                 ui_state.selected = Some(i);
                             }
                             if resp.double_clicked() {
-                                action = Some(TreeAction::EditBevel(i));
+                                action = Some(TreeAction::EditPm(i));
                             }
                             resp.context_menu(|ui| {
                                 if ui.button("Edit fillet").clicked() {
-                                    action = Some(TreeAction::EditBevel(i));
+                                    action = Some(TreeAction::EditPm(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -4028,11 +4053,11 @@ fn ui_system(
                                 ui_state.selected = Some(i);
                             }
                             if resp.double_clicked() {
-                                action = Some(TreeAction::EditBevel(i));
+                                action = Some(TreeAction::EditPm(i));
                             }
                             resp.context_menu(|ui| {
                                 if ui.button("Edit chamfer").clicked() {
-                                    action = Some(TreeAction::EditBevel(i));
+                                    action = Some(TreeAction::EditPm(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -4047,7 +4072,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit mirror").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -4067,7 +4099,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit loft").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -4081,7 +4120,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit thread").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -4190,7 +4236,7 @@ fn ui_system(
                         ui_state.edit_sketch_request = Some(i);
                         ui_state.edit_as_text = true;
                     }
-                    TreeAction::EditBevel(i) => {
+                    TreeAction::EditPm(i) => {
                         // Reopen the Fillet/Chamfer PM with the stored size and picked edges. The
                         // doc rolls back to just before the feature so the preview (and any edge
                         // re-picking) works against the PRE-bevel body; OK updates it in place.
@@ -4201,7 +4247,7 @@ fn ui_system(
                                     ui_state.pending_chamfer = None;
                                     ui_state.fillet_edges = edges.clone();
                                     ui_state.fillet_shown = None;
-                                    ui_state.editing_bevel = Some(i);
+                                    ui_state.editing_feature = Some(i);
                                     doc.0.rollback = i;
                                     ui_state.regen = true;
                                 }
@@ -4210,7 +4256,64 @@ fn ui_system(
                                     ui_state.pending_fillet = None;
                                     ui_state.fillet_edges = edges.clone();
                                     ui_state.chamfer_shown = None;
-                                    ui_state.editing_bevel = Some(i);
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Mirror { plane } => {
+                                    // Recover which datum plane from the stored normal.
+                                    let n = plane.normal;
+                                    let which = if n[1].abs() > 0.9 { 1 } else if n[0].abs() > 0.9 { 2 } else { 0 };
+                                    ui_state.pending_mirror = Some(which);
+                                    ui_state.mirror_shown = None;
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Thread { origin, axis, major_d, pitch, depth, internal, rh } => {
+                                    // Rebuild the spec: keep the anchored placement, find the size
+                                    // table entry nearest the stored major diameter.
+                                    let mut spec = ThreadSpec {
+                                        placed: true,
+                                        origin: Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32),
+                                        axis: Vec3::new(axis[0] as f32, axis[1] as f32, axis[2] as f32),
+                                        pitch: *pitch as f32,
+                                        depth: *depth as f32,
+                                        internal: *internal,
+                                        rh: *rh,
+                                        ..Default::default()
+                                    };
+                                    let (mut best, mut metric, mut size) = (f32::MAX, true, 3usize);
+                                    for (m, table) in [(true, METRIC_THREADS), (false, IMPERIAL_THREADS)] {
+                                        for (k, t) in table.iter().enumerate() {
+                                            let d = (t.1 - *major_d as f32).abs();
+                                            if d < best {
+                                                best = d;
+                                                metric = m;
+                                                size = k;
+                                            }
+                                        }
+                                    }
+                                    spec.metric = metric;
+                                    spec.size = size;
+                                    ui_state.pending_thread = Some(spec);
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Loft { profiles, cut } => {
+                                    // Map each stored profile back to its timeline sketch by
+                                    // fingerprint; unmatched ones are re-picked by the user.
+                                    let spec: Vec<(usize, usize)> = profiles
+                                        .iter()
+                                        .filter_map(|p| {
+                                            let fp = sketch_fingerprint(&p.sketch);
+                                            doc.0.features.iter().position(|f| matches!(&f.kind, FeatureKind::Sketch { sketch, .. } if sketch_fingerprint(sketch) == fp)).map(|fi| (fi, p.region))
+                                        })
+                                        .collect();
+                                    ui_state.loft_cut = *cut;
+                                    ui_state.loft_spec = Some(spec);
+                                    ui_state.editing_feature = Some(i);
                                     doc.0.rollback = i;
                                     ui_state.regen = true;
                                 }
@@ -10969,7 +11072,7 @@ fn apply_fillet(
     }
     history.snapshot(&doc.0);
     // Editing an existing fillet (tree → Edit): update it in place instead of appending.
-    if let Some(i) = ui_state.editing_bevel.take() {
+    if let Some(i) = ui_state.editing_feature.take() {
         if let Some(f) = doc.0.features.get_mut(i) {
             f.kind = FeatureKind::Fillet { radius, edges };
             doc.0.rollback = doc.0.features.len();
@@ -11043,7 +11146,7 @@ fn apply_chamfer(
     }
     history.snapshot(&doc.0);
     // Editing an existing chamfer (tree → Edit): update it in place instead of appending.
-    if let Some(i) = ui_state.editing_bevel.take() {
+    if let Some(i) = ui_state.editing_feature.take() {
         if let Some(f) = doc.0.features.get_mut(i) {
             f.kind = FeatureKind::Chamfer { distance, edges };
             doc.0.rollback = doc.0.features.len();
@@ -11109,6 +11212,16 @@ fn apply_mirror_feature(
 ) {
     let Some(which) = ui_state.mirror_request.take() else { return };
     history.snapshot(&doc.0);
+    // Editing an existing mirror (tree → Edit): update it in place instead of appending.
+    if let Some(i) = ui_state.editing_feature.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = FeatureKind::Mirror { plane: standard_plane_ref(which) };
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
     doc.0.add_feature(FeatureKind::Mirror { plane: standard_plane_ref(which) });
     doc.0.rollback = doc.0.features.len();
     ui_state.selected = Some(doc.0.features.len() - 1);
@@ -11167,6 +11280,16 @@ fn thread_feature(spec: &ThreadSpec) -> FeatureKind {
 fn apply_thread(mut ui_state: ResMut<UiState>, mut doc: ResMut<DocRes>, mut history: ResMut<History>) {
     let Some(spec) = ui_state.thread_request.take() else { return };
     history.snapshot(&doc.0);
+    // Editing an existing thread (tree → Edit): update it in place instead of appending.
+    if let Some(i) = ui_state.editing_feature.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = thread_feature(&spec);
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
     doc.0.add_feature(thread_feature(&spec));
     doc.0.rollback = doc.0.features.len();
     ui_state.selected = Some(doc.0.features.len() - 1);
