@@ -432,6 +432,8 @@ enum TreeAction {
     Edit(usize),
     /// Reopen a sketch that holds a Text entity, straight into the Text tool with it selected.
     EditText(usize),
+    /// Reopen a Fillet/Chamfer in its PropertyManager (radius/distance + picked edges loaded).
+    EditBevel(usize),
     ExtrudeBoss(usize),
     ExtrudeCut(usize),
     Delete(usize),
@@ -574,6 +576,10 @@ struct UiState {
     perspective: bool,
     /// Mouse view-control preset (Tools → Mouse controls).
     mouse_scheme: MouseScheme,
+    /// Timeline index of the Fillet/Chamfer being EDITED via its PM (tree double-click / Edit).
+    /// While set, the doc is rolled back to just before it (so the preview builds on the
+    /// pre-bevel body) and OK updates the feature in place instead of appending a new one.
+    editing_bevel: Option<usize>,
     /// Set with `edit_sketch_request` to reopen a Text feature straight into the Text tool with the
     /// text entity selected and its parameters loaded into the PM. Consumed by `handle_edit_sketch`.
     edit_as_text: bool,
@@ -2590,6 +2596,11 @@ fn ui_system(
                 ui_state.pending_fillet = None;
                 ui_state.fillet_shown = None;
                 ui_state.fillet_edges.clear();
+                // Cancelling an EDIT restores the timeline (the doc was rolled back to preview
+                // against the pre-fillet body) — the original fillet reappears untouched.
+                if ui_state.editing_bevel.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                }
                 ui_state.regen = true; // rebuild without the preview
             } else {
                 ui_state.pending_fillet = Some(r.max(0.01));
@@ -2668,6 +2679,10 @@ fn ui_system(
                 ui_state.pending_chamfer = None;
                 ui_state.chamfer_shown = None;
                 ui_state.fillet_edges.clear();
+                // Cancelling an EDIT restores the timeline (see the fillet cancel above).
+                if ui_state.editing_bevel.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                }
                 ui_state.regen = true;
             } else {
                 ui_state.pending_chamfer = Some(d.max(0.01));
@@ -3992,7 +4007,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditBevel(i));
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit fillet").clicked() {
+                                    action = Some(TreeAction::EditBevel(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -4005,7 +4027,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditBevel(i));
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit chamfer").clicked() {
+                                    action = Some(TreeAction::EditBevel(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -4160,6 +4189,34 @@ fn ui_system(
                     TreeAction::EditText(i) => {
                         ui_state.edit_sketch_request = Some(i);
                         ui_state.edit_as_text = true;
+                    }
+                    TreeAction::EditBevel(i) => {
+                        // Reopen the Fillet/Chamfer PM with the stored size and picked edges. The
+                        // doc rolls back to just before the feature so the preview (and any edge
+                        // re-picking) works against the PRE-bevel body; OK updates it in place.
+                        if let Some(f) = doc.0.features.get(i) {
+                            match &f.kind {
+                                FeatureKind::Fillet { radius, edges } => {
+                                    ui_state.pending_fillet = Some(*radius as f32);
+                                    ui_state.pending_chamfer = None;
+                                    ui_state.fillet_edges = edges.clone();
+                                    ui_state.fillet_shown = None;
+                                    ui_state.editing_bevel = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Chamfer { distance, edges } => {
+                                    ui_state.pending_chamfer = Some(*distance as f32);
+                                    ui_state.pending_fillet = None;
+                                    ui_state.fillet_edges = edges.clone();
+                                    ui_state.chamfer_shown = None;
+                                    ui_state.editing_bevel = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     TreeAction::ExtrudeBoss(i) => {
                         ui_state.edit_sketch_request = Some(i);
@@ -10911,6 +10968,16 @@ fn apply_fillet(
         return;
     }
     history.snapshot(&doc.0);
+    // Editing an existing fillet (tree → Edit): update it in place instead of appending.
+    if let Some(i) = ui_state.editing_bevel.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = FeatureKind::Fillet { radius, edges };
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
     doc.0.add_feature(FeatureKind::Fillet { radius, edges });
     doc.0.rollback = doc.0.features.len();
     ui_state.selected = Some(doc.0.features.len() - 1);
@@ -10975,6 +11042,16 @@ fn apply_chamfer(
         return;
     }
     history.snapshot(&doc.0);
+    // Editing an existing chamfer (tree → Edit): update it in place instead of appending.
+    if let Some(i) = ui_state.editing_bevel.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = FeatureKind::Chamfer { distance, edges };
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
     doc.0.add_feature(FeatureKind::Chamfer { distance, edges });
     doc.0.rollback = doc.0.features.len();
     ui_state.selected = Some(doc.0.features.len() - 1);
