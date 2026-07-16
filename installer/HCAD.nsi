@@ -64,6 +64,14 @@ Section "HCAD (required)" SecMain
   WriteRegDWORD HKLM "${UNINST}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINST}" "NoRepair" 1
 
+  ; .hcad file association: double-click opens the part in HCAD, files show the gear icon.
+  WriteRegStr HKLM "Software\Classes\.hcad" "" "HCAD.Part"
+  WriteRegStr HKLM "Software\Classes\HCAD.Part" "" "HCAD Part"
+  WriteRegStr HKLM "Software\Classes\HCAD.Part\DefaultIcon" "" "$INSTDIR\hcad.ico"
+  WriteRegStr HKLM "Software\Classes\HCAD.Part\shell\open\command" "" '"$INSTDIR\HCAD.exe" "%1"'
+  ; Tell Explorer the associations changed (SHCNE_ASSOCCHANGED, SHCNF_IDLIST).
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
 
@@ -81,4 +89,7 @@ Section "Uninstall"
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\HCAD"
   DeleteRegKey HKLM "Software\HCAD"
+  DeleteRegKey HKLM "Software\Classes\HCAD.Part"
+  DeleteRegKey HKLM "Software\Classes\.hcad"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd

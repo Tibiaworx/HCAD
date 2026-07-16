@@ -133,7 +133,7 @@ fn main() {
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
         .init_resource::<EdgeSelection>()
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup, open_cli_file))
         .add_systems(EguiPrimaryContextPass, ui_system)
         .add_systems(
             Update,
@@ -153,6 +153,7 @@ fn main() {
                     apply_thread,
                     do_regenerate,
                     set_window_icon,
+                    update_projection,
                     fillet_preview,
                     chamfer_preview,
                     mirror_preview,
@@ -474,6 +475,14 @@ struct UiState {
     toasts: Vec<(String, f32)>,
     /// Whether the About window is open.
     show_about: bool,
+    /// Displacement (logical px, +right/+down) of the VISIBLE viewport centre from the window
+    /// centre — panels/toolbars overlay the 3D view. Measured from egui's rects each frame;
+    /// used by "Normal To" framing so geometry centres in what the user actually sees.
+    view_center_offset: (f32, f32),
+    /// Perspective camera toggle. Default OFF: CAD works in ORTHOGRAPHIC projection so a
+    /// "Normal To" view is measurably true — perspective foreshortens off-centre geometry
+    /// (parallax), making circles read elliptical and edges skew.
+    perspective: bool,
     /// Set with `edit_sketch_request` to reopen a Text feature straight into the Text tool with the
     /// text entity selected and its parameters loaded into the PM. Consumed by `handle_edit_sketch`.
     edit_as_text: bool,
@@ -1174,6 +1183,58 @@ fn set_window_icon(
     *done = true;
 }
 
+/// Keep the camera's projection in sync with the zoom and the Perspective toggle. Orthographic is
+/// the default (CAD-true views, no parallax): the view height tracks the orbit radius through the
+/// same half-FOV formula the perspective camera uses, so toggling projections holds the framing
+/// and zoom-to-cursor keeps working (it scales `radius`, which scales the ortho window).
+fn update_projection(ui_state: Res<UiState>, mut q: Query<(&OrbitCamera, &mut Projection)>) {
+    const VFOV: f32 = std::f32::consts::PI / 4.0;
+    for (cam, mut proj) in &mut q {
+        if ui_state.perspective {
+            if !matches!(*proj, Projection::Perspective(_)) {
+                *proj = Projection::from(PerspectiveProjection { near: 0.02, far: 100_000.0, ..default() });
+            }
+        } else {
+            let h = 2.0 * cam.radius.max(0.01) * (VFOV * 0.5).tan();
+            *proj = Projection::Orthographic(OrthographicProjection {
+                scaling_mode: bevy::camera::ScalingMode::FixedVertical { viewport_height: h },
+                near: -100_000.0,
+                far: 100_000.0,
+                ..OrthographicProjection::default_3d()
+            });
+        }
+    }
+}
+
+/// Open a `.hcad` passed on the command line (double-clicking an associated file hands us its
+/// path as the first argument). Loads it exactly like File → Open, so the window title, Save
+/// binding, and regeneration all behave as if opened from the dialog.
+fn open_cli_file(mut doc: ResMut<DocRes>, mut ui_state: ResMut<UiState>) {
+    let Some(arg) = std::env::args().nth(1) else { return };
+    let path = std::path::PathBuf::from(&arg);
+    if !path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad") || e.eq_ignore_ascii_case("ron")) {
+        return;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match ron::from_str::<Document>(&text) {
+            Ok(loaded) => {
+                doc.0 = loaded;
+                ui_state.current_file = Some(path.clone());
+                ui_state.regen = true;
+                info!("Opened {} (command line)", path.display());
+            }
+            Err(e) => {
+                warn!("Could not parse {}: {e}", path.display());
+                ui_state.last_error = Some(format!("Couldn't open {} — it isn't a valid HCAD part.", path.display()));
+            }
+        },
+        Err(e) => {
+            warn!("Could not read {}: {e}", path.display());
+            ui_state.last_error = Some(format!("Couldn't read {}: {e}", path.display()));
+        }
+    }
+}
+
 fn camera_transform(cam: &OrbitCamera) -> Transform {
     let rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
     let translation = cam.focus + rotation * Vec3::new(0.0, 0.0, cam.radius);
@@ -1211,23 +1272,23 @@ fn look_along(cam: &mut OrbitCamera, focus: Vec3, normal: Vec3) {
     cam.focus = focus;
 }
 
-/// Width (logical px) of the left PropertyManager panel — it overlays the 3D viewport, so the
-/// visible drawing area is the window minus this on the left.
-const LEFT_PANEL_PX: f32 = 240.0;
-
-/// Nudge the orbit pivot left (along camera-right) so a "Normal To" frame lands the geometry in
-/// the middle of the *visible* viewport, not the middle of the window. The left panel covers
-/// `LEFT_PANEL_PX`, so the visible centre sits half a panel-width right of window centre; shifting
-/// the pivot left by that many world units at the focus depth puts the sketch back on centre.
+/// Nudge the orbit pivot so a "Normal To" frame lands the geometry in the middle of the *visible*
+/// viewport, not the middle of the window. The left panel and the toolbar strip both overlay the
+/// 3D view, so the visible centre sits right of AND below the window centre — `offset` is that
+/// displacement in logical px (measured from egui's real panel rects each frame, so it tracks a
+/// resized panel and any UI change; the old hardcoded panel-width guess drifted top-left).
 /// Call *after* `look_along` (needs the final yaw/pitch/radius). `win_h` is the logical window height.
-fn recenter_for_panel(cam: &mut OrbitCamera, win_h: f32) {
+fn recenter_for_panel(cam: &mut OrbitCamera, win_h: f32, offset: (f32, f32)) {
     const VFOV: f32 = std::f32::consts::PI / 4.0; // Bevy PerspectiveProjection default vertical fov
     if win_h <= 1.0 {
         return;
     }
     let world_per_px = 2.0 * cam.radius * (VFOV * 0.5).tan() / win_h;
-    let right = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0) * Vec3::X;
-    cam.focus -= right * (LEFT_PANEL_PX * 0.5 * world_per_px);
+    let rot = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
+    let right = rot * Vec3::X;
+    let up = rot * Vec3::Y;
+    // Aim so the geometry projects onto the VISIBLE centre: offset.0 px right, offset.1 px down.
+    cam.focus = cam.focus - right * (offset.0 * world_per_px) + up * (offset.1 * world_per_px);
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1478,8 @@ fn ui_system(
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut ui_state.show_tangent_edges, "Tangent edges");
                 if ui.checkbox(&mut ui_state.seamless, "Seamless").changed() { ui_state.regen = true; }
+                ui.checkbox(&mut ui_state.perspective, "Perspective")
+                    .on_hover_text("Perspective camera (default is orthographic — CAD-true views with no parallax)");
             });
             ui.menu_button("Insert", |ui| {
                 if ui
@@ -3149,11 +3212,18 @@ fn ui_system(
                     Tool::Circle => {
                         // Snap the live radius to a matching existing circular edge.
                         let snapped_live = snap_radius(live, &session.reference_circles, session.snap_dist.max(SNAP));
-                        ui.label(egui::RichText::new("Circle radius").strong());
+                        // All circle measurements are DIAMETER (Ø) — matching the viewport
+                        // callouts, dimensions, and the panel's circle fields. (`live_buf`
+                        // stays a radius internally; only the display converts.)
+                        ui.label(egui::RichText::new("Circle diameter").strong());
                         ui.horizontal(|ui| {
+                            let mut dia = session.live_buf * 2.0;
                             let resp = ui.add(
-                                egui::DragValue::new(&mut session.live_buf).speed(0.05).range(0.01..=10_000.0).suffix(" mm"),
+                                egui::DragValue::new(&mut dia).speed(0.1).range(0.02..=20_000.0).prefix("Ø ").suffix(" mm"),
                             );
+                            if resp.changed() {
+                                session.live_buf = dia * 0.5;
+                            }
                             if focus_now {
                                 resp.request_focus();
                                 focus_now = false;
@@ -3166,10 +3236,6 @@ fn ui_system(
                                 commit_circle_radius(&mut session, r);
                             }
                         });
-                        ui.label(
-                            egui::RichText::new(format!("circumference {:.1} mm", std::f32::consts::TAU * session.live_buf))
-                                .weak(),
-                        );
                         ui.separator();
                     }
                     Tool::Rectangle => {
@@ -3328,10 +3394,14 @@ fn ui_system(
                     ui.horizontal(|ui| {
                         ui.label(format!("C{}", k + 1));
                         if let Some(SketchEntity::Circle { radius, .. }) = session.sketch.entities.get_mut(*i) {
+                            // Shown as DIAMETER (Ø) to match the viewport callouts — the panel
+                            // showing R while the canvas showed Ø read like two different sizes.
+                            let mut dia = *radius * 2.0;
                             if ui
-                                .add(egui::DragValue::new(radius).speed(0.05).range(0.01..=10_000.0).prefix("R ").suffix(" mm"))
+                                .add(egui::DragValue::new(&mut dia).speed(0.1).range(0.02..=20_000.0).prefix("Ø ").suffix(" mm"))
                                 .changed()
                             {
+                                *radius = dia * 0.5;
                                 changed = true;
                             }
                         }
@@ -4157,7 +4227,7 @@ fn ui_system(
                         // current pose and glide to it (so the transition animates).
                         let cur = (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius);
                         look_along(&mut orbit, ap.origin, ap.n);
-                        recenter_for_panel(&mut orbit, ctx.screen_rect().height());
+                        recenter_for_panel(&mut orbit, ctx.screen_rect().height(), ui_state.view_center_offset);
                         let tgt = (orbit.focus, orbit.radius, orbit.yaw, orbit.pitch);
                         (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius) = cur;
                         orbit.animate_to(tgt.0, tgt.1, tgt.2, tgt.3);
@@ -4821,6 +4891,15 @@ fn ui_system(
                 });
         }
         ctx.request_repaint(); // keep animating the fade
+    }
+
+    // Where the visible 3D area's centre sits relative to the window centre (all panels are
+    // declared by now, so available_rect is the true remaining viewport).
+    {
+        let vr = ctx.available_rect();
+        let sr = ctx.screen_rect();
+        let d = vr.center() - sr.center();
+        ui_state.view_center_offset = (d.x, d.y);
     }
 
     blocking.0 = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
@@ -6752,7 +6831,7 @@ fn sketch_interaction(
                 edge_sel.clear();
                 orbit.radius = orbit.radius.max(6.0);
                 look_along(&mut orbit, ap.origin, ap.n);
-                recenter_for_panel(&mut orbit, window.height());
+                recenter_for_panel(&mut orbit, window.height(), ui_state.view_center_offset);
                 *cam_tf = camera_transform(&orbit);
                 session.sketch.clear();
                 session.pending = None;
@@ -9524,7 +9603,9 @@ fn handle_file_io(
         ui_state.export_stl_request = false;
         match &part.mesh {
             Some(mesh) if !mesh.positions.is_empty() => {
-                if let Some(mut path) = rfd::FileDialog::new().add_filter("STL mesh", &["stl"]).set_file_name("part.stl").save_file() {
+                // Default the export name to the part's saved name (part.hcad → part.stl).
+                let stem = ui_state.current_file.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("part");
+                if let Some(mut path) = rfd::FileDialog::new().add_filter("STL mesh", &["stl"]).set_file_name(format!("{stem}.stl")).save_file() {
                     if path.extension().is_none() {
                         path.set_extension("stl");
                     }
@@ -9553,7 +9634,8 @@ fn handle_file_io(
         let solid = part.solid.clone().or_else(|| part.mesh.as_ref().and_then(|m| mesh_to_solid(m)));
         match solid.as_ref().and_then(export_step) {
             Some(step) => {
-                if let Some(mut path) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).set_file_name("part.step").save_file() {
+                let stem = ui_state.current_file.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("part");
+                if let Some(mut path) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).set_file_name(format!("{stem}.step")).save_file() {
                     if path.extension().is_none() {
                         path.set_extension("step");
                     }
@@ -9811,7 +9893,7 @@ fn handle_edit_sketch(
             let (center, radius) = fit_view(&part);
             orbit.radius = (radius * 2.1).max(6.0);
             look_along(&mut orbit, center, ap.n);
-            recenter_for_panel(&mut orbit, win_h);
+            recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
             *tf = camera_transform(&orbit);
         }
         session.sketch.clear();
@@ -9847,7 +9929,7 @@ fn handle_edit_sketch(
                 let (center, radius) = fit_view(&part);
                 orbit.radius = (radius * 2.1).max(6.0);
                 look_along(&mut orbit, center, ap.n);
-                recenter_for_panel(&mut orbit, win_h);
+                recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
                 *tf = camera_transform(&orbit);
             }
             session.sketch.clear();
@@ -9894,7 +9976,7 @@ fn handle_edit_sketch(
         let (center, radius) = fit_view(&part);
         orbit.radius = (radius * 2.1).max(6.0);
         look_along(&mut orbit, center, ap.n);
-        recenter_for_panel(&mut orbit, win_h);
+        recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
         *tf = camera_transform(&orbit);
     }
     session.sketch = sketch;
