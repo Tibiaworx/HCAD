@@ -335,6 +335,18 @@ fn eye_button(ui: &mut egui::Ui, hidden: bool) -> bool {
         .clicked()
 }
 
+/// Mouse view-control preset: how orbit and pan map onto the mouse.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum MouseScheme {
+    /// HCAD native: right-drag orbits, middle-drag pans.
+    #[default]
+    Hcad,
+    /// Blender-style: middle-drag orbits, Shift+middle pans.
+    Blender,
+    /// SolidWorks-style: middle-drag orbits, Ctrl+middle pans.
+    SolidWorks,
+}
+
 /// An action chosen from a feature-tree right-click menu (applied after the
 /// tree's immutable borrow ends).
 #[derive(Clone, Copy)]
@@ -483,6 +495,8 @@ struct UiState {
     /// "Normal To" view is measurably true — perspective foreshortens off-centre geometry
     /// (parallax), making circles read elliptical and edges skew.
     perspective: bool,
+    /// Mouse view-control preset (Tools → Mouse controls).
+    mouse_scheme: MouseScheme,
     /// Set with `edit_sketch_request` to reopen a Text feature straight into the Text tool with the
     /// text entity selected and its parameters loaded into the PM. Consumed by `handle_edit_sketch`.
     edit_as_text: bool,
@@ -1500,6 +1514,17 @@ fn ui_system(
                 ui.menu_button("Units", |ui| {
                     if ui.selectable_label(ui_state.unit == Unit::Mm, "Millimetres (mm)").clicked() { ui_state.unit = Unit::Mm; ui.close(); }
                     if ui.selectable_label(ui_state.unit == Unit::Inch, "Inches (in)").clicked() { ui_state.unit = Unit::Inch; ui.close(); }
+                });
+                ui.menu_button("Mouse controls", |ui| {
+                    let mut pick = |ui: &mut egui::Ui, scheme: MouseScheme, label: &str, tip: &str| {
+                        if ui.selectable_label(ui_state.mouse_scheme == scheme, label).on_hover_text(tip).clicked() {
+                            ui_state.mouse_scheme = scheme;
+                            ui.close();
+                        }
+                    };
+                    pick(ui, MouseScheme::Hcad, "HCAD (default)", "Right-drag orbits, middle-drag pans, scroll zooms to the cursor");
+                    pick(ui, MouseScheme::Blender, "Blender", "Middle-drag orbits, Shift+middle pans, scroll zooms");
+                    pick(ui, MouseScheme::SolidWorks, "SolidWorks", "Middle-drag orbits, Ctrl+middle pans, scroll zooms");
                 });
             });
             ui.menu_button("Help", |ui| {
@@ -12023,9 +12048,11 @@ fn draw_body_edges(
 
 fn orbit_camera(
     buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     blocking: Res<UiBlocking>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    ui_state: Res<UiState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut query: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
 ) {
@@ -12043,8 +12070,20 @@ fn orbit_camera(
     let forward = rot * Vec3::NEG_Z; // camera looks down its local -Z (toward focus)
     let mut changed = false;
 
-    // Right-drag: orbit.
-    if buttons.pressed(MouseButton::Right) && motion.delta != Vec2::ZERO {
+    // Which gesture is which button depends on the chosen control scheme.
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let middle = buttons.pressed(MouseButton::Middle);
+    let (orbiting, panning) = match ui_state.mouse_scheme {
+        // HCAD (default): right-drag orbits, middle-drag pans.
+        MouseScheme::Hcad => (buttons.pressed(MouseButton::Right), middle),
+        // Blender: middle-drag orbits, Shift+middle pans.
+        MouseScheme::Blender => (middle && !shift, middle && shift),
+        // SolidWorks: middle-drag orbits, Ctrl+middle pans.
+        MouseScheme::SolidWorks => (middle && !ctrl, middle && ctrl),
+    };
+
+    if orbiting && motion.delta != Vec2::ZERO {
         cam.yaw -= motion.delta.x * ORBIT_SENS;
         // No pole stop: the camera rotation comes straight from Euler angles, so pitch can roll
         // continuously over the top (turntable-style). Wrap into ±π so it never grows unbounded.
@@ -12053,8 +12092,8 @@ fn orbit_camera(
         changed = true;
     }
 
-    // Middle-drag: pan (move the focus in the camera's screen plane).
-    if buttons.pressed(MouseButton::Middle) && motion.delta != Vec2::ZERO {
+    // Pan: move the focus in the camera's screen plane.
+    if panning && motion.delta != Vec2::ZERO {
         let k = cam.radius * 0.0016;
         cam.focus += (-right * motion.delta.x + up * motion.delta.y) * k;
         changed = true;
