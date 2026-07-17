@@ -99,6 +99,29 @@ pub enum FeatureKind {
     /// Mirror: reflect the whole body across `plane` and union it with the original
     /// (a symmetric part). The plane is recorded so it survives regeneration.
     Mirror { plane: PlaneRef },
+    /// Pattern: repeat the *tool* of an earlier material feature (`seed` = its timeline index —
+    /// an Extrude/Cut/Revolve/Loft) `count` times total, re-applying the seed's op (boss unions,
+    /// cut subtracts) at each instance. Linear: step `spacing` along the world direction `dir`.
+    /// Circular: rotate `step` radians per instance about the world axis through `axis_pt`
+    /// along `axis_dir`.
+    Pattern {
+        seed: usize,
+        circular: bool,
+        dir: [f64; 3],
+        spacing: f64,
+        axis_pt: [f64; 3],
+        axis_dir: [f64; 3],
+        step: f64,
+        count: u32,
+    },
+    /// Shell: hollow the body leaving walls of `thickness`. Each entry in `open` is a picked
+    /// face to REMOVE (a point on the face + its outward normal) — the cavity opens through it,
+    /// like SolidWorks' "faces to remove". Empty = a fully enclosed hollow.
+    Shell { thickness: f64, #[serde(default)] open: Vec<([f64; 3], [f64; 3])> },
+    /// Sweep: sweep a profile sketch region along an open path sketched on (usually) another
+    /// plane. The profile is carried along the path with rotation-minimising frames (no twist).
+    /// `cut` subtracts the swept solid instead of adding it.
+    Sweep { profile: LoftProfile, path_sketch: Sketch, path_plane: PlaneRef, #[serde(default)] cut: bool },
     /// Threaded hole / thread (the "Hole Genie"): at `origin` on a face with outward normal
     /// `axis`, a thread of `major_d` × `pitch` over `depth`. `internal` taps a hole; false
     /// threads an existing boss. `rh` = right-handed.
@@ -244,6 +267,22 @@ impl Document {
                     }
                 }
                 FeatureKind::Mirror { .. } => "[mirror] Mirror".to_string(),
+                FeatureKind::Pattern { circular, count, .. } => {
+                    let kind = if *circular { "Circular" } else { "Linear" };
+                    format!("[pattern] {kind} Pattern  ×{count}")
+                }
+                FeatureKind::Shell { thickness, open } => {
+                    format!("[shell]  Shell  t={thickness:.2} ({} open)", open.len())
+                }
+                FeatureKind::Sweep { cut, .. } => {
+                    if *cut {
+                        ct += 1;
+                        format!("[sweep]  SweepCut{ct}")
+                    } else {
+                        ex += 1;
+                        format!("[sweep]  Sweep{ex}")
+                    }
+                }
                 FeatureKind::Thread { major_d, pitch, internal, .. } => {
                     let kind = if *internal { "tap" } else { "ext" };
                     format!("[thread] Thread {kind}  M{major_d:.1}×{pitch:.2}")

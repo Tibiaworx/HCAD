@@ -1636,6 +1636,183 @@ fn clean_feature_edges(ids: &[(usize, usize)], pos: &[[f32; 3]], diag: f32) -> V
     out.iter().map(|&(a, b)| [pos[a], pos[b]]).collect()
 }
 
+/// A copy of `m` translated by `d` (normals unchanged) — pattern instances.
+pub fn translate_mesh(m: &TriMesh, d: [f64; 3]) -> TriMesh {
+    let mut out = m.clone();
+    for p in &mut out.positions {
+        p[0] += d[0] as f32;
+        p[1] += d[1] as f32;
+        p[2] += d[2] as f32;
+    }
+    out
+}
+
+/// A copy of `m` rotated by `angle` radians about the axis through `pt` along `axis`
+/// (Rodrigues; normals rotate too) — circular-pattern instances.
+pub fn rotate_mesh(m: &TriMesh, pt: [f64; 3], axis: [f64; 3], angle: f64) -> TriMesh {
+    let al = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if al < 1e-12 {
+        return m.clone();
+    }
+    let k = [axis[0] / al, axis[1] / al, axis[2] / al];
+    let (s, c) = angle.sin_cos();
+    let rot = |v: [f64; 3]| -> [f64; 3] {
+        let kv = [k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0]];
+        let kd = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+        [
+            v[0] * c + kv[0] * s + k[0] * kd * (1.0 - c),
+            v[1] * c + kv[1] * s + k[1] * kd * (1.0 - c),
+            v[2] * c + kv[2] * s + k[2] * kd * (1.0 - c),
+        ]
+    };
+    let mut out = m.clone();
+    for p in &mut out.positions {
+        let v = [p[0] as f64 - pt[0], p[1] as f64 - pt[1], p[2] as f64 - pt[2]];
+        let r = rot(v);
+        *p = [(r[0] + pt[0]) as f32, (r[1] + pt[1]) as f32, (r[2] + pt[2]) as f32];
+    }
+    for n in &mut out.normals {
+        let r = rot([n[0] as f64, n[1] as f64, n[2] as f64]);
+        *n = [r[0] as f32, r[1] as f32, r[2] as f32];
+    }
+    out
+}
+
+/// Build the SHELL cutting tool: the body's inner surface, offset inward by `thickness`.
+/// Subtracting it from the body leaves walls of that thickness. Faces listed in `open`
+/// (a point on the face + its outward unit normal) are REMOVED: vertices on them push
+/// *outward* by `overshoot` instead, so the tool pokes through and the cavity opens there.
+///
+/// Vertices are welded by position, then each is moved to satisfy "every adjacent face's
+/// plane shifts in by `thickness`" (least-squares over the distinct adjacent face normals) —
+/// so box corners land exactly and walls stay uniform. Offsets are capped at 3× thickness
+/// to keep shallow creases from exploding. `None` if the mesh is empty.
+pub fn shell_tool(body: &TriMesh, thickness: f64, open: &[([f64; 3], [f64; 3])], overshoot: f64) -> Option<TriMesh> {
+    if body.positions.is_empty() || thickness <= 0.0 {
+        return None;
+    }
+    // Bounding diagonal for tolerances.
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in &body.positions {
+        for a in 0..3 {
+            lo[a] = lo[a].min(p[a] as f64);
+            hi[a] = hi[a].max(p[a] as f64);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt().max(1e-6);
+    let plane_tol = diag * 1e-4 + 1e-6;
+
+    // Weld vertices by quantised position (tessellations may duplicate per-face).
+    let q = diag * 1e-6;
+    let key = |p: [f32; 3]| ((p[0] as f64 / q).round() as i64, (p[1] as f64 / q).round() as i64, (p[2] as f64 / q).round() as i64);
+    let mut weld: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+    let mut verts: Vec<[f64; 3]> = Vec::new();
+    let map: Vec<usize> = body
+        .positions
+        .iter()
+        .map(|&p| {
+            *weld.entry(key(p)).or_insert_with(|| {
+                verts.push([p[0] as f64, p[1] as f64, p[2] as f64]);
+                verts.len() - 1
+            })
+        })
+        .collect();
+
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let norm = |a: [f64; 3]| {
+        let l = dot(a, a).sqrt();
+        if l > 1e-12 { [a[0] / l, a[1] / l, a[2] / l] } else { [0.0; 3] }
+    };
+
+    // Classify triangles: on a removed face, or a keeper (offsets inward).
+    let tris: Vec<[usize; 3]> = body.indices.chunks(3).map(|t| [map[t[0] as usize], map[t[1] as usize], map[t[2] as usize]]).collect();
+    let mut tri_removed: Vec<Option<usize>> = vec![None; tris.len()]; // index into `open`
+    let mut tri_n: Vec<[f64; 3]> = Vec::with_capacity(tris.len());
+    for (ti, t) in tris.iter().enumerate() {
+        let n = norm(cross(sub(verts[t[1]], verts[t[0]]), sub(verts[t[2]], verts[t[0]])));
+        tri_n.push(n);
+        for (oi, (op, on)) in open.iter().enumerate() {
+            let on = norm(*on);
+            if dot(n, on) > 0.985 && t.iter().all(|&vi| (dot(sub(verts[vi], *op), on)).abs() < plane_tol) {
+                tri_removed[ti] = Some(oi);
+                break;
+            }
+        }
+    }
+
+    // Per vertex: the distinct adjacent KEEPER face normals (dedup near-parallel), and the
+    // distinct removed faces it touches.
+    let mut keep_normals: Vec<Vec<[f64; 3]>> = vec![Vec::new(); verts.len()];
+    let mut open_normals: Vec<Vec<[f64; 3]>> = vec![Vec::new(); verts.len()];
+    for (ti, t) in tris.iter().enumerate() {
+        let n = tri_n[ti];
+        if dot(n, n) < 0.5 {
+            continue; // degenerate sliver
+        }
+        for &vi in t {
+            let bucket = if tri_removed[ti].is_some() { &mut open_normals[vi] } else { &mut keep_normals[vi] };
+            if !bucket.iter().any(|m| dot(*m, n) > 0.999) {
+                bucket.push(n);
+            }
+        }
+    }
+
+    // Solve each vertex's inward offset x: n_i · x = thickness for every keeper normal,
+    // least-squares via regularised 3×3 normal equations. Then add the outward overshoot
+    // for removed faces.
+    let mut out_verts: Vec<[f64; 3]> = Vec::with_capacity(verts.len());
+    let cap = thickness * 3.0;
+    for vi in 0..verts.len() {
+        let mut m = [[0.0f64; 3]; 3];
+        let mut b = [0.0f64; 3];
+        for n in &keep_normals[vi] {
+            for r in 0..3 {
+                for c in 0..3 {
+                    m[r][c] += n[r] * n[c];
+                }
+                b[r] += n[r] * thickness;
+            }
+        }
+        let lam = 1e-7 * (m[0][0] + m[1][1] + m[2][2]).max(1e-9);
+        for r in 0..3 {
+            m[r][r] += lam;
+        }
+        // Cramer's rule.
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        let mut x = [0.0f64; 3];
+        if det.abs() > 1e-18 {
+            for col in 0..3 {
+                let mut mm = m;
+                for r in 0..3 {
+                    mm[r][col] = b[r];
+                }
+                let d = mm[0][0] * (mm[1][1] * mm[2][2] - mm[1][2] * mm[2][1]) - mm[0][1] * (mm[1][0] * mm[2][2] - mm[1][2] * mm[2][0])
+                    + mm[0][2] * (mm[1][0] * mm[2][1] - mm[1][1] * mm[2][0]);
+                x[col] = d / det;
+            }
+        }
+        let xl = dot(x, x).sqrt();
+        if xl > cap {
+            x = [x[0] * cap / xl, x[1] * cap / xl, x[2] * cap / xl];
+        }
+        let mut p = sub(verts[vi], x); // move INWARD (x satisfies n·x = +t on outward normals)
+        for on in &open_normals[vi] {
+            p = [p[0] + on[0] * overshoot, p[1] + on[1] * overshoot, p[2] + on[2] * overshoot];
+        }
+        out_verts.push(p);
+    }
+
+    // Rebuild with the moved vertices (same topology; flat per-face normals).
+    let mut mesh = TriMesh::default();
+    for t in &tris {
+        push_tri(&mut mesh, out_verts[t[0]], out_verts[t[1]], out_verts[t[2]]);
+    }
+    (!mesh.indices.is_empty()).then_some(mesh)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

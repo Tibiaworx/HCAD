@@ -26,7 +26,7 @@ use hworks_document::{Document, FeatureId, FeatureKind, LoftProfile, Plane, Plan
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, round_mesh,
+    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -161,7 +161,7 @@ fn main() {
                     do_solid_op,
                     apply_fillet,
                     apply_chamfer,
-                    apply_mirror_feature,
+                    (apply_mirror_feature, apply_pattern_feature, apply_shell_feature, apply_sweep_feature),
                     apply_thread,
                     do_regenerate,
                     apply_section,
@@ -652,6 +652,15 @@ struct UiState {
     pending_mirror: Option<u8>,
     mirror_shown: Option<u8>,
     mirror_request: Option<u8>,
+    /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
+    pattern_spec: Option<PatternSpec>,
+    pattern_request: Option<PatternSpec>,
+    /// Shell feature: the spec while its PM is open (faces are picked by clicking the body).
+    shell_spec: Option<ShellSpec>,
+    shell_request: Option<ShellSpec>,
+    /// Sweep feature: the spec while its PM is open (profile + path chosen from the tree's sketches).
+    sweep_spec: Option<SweepSpec>,
+    sweep_request: Option<SweepSpec>,
     /// Hole Genie (threads): the spec being configured, and a confirmed thread to append.
     pending_thread: Option<ThreadSpec>,
     thread_request: Option<ThreadSpec>,
@@ -772,6 +781,47 @@ impl ThreadSpec {
 
 /// A `PlaneRef` for one of the three standard reference planes (0=Front, 1=Top, 2=Right),
 /// matching `Document::with_default_planes`.
+/// Pattern PM state: which feature to repeat, and how the instances are laid out.
+#[derive(Clone, PartialEq)]
+struct PatternSpec {
+    /// Timeline index of the feature whose tool is repeated.
+    seed: usize,
+    circular: bool,
+    /// 0 = X, 1 = Y, 2 = Z — the linear direction, or the circular axis (through the origin).
+    axis: u8,
+    /// Reverse the direction / rotation sense.
+    flip: bool,
+    /// Linear: distance between instances (mm).
+    spacing: f32,
+    /// Circular: total sweep the instances are spread over (deg; 360 = a full ring).
+    total_deg: f32,
+    /// Total instance count, the seed included.
+    count: u32,
+}
+
+impl Default for PatternSpec {
+    fn default() -> Self {
+        Self { seed: 0, circular: false, axis: 0, flip: false, spacing: 10.0, total_deg: 360.0, count: 3 }
+    }
+}
+
+/// Shell PM state: wall thickness + the faces picked (on the body) to remove.
+#[derive(Clone, PartialEq)]
+struct ShellSpec {
+    thickness: f32,
+    open: Vec<([f64; 3], [f64; 3])>,
+}
+
+/// Sweep PM state: which tree sketches are the profile and the path. `None` while editing
+/// means "keep the stored one".
+#[derive(Clone, PartialEq)]
+struct SweepSpec {
+    profile: Option<usize>,
+    path: Option<usize>,
+    region: usize,
+    cut: bool,
+}
+
 /// Section-view cutting plane: a standard datum plane, slid along its normal and tiltable
 /// about its two in-plane axes. Display-only — never touches the document.
 #[derive(Clone, Copy, PartialEq)]
@@ -2173,6 +2223,10 @@ fn ui_system(
                             ui_state.loft_cut = false;
                             ui.close();
                         }
+                        if ui.add_enabled(can_loft, egui::Button::new("Sweep")).on_hover_text("Sweep a profile sketch along a path sketch (a tube, rail or handle)").clicked() {
+                            ui_state.sweep_spec = Some(SweepSpec { profile: None, path: None, region: 0, cut: false });
+                            ui.close();
+                        }
                     });
                     // Remove material.
                     flyout_menu(ui, "Cut", |ui| {
@@ -2187,6 +2241,10 @@ fn ui_system(
                         if ui.add_enabled(can_loft && has_mesh, egui::Button::new("Loft Cut")).on_hover_text("Subtract a solid lofted between 2+ profiles from the body (a tapered pocket/bore)").clicked() {
                             ui_state.loft_spec = Some(Vec::new());
                             ui_state.loft_cut = true;
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_loft && has_mesh, egui::Button::new("Sweep Cut")).on_hover_text("Subtract a profile swept along a path (a groove or channel)").clicked() {
+                            ui_state.sweep_spec = Some(SweepSpec { profile: None, path: None, region: 0, cut: true });
                             ui.close();
                         }
                         if ui.add_enabled(has_mesh, egui::Button::new("Hole Genie")).on_hover_text("Threaded holes: click a face (or a sketch point) to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
@@ -2226,6 +2284,21 @@ fn ui_system(
                             ui_state.mirror_shown = None;
                             ui_state.pending_fillet = None;
                             ui_state.pending_chamfer = None;
+                            ui.close();
+                        }
+                        let seedable = doc.0.features.iter().rposition(|f| {
+                            matches!(f.kind, FeatureKind::Extrude { .. } | FeatureKind::Cut { .. } | FeatureKind::Revolve { .. } | FeatureKind::Loft { .. } | FeatureKind::Sweep { .. })
+                        });
+                        if ui.add_enabled(bevel_ok && seedable.is_some(), egui::Button::new("Linear Pattern")).on_hover_text("Repeat a feature (a hole, boss, pocket…) in a straight row").clicked() {
+                            ui_state.pattern_spec = Some(PatternSpec { seed: seedable.unwrap_or(0), ..Default::default() });
+                            ui.close();
+                        }
+                        if ui.add_enabled(bevel_ok && seedable.is_some(), egui::Button::new("Circular Pattern")).on_hover_text("Repeat a feature around an axis (a bolt circle)").clicked() {
+                            ui_state.pattern_spec = Some(PatternSpec { seed: seedable.unwrap_or(0), circular: true, ..Default::default() });
+                            ui.close();
+                        }
+                        if ui.add_enabled(bevel_ok, egui::Button::new("Shell")).on_hover_text("Hollow the body leaving walls of a set thickness — click faces to open them (a box, a case)").clicked() {
+                            ui_state.shell_spec = Some(ShellSpec { thickness: 1.5, open: Vec::new() });
                             ui.close();
                         }
                     });
@@ -2878,6 +2951,222 @@ fn ui_system(
                 ui_state.regen = true;
             } else {
                 ui_state.pending_mirror = Some(which);
+            }
+        }
+        if let Some(mut spec) = ui_state.pattern_spec.clone() {
+            ui.heading(if spec.circular { "Circular Pattern" } else { "Linear Pattern" });
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2714}  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2716}  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            ui.label("Feature to repeat");
+            let limit = ui_state.editing_feature.unwrap_or(doc.0.features.len());
+            let eligible: Vec<(usize, String)> = doc.0.features[..limit.min(doc.0.features.len())]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    let name = match &f.kind {
+                        FeatureKind::Extrude { .. } => "Extrude",
+                        FeatureKind::Cut { .. } => "Cut",
+                        FeatureKind::Revolve { cut, .. } => if *cut { "RevolveCut" } else { "Revolve" },
+                        FeatureKind::Loft { cut, .. } => if *cut { "LoftCut" } else { "Loft" },
+                        FeatureKind::Sweep { cut, .. } => if *cut { "SweepCut" } else { "Sweep" },
+                        _ => return None,
+                    };
+                    Some((i, format!("{name} (feature {})", i + 1)))
+                })
+                .collect();
+            let seed_label = eligible.iter().find(|(i, _)| *i == spec.seed).map(|(_, n)| n.clone()).unwrap_or_else(|| "pick a feature".into());
+            egui::ComboBox::from_id_salt("pattern_seed").selected_text(seed_label).show_ui(ui, |ui| {
+                for (i, name) in &eligible {
+                    if ui.selectable_label(spec.seed == *i, name).clicked() {
+                        spec.seed = *i;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.radio(!spec.circular, "Linear").clicked() {
+                    spec.circular = false;
+                }
+                if ui.radio(spec.circular, "Circular").clicked() {
+                    spec.circular = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(if spec.circular { "Axis" } else { "Direction" });
+                for (k, name) in [(0u8, "X"), (1, "Y"), (2, "Z")] {
+                    if ui.radio(spec.axis == k, name).clicked() {
+                        spec.axis = k;
+                    }
+                }
+                ui.checkbox(&mut spec.flip, "Reverse");
+            });
+            if spec.circular {
+                ui.horizontal(|ui| {
+                    ui.label("Total angle");
+                    ui.add(egui::DragValue::new(&mut spec.total_deg).speed(1.0).suffix("\u{b0}").range(1.0..=360.0));
+                });
+                ui.label(egui::RichText::new("Instances spread evenly over the angle, about the axis through the origin.").weak().small());
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Spacing");
+                    ui.add(egui::DragValue::new(&mut spec.spacing).speed(0.5).suffix(" mm").range(0.01..=10_000.0));
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Count");
+                let mut c = spec.count as i32;
+                ui.add(egui::DragValue::new(&mut c).speed(0.1).range(2..=200));
+                spec.count = c.max(2) as u32;
+            });
+            ui.separator();
+            if commit {
+                ui_state.pattern_request = Some(spec);
+                ui_state.pattern_spec = None;
+            } else if cancel {
+                ui_state.pattern_spec = None;
+                if ui_state.editing_feature.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                    ui_state.regen = true;
+                }
+            } else {
+                ui_state.pattern_spec = Some(spec);
+            }
+        }
+        if let Some(mut spec) = ui_state.shell_spec.clone() {
+            ui.heading("Shell");
+            let mut commit = false;
+            let mut cancel = false;
+            let mut clear = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2714}  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2716}  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Wall thickness");
+                ui.add(egui::DragValue::new(&mut spec.thickness).speed(0.1).suffix(" mm").range(0.05..=1_000.0));
+            });
+            ui.label(format!("Faces to remove: {}", spec.open.len()));
+            ui.label(egui::RichText::new("Click faces on the body to open the shell through them (click again to unpick). None picked = a fully enclosed hollow.").weak().small());
+            if !spec.open.is_empty() && ui.small_button("Clear picked faces").clicked() {
+                clear = true;
+            }
+            ui.separator();
+            if commit {
+                ui_state.shell_request = Some(spec);
+                ui_state.shell_spec = None;
+            } else if cancel {
+                ui_state.shell_spec = None;
+                if ui_state.editing_feature.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                    ui_state.regen = true;
+                }
+            } else if let Some(cur) = ui_state.shell_spec.as_mut() {
+                // Viewport clicks edit `open` directly on ui_state, so only write back the
+                // fields this panel owns (a pick landing mid-frame must not be lost).
+                cur.thickness = spec.thickness;
+                if clear {
+                    cur.open.clear();
+                }
+            }
+        }
+        if let Some(mut spec) = ui_state.sweep_spec.clone() {
+            ui.heading(if spec.cut { "Sweep Cut" } else { "Sweep" });
+            let editing = ui_state.editing_feature.is_some();
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                let ready = editing || (spec.profile.is_some() && spec.path.is_some());
+                if ui.add_enabled(ready, egui::Button::new(egui::RichText::new("\u{2714}  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2716}  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            let sketches: Vec<(usize, String)> = {
+                let mut sk = 0usize;
+                doc.0.features
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| match &f.kind {
+                        FeatureKind::Sketch { .. } => {
+                            sk += 1;
+                            Some((i, format!("Sketch{sk}")))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let pick_label = |sel: Option<usize>, fallback: &str| -> String {
+                sel.and_then(|i| sketches.iter().find(|(j, _)| *j == i).map(|(_, n)| n.clone()))
+                    .unwrap_or_else(|| fallback.to_string())
+            };
+            ui.label("Profile (the cross-section sketch)");
+            egui::ComboBox::from_id_salt("sweep_profile")
+                .selected_text(pick_label(spec.profile, if editing { "(keep stored)" } else { "pick a sketch" }))
+                .show_ui(ui, |ui| {
+                    for (i, name) in &sketches {
+                        if ui.selectable_label(spec.profile == Some(*i), name).clicked() {
+                            spec.profile = Some(*i);
+                        }
+                    }
+                });
+            if let Some(pi) = spec.profile {
+                if let Some(FeatureKind::Sketch { sketch, .. }) = doc.0.features.get(pi).map(|f| &f.kind) {
+                    let nregions = sketch.regions().len();
+                    if nregions > 1 {
+                        ui.horizontal(|ui| {
+                            ui.label("Region");
+                            let mut r = spec.region as i32;
+                            ui.add(egui::DragValue::new(&mut r).range(0..=(nregions as i32 - 1)));
+                            spec.region = r.max(0) as usize;
+                        });
+                    } else {
+                        spec.region = 0;
+                    }
+                }
+            }
+            ui.label("Path (an open line/arc/spline chain)");
+            egui::ComboBox::from_id_salt("sweep_path")
+                .selected_text(pick_label(spec.path, if editing { "(keep stored)" } else { "pick a sketch" }))
+                .show_ui(ui, |ui| {
+                    for (i, name) in &sketches {
+                        if spec.profile == Some(*i) {
+                            continue; // the profile cannot also be the path
+                        }
+                        if ui.selectable_label(spec.path == Some(*i), name).clicked() {
+                            spec.path = Some(*i);
+                        }
+                    }
+                });
+            ui.checkbox(&mut spec.cut, "Cut (subtract the swept solid)");
+            ui.label(egui::RichText::new("The profile rides the path centred on it, keeping its orientation (no twist).").weak().small());
+            ui.separator();
+            if commit {
+                ui_state.sweep_request = Some(spec);
+                ui_state.sweep_spec = None;
+            } else if cancel {
+                ui_state.sweep_spec = None;
+                if ui_state.editing_feature.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                    ui_state.regen = true;
+                }
+            } else {
+                ui_state.sweep_spec = Some(spec);
             }
         }
         if let Some(mut spec) = ui_state.pending_thread.clone() {
@@ -4312,6 +4601,75 @@ fn ui_system(
                             });
                             resp.rect
                         }
+                        FeatureKind::Pattern { circular, count, .. } => {
+                            let kind = if *circular { "CirPattern" } else { "LinPattern" };
+                            let resp = ui.selectable_label(selected, styled(format!("{kind}  ×{count}")));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit pattern").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::Shell { thickness, open } => {
+                            let label = format!("Shell  t={thickness:.2}{}", if open.is_empty() { String::new() } else { format!(" ({} open)", open.len()) });
+                            let resp = ui.selectable_label(selected, styled(label));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit shell").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::Sweep { cut, .. } => {
+                            let label = if *cut {
+                                ct += 1;
+                                format!("SweepCut{ct}")
+                            } else {
+                                ex += 1;
+                                format!("Sweep{ex}")
+                            };
+                            let resp = ui.selectable_label(selected, styled(label));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit sweep").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
                         FeatureKind::Loft { profiles, cut } => {
                             let label = if *cut {
                                 ct += 1;
@@ -4491,6 +4849,44 @@ fn ui_system(
                                     let which = if n[1].abs() > 0.9 { 1 } else if n[0].abs() > 0.9 { 2 } else { 0 };
                                     ui_state.pending_mirror = Some(which);
                                     ui_state.mirror_shown = None;
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Pattern { seed, circular, dir, spacing, axis_dir, step, count, .. } => {
+                                    // Recover the axis choice (X/Y/Z) from the stored vectors.
+                                    let major = |v: &[f64; 3]| -> u8 {
+                                        if v[0].abs() >= v[1].abs() && v[0].abs() >= v[2].abs() { 0 } else if v[1].abs() >= v[2].abs() { 1 } else { 2 }
+                                    };
+                                    let (axis, flip) = if *circular {
+                                        (major(axis_dir), *step < 0.0)
+                                    } else {
+                                        let a = major(dir);
+                                        (a, dir[a as usize] < 0.0)
+                                    };
+                                    ui_state.pattern_spec = Some(PatternSpec {
+                                        seed: *seed,
+                                        circular: *circular,
+                                        axis,
+                                        flip,
+                                        spacing: *spacing as f32,
+                                        total_deg: (step.abs() * (*count).max(1) as f64).to_degrees() as f32,
+                                        count: *count,
+                                    });
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Shell { thickness, open } => {
+                                    ui_state.shell_spec = Some(ShellSpec { thickness: *thickness as f32, open: open.clone() });
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Sweep { profile, cut, .. } => {
+                                    // Sketches are stored by value; leave the pickers on "(keep
+                                    // stored)" unless the user re-picks.
+                                    ui_state.sweep_spec = Some(SweepSpec { profile: None, path: None, region: profile.region, cut: *cut });
                                     ui_state.editing_feature = Some(i);
                                     doc.0.rollback = i;
                                     ui_state.regen = true;
@@ -7242,6 +7638,34 @@ fn sketch_interaction(
             }
         }
         return; // swallow viewport clicks while lofting (orbit still works on right-drag)
+    }
+
+    // Shell PM open: viewport clicks pick faces to remove (click again to unpick).
+    if ui_state.shell_spec.is_some() && session.plane.is_none() {
+        if just_pressed {
+            if let (Some(cursor), Some(mesh)) = (window.cursor_position(), part.mesh.as_ref()) {
+                if let Some((p, n)) = pick_face_point(mesh, camera, cam_gt, cursor) {
+                    let (lo, hi) = mesh_bbox(mesh);
+                    let tol = (hi - lo).length() * 1e-3 + 0.02;
+                    if let Some(spec) = ui_state.shell_spec.as_mut() {
+                        let hit = spec.open.iter().position(|(op, on)| {
+                            let onv = Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32);
+                            let opv = Vec3::new(op[0] as f32, op[1] as f32, op[2] as f32);
+                            onv.dot(n) > 0.985 && (p - opv).dot(onv).abs() < tol
+                        });
+                        match hit {
+                            Some(k) => {
+                                spec.open.remove(k);
+                            }
+                            None => {
+                                spec.open.push(([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return; // swallow viewport clicks while the Shell PM is open (orbit still works)
     }
 
     // Section-view gizmo: grab the offset arrow or a rotation handle in plain view mode.
@@ -10472,7 +10896,7 @@ fn handle_edit_sketch(
         | FeatureKind::Revolve { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } => return,
     };
     // A revolve also remembers its axis (point + direction) — re-select the matching line so the
     // PropertyManager's Axis box is filled and the preview shows when reopening it.
@@ -10591,7 +11015,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -10644,7 +11068,7 @@ fn doc_has_text(doc: &Document) -> bool {
 fn doc_has_fillet(doc: &Document) -> bool {
     doc.features
         .iter()
-        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. }))
+        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. }))
 }
 
 /// True if any extrude/cut is a **thin feature** (wall thickness > 0). The exact B-rep path
@@ -10776,8 +11200,8 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
             }
             // These reshape the mesh, so a model with one always builds via the mesh path —
             // this exact-kernel path never runs with one present.
-            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } => {
-                failures.push("Fillet/chamfer/mirror/thread/loft needs the mesh kernel.".into());
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } => {
+                failures.push("Fillet/chamfer/mirror/thread/loft/pattern/shell/sweep needs the mesh kernel.".into());
             }
         }
     }
@@ -10923,8 +11347,11 @@ fn clip_edges_to_mesh(edges: &[([[f32; 3]; 2], [f32; 3])], mesh: &TriMesh, rel: 
 fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32; 3])>)> {
     let mut body: Option<TriMesh> = None;
     let mut bevel_edges: Vec<([[f32; 3]; 2], [f32; 3])> = Vec::new();
+    // Tool meshes actually applied per material feature (timeline index → tools + was-it-a-cut),
+    // kept so a Pattern can re-apply its seed's op at each transformed instance.
+    let mut feat_tools: std::collections::HashMap<usize, (Vec<TriMesh>, bool)> = std::collections::HashMap::new();
     let end = doc.rollback.min(doc.features.len());
-    for feature in &doc.features[..end] {
+    for (fi, feature) in doc.features[..end].iter().enumerate() {
         match &feature.kind {
             FeatureKind::Plane(_) | FeatureKind::Sketch { .. } | FeatureKind::RefImage { .. } => {}
             FeatureKind::Extrude { sketch, regions, plane, distance, back, thin, thin_side } => {
@@ -10991,11 +11418,14 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                             } else {
                                 (*distance, -distance + dip)
                             };
-                            Some(
-                                make_prism(&r.outer, &r.holes, start, length)
-                                    .map(|tool| mesh_union(&b, &tool))
-                                    .unwrap_or(b),
-                            )
+                            match make_prism(&r.outer, &r.holes, start, length) {
+                                Some(tool) => {
+                                    let joined = mesh_union(&b, &tool);
+                                    feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(tool);
+                                    Some(joined)
+                                }
+                                None => Some(b),
+                            }
                         }
                         // First feature: the prism itself is the body. Direction 2 extends it
                         // the opposite way from the base plane.
@@ -11005,7 +11435,11 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                             } else {
                                 (distance - back, -distance + back)
                             };
-                            make_prism(&r.outer, &r.holes, start, length)
+                            let tool = make_prism(&r.outer, &r.holes, start, length);
+                            if let Some(t) = &tool {
+                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(t.clone());
+                            }
+                            tool
                         }
                     };
                 }
@@ -11058,7 +11492,11 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                         cut_tool_mesh(&r.outer, &r.holes, &basis, signed, *back)
                     };
                     body = Some(match tool {
-                        Some(tool) => mesh_difference(&cur, &tool),
+                        Some(tool) => {
+                            let cut_body = mesh_difference(&cur, &tool);
+                            feat_tools.entry(fi).or_insert_with(|| (Vec::new(), true)).0.push(tool);
+                            cut_body
+                        }
                         None => cur,
                     });
                 }
@@ -11077,8 +11515,18 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     if let Some(tool) = revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle) {
                         body = Some(match body.take() {
                             // Boss unions the swept solid; cut subtracts it (no-op if no body yet).
-                            Some(b) => if *cut { mesh_difference(&b, &tool) } else { mesh_union(&b, &tool) },
-                            None => if *cut { continue } else { tool },
+                            Some(b) => {
+                                let joined = if *cut { mesh_difference(&b, &tool) } else { mesh_union(&b, &tool) };
+                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), *cut)).0.push(tool);
+                                joined
+                            }
+                            None => {
+                                if *cut {
+                                    continue;
+                                }
+                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(tool.clone());
+                                tool
+                            }
                         });
                     }
                 }
@@ -11096,9 +11544,20 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 if let Some(m) = loft_mesh(&secs) {
                     body = match body.take() {
                         // Cut subtracts the lofted solid (a tapered pocket); boss unions it.
-                        Some(b) => Some(if *cut { mesh_difference(&b, &m) } else { mesh_union(&b, &m) }),
+                        Some(b) => {
+                            let joined = if *cut { mesh_difference(&b, &m) } else { mesh_union(&b, &m) };
+                            feat_tools.entry(fi).or_insert_with(|| (Vec::new(), *cut)).0.push(m);
+                            Some(joined)
+                        }
                         // First feature: a boss *is* the body; a cut with nothing to cut is a no-op.
-                        None => (!*cut).then_some(m),
+                        None => {
+                            if !*cut {
+                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(m.clone());
+                                Some(m)
+                            } else {
+                                None
+                            }
+                        }
                     };
                 }
             }
@@ -11147,9 +11606,231 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     body = Some(threaded_hole(&b, *origin, *axis, *major_d, *pitch, *depth, *internal, *rh).unwrap_or(b));
                 }
             }
+            // Repeat the seed feature's recorded tool(s) at each transformed instance,
+            // re-applying its op (boss unions, cut subtracts). Instance 0 is the seed itself.
+            FeatureKind::Pattern { seed, circular, dir, spacing, axis_pt, axis_dir, step, count } => {
+                bevel_edges.clear();
+                let Some((tools, is_cut)) = feat_tools.get(seed) else { continue };
+                let Some(mut b) = body.take() else { continue };
+                let (tools, is_cut) = (tools.clone(), *is_cut);
+                for k in 1..(*count).max(1) as i64 {
+                    for tool in &tools {
+                        let inst = if *circular {
+                            rotate_mesh(tool, *axis_pt, *axis_dir, *step * k as f64)
+                        } else {
+                            let d = *spacing * k as f64;
+                            translate_mesh(tool, [dir[0] * d, dir[1] * d, dir[2] * d])
+                        };
+                        b = if is_cut { mesh_difference(&b, &inst) } else { mesh_union(&b, &inst) };
+                    }
+                }
+                body = Some(b);
+            }
+            // Hollow the body: subtract its own inward-offset (walls of `thickness` remain);
+            // picked `open` faces push outward instead, so the cavity opens through them.
+            FeatureKind::Shell { thickness, open } => {
+                bevel_edges.clear();
+                if let Some(b) = body.take() {
+                    let (lo, hi) = mesh_bbox_f64(&b);
+                    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+                    let overshoot = thickness + diag * 0.02 + 0.5;
+                    body = Some(match shell_tool(&b, *thickness, open, overshoot) {
+                        Some(tool) => mesh_difference(&b, &tool),
+                        None => b,
+                    });
+                }
+            }
+            // Sweep the profile along the path: sample the path into rotation-minimising
+            // frames, place the profile at each, and skin them like a many-section loft.
+            FeatureKind::Sweep { profile, path_sketch, path_plane, cut } => {
+                bevel_edges.clear();
+                if let Some(mut secs) = sweep_sections(profile, path_sketch, path_plane) {
+                    if *cut {
+                        extend_loft_caps(&mut secs);
+                    }
+                    if let Some(m) = loft_mesh(&secs) {
+                        body = match body.take() {
+                            Some(b) => {
+                                let joined = if *cut { mesh_difference(&b, &m) } else { mesh_union(&b, &m) };
+                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), *cut)).0.push(m);
+                                Some(joined)
+                            }
+                            None => {
+                                if !*cut {
+                                    feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(m.clone());
+                                    Some(m)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                    }
+                }
+            }
         }
     }
     body.map(|m| (m, bevel_edges))
+}
+
+/// Bounding box of a TriMesh in f64 (the f32 [`mesh_bbox`] loses range on large parts).
+fn mesh_bbox_f64(m: &TriMesh) -> ([f64; 3], [f64; 3]) {
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in &m.positions {
+        for a in 0..3 {
+            lo[a] = lo[a].min(p[a] as f64);
+            hi[a] = hi[a].max(p[a] as f64);
+        }
+    }
+    (lo, hi)
+}
+
+/// Turn a path sketch's drawn entities (lines/arcs/splines; construction and reference
+/// geometry excluded) into ONE chained open polyline in sketch uv. Pieces are joined
+/// end-to-end regardless of draw order/direction. `None` if empty, branching, or closed.
+fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
+    let pt = |i: usize| -> Option<[f64; 2]> { sketch.points.get(i).map(|p| [p.x, p.y]) };
+    let mut pieces: Vec<Vec<[f64; 2]>> = Vec::new();
+    for e in &sketch.entities {
+        match e {
+            SketchEntity::Line { a, b, construction, reference } => {
+                if !construction && !reference {
+                    pieces.push(vec![pt(*a)?, pt(*b)?]);
+                }
+            }
+            SketchEntity::Arc { center, a, b, ccw, construction } => {
+                if !construction {
+                    pieces.push(tessellate_arc(pt(*center)?, pt(*a)?, pt(*b)?, *ccw));
+                }
+            }
+            SketchEntity::Spline { points, closed, construction, control } => {
+                if !construction && !closed {
+                    let pts: Option<Vec<[f64; 2]>> = points.iter().map(|&i| pt(i)).collect();
+                    pieces.push(tessellate_spline(&pts?, false, *control));
+                }
+            }
+            _ => {}
+        }
+    }
+    pieces.retain(|p| p.len() >= 2);
+    if pieces.is_empty() {
+        return None;
+    }
+    let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+    // Find a free end (an endpoint no other piece touches) to start from.
+    let mut start = 0usize;
+    let mut rev = false;
+    'outer: for (i, p) in pieces.iter().enumerate() {
+        for (end, r) in [(p[0], false), (*p.last().unwrap(), true)] {
+            let shared = pieces.iter().enumerate().any(|(j, q)| {
+                i != j && (close(q[0], end) || close(*q.last().unwrap(), end))
+            });
+            if !shared {
+                start = i;
+                rev = r;
+                break 'outer;
+            }
+        }
+    }
+    let mut path = pieces.swap_remove(start);
+    if rev {
+        path.reverse();
+    }
+    // Greedily append whichever remaining piece continues the chain.
+    while !pieces.is_empty() {
+        let tail = *path.last().unwrap();
+        let Some(pos) = pieces.iter().position(|q| close(q[0], tail) || close(*q.last().unwrap(), tail)) else {
+            return None; // disconnected leftovers → not a single path
+        };
+        let mut q = pieces.swap_remove(pos);
+        if close(*q.last().unwrap(), tail) {
+            q.reverse();
+        }
+        path.extend(q.into_iter().skip(1));
+    }
+    // A closed loop (tail meets head) isn't sweepable as an open path (the end caps would
+    // coincide); require open for now.
+    if path.len() < 2 || close(path[0], *path.last().unwrap()) {
+        return None;
+    }
+    Some(path)
+}
+
+/// Build the sweep's loft sections: the profile region carried along the path with
+/// parallel-transport (rotation-minimising) frames, holes included. The profile is centred
+/// on the path (its own centroid rides the path points).
+fn sweep_sections(
+    profile: &LoftProfile,
+    path_sketch: &Sketch,
+    path_plane: &PlaneRef,
+) -> Option<Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)>> {
+    let path2 = sketch_open_path(path_sketch)?;
+    // Path to world through its plane.
+    let po = Vec3::new(path_plane.origin[0] as f32, path_plane.origin[1] as f32, path_plane.origin[2] as f32);
+    let pu = Vec3::new(path_plane.u[0] as f32, path_plane.u[1] as f32, path_plane.u[2] as f32);
+    let pv = Vec3::new(path_plane.v[0] as f32, path_plane.v[1] as f32, path_plane.v[2] as f32);
+    let mut pts: Vec<Vec3> = path2.iter().map(|p| po + pu * p[0] as f32 + pv * p[1] as f32).collect();
+    pts.dedup_by(|a, b| a.distance_squared(*b) < 1e-10);
+    if pts.len() < 2 {
+        return None;
+    }
+    // Split long straight runs so the tube bends smoothly through dense corners elsewhere.
+    let total: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let max_seg = (total / 24.0).max(1e-4);
+    let mut dense: Vec<Vec3> = vec![pts[0]];
+    for w in pts.windows(2) {
+        let d = w[0].distance(w[1]);
+        let n = (d / max_seg).ceil() as usize;
+        for k in 1..=n.max(1) {
+            dense.push(w[0].lerp(w[1], k as f32 / n.max(1) as f32));
+        }
+    }
+    let pts = dense;
+
+    // Profile region loops in its own uv, relative to the outer centroid.
+    let regions = profile.sketch.regions();
+    let r = regions.get(profile.region).or_else(|| regions.first())?;
+    let cen = {
+        let mut c = [0.0f64; 2];
+        for p in &r.outer {
+            c[0] += p[0];
+            c[1] += p[1];
+        }
+        [c[0] / r.outer.len() as f64, c[1] / r.outer.len() as f64]
+    };
+
+    // Frames: tangents by central difference; initial in-plane axes from the PROFILE plane's
+    // own u/v (projected ⊥ the start tangent) so the drawn orientation carries over; then
+    // parallel-transport so the section never spins about the path.
+    let tangent = |i: usize| -> Vec3 {
+        let a = if i == 0 { pts[0] } else { pts[i - 1] };
+        let b = if i + 1 == pts.len() { pts[i] } else { pts[i + 1] };
+        (b - a).normalize_or_zero()
+    };
+    let t0 = tangent(0);
+    let prof_u = Vec3::new(profile.plane.u[0] as f32, profile.plane.u[1] as f32, profile.plane.u[2] as f32);
+    let mut fu = (prof_u - t0 * prof_u.dot(t0)).normalize_or_zero();
+    if fu == Vec3::ZERO {
+        fu = t0.any_orthonormal_vector();
+    }
+    let mut secs: Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() {
+        let t = tangent(i);
+        if t != Vec3::ZERO {
+            fu = (fu - t * fu.dot(t)).normalize_or_zero();
+            if fu == Vec3::ZERO {
+                fu = t.any_orthonormal_vector();
+            }
+        }
+        let fv = t.cross(fu).normalize_or_zero();
+        let place = |p: &[f64; 2]| -> [f64; 3] {
+            let w = pts[i] + fu * (p[0] - cen[0]) as f32 + fv * (p[1] - cen[1]) as f32;
+            [w.x as f64, w.y as f64, w.z as f64]
+        };
+        let outer: Vec<[f64; 3]> = r.outer.iter().map(&place).collect();
+        let holes: Vec<Vec<[f64; 3]>> = r.holes.iter().map(|h| h.iter().map(&place).collect()).collect();
+        secs.push((outer, holes));
+    }
+    Some(secs)
 }
 
 /// Consume a regenerate request: rebuild the solid from the timeline and refresh
@@ -11552,6 +12233,121 @@ fn apply_mirror_feature(
         }
     }
     doc.0.add_feature(FeatureKind::Mirror { plane: standard_plane_ref(which) });
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// Append (or, when editing, replace) a confirmed Pattern feature.
+fn apply_pattern_feature(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+) {
+    let Some(spec) = ui_state.pattern_request.take() else { return };
+    history.snapshot(&doc.0);
+    let unit = match spec.axis {
+        0 => [1.0, 0.0, 0.0],
+        1 => [0.0, 1.0, 0.0],
+        _ => [0.0, 0.0, 1.0],
+    };
+    let sgn = if spec.flip { -1.0 } else { 1.0 };
+    let kind = FeatureKind::Pattern {
+        seed: spec.seed,
+        circular: spec.circular,
+        dir: [unit[0] * sgn, unit[1] * sgn, unit[2] * sgn],
+        spacing: spec.spacing as f64,
+        axis_pt: [0.0; 3],
+        axis_dir: unit,
+        step: (spec.total_deg as f64).to_radians() / spec.count.max(1) as f64 * sgn,
+        count: spec.count,
+    };
+    if let Some(i) = ui_state.editing_feature.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = kind;
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
+    doc.0.add_feature(kind);
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// Append (or, when editing, replace) a confirmed Shell feature.
+fn apply_shell_feature(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+) {
+    let Some(spec) = ui_state.shell_request.take() else { return };
+    history.snapshot(&doc.0);
+    let kind = FeatureKind::Shell { thickness: spec.thickness as f64, open: spec.open };
+    if let Some(i) = ui_state.editing_feature.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = kind;
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
+    doc.0.add_feature(kind);
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
+}
+
+/// Append (or, when editing, replace) a confirmed Sweep feature. The profile and path come
+/// from the chosen tree sketches; while editing, an unpicked slot keeps the stored one.
+fn apply_sweep_feature(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+) {
+    let Some(spec) = ui_state.sweep_request.take() else { return };
+    history.snapshot(&doc.0);
+    let fetch = |idx: Option<usize>| -> Option<(Sketch, PlaneRef)> {
+        match doc.0.features.get(idx?).map(|f| &f.kind) {
+            Some(FeatureKind::Sketch { sketch, plane }) => Some((sketch.clone(), plane.clone())),
+            _ => None,
+        }
+    };
+    let prof_repl = fetch(spec.profile);
+    let path_repl = fetch(spec.path);
+    if let Some(i) = ui_state.editing_feature.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            if let FeatureKind::Sweep { profile, path_sketch, path_plane, cut } = &mut f.kind {
+                if let Some((sk, pl)) = prof_repl {
+                    profile.sketch = sk;
+                    profile.plane = pl;
+                }
+                profile.region = spec.region;
+                if let Some((sk, pl)) = path_repl {
+                    *path_sketch = sk;
+                    *path_plane = pl;
+                }
+                *cut = spec.cut;
+            }
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
+    let (Some((psk, ppl)), Some((tsk, tpl))) = (prof_repl, path_repl) else {
+        ui_state.last_error = Some("Sweep needs both a profile sketch and a path sketch.".into());
+        return;
+    };
+    doc.0.add_feature(FeatureKind::Sweep {
+        profile: LoftProfile { sketch: psk, plane: ppl, region: spec.region },
+        path_sketch: tsk,
+        path_plane: tpl,
+        cut: spec.cut,
+    });
     doc.0.rollback = doc.0.features.len();
     ui_state.selected = Some(doc.0.features.len() - 1);
     ui_state.regen = true;
@@ -12649,6 +13445,22 @@ fn draw_body_edges(
     // selectable boundary ring (on a round body they're often its ONLY edges).
     for e in &part.seam_edges {
         gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), col);
+    }
+    // Shell PM: mark each picked face-to-remove with an X so the pick is visible.
+    if let Some(spec) = &ui_state.shell_spec {
+        let mcol = Color::srgb(1.0, 0.55, 0.1);
+        let r = {
+            let (lo, hi) = part.mesh.as_ref().map(|m| mesh_bbox(m)).unwrap_or((Vec3::ZERO, Vec3::ONE));
+            ((hi - lo).length() * 0.02).max(0.2)
+        };
+        for (p, n) in &spec.open {
+            let p = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+            let n = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32).normalize_or_zero();
+            let u = n.any_orthonormal_vector();
+            let v = n.cross(u);
+            gizmos.line(nudge(p - u * r - v * r), nudge(p + u * r + v * r), mcol);
+            gizmos.line(nudge(p - u * r + v * r), nudge(p + u * r - v * r), mcol);
+        }
     }
     // Section-view cross-hatch: 45° lines on the cut face mark sliced solid material.
     let hcol = Color::srgba(0.22, 0.24, 0.3, 0.85);
@@ -16527,5 +17339,141 @@ mod tests {
             ]],
             &[[x1, dist, z1], [x1, dist, 0.0], [0.0, dist, 0.0], [0.0, dist, z1]],
         );
+    }
+
+    /// Signed volume of a triangle mesh (divergence theorem) — feature tests measure material.
+    fn tri_vol(m: &TriMesh) -> f64 {
+        let mut v = 0.0;
+        for t in m.indices.chunks_exact(3) {
+            let p = |i: u32| {
+                let q = m.positions[i as usize];
+                [q[0] as f64, q[1] as f64, q[2] as f64]
+            };
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            v += a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        v / 6.0
+    }
+
+    #[test]
+    fn linear_pattern_repeats_a_cut() {
+        // A slab with one through-hole; a ×3 linear pattern must remove ~2 more holes of material.
+        let mut doc = Document::with_default_planes();
+        let mut boss = Sketch::default();
+        let c = boss.add_point(0.0, 0.0);
+        boss.add_circle(c, 30.0);
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut hole = Sketch::default();
+        let hc = hole.add_point(-10.0, 0.0);
+        hole.add_circle(hc, 2.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 4.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        let cut_idx = doc.features.len();
+        doc.add_feature(FeatureKind::Cut { sketch: hole, regions: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (before, _) = regenerate_mesh(&doc).expect("body with one hole");
+        doc.add_feature(FeatureKind::Pattern {
+            seed: cut_idx,
+            circular: false,
+            dir: [1.0, 0.0, 0.0],
+            spacing: 10.0,
+            axis_pt: [0.0; 3],
+            axis_dir: [1.0, 0.0, 0.0],
+            step: 0.0,
+            count: 3,
+        });
+        doc.rollback = doc.features.len();
+        let (after, _) = regenerate_mesh(&doc).expect("patterned body");
+        let removed = tri_vol(&before) - tri_vol(&after);
+        let hole_vol = std::f64::consts::PI * 4.0 * 4.0; // r²·h = 4·4
+        eprintln!("pattern removed {removed:.1} (2 holes = {:.1})", hole_vol * 2.0);
+        assert!((removed - hole_vol * 2.0).abs() < hole_vol * 0.3, "expected ~2 extra holes of material removed, got {removed:.1}");
+    }
+
+    #[test]
+    fn circular_pattern_makes_a_bolt_circle() {
+        // One hole at r=20 patterned ×6 about Z — a bolt circle removes ~5 more holes.
+        let mut doc = Document::with_default_planes();
+        let mut boss = Sketch::default();
+        let c = boss.add_point(0.0, 0.0);
+        boss.add_circle(c, 30.0);
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut hole = Sketch::default();
+        let hc = hole.add_point(20.0, 0.0);
+        hole.add_circle(hc, 2.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 4.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        let cut_idx = doc.features.len();
+        doc.add_feature(FeatureKind::Cut { sketch: hole, regions: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (before, _) = regenerate_mesh(&doc).expect("body with one hole");
+        doc.add_feature(FeatureKind::Pattern {
+            seed: cut_idx,
+            circular: true,
+            dir: [0.0; 3],
+            spacing: 0.0,
+            axis_pt: [0.0; 3],
+            axis_dir: [0.0, 0.0, 1.0],
+            step: std::f64::consts::TAU / 6.0,
+            count: 6,
+        });
+        doc.rollback = doc.features.len();
+        let (after, _) = regenerate_mesh(&doc).expect("bolt circle");
+        let removed = tri_vol(&before) - tri_vol(&after);
+        let hole_vol = std::f64::consts::PI * 4.0 * 4.0;
+        eprintln!("bolt circle removed {removed:.1} (5 holes = {:.1})", hole_vol * 5.0);
+        assert!((removed - hole_vol * 5.0).abs() < hole_vol * 0.75, "expected ~5 extra holes removed, got {removed:.1}");
+    }
+
+    #[test]
+    fn shell_hollows_a_box_through_the_open_top() {
+        // 20×20×10 box, t=2 shell with the top face removed → an open tray.
+        // Cavity = 16×16×8 = 2048, so material = 4000 − 2048 = 1952.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Shell { thickness: 2.0, open: vec![([10.0, 10.0, 10.0], [0.0, 0.0, 1.0])] });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("shelled box");
+        let vol = tri_vol(&m);
+        eprintln!("shelled tray volume {vol:.1} (expected ~1952)");
+        assert!((vol - 1952.0).abs() < 1952.0 * 0.1, "open-top shell volume off: {vol:.1}");
+    }
+
+    #[test]
+    fn shell_without_open_faces_leaves_an_enclosed_hollow() {
+        // Fully enclosed: cavity = 16×16×6 = 1536 → material = 4000 − 1536 = 2464.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Shell { thickness: 2.0, open: vec![] });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("enclosed shell");
+        let vol = tri_vol(&m);
+        eprintln!("enclosed shell volume {vol:.1} (expected ~2464)");
+        assert!((vol - 2464.0).abs() < 2464.0 * 0.1, "enclosed shell volume off: {vol:.1}");
+    }
+
+    #[test]
+    fn sweep_builds_a_tube_along_an_l_path() {
+        // A Ø4 circle swept along an L path (20 along X, then 20 along Y) ≈ π·r²·length.
+        let mut doc = Document::with_default_planes();
+        let mut profile = Sketch::default();
+        let c = profile.add_point(0.0, 0.0);
+        profile.add_circle(c, 2.0);
+        let mut path = Sketch::default();
+        let a = path.add_point(0.0, 0.0);
+        let b = path.add_point(20.0, 0.0);
+        let d = path.add_point(20.0, 20.0);
+        path.add_line(a, b, false);
+        path.add_line(b, d, false);
+        doc.add_feature(FeatureKind::Sweep {
+            profile: LoftProfile { sketch: profile, plane: standard_plane_ref(2), region: 0 },
+            path_sketch: path,
+            path_plane: xy(),
+            cut: false,
+        });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("swept tube");
+        let vol = tri_vol(&m);
+        let expect = std::f64::consts::PI * 4.0 * 40.0;
+        eprintln!("swept tube volume {vol:.1} (straight-tube estimate {expect:.1})");
+        assert!(vol > expect * 0.7 && vol < expect * 1.2, "tube volume out of range: {vol:.1}");
     }
 }
