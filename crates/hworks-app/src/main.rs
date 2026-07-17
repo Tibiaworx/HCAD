@@ -578,12 +578,11 @@ struct UiState {
     perspective: bool,
     /// Mouse view-control preset (Tools → Mouse controls).
     mouse_scheme: MouseScheme,
-    /// Section view (SolidWorks-style): visually cut the DISPLAYED body with a datum-parallel
-    /// plane — `(which plane 0/1/2, offset along its normal, flip side)`. Display-only: the
-    /// document and regeneration always use the full body.
-    section: Option<(u8, f32, bool)>,
+    /// Section view (SolidWorks-style): visually cut the DISPLAYED body with a plane.
+    /// Display-only: the document and regeneration always use the full body.
+    section: Option<SectionSpec>,
     /// The section parameters currently baked into the displayed mesh (None = full body shown).
-    section_shown: Option<(u8, f32, bool)>,
+    section_shown: Option<SectionSpec>,
     /// Timeline index of the Fillet/Chamfer being EDITED via its PM (tree double-click / Edit).
     /// While set, the doc is rolled back to just before it (so the preview builds on the
     /// pre-bevel body) and OK updates the feature in place instead of appending a new one.
@@ -773,6 +772,40 @@ impl ThreadSpec {
 
 /// A `PlaneRef` for one of the three standard reference planes (0=Front, 1=Top, 2=Right),
 /// matching `Document::with_default_planes`.
+/// Section-view cutting plane: a standard datum plane, slid along its normal and tiltable
+/// about its two in-plane axes. Display-only — never touches the document.
+#[derive(Clone, Copy, PartialEq)]
+struct SectionSpec {
+    /// Base plane: 0 = Front (XY), 1 = Top (XZ), 2 = Right (YZ).
+    which: u8,
+    /// Offset along the (rotated) normal, mm.
+    offset: f32,
+    /// Keep the other side instead.
+    flip: bool,
+    /// Tilt about the plane's local u axis, degrees.
+    rot_u: f32,
+    /// Tilt about the plane's local v axis, degrees.
+    rot_v: f32,
+}
+
+impl SectionSpec {
+    fn new(which: u8) -> Self {
+        Self { which, offset: 0.0, flip: false, rot_u: 0.0, rot_v: 0.0 }
+    }
+}
+
+/// The section plane's world axes (u, v, normal) with its tilt applied.
+/// Rotation order: about the base u first, then about the base v — matching how the two
+/// PM angles compose, and what the rotation-handle drags accumulate into.
+fn section_axes(spec: &SectionSpec) -> (Vec3, Vec3, Vec3) {
+    let pr = standard_plane_ref(spec.which);
+    let u0 = Vec3::new(pr.u[0] as f32, pr.u[1] as f32, pr.u[2] as f32);
+    let v0 = Vec3::new(pr.v[0] as f32, pr.v[1] as f32, pr.v[2] as f32);
+    let n0 = Vec3::new(pr.normal[0] as f32, pr.normal[1] as f32, pr.normal[2] as f32);
+    let q = Quat::from_axis_angle(v0, spec.rot_v.to_radians()) * Quat::from_axis_angle(u0, spec.rot_u.to_radians());
+    (q * u0, q * v0, q * n0)
+}
+
 fn standard_plane_ref(which: u8) -> PlaneRef {
     match which {
         1 => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: true }, // Top (XZ)
@@ -1065,6 +1098,9 @@ struct SketchSession {
     arrow_drag: bool,
     /// True while dragging the *Direction 2* arrow (sets `depth2`).
     arrow_drag2: bool,
+    /// Active section-gizmo rotation drag: (which angle 0 = rot_u / 1 = rot_v, the frozen
+    /// world rotation axis, last frame's "clock hand" direction from the gizmo centre).
+    section_rot: Option<(u8, Vec3, Vec3)>,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -1499,7 +1535,7 @@ fn ui_system(
     // While a 3D gizmo arrow is being dragged, drop egui keyboard focus: a focused DragValue
     // (e.g. the PM's depth field) keeps its own text buffer and COMMITS the stale value when
     // focus later drops — snapping an arrow-dragged depth back to where it started.
-    if session.arrow_drag || session.arrow_drag2 {
+    if session.arrow_drag || session.arrow_drag2 || session.section_rot.is_some() {
         ctx.memory_mut(|m| {
             if let Some(f) = m.focused() {
                 m.surrender_focus(f);
@@ -1629,7 +1665,7 @@ fn ui_system(
                     .on_hover_text("Cut the displayed body with a plane to see inside (display only — the model is untouched)")
                     .changed()
                 {
-                    ui_state.section = sec.then_some((0, 0.0, false));
+                    ui_state.section = sec.then_some(SectionSpec::new(0));
                 }
             });
             ui.menu_button("Insert", |ui| {
@@ -1714,7 +1750,7 @@ fn ui_system(
                     if ui_state.section.is_some() {
                         ui_state.section = None;
                     } else {
-                        ui_state.section = Some((0, 0.0, false));
+                        ui_state.section = Some(SectionSpec::new(0));
                     }
                 }
                 ui.separator();
@@ -2910,28 +2946,41 @@ fn ui_system(
                 ui_state.pending_thread = Some(spec);
             }
         }
-        if let Some((mut which, mut offset, mut flip)) = ui_state.section {
-            // Section view controls: pick the cutting plane, slide it, flip the kept side.
+        if let Some(mut spec) = ui_state.section {
+            // Section view controls: pick the cutting plane, slide it, tilt it, flip the kept side.
             ui.heading("Section View");
             ui.horizontal(|ui| {
                 if ui.button("Done").clicked() {
                     ui_state.section = None;
                 }
-                if ui.checkbox(&mut flip, "Flip side").changed() {}
+                ui.checkbox(&mut spec.flip, "Flip side");
             });
             for (k, name) in [(0u8, "Front (XY)"), (1, "Top (XZ)"), (2, "Right (YZ)")] {
-                if ui.radio(which == k, name).clicked() {
-                    which = k;
+                if ui.radio(spec.which == k, name).clicked() {
+                    spec.which = k;
+                    spec.rot_u = 0.0;
+                    spec.rot_v = 0.0;
                 }
             }
             ui.horizontal(|ui| {
                 ui.label("Offset");
-                ui.add(egui::DragValue::new(&mut offset).speed(0.2).suffix(" mm"));
+                ui.add(egui::DragValue::new(&mut spec.offset).speed(0.2).suffix(" mm"));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Rotate");
+                ui.add(egui::DragValue::new(&mut spec.rot_u).speed(0.5).suffix("°").range(-180.0..=180.0))
+                    .on_hover_text("Tilt about the plane's horizontal axis (or drag the gizmo's top/bottom handles)");
+                ui.add(egui::DragValue::new(&mut spec.rot_v).speed(0.5).suffix("°").range(-180.0..=180.0))
+                    .on_hover_text("Tilt about the plane's vertical axis (or drag the gizmo's side handles)");
+                if (spec.rot_u != 0.0 || spec.rot_v != 0.0) && ui.small_button("Reset").clicked() {
+                    spec.rot_u = 0.0;
+                    spec.rot_v = 0.0;
+                }
             });
             ui.label(egui::RichText::new("Display only — modelling always uses the full body.").weak().small());
             ui.separator();
             if ui_state.section.is_some() {
-                ui_state.section = Some((which, offset, flip));
+                ui_state.section = Some(spec);
             }
         }
         if let Some(mut spec) = ui_state.plane_spec.clone() {
@@ -11242,12 +11291,14 @@ fn apply_section(
             }
             let (lo, hi) = mesh_bbox(&full);
             let l = (((hi - lo).length()) as f64 * 1.5).max(10.0);
-            let pr = standard_plane_ref(spec.0);
+            let (u, v, n) = section_axes(&spec);
+            let d3 = |w: Vec3| [w.x as f64, w.y as f64, w.z as f64];
+            let pr = PlaneRef { origin: [0.0; 3], u: d3(u), v: d3(v), normal: d3(n), datum: true };
             let basis = basis_from_ref(&pr);
             let sq = [[-l, -l], [l, -l], [l, l], [-l, l]];
             // The half-space box covers the DISCARDED side: past the offset along +normal, or
             // before it when flipped.
-            let (start, len) = if spec.2 { (spec.1 as f64 - 2.0 * l, 2.0 * l) } else { (spec.1 as f64, 2.0 * l) };
+            let (start, len) = if spec.flip { (spec.offset as f64 - 2.0 * l, 2.0 * l) } else { (spec.offset as f64, 2.0 * l) };
             let Some(tool) = extrude_tool_mesh(&sq, &[], &basis, start, len) else { return };
             let cut = mesh_difference(&full, &tool);
             let _ = take_fallback_count(); // a display-only cut must never raise the torn-surface banner
@@ -11259,14 +11310,13 @@ fn apply_section(
             // seams re-filter from the stashed full set so sliding the plane back restores them.
             part.edges = tess.edges.clone();
             part.tangent_edges = tess.tangent_edges.clone();
-            let n = Vec3::new(pr.normal[0] as f32, pr.normal[1] as f32, pr.normal[2] as f32);
-            let side = if spec.2 { -1.0 } else { 1.0 };
+            let side = if spec.flip { -1.0 } else { 1.0 };
             let backup = part.seam_backup.clone();
             part.seam_edges = backup
                 .into_iter()
                 .filter(|e| {
                     let mid = Vec3::new((e[0][0] + e[1][0]) * 0.5, (e[0][1] + e[1][1]) * 0.5, (e[0][2] + e[1][2]) * 0.5);
-                    (mid.dot(n) - spec.1) * side <= 0.0
+                    (mid.dot(n) - spec.offset) * side <= 0.0
                 })
                 .collect();
             spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
@@ -14268,25 +14318,54 @@ fn closest_t_on_axis(base: Vec3, n: Vec3, ro: Vec3, rd: Vec3) -> f32 {
 /// plane analogue of [`extrude_arrow_drag`]. The drag sign sets the `flip` flag, so a wobble past
 /// the base flips sides cleanly. Returns true while dragging (so the caller swallows the click).
 /// Geometry of the on-screen section-plane gizmo: (rect centre at the current offset, plane
-/// normal, arrow tip, rect half-extent). Shared by the drawing and the drag hit-test so the
-/// grab target always matches what's on screen.
-fn section_gizmo_geom(part: &Part, which: u8, offset: f32, flip: bool) -> Option<(Vec3, Vec3, Vec3, f32)> {
+/// u axis, v axis, normal, arrow tip, rect half-extent). Shared by the drawing and the drag
+/// hit-test so the grab targets always match what's on screen.
+fn section_gizmo_geom(part: &Part, spec: &SectionSpec) -> Option<(Vec3, Vec3, Vec3, Vec3, Vec3, f32)> {
     let mesh = part.mesh.as_ref()?;
     if mesh.positions.is_empty() {
         return None;
     }
     let (lo, hi) = mesh_bbox(mesh);
     let c = (lo + hi) * 0.5;
-    let pr = standard_plane_ref(which);
-    let n = Vec3::new(pr.normal[0] as f32, pr.normal[1] as f32, pr.normal[2] as f32);
-    let base = c - n * (c.dot(n) - offset); // bbox centre projected onto the section plane
+    let (u, v, n) = section_axes(spec);
+    let base = c - n * (c.dot(n) - spec.offset); // bbox centre projected onto the section plane
     let diag = (hi - lo).length().max(1.0);
-    let dir = if flip { -n } else { n }; // points toward the DISCARDED side (the view direction)
+    let dir = if spec.flip { -n } else { n }; // points toward the DISCARDED side (the view direction)
     let tip = base + dir * (diag * 0.28);
-    Some((base, n, tip, diag * 0.55))
+    Some((base, u, v, n, tip, diag * 0.55))
 }
 
-/// Drag the section plane's normal arrow to slide the cut through the part (view mode).
+/// The four rotation handles on the gizmo rectangle's edge midpoints. Top/bottom (±v) tilt
+/// about the u axis (`rot_u`), left/right (±u) tilt about the v axis (`rot_v`).
+/// Returns (world position, which angle it drives: 0 = rot_u, 1 = rot_v).
+fn section_rot_handles(base: Vec3, u: Vec3, v: Vec3, half: f32) -> [(Vec3, u8); 4] {
+    [
+        (base + v * half, 0),
+        (base - v * half, 0),
+        (base + u * half, 1),
+        (base - u * half, 1),
+    ]
+}
+
+/// Where the mouse ray pierces the plane through `base` perpendicular to `axis`, as a unit
+/// direction from `base` (the rotation-drag "clock hand"). None if the ray runs parallel.
+fn section_rot_dir(base: Vec3, axis: Vec3, ray: &Ray3d) -> Option<Vec3> {
+    let rd = ray.direction.as_vec3();
+    let denom = rd.dot(axis);
+    if denom.abs() < 1e-5 {
+        return None;
+    }
+    let t = (base - ray.origin).dot(axis) / denom;
+    if !t.is_finite() || t <= 0.0 {
+        return None;
+    }
+    let w = ray.origin + rd * t - base;
+    let w = w - axis * w.dot(axis);
+    (w.length() > 1e-4).then(|| w.normalize())
+}
+
+/// Drag the section gizmo (view mode): the normal arrow slides the cut along the plane's
+/// normal; the four edge-midpoint handles rotate the plane about its in-plane axes.
 #[allow(clippy::too_many_arguments)]
 fn section_arrow_drag(
     session: &mut SketchSession,
@@ -14300,23 +14379,67 @@ fn section_arrow_drag(
     pressed: bool,
     just_released: bool,
 ) -> bool {
-    let Some((which, offset, flip)) = ui_state.section else { return false };
-    let Some((base, n, tip, _half)) = section_gizmo_geom(part, which, offset, flip) else { return false };
-    if just_pressed {
+    let Some(spec) = ui_state.section else { return false };
+    let Some((base, u, v, n, tip, half)) = section_gizmo_geom(part, &spec) else { return false };
+    if just_pressed && !session.arrow_drag && session.section_rot.is_none() {
         if let Some(cursor) = window.cursor_position() {
-            let near_shaft = segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 22.0);
-            let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 26.0).unwrap_or(false);
-            if near_shaft || near_tip {
-                session.arrow_drag = true;
+            // Rotation handles win over the arrow when both are in reach.
+            let mut grabbed = false;
+            for (pos, idx) in section_rot_handles(base, u, v, half) {
+                let near = camera.world_to_viewport(cam_gt, pos).map(|p| p.distance(cursor) < 18.0).unwrap_or(false);
+                if near {
+                    // The world axis this angle actually rotates about (see `section_axes`):
+                    // rot_u turns about the final u; rot_v about the UNROTATED base v.
+                    let axis = if idx == 0 {
+                        u
+                    } else {
+                        let pr = standard_plane_ref(spec.which);
+                        Vec3::new(pr.v[0] as f32, pr.v[1] as f32, pr.v[2] as f32)
+                    };
+                    if let Some(dir) = section_rot_dir(base, axis, ray) {
+                        session.section_rot = Some((idx, axis, dir));
+                        grabbed = true;
+                    }
+                    break;
+                }
+            }
+            if !grabbed && session.section_rot.is_none() {
+                let near_shaft = segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 22.0);
+                let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 26.0).unwrap_or(false);
+                if near_shaft || near_tip {
+                    session.arrow_drag = true;
+                }
             }
         }
     }
+    if let Some((idx, axis, last)) = session.section_rot {
+        if pressed {
+            if let Some(dir) = section_rot_dir(base, axis, ray) {
+                let delta = last.cross(dir).dot(axis).atan2(last.dot(dir).clamp(-1.0, 1.0)).to_degrees();
+                let mut s = spec;
+                let a = if idx == 0 { &mut s.rot_u } else { &mut s.rot_v };
+                *a += delta;
+                if *a > 180.0 {
+                    *a -= 360.0;
+                } else if *a < -180.0 {
+                    *a += 360.0;
+                }
+                ui_state.section = Some(s);
+                session.section_rot = Some((idx, axis, dir));
+            }
+            if just_released {
+                session.section_rot = None;
+            }
+            return true;
+        }
+        session.section_rot = None;
+    }
     if session.arrow_drag && pressed {
         // The axis through the plane's zero position: t along `n` IS the offset.
-        let base0 = base - n * offset;
+        let base0 = base - n * spec.offset;
         let t = closest_t_on_axis(base0, n, ray.origin, ray.direction.as_vec3());
         if t.is_finite() {
-            ui_state.section = Some((which, t, flip));
+            ui_state.section = Some(SectionSpec { offset: t, ..spec });
         }
         if just_released {
             session.arrow_drag = false;
@@ -14329,14 +14452,13 @@ fn section_arrow_drag(
     false
 }
 
-/// Draw the section-plane gizmo: the cutting rectangle + a direction arrow (drag it to slide the
-/// cut; the arrow points at the discarded side, SolidWorks-style).
+/// Draw the section-plane gizmo: the cutting rectangle, a direction arrow (drag to slide the
+/// cut) and four edge-midpoint handles (drag to tilt the plane) — SolidWorks-style.
 fn draw_section_gizmo(mut overlay: Gizmos<OverlayGizmos>, ui_state: Res<UiState>, part: Res<Part>, session: Res<SketchSession>) {
-    let Some((which, offset, flip)) = ui_state.section else { return };
-    let Some((base, _n, tip, half)) = section_gizmo_geom(&part, which, offset, flip) else { return };
-    let pr = standard_plane_ref(which);
-    let u = Vec3::new(pr.u[0] as f32, pr.u[1] as f32, pr.u[2] as f32) * half;
-    let v = Vec3::new(pr.v[0] as f32, pr.v[1] as f32, pr.v[2] as f32) * half;
+    let Some(spec) = ui_state.section else { return };
+    let Some((base, ua, va, n, tip, half)) = section_gizmo_geom(&part, &spec) else { return };
+    let u = ua * half;
+    let v = va * half;
     let col = Color::srgba(1.0, 0.6, 0.15, 0.9);
     let faint = Color::srgba(1.0, 0.6, 0.15, 0.25);
     // The cutting rectangle + corner-to-corner cross so the plane reads as a surface.
@@ -14357,6 +14479,19 @@ fn draw_section_gizmo(mut overlay: Gizmos<OverlayGizmos>, ui_state: Res<UiState>
     let side2 = d.cross(side.normalize_or_zero()) * (half * 0.06);
     overlay.line(tip, back + side2, acol);
     overlay.line(tip, back - side2, acol);
+    // Rotation handles: small diamonds on the edge midpoints, drawn in each handle's drag
+    // plane so they read as "turns this way". Highlighted while that angle is being dragged.
+    let r = half * 0.045;
+    for (pos, idx) in section_rot_handles(base, ua, va, half) {
+        let active = session.section_rot.is_some_and(|(i, _, _)| i == idx);
+        let hcol = if active { Color::srgb(1.0, 1.0, 0.5) } else { col };
+        // Diamond spanning the rotation direction (normal-ward) and the edge direction.
+        let along = if idx == 0 { va } else { ua };
+        let pts = [pos + n * r, pos + along * r, pos - n * r, pos - along * r];
+        for k in 0..4 {
+            overlay.line(pts[k], pts[(k + 1) % 4], hcol);
+        }
+    }
 }
 
 fn plane_arrow_drag(
