@@ -680,15 +680,50 @@ struct ImageCalib {
 }
 
 /// A standard thread: display name, major diameter (mm), coarse pitch (mm).
-const METRIC_THREADS: &[(&str, f32, f32)] = &[
-    ("M3", 3.0, 0.5), ("M4", 4.0, 0.7), ("M5", 5.0, 0.8), ("M6", 6.0, 1.0),
-    ("M8", 8.0, 1.25), ("M10", 10.0, 1.5), ("M12", 12.0, 1.75), ("M16", 16.0, 2.0),
+/// Thread size tables: (name, major Ø mm, standard pitches mm — COARSE first, then fine(s)).
+/// Metric pitches are the ISO coarse/fine series; imperial entries are the UNC/UNF (and UNEF)
+/// pitches converted from TPI (pitch = 25.4 / TPI) — shown to the user as TPI.
+const METRIC_THREADS: &[(&str, f32, &[f32])] = &[
+    ("M2", 2.0, &[0.4, 0.25]),
+    ("M2.5", 2.5, &[0.45, 0.35]),
+    ("M3", 3.0, &[0.5, 0.35]),
+    ("M4", 4.0, &[0.7, 0.5]),
+    ("M5", 5.0, &[0.8, 0.5]),
+    ("M6", 6.0, &[1.0, 0.75]),
+    ("M8", 8.0, &[1.25, 1.0, 0.75]),
+    ("M10", 10.0, &[1.5, 1.25, 1.0]),
+    ("M12", 12.0, &[1.75, 1.5, 1.25]),
+    ("M14", 14.0, &[2.0, 1.5]),
+    ("M16", 16.0, &[2.0, 1.5]),
+    ("M20", 20.0, &[2.5, 2.0, 1.5]),
 ];
-const IMPERIAL_THREADS: &[(&str, f32, f32)] = &[
-    ("#6-32", 3.51, 0.794), ("#8-32", 4.17, 0.794), ("#10-24", 4.83, 1.058),
-    ("1/4-20", 6.35, 1.27), ("5/16-18", 7.94, 1.411), ("3/8-16", 9.53, 1.5875),
-    ("1/2-13", 12.7, 1.954),
+const IMPERIAL_THREADS: &[(&str, f32, &[f32])] = &[
+    ("#4", 2.845, &[0.635, 0.529]),      // 40 UNC, 48 UNF
+    ("#6", 3.505, &[0.794, 0.635]),      // 32 UNC, 40 UNF
+    ("#8", 4.166, &[0.794, 0.706]),      // 32 UNC, 36 UNF
+    ("#10", 4.826, &[1.058, 0.794]),     // 24 UNC, 32 UNF
+    ("1/4\"", 6.35, &[1.27, 0.907]),     // 20 UNC, 28 UNF
+    ("5/16\"", 7.938, &[1.411, 1.058]),  // 18 UNC, 24 UNF
+    ("3/8\"", 9.525, &[1.588, 1.058]),   // 16 UNC, 24 UNF
+    ("7/16\"", 11.112, &[1.814, 1.27]),  // 14 UNC, 20 UNF
+    ("1/2\"", 12.7, &[1.954, 1.27]),     // 13 UNC, 20 UNF
+    ("5/8\"", 15.875, &[2.309, 1.411]),  // 11 UNC, 18 UNF
 ];
+
+/// Display label for a standard pitch: metric shows mm + coarse/fine, imperial shows TPI + series.
+fn pitch_label(metric: bool, k: usize, p: f32) -> String {
+    if metric {
+        format!("{p:.2} mm ({})", if k == 0 { "coarse" } else { "fine" })
+    } else {
+        let tpi = (25.4 / p).round() as i32;
+        let series = match k {
+            0 => "UNC",
+            1 => "UNF",
+            _ => "UNEF",
+        };
+        format!("{tpi} TPI ({series})")
+    }
+}
 
 /// Hole Genie thread state (a threaded hole or an external thread).
 #[derive(Clone, PartialEq)]
@@ -711,7 +746,7 @@ impl Default for ThreadSpec {
             origin: Vec3::ZERO,
             axis: Vec3::Z,
             metric: true,
-            size: 3, // M6
+            size: 5, // M6
             pitch: 1.0,
             depth: 6.0,
             internal: true,
@@ -721,7 +756,7 @@ impl Default for ThreadSpec {
 }
 
 impl ThreadSpec {
-    fn table(&self) -> &'static [(&'static str, f32, f32)] {
+    fn table(&self) -> &'static [(&'static str, f32, &'static [f32])] {
         if self.metric { METRIC_THREADS } else { IMPERIAL_THREADS }
     }
     fn major_d(&self) -> f32 {
@@ -2761,36 +2796,70 @@ fn ui_system(
                 if ui.radio(spec.metric, "Metric").clicked() && !spec.metric {
                     spec.metric = true;
                     spec.size = spec.size.min(METRIC_THREADS.len() - 1);
-                    spec.pitch = spec.table()[spec.size].2;
+                    spec.pitch = spec.table()[spec.size].2[0];
                 }
                 if ui.radio(!spec.metric, "Imperial").clicked() && spec.metric {
                     spec.metric = false;
                     spec.size = spec.size.min(IMPERIAL_THREADS.len() - 1);
-                    spec.pitch = spec.table()[spec.size].2;
+                    spec.pitch = spec.table()[spec.size].2[0];
                 }
             });
-            let cur = spec.table()[spec.size.min(spec.table().len() - 1)].0;
+            spec.size = spec.size.min(spec.table().len() - 1);
+            let cur = spec.table()[spec.size].0;
             egui::ComboBox::from_label("Size").selected_text(cur).show_ui(ui, |ui| {
-                for (i, (name, _, pitch)) in spec.table().iter().enumerate() {
+                for (i, (name, _, pitches)) in spec.table().iter().enumerate() {
                     if ui.selectable_label(spec.size == i, *name).clicked() {
                         spec.size = i;
-                        spec.pitch = *pitch;
+                        spec.pitch = pitches[0]; // coarse default
+                    }
+                }
+            });
+            // Standard pitches for the chosen size (coarse/fine; imperial shown as TPI), with a
+            // custom field for anything off the chart.
+            let pitches = spec.table()[spec.size].2;
+            let sel_label = pitches
+                .iter()
+                .position(|&p| (p - spec.pitch).abs() < 5.0e-3)
+                .map(|k| pitch_label(spec.metric, k, pitches[k]))
+                .unwrap_or_else(|| format!("Custom {:.2} mm", spec.pitch));
+            egui::ComboBox::from_label("Pitch").selected_text(sel_label).show_ui(ui, |ui| {
+                for (k, &p) in pitches.iter().enumerate() {
+                    if ui.selectable_label((p - spec.pitch).abs() < 5.0e-3, pitch_label(spec.metric, k, p)).clicked() {
+                        spec.pitch = p;
                     }
                 }
             });
             egui::Grid::new("thread_params").num_columns(2).show(ui, |ui| {
-                ui.label("Pitch");
-                if ui.add(egui::DragValue::new(&mut spec.pitch).range(0.1..=10.0).speed(0.01).suffix(" mm")).changed() {
-                }
+                ui.label("Custom pitch");
+                ui.add(egui::DragValue::new(&mut spec.pitch).range(0.1..=10.0).speed(0.01).suffix(" mm"));
                 ui.end_row();
                 ui.label("Depth");
-                if ui.add(egui::DragValue::new(&mut spec.depth).range(0.5..=1000.0).speed(0.1).suffix(" mm")).changed() {
-                }
+                ui.add(egui::DragValue::new(&mut spec.depth).range(0.5..=1000.0).speed(0.1).suffix(" mm"));
                 ui.end_row();
+            });
+            // Quick depth presets from the rule-of-thumb engagement lengths.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Depth:").weak().small());
+                for (lbl, m) in [("1.5×d", 1.5_f32), ("2×d", 2.0), ("3×d", 3.0)] {
+                    if ui.small_button(lbl).on_hover_text(format!("Set depth to {m}× the major diameter")).clicked() {
+                        spec.depth = spec.major_d() * m;
+                    }
+                }
             });
             if ui.checkbox(&mut spec.rh, "Right-handed").changed() {
             }
             ui.label(egui::RichText::new(format!("Major Ø {:.2} mm", spec.major_d())).weak().small());
+            if spec.internal {
+                // The pilot hole to drill before tapping (metric rule d − p; a close
+                // approximation for unified threads too).
+                ui.label(
+                    egui::RichText::new(format!("Tap drill Ø {:.2} mm", spec.major_d() - spec.pitch)).weak().small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!("Boss to thread should be Ø {:.2} mm", spec.major_d())).weak().small(),
+                );
+            }
             ui.separator();
             if commit {
                 if spec.placed {
