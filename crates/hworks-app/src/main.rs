@@ -176,7 +176,7 @@ fn main() {
                     thread_ghost,
                 ),
                 (
-                    (handle_new_part, asm_regenerate, sync_asm_instances, draw_asm_edges, asm_interaction, draw_asm_gizmo),
+                    (handle_new_part, asm_regenerate, asm_interaction, sync_asm_instances, draw_asm_edges, draw_asm_gizmo).chain(),
                     highlight_face,
                     hover_body_edge,
                     sync_ref_planes,
@@ -251,7 +251,12 @@ struct AsmDrag {
     /// against a point that does NOT move with the component — anchoring on the live
     /// centre made each frame's delta subtract the previous frame's motion (jitter).
     anchor: Vec3,
-    last_t: f32,
+    /// Cursor parameter along the axis at grab time.
+    t0: f32,
+    /// The component's translation along the axis at grab time. Position is ABSOLUTE:
+    /// `base_tr + (t - t0)` + a freshly computed snap — incremental deltas accumulated
+    /// the snap corrections and rubber-banded against the cursor.
+    base_tr: f64,
     faces: Vec<f64>,
     targets: Vec<f64>,
 }
@@ -527,7 +532,7 @@ fn asm_interaction(
                                             targets.extend(axis_face_planes(&og.tri, &comp_transform(other), dir));
                                         }
                                     }
-                                    ui_state.asm_drag = Some(AsmDrag { comp: id, axis: k as u8, anchor: base, last_t: t0, faces, targets });
+                                    ui_state.asm_drag = Some(AsmDrag { comp: id, axis: k as u8, anchor: base, t0, base_tr: tr, faces, targets });
                                 }
                                 break;
                             }
@@ -539,36 +544,27 @@ fn asm_interaction(
     }
     if let Some(drag) = ui_state.asm_drag.clone() {
         if pressed {
-            if asm.0.component(drag.comp).is_some() {
-                {
-                    let dir = [Vec3::X, Vec3::Y, Vec3::Z][drag.axis as usize];
-                    let t = closest_t_on_axis(drag.anchor, dir, ray.origin, ray.direction.as_vec3());
-                    if t.is_finite() {
-                        let delta = (t - drag.last_t) as f64;
-                        if let Some(comp) = asm.0.component_mut(drag.comp) {
-                            let a = drag.axis as usize;
-                            comp.translation[a] += delta;
-                            // Flush snap: if any of this part's face planes lands near another
-                            // component's matching plane, close the gap (smallest adjustment wins).
-                            let scene = 0.8_f64; // snap tolerance, mm
-                            let mut best_adj: Option<f64> = None;
-                            for f in &drag.faces {
-                                let w = comp.translation[a] + f;
-                                for tgt in &drag.targets {
-                                    let adj = tgt - w;
-                                    if adj.abs() < scene && best_adj.map_or(true, |b: f64| adj.abs() < b.abs()) {
-                                        best_adj = Some(adj);
-                                    }
-                                }
+            let dir = [Vec3::X, Vec3::Y, Vec3::Z][drag.axis as usize];
+            let t = closest_t_on_axis(drag.anchor, dir, ray.origin, ray.direction.as_vec3());
+            if t.is_finite() {
+                if let Some(comp) = asm.0.component_mut(drag.comp) {
+                    let a = drag.axis as usize;
+                    // Absolute raw position from the grab point (never accumulates)…
+                    let raw = drag.base_tr + (t - drag.t0) as f64;
+                    // …then a FRESH flush snap on top: nearest other-component face plane
+                    // within tolerance wins; drifting past it releases cleanly.
+                    let tol = 0.8_f64; // mm
+                    let mut best_adj: Option<f64> = None;
+                    for f in &drag.faces {
+                        let w = raw + f;
+                        for tgt in &drag.targets {
+                            let adj = tgt - w;
+                            if adj.abs() < tol && best_adj.map_or(true, |b: f64| adj.abs() < b.abs()) {
+                                best_adj = Some(adj);
                             }
-                            if let Some(adj) = best_adj {
-                                comp.translation[a] += adj;
-                            }
-                        }
-                        if let Some(d) = ui_state.asm_drag.as_mut() {
-                            d.last_t = t;
                         }
                     }
+                    comp.translation[a] = raw + best_adj.unwrap_or(0.0);
                 }
             }
             if just_released {
