@@ -349,7 +349,12 @@ pub struct Component {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Assembly {
     pub components: Vec<Component>,
+    /// Mates between component faces (Phase 2). Solved sequentially with relaxation.
+    #[serde(default)]
+    pub mates: Vec<Mate>,
     next_id: u64,
+    #[serde(default)]
+    next_mate_id: u64,
 }
 
 impl Assembly {
@@ -378,4 +383,41 @@ impl Assembly {
     pub fn component_mut(&mut self, id: u64) -> Option<&mut Component> {
         self.components.iter_mut().find(|c| c.id == id)
     }
+
+    /// Add a mate; returns its stable id.
+    pub fn add_mate(&mut self, kind: u8, value: f64, flip: bool, a: MateRef, b: MateRef) -> u64 {
+        self.next_mate_id += 1;
+        let id = self.next_mate_id;
+        self.mates.push(Mate { id, kind, value, flip, a, b });
+        id
+    }
+}
+
+/// One side of a mate: a geometric sample on a component's face — a point on it plus its
+/// normal (planar) or axis (cylindrical), all in PART-LOCAL space. Sampling geometry rather
+/// than face indices survives regeneration (mesh face ids are unstable across rebuilds).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MateRef {
+    /// The component instance this face belongs to.
+    pub comp: u64,
+    /// 0 = planar face, 1 = cylindrical face.
+    pub kind: u8,
+    /// A point ON the face (planar), or a point on the cylinder AXIS (cylindrical).
+    pub point: [f64; 3],
+    /// The face normal (planar) or the axis direction (cylindrical), unit.
+    pub dir: [f64; 3],
+}
+
+/// A mate constrains two components' faces. `kind`: 0 = Coincident (planes flush),
+/// 1 = Distance (planes parallel at `value` mm), 2 = Concentric (cylinder axes align),
+/// 3 = Parallel (normals align only). `flip` reverses the facing direction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Mate {
+    pub id: u64,
+    pub kind: u8,
+    pub value: f64,
+    #[serde(default)]
+    pub flip: bool,
+    pub a: MateRef,
+    pub b: MateRef,
 }

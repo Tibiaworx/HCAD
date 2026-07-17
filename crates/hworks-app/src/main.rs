@@ -22,7 +22,7 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
+use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
@@ -176,7 +176,7 @@ fn main() {
                     thread_ghost,
                 ),
                 (
-                    (handle_new_part, asm_regenerate, asm_interaction, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
+                    (handle_new_part, asm_regenerate, asm_interaction, asm_solve_mates, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
                     highlight_face,
                     hover_body_edge,
                     sync_ref_planes,
@@ -301,6 +301,295 @@ fn comp_transform(c: &hworks_document::Component) -> Transform {
         translation: Vec3::new(c.translation[0] as f32, c.translation[1] as f32, c.translation[2] as f32),
         rotation: Quat::from_xyzw(c.rotation[0] as f32, c.rotation[1] as f32, c.rotation[2] as f32, c.rotation[3] as f32).normalize(),
         scale: Vec3::ONE,
+    }
+}
+
+/// The Mate PM state: two picked face references, the mate type and its parameters.
+/// `kind`: 0 = Coincident, 1 = Distance, 2 = Concentric, 3 = Parallel.
+#[derive(Clone, PartialEq)]
+struct MateSpec {
+    a: Option<MateRef>,
+    b: Option<MateRef>,
+    kind: u8,
+    value: f32,
+    flip: bool,
+    /// While true the kind auto-suggests from the picked face types; a manual radio unsets it.
+    auto_kind: bool,
+}
+
+impl Default for MateSpec {
+    fn default() -> Self {
+        Self { a: None, b: None, kind: 0, value: 5.0, flip: false, auto_kind: true }
+    }
+}
+
+/// Resolve a mate reference to world space through its component's placement: (point, dir).
+fn mate_ref_world(asm: &Assembly, r: &MateRef) -> Option<(Vec3, Vec3)> {
+    let c = asm.component(r.comp)?;
+    let tf = comp_transform(c);
+    let p = tf.transform_point(Vec3::new(r.point[0] as f32, r.point[1] as f32, r.point[2] as f32));
+    let d = (tf.rotation * Vec3::new(r.dir[0] as f32, r.dir[1] as f32, r.dir[2] as f32)).normalize_or_zero();
+    Some((p, d))
+}
+
+/// Apply a rigid correction to a component: rotate by `q` about the world point `pivot`,
+/// then translate by `t`.
+fn nudge_component(c: &mut hworks_document::Component, q: Quat, pivot: Vec3, t: Vec3) {
+    let rot = Quat::from_xyzw(c.rotation[0] as f32, c.rotation[1] as f32, c.rotation[2] as f32, c.rotation[3] as f32);
+    let nr = (q * rot).normalize();
+    c.rotation = [nr.x as f64, nr.y as f64, nr.z as f64, nr.w as f64];
+    let tr = Vec3::new(c.translation[0] as f32, c.translation[1] as f32, c.translation[2] as f32);
+    let ntr = pivot + q * (tr - pivot) + t;
+    c.translation = [ntr.x as f64, ntr.y as f64, ntr.z as f64];
+}
+
+/// Solve the assembly's mates: sequential geometric snaps, relaxed over multiple passes so
+/// chains settle. Each mate rigidly corrects ONE free component (the b side when both float);
+/// fixed components never move. Converges when a pass produces no meaningful correction.
+fn solve_mates(asm: &mut Assembly) {
+    for _pass in 0..32 {
+        let mut worst = 0.0_f32;
+        for mi in 0..asm.mates.len() {
+            let m = asm.mates[mi].clone();
+            let (Some((pa, na)), Some((pb, nb))) = (mate_ref_world(asm, &m.a), mate_ref_world(asm, &m.b)) else { continue };
+            let a_free = asm.component(m.a.comp).is_some_and(|c| !c.fixed);
+            let b_free = asm.component(m.b.comp).is_some_and(|c| !c.fixed);
+            // Move the b side by default; fall back to a; both fixed = unsatisfiable, skip.
+            let (mover, mv_p, mv_n, tgt_p, tgt_n) = if b_free {
+                (m.b.comp, pb, nb, pa, na)
+            } else if a_free {
+                (m.a.comp, pa, na, pb, nb)
+            } else {
+                continue;
+            };
+            match m.kind {
+                // Planes: face the target (normals oppose; flip = same way), then close the
+                // gap along the target normal to 0 (coincident) or `value` (distance).
+                0 | 1 | 3 => {
+                    let want = if m.flip { tgt_n } else { -tgt_n };
+                    let q = Quat::from_rotation_arc(mv_n, want);
+                    worst = worst.max(q.to_axis_angle().1.abs());
+                    let mut t = Vec3::ZERO;
+                    if m.kind != 3 {
+                        let target = if m.kind == 1 { m.value as f32 } else { 0.0 };
+                        let cur = (mv_p - tgt_p).dot(tgt_n);
+                        t = tgt_n * (target - cur);
+                        worst = worst.max(t.length() * 0.05);
+                    }
+                    if let Some(c) = asm.component_mut(mover) {
+                        nudge_component(c, q, mv_p, t);
+                    }
+                }
+                // Concentric: align the axes (nearest sense; flip reverses), then bring the
+                // mover's axis onto the target line (sliding along it stays free).
+                2 => {
+                    let mut want = tgt_n;
+                    if mv_n.dot(want) < 0.0 {
+                        want = -want;
+                    }
+                    if m.flip {
+                        want = -want;
+                    }
+                    let q = Quat::from_rotation_arc(mv_n, want);
+                    worst = worst.max(q.to_axis_angle().1.abs());
+                    let d = tgt_p - mv_p;
+                    let t = d - want * d.dot(want);
+                    worst = worst.max(t.length() * 0.05);
+                    if let Some(c) = asm.component_mut(mover) {
+                        nudge_component(c, q, mv_p, t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if worst < 1e-4 {
+            break;
+        }
+    }
+}
+
+/// Classify the smooth face patch around a clicked triangle as planar or cylindrical, in
+/// PART-LOCAL space. Returns `(kind, point, dir)` shaped like [`MateRef`]: planar = (0, the
+/// hit point, the face normal); cylindrical = (1, a point on the fitted axis, the axis).
+///
+/// The patch grows by BFS over shared vertices while normals stay within a step angle. A
+/// near-zero smallest eigenvalue of the normal covariance with a wide normal spread reads as
+/// a cylinder (all side normals ⊥ one axis); the axis position comes from a Kasa circle fit
+/// of the patch vertices projected along it.
+fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, Vec3) {
+    let ntri = tri.indices.len() / 3;
+    let tn = |ti: usize| -> Vec3 {
+        let t = &tri.indices[ti * 3..ti * 3 + 3];
+        let a = Vec3::from_array(tri.positions[t[0] as usize]);
+        let b = Vec3::from_array(tri.positions[t[1] as usize]);
+        let c = Vec3::from_array(tri.positions[t[2] as usize]);
+        (b - a).cross(c - a) // area-weighted
+    };
+    let hit_n = tn(hit_tri).normalize_or_zero();
+    // Vertex-position welding → triangle adjacency.
+    let (lo, hi) = mesh_bbox(tri);
+    let q = ((hi - lo).length() * 1e-5).max(1e-6);
+    let key = |p: [f32; 3]| ((p[0] / q).round() as i64, (p[1] / q).round() as i64, (p[2] / q).round() as i64);
+    let mut vert_tris: std::collections::HashMap<(i64, i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    for ti in 0..ntri {
+        for k in 0..3 {
+            vert_tris.entry(key(tri.positions[tri.indices[ti * 3 + k] as usize])).or_default().push(ti);
+        }
+    }
+    let mut in_patch = vec![false; ntri];
+    let mut queue = vec![hit_tri];
+    in_patch[hit_tri] = true;
+    let mut patch: Vec<usize> = Vec::new();
+    while let Some(ti) = queue.pop() {
+        patch.push(ti);
+        if patch.len() > 4000 {
+            break;
+        }
+        let n0 = tn(ti).normalize_or_zero();
+        for k in 0..3 {
+            if let Some(neigh) = vert_tris.get(&key(tri.positions[tri.indices[ti * 3 + k] as usize])) {
+                for &nj in neigh {
+                    if !in_patch[nj] && tn(nj).normalize_or_zero().dot(n0) > 0.82 {
+                        in_patch[nj] = true;
+                        queue.push(nj);
+                    }
+                }
+            }
+        }
+    }
+    // Area-weighted normal covariance + spread.
+    let mut m = [[0.0f64; 3]; 3];
+    let mut mean = Vec3::ZERO;
+    let mut area = 0.0f32;
+    let mut spread: f32 = 0.0;
+    for &ti in &patch {
+        let an = tn(ti);
+        let a = an.length();
+        if a < 1e-12 {
+            continue;
+        }
+        let n = an / a;
+        spread = spread.max(1.0 - n.dot(hit_n));
+        mean += n * a;
+        area += a;
+        for r in 0..3 {
+            for c in 0..3 {
+                m[r][c] += (n[r] * n[c] * a) as f64;
+            }
+        }
+    }
+    if area < 1e-12 {
+        return (0, hit, hit_n);
+    }
+    for r in 0..3 {
+        for c in 0..3 {
+            m[r][c] /= area as f64;
+        }
+    }
+    // Planar when the normals barely fan out.
+    if spread < 0.015 {
+        return (0, hit, (mean / area).normalize_or_zero());
+    }
+    // Smallest eigenvector of m = largest of (tr·I − m): power iteration.
+    let tr = m[0][0] + m[1][1] + m[2][2];
+    let sh = [
+        [tr - m[0][0], -m[0][1], -m[0][2]],
+        [-m[1][0], tr - m[1][1], -m[1][2]],
+        [-m[2][0], -m[2][1], tr - m[2][2]],
+    ];
+    let mut v = [0.577f64, 0.577, 0.577];
+    for _ in 0..60 {
+        let w = [
+            sh[0][0] * v[0] + sh[0][1] * v[1] + sh[0][2] * v[2],
+            sh[1][0] * v[0] + sh[1][1] * v[1] + sh[1][2] * v[2],
+            sh[2][0] * v[0] + sh[2][1] * v[1] + sh[2][2] * v[2],
+        ];
+        let l = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+        if l < 1e-12 {
+            break;
+        }
+        v = [w[0] / l, w[1] / l, w[2] / l];
+    }
+    let axis = Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32).normalize_or_zero();
+    if axis == Vec3::ZERO {
+        return (0, hit, hit_n);
+    }
+    // How cylindrical is the patch? Normals should be ⊥ the axis.
+    let resid: f32 = patch
+        .iter()
+        .map(|&ti| {
+            let n = tn(ti).normalize_or_zero();
+            n.dot(axis).abs()
+        })
+        .fold(0.0, f32::max);
+    if resid > 0.25 {
+        // Not a clean cylinder — treat as planar at the hit (best effort).
+        return (0, hit, hit_n);
+    }
+    // Kasa circle fit of the patch vertices projected into the plane ⊥ axis.
+    let u = axis.any_orthonormal_vector();
+    let w = axis.cross(u);
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    let mut syy = 0.0f64;
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut sxz = 0.0f64;
+    let mut syz = 0.0f64;
+    let mut sz = 0.0f64;
+    let mut np = 0.0f64;
+    let mut seen: std::collections::HashSet<(i64, i64, i64)> = std::collections::HashSet::new();
+    for &ti in &patch {
+        for k in 0..3 {
+            let pos = tri.positions[tri.indices[ti * 3 + k] as usize];
+            if !seen.insert(key(pos)) {
+                continue;
+            }
+            let p = Vec3::from_array(pos);
+            let (x, y) = (p.dot(u) as f64, p.dot(w) as f64);
+            let z = x * x + y * y;
+            sxx += x * x;
+            sxy += x * y;
+            syy += y * y;
+            sx += x;
+            sy += y;
+            sxz += x * z;
+            syz += y * z;
+            sz += z;
+            np += 1.0;
+        }
+    }
+    // Solve [sxx sxy sx; sxy syy sy; sx sy n] · [A B C]ᵀ = [sxz; syz; sz]; centre = (A/2, B/2).
+    let mm = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, np]];
+    let bb = [sxz, syz, sz];
+    let det = mm[0][0] * (mm[1][1] * mm[2][2] - mm[1][2] * mm[2][1]) - mm[0][1] * (mm[1][0] * mm[2][2] - mm[1][2] * mm[2][0])
+        + mm[0][2] * (mm[1][0] * mm[2][1] - mm[1][1] * mm[2][0]);
+    if det.abs() < 1e-12 {
+        return (0, hit, hit_n);
+    }
+    let mut sol = [0.0f64; 3];
+    for col in 0..3 {
+        let mut mc = mm;
+        for r in 0..3 {
+            mc[r][col] = bb[r];
+        }
+        let d = mc[0][0] * (mc[1][1] * mc[2][2] - mc[1][2] * mc[2][1]) - mc[0][1] * (mc[1][0] * mc[2][2] - mc[1][2] * mc[2][0])
+            + mc[0][2] * (mc[1][0] * mc[2][1] - mc[1][1] * mc[2][0]);
+        sol[col] = d / det;
+    }
+    let (cu, cw) = (sol[0] * 0.5, sol[1] * 0.5);
+    let axis_pt = u * cu as f32 + w * cw as f32 + axis * hit.dot(axis);
+    (1, axis_pt, axis)
+}
+
+/// Run the mate solver when flagged (mate added/changed, drag released).
+fn asm_solve_mates(mode: Res<DocMode>, mut asm: ResMut<AsmRes>, mut ui_state: ResMut<UiState>) {
+    if !ui_state.asm_solve {
+        return;
+    }
+    ui_state.asm_solve = false;
+    if *mode == DocMode::Assembly && !asm.0.mates.is_empty() {
+        solve_mates(&mut asm.0);
     }
 }
 
@@ -449,6 +738,36 @@ fn draw_asm_gizmo(
     if *mode != DocMode::Assembly {
         return;
     }
+    // Mate PM pick markers: a ring + normal tick on planar picks, an axis line on cylinders.
+    if let Some(spec) = &ui_state.mate_spec {
+        for (r, col) in [(&spec.a, Color::srgb(0.3, 0.85, 1.0)), (&spec.b, Color::srgb(1.0, 0.6, 0.15))] {
+            let Some(r) = r else { continue };
+            let Some((p, d)) = mate_ref_world(&asm.0, r) else { continue };
+            let scale = asm
+                .0
+                .component(r.comp)
+                .and_then(|c| render.cache.get(&asm_geom_key(c)))
+                .map(|g| {
+                    let (lo, hi) = mesh_bbox(&g.tri);
+                    (hi - lo).length()
+                })
+                .unwrap_or(20.0);
+            if r.kind == 1 {
+                overlay.line(p - d * scale * 0.7, p + d * scale * 0.7, col);
+            } else {
+                let u = d.any_orthonormal_vector();
+                let v = d.cross(u);
+                let rr = scale * 0.06;
+                const N: usize = 24;
+                for i in 0..N {
+                    let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
+                    let a1 = (i + 1) as f32 / N as f32 * std::f32::consts::TAU;
+                    overlay.line(p + (u * a0.cos() + v * a0.sin()) * rr, p + (u * a1.cos() + v * a1.sin()) * rr, col);
+                }
+                overlay.line(p, p + d * rr * 2.0, col);
+            }
+        }
+    }
     let Some(id) = ui_state.asm_selected else { return };
     let Some(comp) = asm.0.component(id) else { return };
     if comp.fixed || comp.hidden {
@@ -580,6 +899,63 @@ fn asm_interaction(
     let Ok((camera, cam_gt)) = cam.single() else { return };
     let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else { return };
 
+    // ---- Mate PM open: viewport clicks pick faces (A then B) ----
+    if ui_state.mate_spec.is_some() {
+        if !just_pressed {
+            return;
+        }
+        let mut best: Option<(f32, u64, usize, Vec3)> = None; // (t, comp, tri index, local hit)
+        for comp in &asm.0.components {
+            if comp.hidden {
+                continue;
+            }
+            let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+            let tf = comp_transform(comp);
+            let inv = tf.compute_affine().inverse();
+            let lo = inv.transform_point3(ray.origin);
+            let ld = inv.transform_vector3(*ray.direction).normalize_or_zero();
+            for (ti, tri) in geom.tri.indices.chunks_exact(3).enumerate() {
+                let a = Vec3::from_array(geom.tri.positions[tri[0] as usize]);
+                let b = Vec3::from_array(geom.tri.positions[tri[1] as usize]);
+                let c = Vec3::from_array(geom.tri.positions[tri[2] as usize]);
+                if let Some(t) = ray_triangle(lo, ld, a, b, c) {
+                    if best.map_or(true, |(bt, _, _, _)| t < bt) {
+                        best = Some((t, comp.id, ti, lo + ld * t));
+                    }
+                }
+            }
+        }
+        if let Some((_, cid, ti, lp)) = best {
+            if let Some(geom) = asm.0.component(cid).and_then(|c| render.cache.get(&asm_geom_key(c))) {
+                let (kind, point, dir) = classify_face_local(&geom.tri, ti, lp);
+                let r = MateRef {
+                    comp: cid,
+                    kind,
+                    point: [point.x as f64, point.y as f64, point.z as f64],
+                    dir: [dir.x as f64, dir.y as f64, dir.z as f64],
+                };
+                if let Some(spec) = ui_state.mate_spec.as_mut() {
+                    match (&spec.a, &spec.b) {
+                        (None, _) => spec.a = Some(r),
+                        (Some(a), None) if a.comp != cid => spec.b = Some(r),
+                        (Some(_), None) => spec.a = Some(r), // same component again → re-pick A
+                        (Some(_), Some(_)) => spec.b = Some(r), // replace B
+                    }
+                    if spec.auto_kind {
+                        if let (Some(a), Some(b)) = (&spec.a, &spec.b) {
+                            spec.kind = match (a.kind, b.kind) {
+                                (1, 1) => 2, // two cylinders → concentric
+                                (0, 0) => 0, // two planes → coincident
+                                _ => 3,      // mixed → parallel
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        return; // the Mate PM owns viewport clicks
+    }
+
     // ---- Move-arrow drag on the selected component ----
     if just_pressed && ui_state.asm_drag.is_none() {
         if let Some(id) = ui_state.asm_selected {
@@ -664,6 +1040,7 @@ fn asm_interaction(
             }
             if just_released {
                 ui_state.asm_rot = None;
+                ui_state.asm_solve = true; // mates re-settle after a manual spin
             }
             return; // the ring drag consumes the click
         }
@@ -696,6 +1073,7 @@ fn asm_interaction(
             }
             if just_released {
                 ui_state.asm_drag = None;
+                ui_state.asm_solve = true; // mates re-settle after a manual move
             }
             return; // a drag consumes the click — no reselection underneath
         }
@@ -1191,6 +1569,10 @@ struct UiState {
     finish_edit_component: Option<bool>,
     /// The assembly file to rebind when the in-place edit ends (current_file points at the part meanwhile).
     asm_return_file: Option<std::path::PathBuf>,
+    /// The Mate PM state while it's open (viewport clicks pick faces A then B).
+    mate_spec: Option<MateSpec>,
+    /// One-shot: run the mate solver over the assembly.
+    asm_solve: bool,
     new_asm_request: bool,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
@@ -2514,6 +2896,9 @@ fn ui_system(
             if in_asm {
                 if ui.button("Insert Component…").on_hover_text("Insert saved part files (.hcad) into the assembly").clicked() {
                     ui_state.insert_component_request = true;
+                }
+                if ui.selectable_label(ui_state.mate_spec.is_some(), "Mate").on_hover_text("Constrain two components: click a face on each (flush faces, or a bolt into a hole)").clicked() {
+                    ui_state.mate_spec = if ui_state.mate_spec.is_some() { None } else { Some(MateSpec::default()) };
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Click a component to select it; right-click it in the tree to fix, hide or open the part.").weak().small());
@@ -4894,6 +5279,76 @@ fn ui_system(
             if ui.button("\u{2795} Insert Component…").clicked() {
                 ui_state.insert_component_request = true;
             }
+            if let Some(mut spec) = ui_state.mate_spec.clone() {
+                ui.separator();
+                ui.heading("Mate");
+                let mut commit = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    let ready = spec.a.is_some() && spec.b.is_some();
+                    if ui.add_enabled(ready, egui::Button::new(egui::RichText::new("\u{2714}  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                        commit = true;
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("\u{2716}  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                        cancel = true;
+                    }
+                });
+                let describe = |r: &Option<MateRef>| -> String {
+                    match r {
+                        Some(r) => {
+                            let cname = asm.0.component(r.comp).map(|c| c.name.clone()).unwrap_or_else(|| "?".into());
+                            let face = if r.kind == 1 { "cylinder" } else { "face" };
+                            format!("{face} of {cname}")
+                        }
+                        None => "click a face in the viewport".into(),
+                    }
+                };
+                ui.label(format!("A:  {}", describe(&spec.a)));
+                ui.label(format!("B:  {}", describe(&spec.b)));
+                if (spec.a.is_some() || spec.b.is_some()) && ui.small_button("Clear picks").clicked() {
+                    spec.a = None;
+                    spec.b = None;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (k, name) in [(0u8, "Coincident"), (1, "Distance"), (2, "Concentric"), (3, "Parallel")] {
+                        if ui.radio(spec.kind == k, name).clicked() {
+                            spec.kind = k;
+                            spec.auto_kind = false;
+                        }
+                    }
+                });
+                if spec.kind == 1 {
+                    ui.horizontal(|ui| {
+                        ui.label("Distance");
+                        ui.add(egui::DragValue::new(&mut spec.value).speed(0.2).suffix(" mm"));
+                    });
+                }
+                ui.checkbox(&mut spec.flip, "Flip").on_hover_text("Reverse which way the faces point at each other");
+                ui.label(egui::RichText::new("Pick one face on each component. Two flat faces \u{2192} flush; two round faces \u{2192} bolt-in-hole.").weak().small());
+                if commit {
+                    if let (Some(a), Some(b)) = (spec.a.clone(), spec.b.clone()) {
+                        asm.0.add_mate(spec.kind, spec.value as f64, spec.flip, a, b);
+                        ui_state.asm_solve = true;
+                    }
+                    ui_state.mate_spec = None;
+                } else if cancel {
+                    ui_state.mate_spec = None;
+                } else {
+                    // Viewport clicks write the picks straight into ui_state; only carry over
+                    // the fields this panel owns.
+                    if let Some(cur) = ui_state.mate_spec.as_mut() {
+                        cur.kind = spec.kind;
+                        cur.value = spec.value;
+                        cur.flip = spec.flip;
+                        cur.auto_kind = spec.auto_kind;
+                        if spec.a.is_none() && spec.b.is_none() {
+                            cur.a = None;
+                            cur.b = None;
+                        }
+                    }
+                }
+                ui.separator();
+            }
             ui.add_space(4.0);
             let mut delete: Option<u64> = None;
             let mut vis_changed = false;
@@ -4955,6 +5410,7 @@ fn ui_system(
             }
             if let Some(id) = delete {
                 asm.0.components.retain(|c| c.id != id);
+                asm.0.mates.retain(|m| m.a.comp != id && m.b.comp != id);
                 if ui_state.asm_selected == Some(id) {
                     ui_state.asm_selected = None;
                 }
@@ -4962,6 +5418,43 @@ fn ui_system(
             }
             if vis_changed {
                 asm_render.dirty = true;
+            }
+            // ---- Mates list ----
+            if !asm.0.mates.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Mates").weak().small());
+                let mut del_mate: Option<u64> = None;
+                let mut flip_mate: Option<u64> = None;
+                for m in &asm.0.mates {
+                    let kind_name = ["Coincident", "Distance", "Concentric", "Parallel"][m.kind.min(3) as usize];
+                    let cname = |id: u64| asm.0.component(id).map(|c| c.name.clone()).unwrap_or_else(|| "?".into());
+                    let label = if m.kind == 1 {
+                        format!("{kind_name} {:.1}  {} \u{2194} {}", m.value, cname(m.a.comp), cname(m.b.comp))
+                    } else {
+                        format!("{kind_name}  {} \u{2194} {}", cname(m.a.comp), cname(m.b.comp))
+                    };
+                    let resp = ui.selectable_label(false, egui::RichText::new(label).small());
+                    resp.context_menu(|ui| {
+                        if ui.button("Flip").clicked() {
+                            flip_mate = Some(m.id);
+                            ui.close();
+                        }
+                        if ui.button("Delete mate").clicked() {
+                            del_mate = Some(m.id);
+                            ui.close();
+                        }
+                    });
+                }
+                if let Some(id) = flip_mate {
+                    if let Some(m) = asm.0.mates.iter_mut().find(|m| m.id == id) {
+                        m.flip = !m.flip;
+                    }
+                    ui_state.asm_solve = true;
+                }
+                if let Some(id) = del_mate {
+                    asm.0.mates.retain(|m| m.id != id);
+                    ui_state.asm_solve = true;
+                }
             }
             // Component PM: exact placement + fixed flag for the selected instance.
             if let Some(id) = ui_state.asm_selected {
@@ -18476,6 +18969,94 @@ mod tests {
         let tess = component_tessellation(&loaded.component(a).unwrap().cached).expect("component regenerates");
         let vol = tri_vol(&tess.mesh);
         assert!((vol - 500.0).abs() < 25.0, "10×10×5 box volume, got {vol:.1}");
+    }
+
+    #[test]
+    fn coincident_mate_pulls_faces_flush() {
+        // Two boxes; mate box B's bottom (z=0 local) onto box A's top (z=5 local). B floats
+        // somewhere off in space — the solver must land its bottom plane on A's top plane.
+        let mut part = Document::with_default_planes();
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("b".into(), String::new(), part.clone(), [3.0, 7.0, 40.0]);
+        asm.add_mate(
+            0,
+            0.0,
+            false,
+            MateRef { comp: a, kind: 0, point: [5.0, 5.0, 5.0], dir: [0.0, 0.0, 1.0] },
+            MateRef { comp: b, kind: 0, point: [5.0, 5.0, 0.0], dir: [0.0, 0.0, -1.0] },
+        );
+        solve_mates(&mut asm);
+        let c = asm.component(b).unwrap();
+        // B's bottom plane must land at world z = 5 (A is fixed at the origin).
+        assert!((c.translation[2] - 5.0).abs() < 1e-3, "B bottom should sit on A top, tz = {}", c.translation[2]);
+        // And B must still face up (no needless spin).
+        let q = Quat::from_xyzw(c.rotation[0] as f32, c.rotation[1] as f32, c.rotation[2] as f32, c.rotation[3] as f32);
+        assert!((q * Vec3::Z).dot(Vec3::Z) > 0.999, "B should stay upright");
+    }
+
+    #[test]
+    fn concentric_mate_aligns_cylinder_axes() {
+        // Two cylinders (r=3, h=5, axis +Z through local (0,0)). B starts offset and the
+        // concentric mate must bring its axis onto A's (XY match; Z stays free).
+        let mut part = Document::with_default_planes();
+        let mut sk = Sketch::default();
+        let c = sk.add_point(0.0, 0.0);
+        sk.add_circle(c, 3.0);
+        part.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("b".into(), String::new(), part.clone(), [11.0, -6.0, 9.0]);
+        asm.add_mate(
+            2,
+            0.0,
+            false,
+            MateRef { comp: a, kind: 1, point: [0.0, 0.0, 2.5], dir: [0.0, 0.0, 1.0] },
+            MateRef { comp: b, kind: 1, point: [0.0, 0.0, 2.5], dir: [0.0, 0.0, 1.0] },
+        );
+        solve_mates(&mut asm);
+        let cb = asm.component(b).unwrap();
+        assert!(cb.translation[0].abs() < 1e-3 && cb.translation[1].abs() < 1e-3, "B axis should land on A's axis, got {:?}", cb.translation);
+        assert!((cb.translation[2] - 9.0).abs() < 1e-3, "sliding along the axis must stay free");
+    }
+
+    #[test]
+    fn face_classification_tells_planes_from_cylinders() {
+        // A cylinder part: its side wall must classify as cylindrical with a +Z axis through
+        // (0,0); its top cap as planar with a +Z normal.
+        let mut part = Document::with_default_planes();
+        let mut sk = Sketch::default();
+        let c = sk.add_point(0.0, 0.0);
+        sk.add_circle(c, 4.0);
+        part.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], plane: xy(), distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.rollback = part.features.len();
+        let tess = component_tessellation(&part).expect("cylinder");
+        let tri = &tess.mesh;
+        // Find a side-wall triangle (normal ⊥ Z) and a cap triangle (normal ≈ +Z).
+        let mut side = None;
+        let mut cap = None;
+        for (ti, t) in tri.indices.chunks_exact(3).enumerate() {
+            let a = Vec3::from_array(tri.positions[t[0] as usize]);
+            let b = Vec3::from_array(tri.positions[t[1] as usize]);
+            let c3 = Vec3::from_array(tri.positions[t[2] as usize]);
+            let n = (b - a).cross(c3 - a).normalize_or_zero();
+            if n.z.abs() < 0.1 && side.is_none() {
+                side = Some((ti, (a + b + c3) / 3.0));
+            }
+            if n.z > 0.9 && cap.is_none() {
+                cap = Some((ti, (a + b + c3) / 3.0));
+            }
+        }
+        let (sti, sp) = side.expect("side tri");
+        let (kind, axis_pt, dir) = classify_face_local(tri, sti, sp);
+        assert_eq!(kind, 1, "side wall should classify as a cylinder");
+        assert!(dir.z.abs() > 0.99, "cylinder axis should be Z, got {dir:?}");
+        assert!(axis_pt.x.abs() < 0.2 && axis_pt.y.abs() < 0.2, "axis should pass near (0,0), got {axis_pt:?}");
+        let (cti, cp) = cap.expect("cap tri");
+        let (kind2, _, dir2) = classify_face_local(tri, cti, cp);
+        assert_eq!(kind2, 0, "cap should classify as planar");
+        assert!(dir2.z > 0.99, "cap normal should be +Z, got {dir2:?}");
     }
 
     #[test]
