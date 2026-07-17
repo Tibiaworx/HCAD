@@ -164,6 +164,7 @@ fn main() {
                     apply_mirror_feature,
                     apply_thread,
                     do_regenerate,
+                    apply_section,
                     set_window_icon,
                     update_projection,
                     fillet_preview,
@@ -577,6 +578,12 @@ struct UiState {
     perspective: bool,
     /// Mouse view-control preset (Tools → Mouse controls).
     mouse_scheme: MouseScheme,
+    /// Section view (SolidWorks-style): visually cut the DISPLAYED body with a datum-parallel
+    /// plane — `(which plane 0/1/2, offset along its normal, flip side)`. Display-only: the
+    /// document and regeneration always use the full body.
+    section: Option<(u8, f32, bool)>,
+    /// The section parameters currently baked into the displayed mesh (None = full body shown).
+    section_shown: Option<(u8, f32, bool)>,
     /// Timeline index of the Fillet/Chamfer being EDITED via its PM (tree double-click / Edit).
     /// While set, the doc is rolled back to just before it (so the preview builds on the
     /// pre-bevel body) and OK updates the feature in place instead of appending a new one.
@@ -813,6 +820,9 @@ struct Part {
     /// A round body's rim keeps these as its only edges, so they draw like real edges and are
     /// always selectable — unlike `tangent_edges`, which on the exact path is every facet line.
     seam_edges: Vec<[[f32; 3]; 2]>,
+    /// Full-body seam set stashed while a SECTION VIEW is active (the displayed `seam_edges` are
+    /// filtered to the kept side; moving the plane back must be able to restore them).
+    seam_backup: Vec<[[f32; 3]; 2]>,
 }
 
 /// A picked model edge (or edge loop) in view mode: the ordered world-space
@@ -1613,6 +1623,14 @@ fn ui_system(
                 if ui.checkbox(&mut ui_state.seamless, "Seamless").changed() { ui_state.regen = true; }
                 ui.checkbox(&mut ui_state.perspective, "Perspective")
                     .on_hover_text("Perspective camera (default is orthographic — CAD-true views with no parallax)");
+                let mut sec = ui_state.section.is_some();
+                if ui
+                    .checkbox(&mut sec, "Section view")
+                    .on_hover_text("Cut the displayed body with a plane to see inside (display only — the model is untouched)")
+                    .changed()
+                {
+                    ui_state.section = sec.then_some((0, 0.0, false));
+                }
             });
             ui.menu_button("Insert", |ui| {
                 if ui
@@ -2878,6 +2896,30 @@ fn ui_system(
                 ui_state.regen = true;
             } else {
                 ui_state.pending_thread = Some(spec);
+            }
+        }
+        if let Some((mut which, mut offset, mut flip)) = ui_state.section {
+            // Section view controls: pick the cutting plane, slide it, flip the kept side.
+            ui.heading("Section View");
+            ui.horizontal(|ui| {
+                if ui.button("Done").clicked() {
+                    ui_state.section = None;
+                }
+                if ui.checkbox(&mut flip, "Flip side").changed() {}
+            });
+            for (k, name) in [(0u8, "Front (XY)"), (1, "Top (XZ)"), (2, "Right (YZ)")] {
+                if ui.radio(which == k, name).clicked() {
+                    which = k;
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Offset");
+                ui.add(egui::DragValue::new(&mut offset).speed(0.2).suffix(" mm"));
+            });
+            ui.label(egui::RichText::new("Display only — modelling always uses the full body.").weak().small());
+            ui.separator();
+            if ui_state.section.is_some() {
+                ui_state.section = Some((which, offset, flip));
             }
         }
         if let Some(mut spec) = ui_state.plane_spec.clone() {
@@ -11005,6 +11047,9 @@ fn do_regenerate(
         return;
     }
     ui_state.regen = false;
+    // The rebuild replaces the displayed body with the FULL model — an active section view
+    // re-applies afterwards (apply_section keys off this reset).
+    ui_state.section_shown = None;
     // Vertices move when the model rebuilds, so any edge selection is stale.
     edge_sel.clear();
 
@@ -11138,6 +11183,79 @@ fn do_regenerate(
                     part.seam_edges.clear();
                 }
             }
+        }
+    }
+}
+
+/// Apply the display-only SECTION VIEW: cut the (full) tessellated body with a half-space box on
+/// the discarded side of the chosen plane and show the capped result — a true cross-section, not
+/// a hollow shader clip. Re-runs when the parameters change or a regen refreshed the body;
+/// switching it off restores the full display via a normal regen. `part.mesh` is never touched,
+/// so regeneration, face reprojection, and the document stay on the full body.
+fn apply_section(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ui_state: ResMut<UiState>,
+    mut part: ResMut<Part>,
+    existing: Query<Entity, With<SolidPart>>,
+) {
+    if ui_state.regen {
+        return; // let the pending rebuild land first; it resets `section_shown`
+    }
+    if ui_state.section == ui_state.section_shown {
+        return;
+    }
+    match ui_state.section {
+        None => {
+            // Section switched off → a normal regen restores the full display and edge pools.
+            ui_state.section_shown = None;
+            ui_state.regen = true;
+        }
+        Some(spec) => {
+            let Some(full) = part.mesh.clone() else {
+                ui_state.section_shown = ui_state.section;
+                return;
+            };
+            if full.positions.is_empty() {
+                ui_state.section_shown = ui_state.section;
+                return;
+            }
+            // First application since the last regen: stash the full seam set for re-filtering.
+            if ui_state.section_shown.is_none() {
+                part.seam_backup = part.seam_edges.clone();
+            }
+            let (lo, hi) = mesh_bbox(&full);
+            let l = (((hi - lo).length()) as f64 * 1.5).max(10.0);
+            let pr = standard_plane_ref(spec.0);
+            let basis = basis_from_ref(&pr);
+            let sq = [[-l, -l], [l, -l], [l, l], [-l, l]];
+            // The half-space box covers the DISCARDED side: past the offset along +normal, or
+            // before it when flipped.
+            let (start, len) = if spec.2 { (spec.1 as f64 - 2.0 * l, 2.0 * l) } else { (spec.1 as f64, 2.0 * l) };
+            let Some(tool) = extrude_tool_mesh(&sq, &[], &basis, start, len) else { return };
+            let cut = mesh_difference(&full, &tool);
+            let _ = take_fallback_count(); // a display-only cut must never raise the torn-surface banner
+            let tess = mesh_tessellation(cut);
+            for e in &existing {
+                commands.entity(e).despawn();
+            }
+            // Displayed edges follow the sectioned view (including the fresh section outline);
+            // seams re-filter from the stashed full set so sliding the plane back restores them.
+            part.edges = tess.edges.clone();
+            part.tangent_edges = tess.tangent_edges.clone();
+            let n = Vec3::new(pr.normal[0] as f32, pr.normal[1] as f32, pr.normal[2] as f32);
+            let side = if spec.2 { -1.0 } else { 1.0 };
+            let backup = part.seam_backup.clone();
+            part.seam_edges = backup
+                .into_iter()
+                .filter(|e| {
+                    let mid = Vec3::new((e[0][0] + e[1][0]) * 0.5, (e[0][1] + e[1][1]) * 0.5, (e[0][2] + e[1][2]) * 0.5);
+                    (mid.dot(n) - spec.1) * side <= 0.0
+                })
+                .collect();
+            spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+            ui_state.section_shown = ui_state.section;
         }
     }
 }
