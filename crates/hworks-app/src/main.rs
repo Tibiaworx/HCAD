@@ -22,7 +22,7 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Document, FeatureId, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
+use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
@@ -126,6 +126,9 @@ fn main() {
         .insert_resource(DocRes(Document::with_default_planes()))
         .init_resource::<SketchSession>()
         .init_resource::<Part>()
+        .init_resource::<AsmRes>()
+        .init_resource::<AsmRender>()
+        .init_resource::<DocMode>()
         // Seamless on by default — build with the robust mesh kernel so shared/coincident
         // walls fuse without a seam. Toggle off in the toolbar for exact B-rep faces.
         .insert_resource({
@@ -173,7 +176,7 @@ fn main() {
                     thread_ghost,
                 ),
                 (
-                    handle_new_part,
+                    (handle_new_part, asm_regenerate, sync_asm_instances, draw_asm_edges, asm_interaction, draw_asm_gizmo),
                     highlight_face,
                     hover_body_edge,
                     sync_ref_planes,
@@ -205,6 +208,401 @@ fn main() {
 
 #[derive(Resource)]
 struct DocRes(Document);
+
+/// Which kind of document the window is editing. Part mode is everything HCAD did before
+/// assemblies; Assembly mode renders placed component instances instead of the Part body.
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+enum DocMode {
+    #[default]
+    Part,
+    Assembly,
+}
+
+/// The open assembly document (empty & unused in Part mode).
+#[derive(Resource, Default)]
+struct AsmRes(Assembly);
+
+/// Regenerated geometry for one DISTINCT part used by the assembly. Instances of the same
+/// source share one entry (and thus one GPU mesh) — a 20-screw assembly builds the screw once.
+struct AsmGeom {
+    mesh: Handle<Mesh>,
+    /// Local-space tessellation, for ray picking.
+    tri: TriMesh,
+    /// Local-space feature edges, drawn transformed per instance.
+    edges: Vec<[[f32; 3]; 2]>,
+}
+
+/// Assembly render state: distinct-part geometry cache + a rebuild flag.
+#[derive(Resource, Default)]
+struct AsmRender {
+    cache: std::collections::HashMap<String, AsmGeom>,
+    dirty: bool,
+}
+
+/// An in-progress component move drag: which world axis, the last cursor parameter along
+/// it, and the flush-snap candidates gathered at grab time (the dragged part's face planes
+/// perpendicular to the axis, in part-local axis coordinates, plus every other component's
+/// matching face planes in world axis coordinates).
+#[derive(Clone)]
+struct AsmDrag {
+    comp: u64,
+    axis: u8,
+    last_t: f32,
+    faces: Vec<f64>,
+    targets: Vec<f64>,
+}
+
+/// World-space centre of a placed component (bbox centre through its transform).
+fn asm_comp_center(comp: &hworks_document::Component, geom: &AsmGeom) -> Vec3 {
+    let (lo, hi) = mesh_bbox(&geom.tri);
+    comp_transform(comp).transform_point((lo + hi) * 0.5)
+}
+
+/// Distinct face-plane coordinates of `tri` along world axis `axis` (unit, axis-aligned):
+/// the positions of planar faces perpendicular to it. Used for flush snapping.
+fn axis_face_planes(tri: &TriMesh, tf: &Transform, axis: Vec3) -> Vec<f64> {
+    let mut planes: Vec<f64> = Vec::new();
+    for t in tri.indices.chunks_exact(3) {
+        let a = tf.transform_point(Vec3::from_array(tri.positions[t[0] as usize]));
+        let b = tf.transform_point(Vec3::from_array(tri.positions[t[1] as usize]));
+        let c = tf.transform_point(Vec3::from_array(tri.positions[t[2] as usize]));
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        if n.dot(axis).abs() < 0.99 {
+            continue;
+        }
+        let coord = a.dot(axis) as f64;
+        if !planes.iter().any(|p| (p - coord).abs() < 1e-3) {
+            planes.push(coord);
+        }
+    }
+    planes
+}
+
+/// Marker on each spawned component instance entity (the value is the component id).
+#[derive(Component)]
+struct AsmComp(u64);
+
+/// The geometry cache key for a component: shared per source file, unique when embedded-only.
+fn asm_geom_key(c: &hworks_document::Component) -> String {
+    if c.source.is_empty() { format!("#{}", c.id) } else { c.source.clone() }
+}
+
+fn comp_transform(c: &hworks_document::Component) -> Transform {
+    Transform {
+        translation: Vec3::new(c.translation[0] as f32, c.translation[1] as f32, c.translation[2] as f32),
+        rotation: Quat::from_xyzw(c.rotation[0] as f32, c.rotation[1] as f32, c.rotation[2] as f32, c.rotation[3] as f32).normalize(),
+        scale: Vec3::ONE,
+    }
+}
+
+/// Regenerate a component's part document to a tessellation — the exact kernel when possible,
+/// the mesh kernel when the part contains mesh-only features (same rule as `do_regenerate`).
+fn component_tessellation(doc: &Document) -> Option<Tessellation> {
+    let has_loft = doc.features.iter().any(|f| matches!(f.kind, FeatureKind::Loft { .. }));
+    let force = doc_has_text(doc) || doc_has_fillet(doc) || has_loft || doc_has_thin(doc);
+    if !force {
+        let (solid, _) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_reported(doc))).unwrap_or((None, Vec::new()));
+        if let Some(s) = solid {
+            return Some(tessellate(&s, 0.03));
+        }
+    }
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(doc))).unwrap_or(None)?;
+    Some(mesh_tessellation(out.0))
+}
+
+/// Rebuild the assembly scene when flagged dirty: regenerate distinct parts into the cache
+/// (each once), then spawn one entity per visible component instance sharing the cached mesh.
+fn asm_regenerate(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    mut render: ResMut<AsmRender>,
+    existing: Query<Entity, With<AsmComp>>,
+) {
+    if !render.dirty {
+        return;
+    }
+    render.dirty = false;
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    if *mode != DocMode::Assembly {
+        render.cache.clear();
+        return;
+    }
+    // Drop cache entries whose part is gone (deleted last instance), keep shared ones.
+    let live: std::collections::HashSet<String> = asm.0.components.iter().map(asm_geom_key).collect();
+    render.cache.retain(|k, _| live.contains(k));
+    for comp in &asm.0.components {
+        if comp.hidden {
+            continue;
+        }
+        let key = asm_geom_key(comp);
+        if !render.cache.contains_key(&key) {
+            let Some(tess) = component_tessellation(&comp.cached) else {
+                warn!("Component '{}' produced no geometry.", comp.name);
+                continue;
+            };
+            let edges = tess.edges.clone();
+            let tri = tess.mesh.clone();
+            let mesh = meshes.add(trimesh_to_bevy(tess.mesh));
+            render.cache.insert(key.clone(), AsmGeom { mesh, tri, edges });
+        }
+        let Some(geom) = render.cache.get(&key) else { continue };
+        // Each instance gets its own material so the selection tint can single it out.
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.62, 0.66, 0.74),
+            metallic: 0.1,
+            perceptual_roughness: 0.55,
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(geom.mesh.clone()),
+            MeshMaterial3d(material),
+            comp_transform(comp),
+            AsmComp(comp.id),
+            Name::new(comp.name.clone()),
+        ));
+    }
+}
+
+/// Keep entity transforms following the document every frame (dragging edits AsmRes only),
+/// and tint the selected instance.
+fn sync_asm_instances(
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    ui_state: Res<UiState>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut q: Query<(&AsmComp, &mut Transform, &MeshMaterial3d<StandardMaterial>)>,
+) {
+    if *mode != DocMode::Assembly {
+        return;
+    }
+    for (marker, mut tf, mat) in &mut q {
+        if let Some(comp) = asm.0.component(marker.0) {
+            *tf = comp_transform(comp);
+        }
+        if let Some(m) = materials.get_mut(&mat.0) {
+            let selected = ui_state.asm_selected == Some(marker.0);
+            m.base_color = if selected { Color::srgb(0.55, 0.68, 0.9) } else { Color::srgb(0.62, 0.66, 0.74) };
+        }
+    }
+}
+
+/// Draw every visible component's feature edges, transformed to its placement (the same
+/// camera-nudged overlay treatment as the part body's edges).
+fn draw_asm_edges(
+    mut gizmos: Gizmos,
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    render: Res<AsmRender>,
+    cam_q: Query<&GlobalTransform, With<Camera3d>>,
+) {
+    if *mode != DocMode::Assembly {
+        return;
+    }
+    let Ok(cam) = cam_q.single() else { return };
+    let cam_pos = cam.translation();
+    let nudge = |p: Vec3| p + (cam_pos - p) * 0.0025;
+    let col = Color::srgb(0.05, 0.05, 0.07);
+    for comp in &asm.0.components {
+        if comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        let tf = comp_transform(comp);
+        for e in &geom.edges {
+            let a = tf.transform_point(Vec3::from_array(e[0]));
+            let b = tf.transform_point(Vec3::from_array(e[1]));
+            gizmos.line(nudge(a), nudge(b), col);
+        }
+    }
+}
+
+/// Draw the move gizmo on the selected (non-fixed) component: three world-axis arrows from
+/// its centre. The active drag axis highlights.
+fn draw_asm_gizmo(
+    mut overlay: Gizmos<OverlayGizmos>,
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    render: Res<AsmRender>,
+    ui_state: Res<UiState>,
+) {
+    if *mode != DocMode::Assembly {
+        return;
+    }
+    let Some(id) = ui_state.asm_selected else { return };
+    let Some(comp) = asm.0.component(id) else { return };
+    if comp.fixed || comp.hidden {
+        return;
+    }
+    let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { return };
+    let base = asm_comp_center(comp, geom);
+    let (lo, hi) = mesh_bbox(&geom.tri);
+    let len = ((hi - lo).length() * 0.6).max(5.0);
+    for (k, (dir, col)) in [
+        (Vec3::X, Color::srgb(0.95, 0.35, 0.35)),
+        (Vec3::Y, Color::srgb(0.35, 0.85, 0.35)),
+        (Vec3::Z, Color::srgb(0.4, 0.55, 0.95)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let active = ui_state.asm_drag.as_ref().is_some_and(|d| d.axis == k as u8);
+        let c = if active { Color::srgb(1.0, 1.0, 0.5) } else { col };
+        let tip = base + dir * len;
+        overlay.line(base, tip, c);
+        let side = dir.any_orthonormal_vector() * (len * 0.06);
+        let back = tip - dir * (len * 0.12);
+        overlay.line(tip, back + side, c);
+        overlay.line(tip, back - side, c);
+        let side2 = dir.cross(side.normalize_or_zero()) * (len * 0.06);
+        overlay.line(tip, back + side2, c);
+        overlay.line(tip, back - side2, c);
+    }
+}
+
+/// Assembly-mode viewport clicks: select the component under the cursor (nearest hit wins;
+/// empty space clears the selection).
+fn asm_interaction(
+    buttons: Res<ButtonInput<MouseButton>>,
+    blocking: Res<UiBlocking>,
+    mode: Res<DocMode>,
+    mut asm: ResMut<AsmRes>,
+    render: Res<AsmRender>,
+    mut ui_state: ResMut<UiState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+) {
+    if *mode != DocMode::Assembly || blocking.0 {
+        return;
+    }
+    let just_pressed = buttons.just_pressed(MouseButton::Left);
+    let pressed = buttons.pressed(MouseButton::Left);
+    let just_released = buttons.just_released(MouseButton::Left);
+    if !just_pressed && !pressed && !just_released {
+        return;
+    }
+    let Ok(window) = windows.single() else { return };
+    let Some(cursor) = window.cursor_position() else { return };
+    let Ok((camera, cam_gt)) = cam.single() else { return };
+    let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else { return };
+
+    // ---- Move-arrow drag on the selected component ----
+    if just_pressed && ui_state.asm_drag.is_none() {
+        if let Some(id) = ui_state.asm_selected {
+            if let Some(comp) = asm.0.component(id) {
+                if !comp.fixed && !comp.hidden {
+                    if let Some(geom) = render.cache.get(&asm_geom_key(comp)) {
+                        let base = asm_comp_center(comp, geom);
+                        let (lo, hi) = mesh_bbox(&geom.tri);
+                        let len = ((hi - lo).length() * 0.6).max(5.0);
+                        for (k, dir) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                            let tip = base + dir * len;
+                            let near_shaft = segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 16.0);
+                            let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 22.0).unwrap_or(false);
+                            if near_shaft || near_tip {
+                                let t0 = closest_t_on_axis(base, dir, ray.origin, ray.direction.as_vec3());
+                                if t0.is_finite() {
+                                    // Flush-snap candidates: the dragged part's face planes ⊥ axis
+                                    // (in part-local axis coords, i.e. world minus this translation)
+                                    // and every other visible component's matching planes.
+                                    let tf = comp_transform(comp);
+                                    let tr = comp.translation[k];
+                                    let faces: Vec<f64> = axis_face_planes(&geom.tri, &tf, dir).into_iter().map(|w| w - tr).collect();
+                                    let mut targets: Vec<f64> = Vec::new();
+                                    for other in &asm.0.components {
+                                        if other.id == id || other.hidden {
+                                            continue;
+                                        }
+                                        if let Some(og) = render.cache.get(&asm_geom_key(other)) {
+                                            targets.extend(axis_face_planes(&og.tri, &comp_transform(other), dir));
+                                        }
+                                    }
+                                    ui_state.asm_drag = Some(AsmDrag { comp: id, axis: k as u8, last_t: t0, faces, targets });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(drag) = ui_state.asm_drag.clone() {
+        if pressed {
+            if let Some(comp) = asm.0.component(drag.comp) {
+                if let Some(geom) = render.cache.get(&asm_geom_key(comp)) {
+                    let dir = [Vec3::X, Vec3::Y, Vec3::Z][drag.axis as usize];
+                    let base = asm_comp_center(comp, geom);
+                    let t = closest_t_on_axis(base, dir, ray.origin, ray.direction.as_vec3());
+                    if t.is_finite() {
+                        let delta = (t - drag.last_t) as f64;
+                        if let Some(comp) = asm.0.component_mut(drag.comp) {
+                            let a = drag.axis as usize;
+                            comp.translation[a] += delta;
+                            // Flush snap: if any of this part's face planes lands near another
+                            // component's matching plane, close the gap (smallest adjustment wins).
+                            let scene = 0.8_f64; // snap tolerance, mm
+                            let mut best_adj: Option<f64> = None;
+                            for f in &drag.faces {
+                                let w = comp.translation[a] + f;
+                                for tgt in &drag.targets {
+                                    let adj = tgt - w;
+                                    if adj.abs() < scene && best_adj.map_or(true, |b: f64| adj.abs() < b.abs()) {
+                                        best_adj = Some(adj);
+                                    }
+                                }
+                            }
+                            if let Some(adj) = best_adj {
+                                comp.translation[a] += adj;
+                            }
+                        }
+                        if let Some(d) = ui_state.asm_drag.as_mut() {
+                            d.last_t = t;
+                        }
+                    }
+                }
+            }
+            if just_released {
+                ui_state.asm_drag = None;
+            }
+            return; // a drag consumes the click — no reselection underneath
+        }
+        ui_state.asm_drag = None;
+    }
+
+    if !just_pressed {
+        return;
+    }
+    let mut best: Option<(f32, u64)> = None;
+    for comp in &asm.0.components {
+        if comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        // Cast in part-local space: cheaper than transforming every triangle out.
+        let tf = comp_transform(comp);
+        let inv = tf.compute_affine().inverse();
+        let lo = inv.transform_point3(ray.origin);
+        let ld = inv.transform_vector3(*ray.direction).normalize_or_zero();
+        for tri in geom.tri.indices.chunks_exact(3) {
+            let a = Vec3::from_array(geom.tri.positions[tri[0] as usize]);
+            let b = Vec3::from_array(geom.tri.positions[tri[1] as usize]);
+            let c = Vec3::from_array(geom.tri.positions[tri[2] as usize]);
+            if let Some(t) = ray_triangle(lo, ld, a, b, c) {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, comp.id));
+                }
+            }
+        }
+    }
+    ui_state.asm_selected = best.map(|(_, id)| id);
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Tool {
@@ -652,6 +1050,12 @@ struct UiState {
     pending_mirror: Option<u8>,
     mirror_shown: Option<u8>,
     mirror_request: Option<u8>,
+    /// Assembly mode: the selected component instance id, and one-shot UI requests.
+    asm_selected: Option<u64>,
+    /// Active component move-arrow drag.
+    asm_drag: Option<AsmDrag>,
+    new_asm_request: bool,
+    insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
     pattern_spec: Option<PatternSpec>,
     pattern_request: Option<PatternSpec>,
@@ -1490,10 +1894,52 @@ fn update_projection(ui_state: Res<UiState>, mut q: Query<(&OrbitCamera, &mut Pr
 /// Open a `.hcad` passed on the command line (double-clicking an associated file hands us its
 /// path as the first argument). Loads it exactly like File → Open, so the window title, Save
 /// binding, and regeneration all behave as if opened from the dialog.
-fn open_cli_file(mut doc: ResMut<DocRes>, mut ui_state: ResMut<UiState>) {
+fn open_cli_file(
+    mut doc: ResMut<DocRes>,
+    mut ui_state: ResMut<UiState>,
+    mut asm: ResMut<AsmRes>,
+    mut asm_render: ResMut<AsmRender>,
+    mut mode: ResMut<DocMode>,
+) {
     let Some(arg) = std::env::args().nth(1) else { return };
     let path = std::path::PathBuf::from(&arg);
-    if !path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad") || e.eq_ignore_ascii_case("ron")) {
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    // Double-clicked assembly: load it, refresh caches from any present sources.
+    if ext == "hasm" {
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Assembly>(&t).map_err(|e| e.to_string())) {
+            Ok(mut loaded) => {
+                let dir = path.parent().map(|d| d.to_path_buf());
+                for c in &mut loaded.components {
+                    if c.source.is_empty() {
+                        continue;
+                    }
+                    let sp = std::path::PathBuf::from(&c.source);
+                    let full = if sp.is_absolute() { sp } else { dir.clone().map(|d| d.join(&sp)).unwrap_or(sp) };
+                    if let Ok(t) = std::fs::read_to_string(&full) {
+                        if let Ok(d) = ron::from_str::<Document>(&t) {
+                            c.cached = d;
+                        }
+                    }
+                }
+                *mode = DocMode::Assembly;
+                asm.0 = loaded;
+                asm_render.dirty = true;
+                doc.0 = Document::with_default_planes();
+                for f in &mut doc.0.features {
+                    f.hidden = true;
+                }
+                ui_state.current_file = Some(path.clone());
+                ui_state.regen = true;
+                info!("Opened assembly {} (command line)", path.display());
+            }
+            Err(e) => {
+                warn!("Could not open {}: {e}", path.display());
+                ui_state.last_error = Some(format!("Couldn't open {} — it isn't a valid HCAD assembly.", path.display()));
+            }
+        }
+        return;
+    }
+    if ext != "hcad" && ext != "ron" {
         return;
     }
     match std::fs::read_to_string(&path) {
@@ -1621,6 +2067,7 @@ fn ui_system(
     mut ui_state: ResMut<UiState>,
     mut blocking: ResMut<UiBlocking>,
     mut doc: ResMut<DocRes>,
+    mut asm_ctx: (ResMut<AsmRes>, ResMut<AsmRender>, Res<DocMode>),
     mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
     cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
@@ -1632,6 +2079,8 @@ fn ui_system(
     mut image_loaders: Local<bool>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    let (asm, asm_render, asm_mode) = (&mut asm_ctx.0, &mut asm_ctx.1, &asm_ctx.2);
+    let in_asm = **asm_mode == DocMode::Assembly;
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
 
     // While a 3D gizmo arrow is being dragged, drop egui keyboard focus: a focused DragValue
@@ -1736,6 +2185,10 @@ fn ui_system(
             // Menus — only real, wired actions (no dead placeholders).
             ui.menu_button("File", |ui| {
                 if ui.button("New Part").clicked() { ui_state.new_part = true; ui.close(); }
+                if ui.button("New Assembly").on_hover_text("Place saved parts together (insert .hcad files, move them into position)").clicked() {
+                    ui_state.new_asm_request = true;
+                    ui.close();
+                }
                 if ui.button("Open…").clicked() { ui_state.open_request = true; ui.close(); }
                 ui.separator();
                 if ui.button("Save").clicked() { ui_state.save_request = true; ui.close(); }
@@ -1771,6 +2224,10 @@ fn ui_system(
                 }
             });
             ui.menu_button("Insert", |ui| {
+                if ui.add_enabled(in_asm, egui::Button::new("Component…")).on_hover_text("Insert saved part files (.hcad) into the assembly").clicked() {
+                    ui_state.insert_component_request = true;
+                    ui.close();
+                }
                 if ui
                     .button("Sketch Picture…")
                     .on_hover_text("Place a reference image on the selected plane (or Front) to trace over — then sketch on the same plane")
@@ -1858,7 +2315,30 @@ fn ui_system(
                 ui.separator();
                 if ui.button("Fit").on_hover_text("Zoom to fit the part").clicked() {
                     if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
-                        let (focus, radius) = fit_view(&part);
+                        // Assembly mode fits the union of all placed components instead.
+                        let (focus, radius) = if in_asm {
+                            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                            for comp in &asm.0.components {
+                                if comp.hidden {
+                                    continue;
+                                }
+                                if let Some(geom) = asm_render.cache.get(&asm_geom_key(comp)) {
+                                    let tf = comp_transform(comp);
+                                    for p in &geom.tri.positions {
+                                        let w = tf.transform_point(Vec3::from_array(*p));
+                                        lo = lo.min(w);
+                                        hi = hi.max(w);
+                                    }
+                                }
+                            }
+                            if lo.x.is_finite() {
+                                ((lo + hi) * 0.5, ((hi - lo).length() * 0.75).max(5.0))
+                            } else {
+                                (Vec3::ZERO, 30.0)
+                            }
+                        } else {
+                            fit_view(&part)
+                        };
                         let (yaw, pitch) = (orbit.yaw, orbit.pitch);
                         orbit.animate_to(focus, radius, yaw, pitch);
                     }
@@ -1880,8 +2360,17 @@ fn ui_system(
         });
         ui.separator();
 
-        // Row 2: CommandManager tabs + the active tab's tools.
+        // Row 2: CommandManager tabs + the active tab's tools. Assembly mode swaps the row for
+        // its own tools — the part-modelling tools would only operate on the hidden part doc.
         ui.horizontal_wrapped(|ui| {
+            if in_asm {
+                if ui.button("Insert Component…").on_hover_text("Insert saved part files (.hcad) into the assembly").clicked() {
+                    ui_state.insert_component_request = true;
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Click a component to select it; right-click it in the tree to fix, hide or open the part.").weak().small());
+                return;
+            }
             if ui.selectable_label(ui_state.active_tab == Tab::Features, "Features").clicked() {
                 ui_state.active_tab = Tab::Features;
                 session.tool = Tool::Select;
@@ -4236,6 +4725,118 @@ fn ui_system(
                 session.sketch.constraints.push(c);
                 session.selected_entities.clear();
                 session.needs_apply = true;
+            }
+        } else if in_asm {
+            // ---- Assembly tree: the component list ----
+            ui.horizontal(|ui| {
+                let name = ui_state
+                    .current_file
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Assembly".to_string());
+                ui.label(egui::RichText::new(format!("\u{2b21} {name}")).strong().size(15.0)).on_hover_text(
+                    ui_state.current_file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Unsaved assembly".to_string()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{}", asm.0.components.len())).weak().small()).on_hover_text("Components");
+                });
+            });
+            ui.separator();
+            if ui.button("\u{2795} Insert Component…").clicked() {
+                ui_state.insert_component_request = true;
+            }
+            ui.add_space(4.0);
+            let mut delete: Option<u64> = None;
+            let mut vis_changed = false;
+            let asm_dir = ui_state.current_file.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            for comp in &mut asm.0.components {
+                let selected = ui_state.asm_selected == Some(comp.id);
+                let mut label = comp.name.clone();
+                if comp.fixed {
+                    label = format!("(f)  {label}");
+                }
+                let mut rt = egui::RichText::new(label);
+                if selected {
+                    rt = rt.color(egui::Color32::from_rgb(120, 180, 255)).strong();
+                }
+                if comp.hidden {
+                    rt = rt.weak();
+                }
+                let resp = ui.selectable_label(selected, rt);
+                if resp.clicked() {
+                    ui_state.asm_selected = Some(comp.id);
+                }
+                resp.context_menu(|ui| {
+                    if ui.button(if comp.fixed { "Float" } else { "Fix" }).on_hover_text("Fixed components anchor the assembly and can't be dragged").clicked() {
+                        comp.fixed = !comp.fixed;
+                        ui.close();
+                    }
+                    if ui.button(if comp.hidden { "Show" } else { "Hide" }).clicked() {
+                        comp.hidden = !comp.hidden;
+                        vis_changed = true;
+                        ui.close();
+                    }
+                    if !comp.source.is_empty() && ui.button("Open Part").on_hover_text("Open the source .hcad in a new HCAD window").clicked() {
+                        let sp = std::path::PathBuf::from(&comp.source);
+                        let full = if sp.is_absolute() {
+                            sp
+                        } else {
+                            asm_dir.clone().map(|d| d.join(&sp)).unwrap_or(sp)
+                        };
+                        match std::env::current_exe() {
+                            Ok(exe) => {
+                                let _ = std::process::Command::new(exe).arg(&full).spawn();
+                            }
+                            Err(e) => warn!("Could not find the HCAD executable: {e}"),
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Delete").clicked() {
+                        delete = Some(comp.id);
+                        ui.close();
+                    }
+                });
+            }
+            if let Some(id) = delete {
+                asm.0.components.retain(|c| c.id != id);
+                if ui_state.asm_selected == Some(id) {
+                    ui_state.asm_selected = None;
+                }
+                vis_changed = true;
+            }
+            if vis_changed {
+                asm_render.dirty = true;
+            }
+            // Component PM: exact placement + fixed flag for the selected instance.
+            if let Some(id) = ui_state.asm_selected {
+                if let Some(comp) = asm.0.component_mut(id) {
+                    ui.separator();
+                    ui.heading(comp.name.clone());
+                    ui.horizontal(|ui| {
+                        ui.label("Position");
+                        for a in 0..3 {
+                            ui.add(egui::DragValue::new(&mut comp.translation[a]).speed(0.5).suffix(" mm"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Rotate");
+                        for (label, axis) in [("X+90\u{b0}", Vec3::X), ("Y+90\u{b0}", Vec3::Y), ("Z+90\u{b0}", Vec3::Z)] {
+                            if ui.small_button(label).clicked() {
+                                let q = Quat::from_xyzw(comp.rotation[0] as f32, comp.rotation[1] as f32, comp.rotation[2] as f32, comp.rotation[3] as f32);
+                                let r = (Quat::from_axis_angle(axis, std::f32::consts::FRAC_PI_2) * q).normalize();
+                                comp.rotation = [r.x as f64, r.y as f64, r.z as f64, r.w as f64];
+                            }
+                        }
+                        if ui.small_button("Reset").clicked() {
+                            comp.rotation = [0.0, 0.0, 0.0, 1.0];
+                        }
+                    });
+                    ui.checkbox(&mut comp.fixed, "Fixed").on_hover_text("Anchored — can't be dragged");
+                    if !comp.source.is_empty() {
+                        ui.label(egui::RichText::new(comp.source.clone()).weak().small());
+                    }
+                }
             }
         } else {
             // ---- FeatureManager design tree (SolidWorks-style) ----
@@ -10472,7 +11073,64 @@ fn handle_file_io(
     mut history: ResMut<History>,
     mut session: ResMut<SketchSession>,
     part: Res<Part>,
+    mut asm: ResMut<AsmRes>,
+    mut asm_render: ResMut<AsmRender>,
+    mut mode: ResMut<DocMode>,
 ) {
+    // ---- Assembly document requests ----
+    if ui_state.new_asm_request {
+        ui_state.new_asm_request = false;
+        *mode = DocMode::Assembly;
+        asm.0 = Assembly::default();
+        asm_render.dirty = true;
+        // Park the part world: a fresh doc with its datum planes hidden (they'd float in the
+        // assembly scene), and a regen that clears the old body.
+        doc.0 = Document::with_default_planes();
+        for f in &mut doc.0.features {
+            f.hidden = true;
+        }
+        session.plane = None;
+        session.editing = None;
+        session.sketch.clear();
+        ui_state.selected = None;
+        ui_state.asm_selected = None;
+        ui_state.current_file = None;
+        ui_state.regen = true;
+        ui_state.toasts.push(("New assembly — Insert Component to add parts".into(), 3.0));
+    }
+    if ui_state.insert_component_request {
+        ui_state.insert_component_request = false;
+        if *mode == DocMode::Assembly {
+            if let Some(paths) = rfd::FileDialog::new().add_filter("HCAD part", &["hcad", "ron"]).pick_files() {
+                let asm_dir = ui_state.current_file.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let mut added = 0;
+                for path in paths {
+                    match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Document>(&t).map_err(|e| e.to_string())) {
+                        Ok(part_doc) => {
+                            let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("part").to_string();
+                            // Store the path relative to the assembly file when possible.
+                            let source = match &asm_dir {
+                                Some(dir) => path.strip_prefix(dir).map(|r| r.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string_lossy().into_owned()),
+                                None => path.to_string_lossy().into_owned(),
+                            };
+                            // Stagger inserts so instances don't land exactly on each other.
+                            let off = asm.0.components.len() as f64 * 40.0;
+                            let id = asm.0.add_component(name, source, part_doc, [off, 0.0, 0.0]);
+                            ui_state.asm_selected = Some(id);
+                            added += 1;
+                        }
+                        Err(e) => {
+                            warn!("Could not load component {}: {e}", path.display());
+                            ui_state.last_error = Some(format!("Couldn't open {} — not a valid HCAD part.", path.display()));
+                        }
+                    }
+                }
+                if added > 0 {
+                    asm_render.dirty = true;
+                }
+            }
+        }
+    }
     // Force a `.hcad` extension on a chosen path (so Save As without a typed extension still saves a part).
     let with_hcad = |mut p: std::path::PathBuf| {
         if p.extension().is_none() {
@@ -10498,6 +11156,68 @@ fn handle_file_io(
             }
         }
     };
+
+    let write_asm = |asm: &Assembly, path: &std::path::Path| -> bool {
+        // Relativise absolute component sources against the save folder so a copied
+        // project directory keeps its references.
+        let mut out = asm.clone();
+        if let Some(dir) = path.parent() {
+            for c in &mut out.components {
+                let sp = std::path::PathBuf::from(&c.source);
+                if sp.is_absolute() {
+                    if let Ok(rel) = sp.strip_prefix(dir) {
+                        c.source = rel.to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+        match ron::ser::to_string_pretty(&out, ron::ser::PrettyConfig::default()) {
+            Ok(text) => match std::fs::write(path, text) {
+                Ok(()) => {
+                    info!("Saved {}", path.display());
+                    true
+                }
+                Err(e) => {
+                    warn!("Save failed: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("Serialize failed: {e}");
+                false
+            }
+        }
+    };
+
+    // ---- Assembly save (bound file / dialog), before the part paths below ----
+    if *mode == DocMode::Assembly && (ui_state.save_request || ui_state.save_as_request) {
+        let need_dialog = ui_state.save_as_request || ui_state.current_file.is_none();
+        ui_state.save_request = false;
+        ui_state.save_as_request = false;
+        let target = if need_dialog {
+            rfd::FileDialog::new()
+                .add_filter("HCAD assembly", &["hasm"])
+                .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("assembly.hasm"))
+                .save_file()
+                .map(|mut p| {
+                    if p.extension().is_none() {
+                        p.set_extension("hasm");
+                    }
+                    p
+                })
+        } else {
+            ui_state.current_file.clone()
+        };
+        if let Some(path) = target {
+            if write_asm(&asm.0, &path) {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("assembly").to_string();
+                ui_state.current_file = Some(path);
+                ui_state.toasts.push((format!("Saved {name}"), 2.5));
+            } else {
+                ui_state.last_error = Some("Save failed — see the log.".into());
+            }
+        }
+    }
 
     // Save: write to the bound file directly; if there isn't one yet, fall through to Save As.
     if ui_state.save_request {
@@ -10596,10 +11316,63 @@ fn handle_file_io(
 
     if ui_state.open_request {
         ui_state.open_request = false;
-        if let Some(path) = rfd::FileDialog::new().add_filter("HCAD part", &["hcad", "ron"]).pick_file() {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("HCAD documents", &["hcad", "hasm", "ron"])
+            .add_filter("HCAD part", &["hcad", "ron"])
+            .add_filter("HCAD assembly", &["hasm"])
+            .pick_file()
+        {
+            if path.extension().and_then(|e| e.to_str()) == Some("hasm") {
+                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Assembly>(&t).map_err(|e| e.to_string())) {
+                    Ok(mut loaded) => {
+                        // Refresh each component's cache from its source file when present;
+                        // a missing source silently keeps the embedded copy.
+                        let dir = path.parent().map(|d| d.to_path_buf());
+                        for c in &mut loaded.components {
+                            if c.source.is_empty() {
+                                continue;
+                            }
+                            let sp = std::path::PathBuf::from(&c.source);
+                            let full = if sp.is_absolute() { sp } else { dir.clone().map(|d| d.join(&sp)).unwrap_or(sp) };
+                            if let Ok(t) = std::fs::read_to_string(&full) {
+                                if let Ok(d) = ron::from_str::<Document>(&t) {
+                                    c.cached = d;
+                                }
+                            } else {
+                                ui_state.toasts.push((format!("{}: source missing — using the embedded copy", c.name), 4.0));
+                            }
+                        }
+                        *mode = DocMode::Assembly;
+                        asm.0 = loaded;
+                        asm_render.cache.clear();
+                        asm_render.dirty = true;
+                        doc.0 = Document::with_default_planes();
+                        for f in &mut doc.0.features {
+                            f.hidden = true;
+                        }
+                        session.plane = None;
+                        session.editing = None;
+                        session.sketch.clear();
+                        ui_state.selected = None;
+                        ui_state.asm_selected = None;
+                        ui_state.current_file = Some(path.clone());
+                        ui_state.regen = true;
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("assembly").to_string();
+                        ui_state.toasts.push((format!("Opened {name}"), 2.5));
+                        info!("Opened assembly {}", path.display());
+                    }
+                    Err(e) => {
+                        warn!("Could not parse {}: {e}", path.display());
+                        ui_state.last_error = Some(format!("Couldn't open {} — it isn't a valid HCAD assembly.", path.display()));
+                    }
+                }
+                return;
+            }
             match std::fs::read_to_string(&path) {
                 Ok(text) => match ron::from_str::<Document>(&text) {
                     Ok(loaded) => {
+                        *mode = DocMode::Part;
+                        asm_render.dirty = true; // clears any assembly scene
                         doc.0 = loaded;
                         history.undo.clear();
                         history.redo.clear();
@@ -13347,6 +14120,8 @@ fn thin_wall_mesh(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>], basis: &PlaneBasi
 /// Reset the model to an empty part with the three default planes.
 fn handle_new_part(
     mut commands: Commands,
+    mut asm_mode: ResMut<DocMode>,
+    mut asm_render: ResMut<AsmRender>,
     mut ui_state: ResMut<UiState>,
     mut part: ResMut<Part>,
     mut doc: ResMut<DocRes>,
@@ -13360,6 +14135,9 @@ fn handle_new_part(
         return;
     }
     ui_state.new_part = false;
+    *asm_mode = DocMode::Part;
+    asm_render.dirty = true; // clears any assembly scene
+    ui_state.asm_selected = None;
     edge_sel.clear();
     history.snapshot(&doc.0);
     for e in &existing {
@@ -17448,6 +18226,28 @@ mod tests {
         let vol = tri_vol(&m);
         eprintln!("enclosed shell volume {vol:.1} (expected ~2464)");
         assert!((vol - 2464.0).abs() < 2464.0 * 0.1, "enclosed shell volume off: {vol:.1}");
+    }
+
+    #[test]
+    fn assembly_roundtrips_and_components_regenerate() {
+        // Two instances of a box part, one moved: RON roundtrip preserves everything, and the
+        // component regenerates through the same pipeline the assembly renderer uses.
+        let mut part = Document::with_default_planes();
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.rollback = part.features.len();
+        let mut asm = Assembly::default();
+        let a = asm.add_component("box".into(), "box.hcad".into(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("box".into(), "box.hcad".into(), part.clone(), [30.0, 0.0, 0.0]);
+        assert_ne!(a, b);
+        assert!(asm.component(a).unwrap().fixed, "first component must anchor the assembly");
+        assert!(!asm.component(b).unwrap().fixed);
+        let text = ron::ser::to_string_pretty(&asm, ron::ser::PrettyConfig::default()).expect("serialize");
+        let loaded: Assembly = ron::from_str(&text).expect("parse back");
+        assert_eq!(loaded.components.len(), 2);
+        assert_eq!(loaded.component(b).unwrap().translation, [30.0, 0.0, 0.0]);
+        let tess = component_tessellation(&loaded.component(a).unwrap().cached).expect("component regenerates");
+        let vol = tri_vol(&tess.mesh);
+        assert!((vol - 500.0).abs() < 25.0, "10×10×5 box volume, got {vol:.1}");
     }
 
     #[test]

@@ -312,3 +312,70 @@ impl Document {
         })
     }
 }
+
+// ===================== Assemblies (Phase 1) =====================
+
+fn quat_identity() -> [f64; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
+/// One placed part instance inside an assembly.
+///
+/// The part is referenced the **hybrid** way: `source` is the `.hcad` path *relative to the
+/// assembly file* (so a copied project folder keeps working), and `cached` is an embedded copy
+/// of the part document — the fallback when the source file is missing, and what actually
+/// regenerates. Opening an assembly refreshes each cache from its source file when present.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Component {
+    /// Stable instance id (never reused) — selections and future mates point at this.
+    pub id: u64,
+    pub name: String,
+    /// Source `.hcad` path relative to the assembly file; empty = embedded only.
+    pub source: String,
+    /// Embedded copy of the part's document.
+    pub cached: Document,
+    /// Placement: translation + unit quaternion `[x, y, z, w]`, part-local → assembly.
+    pub translation: [f64; 3],
+    #[serde(default = "quat_identity")]
+    pub rotation: [f64; 4],
+    /// Fixed components can't be dragged (the assembly's anchor).
+    #[serde(default)]
+    pub fixed: bool,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// An assembly document (`.hasm`): placed component instances. Mates arrive in Phase 2.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Assembly {
+    pub components: Vec<Component>,
+    next_id: u64,
+}
+
+impl Assembly {
+    /// Add a component instance; returns its stable id. The first component lands fixed
+    /// (an assembly needs an anchor), later ones float.
+    pub fn add_component(&mut self, name: String, source: String, cached: Document, translation: [f64; 3]) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.components.push(Component {
+            id,
+            name,
+            source,
+            cached,
+            translation,
+            rotation: quat_identity(),
+            fixed: self.components.is_empty(),
+            hidden: false,
+        });
+        id
+    }
+
+    pub fn component(&self, id: u64) -> Option<&Component> {
+        self.components.iter().find(|c| c.id == id)
+    }
+
+    pub fn component_mut(&mut self, id: u64) -> Option<&mut Component> {
+        self.components.iter_mut().find(|c| c.id == id)
+    }
+}

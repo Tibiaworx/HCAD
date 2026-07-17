@@ -69,6 +69,11 @@ Section "HCAD (required)" SecMain
   WriteRegStr HKLM "Software\Classes\HCAD.Part" "" "HCAD Part"
   WriteRegStr HKLM "Software\Classes\HCAD.Part\DefaultIcon" "" "$INSTDIR\hcad.ico"
   WriteRegStr HKLM "Software\Classes\HCAD.Part\shell\open\command" "" '"$INSTDIR\HCAD.exe" "%1"'
+  ; .hasm file association: assemblies open the same way.
+  WriteRegStr HKLM "Software\Classes\.hasm" "" "HCAD.Assembly"
+  WriteRegStr HKLM "Software\Classes\HCAD.Assembly" "" "HCAD Assembly"
+  WriteRegStr HKLM "Software\Classes\HCAD.Assembly\DefaultIcon" "" "$INSTDIR\hcad.ico"
+  WriteRegStr HKLM "Software\Classes\HCAD.Assembly\shell\open\command" "" '"$INSTDIR\HCAD.exe" "%1"'
   ; Tell Explorer the associations changed (SHCNE_ASSOCCHANGED, SHCNF_IDLIST).
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
@@ -91,5 +96,7 @@ Section "Uninstall"
   DeleteRegKey HKLM "Software\HCAD"
   DeleteRegKey HKLM "Software\Classes\HCAD.Part"
   DeleteRegKey HKLM "Software\Classes\.hcad"
+  DeleteRegKey HKLM "Software\Classes\HCAD.Assembly"
+  DeleteRegKey HKLM "Software\Classes\.hasm"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd
