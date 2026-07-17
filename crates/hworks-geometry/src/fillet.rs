@@ -1773,7 +1773,13 @@ pub fn threaded_hole(
 /// Distance from `o` along unit `dir` to where the ray exits the solid `tris` (the first
 /// front/back surface it crosses after stepping just inside). `None` if it never exits.
 fn axis_exit(tris: &[[V3; 3]], o: V3, dir: V3) -> Option<f64> {
-    let oo = add(o, scale(dir, 1e-3)); // step just inside so the entry face is skipped
+    // Step WELL inside before looking for the exit: the placement point comes from a face
+    // pick/snap and can sit a few thousandths OFF the surface — a 1e-3 step then "exited"
+    // at the entry face itself, read the body as paper-thin, and clamped every thread to
+    // the 0.5 minimum depth (the "hole only goes a small depth" bug). 0.05 clears any
+    // realistic snap error while staying far below a tappable wall thickness.
+    const EPS: f64 = 0.05;
+    let oo = add(o, scale(dir, EPS));
     let mut best: Option<f64> = None;
     for t in tris {
         if let Some(td) = ray_tri(oo, dir, t[0], t[1], t[2]) {
@@ -1782,7 +1788,7 @@ fn axis_exit(tris: &[[V3; 3]], o: V3, dir: V3) -> Option<f64> {
             }
         }
     }
-    best.map(|t| t + 1e-3)
+    best.map(|t| t + EPS)
 }
 
 /// Möller–Trumbore ray/triangle: distance `t > 0` along `dir` from `o` to triangle `abc`.

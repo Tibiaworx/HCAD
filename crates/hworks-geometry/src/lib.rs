@@ -1936,6 +1936,41 @@ mod tests {
     }
 
     #[test]
+    fn thread_depth_survives_off_face_placement() {
+        // Replay of holegenieupgrade.hcad: the Hole Genie placement point sits a few
+        // thousandths ABOVE the face it was clicked on (face-pick snap error). The depth clamp
+        // used to cast its exit ray from a 1e-3 step, hit the ENTRY face 0.004 away, read the
+        // body as paper-thin, and cap the thread at the 0.5 minimum — "the hole only goes a
+        // small depth and stops".
+        let block = extrude_tool_mesh(&[[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]], &[], &xy_plane(), 0.0, 20.0)
+            .expect("block");
+        let origin = [15.0, 15.0, 20.0039]; // slightly OFF the top face, like the logged file
+        let out = threaded_hole(&block, origin, [0.0, 0.0, 1.0], 5.0, 0.8, 9.0, true, true).expect("thread");
+        // Signed volume (divergence theorem): the block is exactly 30×30×20 = 18000. A 9-deep
+        // Ø5 bore removes ~πr²·9 ≈ 177 (the thread ridges union a fraction back). The old bug
+        // clamped the hole to 0.5 deep — removing barely ~10 — so require a healthy chunk gone.
+        let volume = |m: &TriMesh| -> f64 {
+            let mut v = 0.0;
+            for t in m.indices.chunks(3) {
+                let g = |i: u32| {
+                    let q = m.positions[i as usize];
+                    [q[0] as f64, q[1] as f64, q[2] as f64]
+                };
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                v += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2])
+                    + a[2] * (b[0] * c[1] - c[0] * b[1]))
+                    / 6.0;
+            }
+            v.abs()
+        };
+        let removed = volume(&block) - volume(&out);
+        assert!(
+            removed > 80.0,
+            "thread only removed {removed:.1} of material — the depth clamp cut the hole short (expected ~120+ for a 9-deep Ø5 tap)"
+        );
+    }
+
+    #[test]
     fn extrude_square_makes_a_box() {
         let square = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
         let solid = extrude_solid(&square, &[], &xy_plane(), 2.0).expect("extrude");
