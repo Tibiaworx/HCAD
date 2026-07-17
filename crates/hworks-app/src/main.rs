@@ -7192,12 +7192,17 @@ fn sketch_interaction(
         return; // swallow viewport clicks while lofting (orbit still works on right-drag)
     }
 
+    // Section-view gizmo: grab the offset arrow or a rotation handle in plain view mode.
+    if ui_state.section.is_some()
+        && session.plane.is_none()
+        && section_arrow_drag(&mut session, &mut ui_state, &part, window, camera, cam_gt, &ray, just_pressed, pressed, just_released)
+    {
+        return;
+    }
+
     // Reference-plane creation: drag the offset arrow, or click a face / datum plane to set the
     // base to offset from. (Swallows viewport interaction while the Plane PM is open.)
     if ui_state.plane_spec.is_some() && session.plane.is_none() {
-        if section_arrow_drag(&mut session, &mut ui_state, &part, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
-            return;
-        }
         if plane_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
