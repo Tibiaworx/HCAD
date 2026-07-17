@@ -1101,6 +1101,9 @@ struct SketchSession {
     /// Active section-gizmo rotation drag: (which angle 0 = rot_u / 1 = rot_v, the frozen
     /// world rotation axis, last frame's "clock hand" direction from the gizmo centre).
     section_rot: Option<(u8, Vec3, Vec3)>,
+    /// Where on the arrow the section offset drag was grabbed: `offset - t(cursor)` at grab
+    /// time, added back during the drag so the plane doesn't jump to the click point.
+    section_grab: f32,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -14413,6 +14416,11 @@ fn section_arrow_drag(
                 let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 26.0).unwrap_or(false);
                 if near_shaft || near_tip {
                     session.arrow_drag = true;
+                    // Anchor the grab: remember how far along the axis the click landed from
+                    // the current offset, so the plane follows the mouse instead of jumping.
+                    let base0 = base - n * spec.offset;
+                    let t0 = closest_t_on_axis(base0, n, ray.origin, ray.direction.as_vec3());
+                    session.section_grab = if t0.is_finite() { spec.offset - t0 } else { 0.0 };
                 }
             }
         }
@@ -14444,7 +14452,7 @@ fn section_arrow_drag(
         let base0 = base - n * spec.offset;
         let t = closest_t_on_axis(base0, n, ray.origin, ray.direction.as_vec3());
         if t.is_finite() {
-            ui_state.section = Some(SectionSpec { offset: t, ..spec });
+            ui_state.section = Some(SectionSpec { offset: t + session.section_grab, ..spec });
         }
         if just_released {
             session.arrow_drag = false;
