@@ -12243,7 +12243,11 @@ fn handle_new_part(
     // Reference-plane quads resync via `sync_ref_planes` once the doc resets to default planes.
     part.solid = None;
     part.mesh = None;
+    // Clear EVERY edge pool — leaving tangent/seam edges behind ghosted the old part's
+    // fillet rings over the fresh empty scene (they draw from Part, not the despawned mesh).
     part.edges.clear();
+    part.tangent_edges.clear();
+    part.seam_edges.clear();
     session.selected_contours.clear();
     session.editing = None;
     doc.0 = Document::with_default_planes();
