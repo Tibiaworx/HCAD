@@ -1968,6 +1968,16 @@ mod tests {
             removed > 80.0,
             "thread only removed {removed:.1} of material — the depth clamp cut the hole short (expected ~120+ for a 9-deep Ø5 tap)"
         );
+
+        // THROUGH hole: ask for a depth past the far side (block is 20 tall, ask 25). The bore
+        // must punch clean out the bottom — the old clamp left a paper-thin floor skin. A full
+        // Ø5 bore through 20 removes ~πr²·20 ≈ 393 (threads union a fraction back).
+        let out = threaded_hole(&block, origin, [0.0, 0.0, 1.0], 5.0, 0.8, 25.0, true, true).expect("through");
+        let removed = volume(&block) - volume(&out);
+        assert!(
+            removed > 250.0,
+            "through-tap removed only {removed:.1} — the bore didn't punch out the far side"
+        );
     }
 
     #[test]

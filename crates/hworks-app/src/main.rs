@@ -3620,6 +3620,7 @@ fn ui_system(
                 }
                 if changed {
                     session.needs_apply = true;
+                    session.dirty = true; // re-solve so dependent geometry follows the new size
                 }
             }
 
@@ -6102,6 +6103,22 @@ fn sketch_fingerprint(s: &Sketch) -> u64 {
         mix((p.x * 1.0e4).round() as i64 as u64);
         mix((p.y * 1.0e4).round() as i64 as u64);
         mix(p.fixed as u64);
+    }
+    // Entity PARAMETERS matter too: a circle/slot radius lives on the entity, not in a point or
+    // a constraint — editing it in the panel changed nothing this hash saw, so the cached
+    // regions (the green contour fill) froze at the old size.
+    for e in &s.entities {
+        let (tag, val) = match e {
+            SketchEntity::Point { .. } => (1u64, 0.0),
+            SketchEntity::Line { construction, reference, .. } => (2 | (*construction as u64) << 4 | (*reference as u64) << 5, 0.0),
+            SketchEntity::Circle { radius, construction, .. } => (3 | (*construction as u64) << 4, *radius),
+            SketchEntity::Arc { ccw, construction, .. } => (4 | (*ccw as u64) << 4 | (*construction as u64) << 5, 0.0),
+            SketchEntity::Slot { radius, construction, .. } => (5 | (*construction as u64) << 4, *radius),
+            SketchEntity::Spline { closed, construction, .. } => (6 | (*closed as u64) << 4 | (*construction as u64) << 5, 0.0),
+            SketchEntity::Text { height, .. } => (7, *height),
+        };
+        mix(tag);
+        mix((val * 1.0e4).round() as i64 as u64);
     }
     for c in &s.constraints {
         let v = match c {

@@ -1743,26 +1743,32 @@ pub fn threaded_hole(
         })
         .collect();
     let avail = axis_exit(&tris, origin, scale(a, -1.0)).unwrap_or(depth + 1.0);
+    // THROUGH hole: the user asked for a depth at/past the far side. The bore must punch clean
+    // out the back (clamping it left a paper-thin floor skin); the thread runs to just shy of
+    // the exit so the last tooth doesn't poke out of the bottom face.
+    let through = depth >= avail - 2.5 * hw;
     // The bottom tooth's outer base reaches ~hw below the last helix point (which itself sits
     // hw below the face), so leave ~2.5·hw of clearance to keep the whole tooth inside.
-    let depth = depth.min((avail - 2.5 * hw).max(0.5));
+    let thread_depth = if through { (avail - 2.5 * hw).max(0.5) } else { depth.min((avail - 2.5 * hw).max(0.5)) };
     let mut out = body.clone();
     if internal {
-        // Drill the clearance hole (major), starting just above the face going inward. It runs
-        // a bit past the thread so the bore floor (or the through-exit) sits below the run-out.
+        // Drill the clearance hole (major), starting just above the face going inward. A blind
+        // hole runs a bit past the thread so the bore floor sits below the run-out; a through
+        // hole overshoots the far side so no skin survives the subtraction.
+        let bore_len = if through { avail + 1.0 } else { thread_depth + 0.5 * pitch + 0.4 };
         let start = add(origin, scale(a, 0.2));
-        let hole = make_cylinder(start, scale(a, -1.0), u, w, major_d * 0.5, depth + 0.5 * pitch + 0.4, 48);
+        let hole = make_cylinder(start, scale(a, -1.0), u, w, major_d * 0.5, bore_len + 0.2, 48);
         out = crate::mesh_difference(&out, &hole);
         // Union the thread ridges (apex at minor, base buried a hair in the wall).
         let r_out = major_d * 0.5 + 0.1 * pitch;
-        let coil = thread_coil(origin, a, r_out, minor_d * 0.5, pitch, depth, rh);
+        let coil = thread_coil(origin, a, r_out, minor_d * 0.5, pitch, thread_depth, rh);
         if coil.indices.len() >= 3 {
             out = crate::mesh_union(&out, &coil);
         }
     } else {
         // External: cut a helical V-groove into the boss (crest stays at major, root at minor).
         let r_out = major_d * 0.5 + 0.1 * pitch; // base outside the surface
-        let groove = thread_coil(origin, a, r_out, minor_d * 0.5, pitch, depth, rh);
+        let groove = thread_coil(origin, a, r_out, minor_d * 0.5, pitch, thread_depth, rh);
         if groove.indices.len() >= 3 {
             out = crate::mesh_difference(&out, &groove);
         }
