@@ -473,6 +473,28 @@ fn draw_asm_gizmo(
         overlay.line(tip, back + side2, c);
         overlay.line(tip, back - side2, c);
     }
+    // Rotation rings: one circle per world axis around the centre — drag to spin the
+    // component about that axis (through its centre). Active ring highlights.
+    let rr = len * 0.8;
+    for (k, (dir, col)) in [
+        (Vec3::X, Color::srgba(0.95, 0.35, 0.35, 0.55)),
+        (Vec3::Y, Color::srgba(0.35, 0.85, 0.35, 0.55)),
+        (Vec3::Z, Color::srgba(0.4, 0.55, 0.95, 0.55)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let active = ui_state.asm_rot.is_some_and(|(_, a, _, _)| a == k as u8);
+        let c = if active { Color::srgb(1.0, 1.0, 0.5) } else { col };
+        let u = dir.any_orthonormal_vector();
+        let v = dir.cross(u);
+        const N: usize = 56;
+        for i in 0..N {
+            let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / N as f32 * std::f32::consts::TAU;
+            overlay.line(base + (u * a0.cos() + v * a0.sin()) * rr, base + (u * a1.cos() + v * a1.sin()) * rr, c);
+        }
+    }
 }
 
 /// Assembly-mode viewport clicks: select the component under the cursor (nearest hit wins;
@@ -537,10 +559,58 @@ fn asm_interaction(
                                 break;
                             }
                         }
+                        // No arrow grabbed → try the rotation rings (screen distance to the
+                        // sampled circle; the clock-hand direction seeds the incremental drag).
+                        if ui_state.asm_drag.is_none() && ui_state.asm_rot.is_none() {
+                            let rr = len * 0.8;
+                            'rings: for (k, dir) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+                                let u = dir.any_orthonormal_vector();
+                                let v = dir.cross(u);
+                                const N: usize = 56;
+                                for i in 0..N {
+                                    let a = i as f32 / N as f32 * std::f32::consts::TAU;
+                                    let pw = base + (u * a.cos() + v * a.sin()) * rr;
+                                    let near = camera.world_to_viewport(cam_gt, pw).map(|sp| sp.distance(cursor) < 12.0).unwrap_or(false);
+                                    if near {
+                                        if let Some(d0) = section_rot_dir(base, dir, &ray) {
+                                            ui_state.asm_rot = Some((id, k as u8, base, d0));
+                                        }
+                                        break 'rings;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    // ---- Rotation-ring drag: spin about the frozen centre, incremental clock-hand angle ----
+    if let Some((cid, axis_i, center, last)) = ui_state.asm_rot {
+        if pressed {
+            let dir = [Vec3::X, Vec3::Y, Vec3::Z][axis_i as usize];
+            if let Some(cur) = section_rot_dir(center, dir, &ray) {
+                let delta = last.cross(cur).dot(dir).atan2(last.dot(cur).clamp(-1.0, 1.0));
+                if let Some(comp) = asm.0.component_mut(cid) {
+                    let rd = Quat::from_axis_angle(dir, delta);
+                    let q = Quat::from_xyzw(comp.rotation[0] as f32, comp.rotation[1] as f32, comp.rotation[2] as f32, comp.rotation[3] as f32);
+                    let nq = (rd * q).normalize();
+                    comp.rotation = [nq.x as f64, nq.y as f64, nq.z as f64, nq.w as f64];
+                    // Rotating about the component CENTRE, not its part origin: the placement
+                    // translation swings around the centre by the same increment.
+                    let t = Vec3::new(comp.translation[0] as f32, comp.translation[1] as f32, comp.translation[2] as f32);
+                    let nt = center + rd * (t - center);
+                    comp.translation = [nt.x as f64, nt.y as f64, nt.z as f64];
+                }
+                ui_state.asm_rot = Some((cid, axis_i, center, cur));
+            }
+            if just_released {
+                ui_state.asm_rot = None;
+            }
+            return; // the ring drag consumes the click
+        }
+        ui_state.asm_rot = None;
     }
     if let Some(drag) = ui_state.asm_drag.clone() {
         if pressed {
@@ -1053,6 +1123,9 @@ struct UiState {
     asm_selected: Option<u64>,
     /// Active component move-arrow drag.
     asm_drag: Option<AsmDrag>,
+    /// Active component rotation-ring drag: (component id, axis 0/1/2, the rotation centre
+    /// frozen at grab, last frame's clock-hand direction).
+    asm_rot: Option<(u64, u8, Vec3, Vec3)>,
     new_asm_request: bool,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
