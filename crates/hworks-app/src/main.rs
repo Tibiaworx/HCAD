@@ -176,7 +176,7 @@ fn main() {
                     thread_ghost,
                 ),
                 (
-                    (handle_new_part, asm_regenerate, asm_interaction, sync_asm_instances, draw_asm_edges, draw_asm_gizmo).chain(),
+                    (handle_new_part, asm_regenerate, asm_interaction, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
                     highlight_face,
                     hover_body_edge,
                     sync_ref_planes,
@@ -327,6 +327,7 @@ fn asm_regenerate(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mode: Res<DocMode>,
     asm: Res<AsmRes>,
+    ui_state: Res<UiState>,
     mut render: ResMut<AsmRender>,
     existing: Query<Entity, With<AsmComp>>,
 ) {
@@ -338,7 +339,11 @@ fn asm_regenerate(
         commands.entity(e).despawn();
     }
     if *mode != DocMode::Assembly {
-        render.cache.clear();
+        // Keep the geometry cache during an in-place part edit — the ghost context and the
+        // return to assembly mode reuse it.
+        if ui_state.editing_component.is_none() {
+            render.cache.clear();
+        }
         return;
     }
     // Drop cache entries whose part is gone (deleted last instance), keep shared ones.
@@ -495,6 +500,58 @@ fn draw_asm_gizmo(
             overlay.line(base + (u * a0.cos() + v * a0.sin()) * rr, base + (u * a1.cos() + v * a1.sin()) * rr, c);
         }
     }
+}
+
+/// Marker on the ghosted context components shown while a part is edited in place.
+#[derive(Component)]
+struct AsmGhost;
+
+/// While a component's part is being edited IN PLACE (Part mode + `editing_component`), show
+/// the OTHER components as transparent ghosts, transformed relative to the edited part — the
+/// part is modelled at its own origin, so the context moves to it, SolidWorks-style.
+fn sync_asm_ghosts(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    render: Res<AsmRender>,
+    ui_state: Res<UiState>,
+    existing: Query<Entity, With<AsmGhost>>,
+    mut shown: Local<bool>,
+) {
+    let active = *mode == DocMode::Part && ui_state.editing_component.is_some();
+    if !active {
+        if *shown {
+            for e in &existing {
+                commands.entity(e).despawn();
+            }
+            *shown = false;
+        }
+        return;
+    }
+    if *shown {
+        return; // components can't move during the edit — spawn once
+    }
+    let Some(eid) = ui_state.editing_component else { return };
+    let Some(edited) = asm.0.component(eid) else { return };
+    let inv = comp_transform(edited).to_matrix().inverse();
+    for comp in &asm.0.components {
+        if comp.id == eid || comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        let rel = Transform::from_matrix(inv * comp_transform(comp).to_matrix());
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.55, 0.62, 0.75, 0.22),
+            alpha_mode: AlphaMode::Blend,
+            unlit: false,
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        });
+        commands.spawn((Mesh3d(geom.mesh.clone()), MeshMaterial3d(material), rel, AsmGhost, Name::new(format!("ghost:{}", comp.name))));
+    }
+    *shown = true;
 }
 
 /// Assembly-mode viewport clicks: select the component under the cursor (nearest hit wins;
@@ -1126,6 +1183,14 @@ struct UiState {
     /// Active component rotation-ring drag: (component id, axis 0/1/2, the rotation centre
     /// frozen at grab, last frame's clock-hand direction).
     asm_rot: Option<(u64, u8, Vec3, Vec3)>,
+    /// Edit-in-place: the assembly component whose part is loaded in Part mode right now.
+    editing_component: Option<u64>,
+    /// One-shot request to start editing a component's part in place.
+    edit_component_request: Option<u64>,
+    /// One-shot request to finish the in-place edit: `Some(true)` = save back, `Some(false)` = discard.
+    finish_edit_component: Option<bool>,
+    /// The assembly file to rebind when the in-place edit ends (current_file points at the part meanwhile).
+    asm_return_file: Option<std::path::PathBuf>,
     new_asm_request: bool,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
@@ -2435,6 +2500,17 @@ fn ui_system(
         // Row 2: CommandManager tabs + the active tab's tools. Assembly mode swaps the row for
         // its own tools — the part-modelling tools would only operate on the hidden part doc.
         ui.horizontal_wrapped(|ui| {
+            if ui_state.editing_component.is_some() && !in_asm {
+                // In-place part edit: the return bar rides ahead of the normal part tools.
+                ui.label(egui::RichText::new("\u{2699} Editing part in assembly").color(egui::Color32::from_rgb(255, 180, 70)).strong());
+                if ui.button(egui::RichText::new("\u{2714} Save & Return").color(egui::Color32::WHITE)).on_hover_text("Save the part (to its file and every instance) and go back to the assembly").clicked() {
+                    ui_state.finish_edit_component = Some(true);
+                }
+                if ui.button("\u{21a9} Return without saving").on_hover_text("Discard the part changes and go back to the assembly").clicked() {
+                    ui_state.finish_edit_component = Some(false);
+                }
+                ui.separator();
+            }
             if in_asm {
                 if ui.button("Insert Component…").on_hover_text("Insert saved part files (.hcad) into the assembly").clicked() {
                     ui_state.insert_component_request = true;
@@ -4839,7 +4915,14 @@ fn ui_system(
                 if resp.clicked() {
                     ui_state.asm_selected = Some(comp.id);
                 }
+                if resp.double_clicked() {
+                    ui_state.edit_component_request = Some(comp.id);
+                }
                 resp.context_menu(|ui| {
+                    if ui.button("Edit Part").on_hover_text("Edit this part here, with the rest of the assembly ghosted around it").clicked() {
+                        ui_state.edit_component_request = Some(comp.id);
+                        ui.close();
+                    }
                     if ui.button(if comp.fixed { "Float" } else { "Fix" }).on_hover_text("Fixed components anchor the assembly and can't be dragged").clicked() {
                         comp.fixed = !comp.fixed;
                         ui.close();
@@ -11149,9 +11232,82 @@ fn handle_file_io(
     mut asm_render: ResMut<AsmRender>,
     mut mode: ResMut<DocMode>,
 ) {
+    // ---- Edit-in-place: load a component's part into Part mode ----
+    if let Some(id) = ui_state.edit_component_request.take() {
+        if *mode == DocMode::Assembly && ui_state.editing_component.is_none() {
+            if let Some(comp) = asm.0.component(id) {
+                let asm_dir = ui_state.current_file.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                // Bind Save to the part's source file (absolute), when it has one.
+                let part_file = (!comp.source.is_empty()).then(|| {
+                    let sp = std::path::PathBuf::from(&comp.source);
+                    if sp.is_absolute() { sp } else { asm_dir.map(|d| d.join(&sp)).unwrap_or(sp) }
+                });
+                doc.0 = comp.cached.clone();
+                doc.0.rollback = doc.0.features.len();
+                session.plane = None;
+                session.editing = None;
+                session.sketch.clear();
+                ui_state.selected = None;
+                ui_state.asm_return_file = ui_state.current_file.take();
+                ui_state.current_file = part_file;
+                ui_state.editing_component = Some(id);
+                *mode = DocMode::Part;
+                asm_render.dirty = true; // clears the assembly entities (the ghosts take over)
+                ui_state.regen = true;
+                ui_state.toasts.push((format!("Editing {} — Save & Return when done", comp.name), 3.5));
+            }
+        }
+    }
+    // ---- Edit-in-place: finish (save back or discard) and return to the assembly ----
+    if let Some(save) = ui_state.finish_edit_component.take() {
+        if let Some(id) = ui_state.editing_component.take() {
+            if save {
+                // Write the part file (when it has one) and refresh EVERY instance's cache
+                // that shares the source, so all of them rebuild with the edit.
+                if let Some(path) = ui_state.current_file.clone() {
+                    match ron::ser::to_string_pretty(&doc.0, ron::ser::PrettyConfig::default()) {
+                        Ok(text) => {
+                            if let Err(e) = std::fs::write(&path, text) {
+                                warn!("Save failed: {e}");
+                                ui_state.last_error = Some(format!("Couldn't save the part: {e}"));
+                            }
+                        }
+                        Err(e) => warn!("Serialize failed: {e}"),
+                    }
+                }
+                let key = asm.0.component(id).map(|c| asm_geom_key(c));
+                let src = asm.0.component(id).map(|c| c.source.clone()).unwrap_or_default();
+                for c in &mut asm.0.components {
+                    if c.id == id || (!src.is_empty() && c.source == src) {
+                        c.cached = doc.0.clone();
+                    }
+                }
+                if let Some(k) = key {
+                    asm_render.cache.remove(&k); // force a rebuild of the edited part's geometry
+                }
+            }
+            *mode = DocMode::Assembly;
+            ui_state.current_file = ui_state.asm_return_file.take();
+            ui_state.asm_selected = Some(id);
+            asm_render.dirty = true;
+            // Park the part world again.
+            doc.0 = Document::with_default_planes();
+            for f in &mut doc.0.features {
+                f.hidden = true;
+            }
+            session.plane = None;
+            session.editing = None;
+            session.sketch.clear();
+            ui_state.selected = None;
+            ui_state.regen = true;
+        }
+    }
+
     // ---- Assembly document requests ----
     if ui_state.new_asm_request {
         ui_state.new_asm_request = false;
+        ui_state.editing_component = None;
+        ui_state.asm_return_file = None;
         *mode = DocMode::Assembly;
         asm.0 = Assembly::default();
         asm_render.dirty = true;
