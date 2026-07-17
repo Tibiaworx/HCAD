@@ -26,7 +26,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, M
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -176,7 +176,7 @@ fn main() {
                     thread_ghost,
                 ),
                 (
-                    (handle_new_part, asm_regenerate, asm_interaction, asm_solve_mates, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
+                    (handle_new_part, asm_regenerate, asm_interaction, asm_solve_mates, check_interference, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
                     highlight_face,
                     hover_body_edge,
                     sync_ref_planes,
@@ -582,6 +582,142 @@ fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, V
     (1, axis_pt, axis)
 }
 
+/// Signed volume of a triangle mesh (divergence theorem), mm^3.
+fn mesh_volume(m: &TriMesh) -> f64 {
+    let mut v = 0.0;
+    for t in m.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            let q = m.positions[i as usize];
+            [q[0] as f64, q[1] as f64, q[2] as f64]
+        };
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        v += a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+    }
+    (v / 6.0).abs()
+}
+
+/// A component's local mesh carried into world space through its placement.
+fn transformed_tri(tri: &TriMesh, tf: &Transform) -> TriMesh {
+    let mut out = tri.clone();
+    for p in &mut out.positions {
+        let w = tf.transform_point(Vec3::from_array(*p));
+        *p = [w.x, w.y, w.z];
+    }
+    for n in &mut out.normals {
+        let w = tf.rotation * Vec3::from_array(*n);
+        *n = [w.x, w.y, w.z];
+    }
+    out
+}
+
+/// The assembly's overall centre + diagonal (over visible components), for the exploded view.
+fn asm_scene_extent(asm: &Assembly, render: &AsmRender) -> (Vec3, f32) {
+    let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+    for comp in &asm.components {
+        if comp.hidden {
+            continue;
+        }
+        if let Some(geom) = render.cache.get(&asm_geom_key(comp)) {
+            let (glo, ghi) = mesh_bbox(&geom.tri);
+            let tf = comp_transform(comp);
+            for c in [glo, ghi, Vec3::new(glo.x, ghi.y, glo.z), Vec3::new(ghi.x, glo.y, ghi.z)] {
+                let w = tf.transform_point(c);
+                lo = lo.min(w);
+                hi = hi.max(w);
+            }
+        }
+    }
+    if lo.x.is_finite() {
+        ((lo + hi) * 0.5, (hi - lo).length().max(1.0))
+    } else {
+        (Vec3::ZERO, 30.0)
+    }
+}
+
+/// The transform a component DISPLAYS at: its placement, plus the exploded-view offset
+/// (radially out from the assembly centre; fixed components hold still).
+fn comp_display_transform(comp: &hworks_document::Component, geom: &AsmGeom, centre: Vec3, diag: f32, explode: f32) -> Transform {
+    let mut tf = comp_transform(comp);
+    if explode > 1e-3 && !comp.fixed {
+        let (lo, hi) = mesh_bbox(&geom.tri);
+        let c = tf.transform_point((lo + hi) * 0.5);
+        let dir = (c - centre).normalize_or_zero();
+        let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };
+        tf.translation += dir * explode * diag * 0.7;
+    }
+    tf
+}
+
+/// Marker on the red overlap meshes spawned by the interference check.
+#[derive(Component)]
+struct AsmInterf;
+
+/// Interference check: intersect every visible component pair (in world space) and highlight
+/// overlaps in red. Runs on demand from the toolbar; results list in the panel.
+fn check_interference(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    render: Res<AsmRender>,
+    mut ui_state: ResMut<UiState>,
+    existing: Query<Entity, With<AsmInterf>>,
+) {
+    if ui_state.interf_clear {
+        ui_state.interf_clear = false;
+        for e in &existing {
+            commands.entity(e).despawn();
+        }
+    }
+    if !ui_state.interf_request {
+        return;
+    }
+    ui_state.interf_request = false;
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    if *mode != DocMode::Assembly {
+        return;
+    }
+    let comps: Vec<_> = asm.0.components.iter().filter(|c| !c.hidden).collect();
+    let mut hits: Vec<(String, String, f64)> = Vec::new();
+    for i in 0..comps.len() {
+        for j in (i + 1)..comps.len() {
+            let (Some(ga), Some(gb)) = (render.cache.get(&asm_geom_key(comps[i])), render.cache.get(&asm_geom_key(comps[j]))) else { continue };
+            let wa = transformed_tri(&ga.tri, &comp_transform(comps[i]));
+            let wb = transformed_tri(&gb.tri, &comp_transform(comps[j]));
+            // Cheap reject: world bboxes must overlap before paying for a boolean.
+            let (la, ha) = mesh_bbox(&wa);
+            let (lb, hb) = mesh_bbox(&wb);
+            if la.x > hb.x || lb.x > ha.x || la.y > hb.y || lb.y > ha.y || la.z > hb.z || lb.z > ha.z {
+                continue;
+            }
+            let inter = mesh_intersection(&wa, &wb);
+            let _ = take_fallback_count(); // diagnostic booleans never raise the torn-surface banner
+            let vol = mesh_volume(&inter);
+            if vol > 1e-3 && !inter.positions.is_empty() {
+                hits.push((comps[i].name.clone(), comps[j].name.clone(), vol));
+                let material = materials.add(StandardMaterial {
+                    base_color: Color::srgba(1.0, 0.15, 0.1, 0.6),
+                    alpha_mode: AlphaMode::Blend,
+                    unlit: true,
+                    cull_mode: None,
+                    double_sided: true,
+                    ..default()
+                });
+                commands.spawn((Mesh3d(meshes.add(trimesh_to_bevy(inter))), MeshMaterial3d(material), AsmInterf, Name::new("interference")));
+            }
+        }
+    }
+    let n = hits.len();
+    ui_state.interference = Some(hits);
+    ui_state.toasts.push((
+        if n == 0 { "No interference — all parts clear".to_string() } else { format!("\u{26a0} {n} interfering pair(s) — shown in red") },
+        3.5,
+    ));
+}
+
 /// Run the mate solver when flagged (mate added/changed, drag released).
 fn asm_solve_mates(mode: Res<DocMode>, mut asm: ResMut<AsmRes>, mut ui_state: ResMut<UiState>) {
     if !ui_state.asm_solve {
@@ -678,6 +814,7 @@ fn asm_regenerate(
 fn sync_asm_instances(
     mode: Res<DocMode>,
     asm: Res<AsmRes>,
+    render: Res<AsmRender>,
     ui_state: Res<UiState>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut q: Query<(&AsmComp, &mut Transform, &MeshMaterial3d<StandardMaterial>)>,
@@ -685,9 +822,14 @@ fn sync_asm_instances(
     if *mode != DocMode::Assembly {
         return;
     }
+    let (centre, diag) = asm_scene_extent(&asm.0, &render);
     for (marker, mut tf, mat) in &mut q {
         if let Some(comp) = asm.0.component(marker.0) {
-            *tf = comp_transform(comp);
+            if let Some(geom) = render.cache.get(&asm_geom_key(comp)) {
+                *tf = comp_display_transform(comp, geom, centre, diag, ui_state.explode);
+            } else {
+                *tf = comp_transform(comp);
+            }
         }
         if let Some(m) = materials.get_mut(&mat.0) {
             let selected = ui_state.asm_selected == Some(marker.0);
@@ -703,6 +845,7 @@ fn draw_asm_edges(
     mode: Res<DocMode>,
     asm: Res<AsmRes>,
     render: Res<AsmRender>,
+    ui_state: Res<UiState>,
     cam_q: Query<&GlobalTransform, With<Camera3d>>,
 ) {
     if *mode != DocMode::Assembly {
@@ -712,12 +855,13 @@ fn draw_asm_edges(
     let cam_pos = cam.translation();
     let nudge = |p: Vec3| p + (cam_pos - p) * 0.0025;
     let col = Color::srgb(0.05, 0.05, 0.07);
+    let (centre, diag) = asm_scene_extent(&asm.0, &render);
     for comp in &asm.0.components {
         if comp.hidden {
             continue;
         }
         let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
-        let tf = comp_transform(comp);
+        let tf = comp_display_transform(comp, geom, centre, diag, ui_state.explode);
         for e in &geom.edges {
             let a = tf.transform_point(Vec3::from_array(e[0]));
             let b = tf.transform_point(Vec3::from_array(e[1]));
@@ -767,6 +911,9 @@ fn draw_asm_gizmo(
                 overlay.line(p, p + d * rr * 2.0, col);
             }
         }
+    }
+    if ui_state.explode > 1e-3 {
+        return; // exploded view is display-only — no drag handles
     }
     let Some(id) = ui_state.asm_selected else { return };
     let Some(comp) = asm.0.component(id) else { return };
@@ -899,8 +1046,12 @@ fn asm_interaction(
     let Ok((camera, cam_gt)) = cam.single() else { return };
     let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else { return };
 
+    // Exploded view is display-only: selection still works (at the exploded positions),
+    // but gizmo drags and mate picking wait until the slider returns to zero.
+    let exploded = ui_state.explode > 1e-3;
+
     // ---- Mate PM open: viewport clicks pick faces (A then B) ----
-    if ui_state.mate_spec.is_some() {
+    if ui_state.mate_spec.is_some() && !exploded {
         if !just_pressed {
             return;
         }
@@ -957,7 +1108,7 @@ fn asm_interaction(
     }
 
     // ---- Move-arrow drag on the selected component ----
-    if just_pressed && ui_state.asm_drag.is_none() {
+    if just_pressed && ui_state.asm_drag.is_none() && !exploded {
         if let Some(id) = ui_state.asm_selected {
             if let Some(comp) = asm.0.component(id) {
                 if !comp.fixed && !comp.hidden {
@@ -1037,6 +1188,9 @@ fn asm_interaction(
                     comp.translation = [nt.x as f64, nt.y as f64, nt.z as f64];
                 }
                 ui_state.asm_rot = Some((cid, axis_i, center, cur));
+                if !asm.0.mates.is_empty() {
+                    solve_mates(&mut asm.0);
+                }
             }
             if just_released {
                 ui_state.asm_rot = None;
@@ -1070,6 +1224,11 @@ fn asm_interaction(
                     }
                     comp.translation[a] = raw + best_adj.unwrap_or(0.0);
                 }
+                // Constrained dragging: mates re-project every frame, so a concentric part
+                // slides along its axis and a flush part stays in its plane while dragged.
+                if !asm.0.mates.is_empty() {
+                    solve_mates(&mut asm.0);
+                }
             }
             if just_released {
                 ui_state.asm_drag = None;
@@ -1083,6 +1242,7 @@ fn asm_interaction(
     if !just_pressed {
         return;
     }
+    let (centre, diag) = asm_scene_extent(&asm.0, &render);
     let mut best: Option<(f32, u64)> = None;
     for comp in &asm.0.components {
         if comp.hidden {
@@ -1090,7 +1250,7 @@ fn asm_interaction(
         }
         let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
         // Cast in part-local space: cheaper than transforming every triangle out.
-        let tf = comp_transform(comp);
+        let tf = comp_display_transform(comp, geom, centre, diag, ui_state.explode);
         let inv = tf.compute_affine().inverse();
         let lo = inv.transform_point3(ray.origin);
         let ld = inv.transform_vector3(*ray.direction).normalize_or_zero();
@@ -1573,6 +1733,14 @@ struct UiState {
     mate_spec: Option<MateSpec>,
     /// One-shot: run the mate solver over the assembly.
     asm_solve: bool,
+    /// Exploded-view factor (0 = assembled .. 1 = fully spread). Display-only.
+    explode: f32,
+    /// One-shot: run the interference check over all visible component pairs.
+    interf_request: bool,
+    /// Last interference results: (component A, component B, overlap volume mm^3).
+    interference: Option<Vec<(String, String, f64)>>,
+    /// One-shot: remove the red interference overlays without recomputing.
+    interf_clear: bool,
     new_asm_request: bool,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
@@ -2900,6 +3068,13 @@ fn ui_system(
                 if ui.selectable_label(ui_state.mate_spec.is_some(), "Mate").on_hover_text("Constrain two components: click a face on each (flush faces, or a bolt into a hole)").clicked() {
                     ui_state.mate_spec = if ui_state.mate_spec.is_some() { None } else { Some(MateSpec::default()) };
                 }
+                if ui.button("Interference").on_hover_text("Check every pair of parts for overlap — collisions show in red (great before printing a fit)").clicked() {
+                    ui_state.interf_request = true;
+                }
+                ui.separator();
+                ui.label("Explode");
+                ui.add(egui::Slider::new(&mut ui_state.explode, 0.0..=1.0).show_value(false))
+                    .on_hover_text("Spread the parts out radially to see how the assembly goes together (display only)");
                 ui.separator();
                 ui.label(egui::RichText::new("Click a component to select it; right-click it in the tree to fix, hide or open the part.").weak().small());
                 return;
@@ -5454,6 +5629,44 @@ fn ui_system(
                 if let Some(id) = del_mate {
                     asm.0.mates.retain(|m| m.id != id);
                     ui_state.asm_solve = true;
+                }
+            }
+            // ---- Interference results ----
+            if let Some(hits) = ui_state.interference.clone() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Interference").weak().small());
+                if hits.is_empty() {
+                    ui.label(egui::RichText::new("\u{2713} no overlaps").small());
+                } else {
+                    for (a, b, vol) in &hits {
+                        ui.label(egui::RichText::new(format!("\u{26a0} {a} \u{2194} {b}:  {vol:.2} mm\u{b3}")).small().color(egui::Color32::from_rgb(255, 120, 100)));
+                    }
+                }
+                if ui.small_button("Clear").clicked() {
+                    ui_state.interference = None;
+                    ui_state.interf_clear = true; // despawn the red overlays without recomputing
+                }
+            }
+            // ---- BOM: distinct parts and their counts ----
+            if !asm.0.components.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("BOM").weak().small());
+                let mut counts: Vec<(String, usize)> = Vec::new();
+                for comp in &asm.0.components {
+                    let key = if comp.source.is_empty() { comp.name.clone() } else { comp.source.clone() };
+                    let name = comp.name.clone();
+                    match counts.iter_mut().find(|(k, _)| *k == key || *k == name) {
+                        Some((_, n)) => *n += 1,
+                        None => counts.push((name, 1)),
+                    }
+                }
+                let mut text = String::new();
+                for (name, n) in &counts {
+                    ui.label(egui::RichText::new(format!("{n} \u{d7} {name}")).small());
+                    text.push_str(&format!("{n}\t{name}\n"));
+                }
+                if ui.small_button("Copy BOM").on_hover_text("Copy as tab-separated qty/name lines").clicked() {
+                    ui.ctx().copy_text(text);
                 }
             }
             // Component PM: exact placement + fixed flag for the selected instance.
