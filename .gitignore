@@ -12,6 +12,9 @@ run.log
 /installer/HCAD-Setup.exe
 /installer/vc_redist.x64.exe
 
+# Local test parts / bug-repro files saved out of the app
+/saved files/
+
 # Raw source art / working screenshots (the ones used in the repo live under
 # crates/hworks-app/assets and docs/screenshots; these folders are the untracked originals).
 /logo/

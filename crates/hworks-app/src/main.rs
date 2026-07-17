@@ -806,6 +806,52 @@ fn section_axes(spec: &SectionSpec) -> (Vec3, Vec3, Vec3) {
     (q * u0, q * v0, q * n0)
 }
 
+/// Cross-hatch the section cut face: 45° parallel lines clipped to the triangles that lie on
+/// the cutting plane. Works per-triangle (intersecting each with a family of parallel planes),
+/// so holes, islands and any outline shape hatch correctly without polygon reconstruction.
+fn section_hatch(mesh: &TriMesh, spec: &SectionSpec, u: Vec3, v: Vec3, n: Vec3, diag: f32) -> Vec<[[f32; 3]; 2]> {
+    let dir = if spec.flip { -n } else { n }; // the cut face's outward normal (toward the removed side)
+    let eps = (diag * 5e-4).max(1e-4); // "on the plane" tolerance
+    let sweep = (u - v).normalize_or_zero(); // hatch planes advance this way → lines run 45° to u
+    let s = (diag / 45.0).max(1e-3); // hatch spacing
+    let mut hatch: Vec<[[f32; 3]; 2]> = Vec::new();
+    for t in mesh.indices.chunks(3) {
+        let p = [
+            Vec3::from_array(mesh.positions[t[0] as usize]),
+            Vec3::from_array(mesh.positions[t[1] as usize]),
+            Vec3::from_array(mesh.positions[t[2] as usize]),
+        ];
+        if p.iter().any(|q| (q.dot(n) - spec.offset).abs() > eps) {
+            continue; // not on the cutting plane
+        }
+        let gn = (p[1] - p[0]).cross(p[2] - p[0]);
+        if gn.length_squared() < 1e-12 || gn.normalize().dot(dir) < 0.5 {
+            continue; // degenerate, or a pre-existing face that merely touches the plane from behind
+        }
+        let w = [p[0].dot(sweep), p[1].dot(sweep), p[2].dot(sweep)];
+        let (wmin, wmax) = (w[0].min(w[1]).min(w[2]), w[0].max(w[1]).max(w[2]));
+        let mut k = (wmin / s).ceil() as i64;
+        while (k as f32) * s <= wmax && hatch.len() < 60_000 {
+            let lvl = k as f32 * s;
+            let mut hits: [Vec3; 2] = [Vec3::ZERO; 2];
+            let mut count = 0;
+            for e in 0..3 {
+                let (a, b) = (e, (e + 1) % 3);
+                let (wa, wb) = (w[a] - lvl, w[b] - lvl);
+                if (wa <= 0.0) != (wb <= 0.0) && count < 2 {
+                    hits[count] = p[a] + (p[b] - p[a]) * (wa / (wa - wb));
+                    count += 1;
+                }
+            }
+            if count == 2 && hits[0].distance_squared(hits[1]) > 1e-8 {
+                hatch.push([hits[0].to_array(), hits[1].to_array()]);
+            }
+            k += 1;
+        }
+    }
+    hatch
+}
+
 fn standard_plane_ref(which: u8) -> PlaneRef {
     match which {
         1 => PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: true }, // Top (XZ)
@@ -856,6 +902,9 @@ struct Part {
     /// Full-body seam set stashed while a SECTION VIEW is active (the displayed `seam_edges` are
     /// filtered to the kept side; moving the plane back must be able to restore them).
     seam_backup: Vec<[[f32; 3]; 2]>,
+    /// Section view: cross-hatch segments on the freshly cut face (45° in-plane lines), so
+    /// sliced solid material reads differently from voids — SolidWorks-style.
+    cut_hatch: Vec<[[f32; 3]; 2]>,
 }
 
 /// A picked model edge (or edge loop) in view mode: the ordered world-space
@@ -11167,6 +11216,7 @@ fn do_regenerate(
                 part.edges.clear();
                 part.tangent_edges.clear();
                 part.seam_edges.clear();
+                part.cut_hatch.clear();
             }
         }
         return;
@@ -11281,6 +11331,7 @@ fn apply_section(
     match ui_state.section {
         None => {
             // Section switched off → a normal regen restores the full display and edge pools.
+            part.cut_hatch.clear();
             ui_state.section_shown = None;
             ui_state.regen = true;
         }
@@ -11327,6 +11378,7 @@ fn apply_section(
                     (mid.dot(n) - spec.offset) * side <= 0.0
                 })
                 .collect();
+            part.cut_hatch = section_hatch(&tess.mesh, &spec, u, v, n, (hi - lo).length());
             spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
             ui_state.section_shown = ui_state.section;
         }
@@ -12525,6 +12577,10 @@ fn handle_new_part(
     part.edges.clear();
     part.tangent_edges.clear();
     part.seam_edges.clear();
+    part.seam_backup.clear();
+    part.cut_hatch.clear();
+    ui_state.section = None;
+    ui_state.section_shown = None;
     session.selected_contours.clear();
     session.editing = None;
     doc.0 = Document::with_default_planes();
@@ -12593,6 +12649,11 @@ fn draw_body_edges(
     // selectable boundary ring (on a round body they're often its ONLY edges).
     for e in &part.seam_edges {
         gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), col);
+    }
+    // Section-view cross-hatch: 45° lines on the cut face mark sliced solid material.
+    let hcol = Color::srgba(0.22, 0.24, 0.3, 0.85);
+    for e in &part.cut_hatch {
+        gizmos.line(nudge(Vec3::from_array(e[0])), nudge(Vec3::from_array(e[1])), hcol);
     }
     // Tangent/curvature edges only when the user asks (drawn lighter to read as soft) —
     // on the exact path this set is every facet line of a curved wall, so it stays opt-in.
