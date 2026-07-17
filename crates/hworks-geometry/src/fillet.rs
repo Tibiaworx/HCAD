@@ -1678,7 +1678,12 @@ fn thread_coil(o: V3, axis: V3, r_out: f64, r_in: f64, pitch: f64, length: f64, 
         let z = z0 - pitch * theta / std::f64::consts::TAU; // spiral into the material (−axis)
         let rad = add(scale(u, (sign * theta).cos()), scale(v, (sign * theta).sin()));
         let base = add(o, scale(a, z));
-        let taper = (k as f64 / ramp as f64).min((n - k) as f64 / ramp as f64).clamp(0.0, 1.0);
+        // Fade the tooth out over the run-out — but NEVER fully: at taper 0 the apex lands
+        // exactly on the base circle, the cross-section goes collinear (zero area), and
+        // Manifold's vertex merge folds those degenerate stations into broken topology —
+        // rejecting the coil and kicking EVERY thread boolean to the lossy BSP fallback.
+        // A 25% floor keeps every section a real triangle; the stub ends sit buried/blunt.
+        let taper = (k as f64 / ramp as f64).min((n - k) as f64 / ramp as f64).clamp(0.25, 1.0);
         let r_apex = r_out + (r_in - r_out) * taper; // r_out at the ends, r_in in the middle
         let outer = |dz: f64| add(add(base, scale(a, dz)), scale(rad, r_out));
         [outer(-hw), outer(hw), add(base, scale(rad, r_apex))]
@@ -1698,8 +1703,12 @@ fn thread_coil(o: V3, axis: V3, r_out: f64, r_in: f64, pitch: f64, length: f64, 
             indices.extend_from_slice(&[a0, a1, b1, a0, b1, b0]);
         }
     }
-    indices.extend_from_slice(&[vi(0, 0), vi(0, 1), vi(0, 2)]); // start cap
-    indices.extend_from_slice(&[vi(n, 2), vi(n, 1), vi(n, 0)]); // end cap
+    // End caps, wound OPPOSITE to the tube walls' traversal of the ring edges — a consistently
+    // oriented closed mesh uses every directed edge exactly once. Both caps used to run the same
+    // way as the walls (6 duplicated directed edges), which made Manifold reject the coil and
+    // dropped EVERY thread boolean to the lossy BSP fallback (the "surface may be torn" banner).
+    indices.extend_from_slice(&[vi(0, 2), vi(0, 1), vi(0, 0)]); // start cap
+    indices.extend_from_slice(&[vi(n, 0), vi(n, 1), vi(n, 2)]); // end cap
     let mut m = TriMesh { positions, normals: Vec::new(), indices };
     orient_outward(&mut m);
     fill_normals(&mut m);
@@ -1819,4 +1828,52 @@ fn ray_tri(o: V3, dir: V3, a: V3, b: V3, c: V3) -> Option<f64> {
     }
     let t = dot(e2, q) * inv;
     (t > 0.0).then_some(t)
+}
+
+#[cfg(test)]
+mod coil_tests {
+    use super::*;
+
+    #[test]
+    fn thread_coil_is_manifold() {
+        let coil = thread_coil([0.0, 0.0, 20.0], [0.0, 0.0, 1.0], 2.58, 2.07, 0.8, 9.0, true);
+        eprintln!("coil: {} verts {} tris", coil.positions.len(), coil.indices.len() / 3);
+        let (v, t, boundary, nonman) = crate::mesh_bool::weld_edge_stats(&coil);
+        eprintln!("welded: v={v} t={t} boundary={boundary} nonman={nonman}");
+        // Orientation audit: in a consistently-wound closed mesh every DIRECTED edge appears
+        // exactly once (its partner traverses the reverse direction).
+        {
+            use std::collections::HashMap;
+            let mut dir_edges: HashMap<(u32, u32), u32> = HashMap::new();
+            for tri in coil.indices.chunks(3) {
+                for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                    *dir_edges.entry((a, b)).or_default() += 1;
+                }
+            }
+            let dup = dir_edges.values().filter(|&&c| c > 1).count();
+            let zero_area = coil
+                .indices
+                .chunks(3)
+                .filter(|t| {
+                    let p = |i: u32| {
+                        let q = coil.positions[t[i as usize % 3] as usize];
+                        [q[0] as f64, q[1] as f64, q[2] as f64]
+                    };
+                    let (a, b, c) = (p(0), p(1), p(2));
+                    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                    let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                    (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() < 1e-10
+                })
+                .count();
+            eprintln!("directed dup edges={dup} zero-area tris={zero_area}");
+        }
+        assert!(crate::mesh_bool::is_manifold(&coil), "thread coil mesh is not 2-manifold");
+    }
+
+    #[test]
+    fn bore_cylinder_is_manifold() {
+        let cyl = make_cylinder([0.0, 0.0, 20.2], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 2.5, 9.8, 48);
+        assert!(crate::mesh_bool::is_manifold(&cyl), "bore cylinder mesh is not 2-manifold");
+    }
 }

@@ -1980,6 +1980,19 @@ mod tests {
         );
     }
 
+    /// Every Hole Genie boolean must go through Manifold — the lossy BSP fallback tears surfaces
+    /// and fired the "1 boolean(s) used the lossy fallback" banner on EVERY thread.
+    #[test]
+    fn hole_genie_booleans_stay_manifold() {
+        let _ = take_fallback_count(); // reset the counter
+        let block = extrude_tool_mesh(&[[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]], &[], &xy_plane(), 0.0, 20.0)
+            .expect("block");
+        let _tap = threaded_hole(&block, [15.0, 15.0, 20.0], [0.0, 0.0, 1.0], 5.0, 0.8, 9.0, true, true).expect("tap");
+        assert_eq!(take_fallback_count(), 0, "internal tap used the lossy BSP fallback");
+        let _ext = threaded_hole(&block, [15.0, 15.0, 20.0], [0.0, 0.0, 1.0], 5.0, 0.8, 9.0, false, true).expect("ext");
+        assert_eq!(take_fallback_count(), 0, "external thread used the lossy BSP fallback");
+    }
+
     #[test]
     fn extrude_square_makes_a_box() {
         let square = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
