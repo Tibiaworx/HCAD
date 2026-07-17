@@ -582,6 +582,93 @@ fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, V
     (1, axis_pt, axis)
 }
 
+/// Fit a circle to a closed 3D point loop (a tessellated circular edge): find the loop plane
+/// (Newell normal), project into it, fit a 2D circle, and lift back. Returns `(centre, axis,
+/// radius)` with `axis` the unit loop normal. `None` if the loop isn't planar/circular enough.
+fn fit_circle_3d(pts: &[Vec3]) -> Option<(Vec3, Vec3, f32)> {
+    if pts.len() < 6 {
+        return None;
+    }
+    let m = pts.len();
+    let mut nrm = Vec3::ZERO;
+    for i in 0..m {
+        let (a, b) = (pts[i], pts[(i + 1) % m]);
+        nrm += Vec3::new((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y));
+    }
+    let axis = nrm.normalize_or_zero();
+    if axis.length_squared() < 0.5 {
+        return None; // degenerate / non-planar
+    }
+    let u = axis.any_orthonormal_vector();
+    let v = axis.cross(u);
+    let o = pts[0];
+    let flat: Vec<Vec2> = pts.iter().map(|p| { let d = *p - o; Vec2::new(d.dot(u), d.dot(v)) }).collect();
+    let (c2, r) = fit_circle(&flat)?;
+    // Reject if the loop doesn't actually hug that circle (a rectangle would "fit" loosely).
+    let max_dev = flat.iter().map(|p| (p.distance(c2) - r).abs()).fold(0.0_f32, f32::max);
+    if r < 1e-4 || max_dev > r * 0.05 {
+        return None;
+    }
+    Some((o + u * c2.x + v * c2.y, axis, r))
+}
+
+/// A mate reference from a picked body edge (in PART-LOCAL space), or `None` if the cursor
+/// isn't near any component's edge. A **closed circular** edge (a hole rim, a cylinder cap)
+/// becomes an axis ref through its centre — concentric-mateable, just like a cylindrical face,
+/// so a bolt drops into a hole by clicking the rim. A **straight** edge becomes an axis ref
+/// along it (align two edges). Both are `kind: 1` (axis), which the mate solver already aligns.
+fn pick_mate_edge(
+    asm: &Assembly,
+    render: &AsmRender,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    cursor: Vec2,
+    thresh: f32,
+) -> Option<(u64, MateRef)> {
+    // Nearest edge across all visible components, in world space.
+    let mut best: Option<(f32, u64, Vec<Vec3>, bool)> = None; // (screen dist, comp, world chain, closed)
+    for comp in &asm.components {
+        if comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        let tf = comp_transform(comp);
+        let wedges: Vec<[[f32; 3]; 2]> = geom
+            .edges
+            .iter()
+            .map(|e| [tf.transform_point(Vec3::from_array(e[0])).to_array(), tf.transform_point(Vec3::from_array(e[1])).to_array()])
+            .collect();
+        let Some(si) = pick_edge(&wedges, camera, cam_gt, cursor, thresh) else { continue };
+        let (a, b) = (Vec3::from_array(wedges[si][0]), Vec3::from_array(wedges[si][1]));
+        let d = segment_screen_dist(camera, cam_gt, cursor, a, b).unwrap_or(f32::MAX);
+        if best.as_ref().map_or(true, |(bd, _, _, _)| d < *bd) {
+            let (chain, closed) = edge_chain(&wedges, si);
+            best = Some((d, comp.id, chain, closed));
+        }
+    }
+    let (_, cid, chain, closed) = best?;
+    // Classify in the component's LOCAL frame (so the ref survives its transform).
+    let comp = asm.component(cid)?;
+    let inv = comp_transform(comp).compute_affine().inverse();
+    let local: Vec<Vec3> = chain.iter().map(|&p| inv.transform_point3(p)).collect();
+    let mk = |point: Vec3, dir: Vec3| MateRef {
+        comp: cid,
+        kind: 1,
+        point: [point.x as f64, point.y as f64, point.z as f64],
+        dir: [dir.x as f64, dir.y as f64, dir.z as f64],
+    };
+    if closed {
+        if let Some((c, axis, _r)) = fit_circle_3d(&local) {
+            return Some((cid, mk(c, axis)));
+        }
+    }
+    // Straight edge → the line along it.
+    let a = *local.first()?;
+    let b = *local.last()?;
+    let dir = (b - a).normalize_or_zero();
+    (dir.length_squared() > 0.5).then(|| (cid, mk(a, dir)))
+}
+
 /// Signed volume of a triangle mesh (divergence theorem), mm^3.
 fn mesh_volume(m: &TriMesh) -> f64 {
     let mut v = 0.0;
@@ -1050,9 +1137,32 @@ fn asm_interaction(
     // but gizmo drags and mate picking wait until the slider returns to zero.
     let exploded = ui_state.explode > 1e-3;
 
-    // ---- Mate PM open: viewport clicks pick faces (A then B) ----
+    // ---- Mate PM open: viewport clicks pick faces or edges (A then B) ----
     if ui_state.mate_spec.is_some() && !exploded {
         if !just_pressed {
+            return;
+        }
+        // Edge pick first: a body edge under the cursor is a more specific target than the
+        // face behind it (a hole's rim → concentric, a straight edge → an alignment axis).
+        // Only when no edge is close enough do we fall through to the face ray-cast below.
+        if let Some((cid, r)) = pick_mate_edge(&asm.0, &render, camera, cam_gt, cursor, 12.0) {
+            if let Some(spec) = ui_state.mate_spec.as_mut() {
+                match (&spec.a, &spec.b) {
+                    (None, _) => spec.a = Some(r),
+                    (Some(a), None) if a.comp != cid => spec.b = Some(r),
+                    (Some(_), None) => spec.a = Some(r),
+                    (Some(_), Some(_)) => spec.b = Some(r),
+                }
+                if spec.auto_kind {
+                    if let (Some(a), Some(b)) = (&spec.a, &spec.b) {
+                        spec.kind = match (a.kind, b.kind) {
+                            (1, 1) => 2, // two axes/cylinders → concentric
+                            (0, 0) => 0, // two planes → coincident
+                            _ => 3,      // mixed → parallel
+                        };
+                    }
+                }
+            }
             return;
         }
         let mut best: Option<(f32, u64, usize, Vec3)> = None; // (t, comp, tri index, local hit)
@@ -3065,7 +3175,7 @@ fn ui_system(
                 if ui.button("Insert Component…").on_hover_text("Insert saved part files (.hcad) into the assembly").clicked() {
                     ui_state.insert_component_request = true;
                 }
-                if ui.selectable_label(ui_state.mate_spec.is_some(), "Mate").on_hover_text("Constrain two components: click a face on each (flush faces, or a bolt into a hole)").clicked() {
+                if ui.selectable_label(ui_state.mate_spec.is_some(), "Mate").on_hover_text("Constrain two components: click a face or edge on each (flush faces, or a bolt into a hole — pick a round face or a hole's rim edge)").clicked() {
                     ui_state.mate_spec = if ui_state.mate_spec.is_some() { None } else { Some(MateSpec::default()) };
                 }
                 if ui.button("Interference").on_hover_text("Check every pair of parts for overlap — collisions show in red (great before printing a fit)").clicked() {
@@ -5472,10 +5582,12 @@ fn ui_system(
                     match r {
                         Some(r) => {
                             let cname = asm.0.component(r.comp).map(|c| c.name.clone()).unwrap_or_else(|| "?".into());
-                            let face = if r.kind == 1 { "cylinder" } else { "face" };
-                            format!("{face} of {cname}")
+                            // kind 1 is any axis reference: a cylindrical face, a circular edge
+                            // (hole rim), or a straight edge — all mate concentrically.
+                            let what = if r.kind == 1 { "axis" } else { "face" };
+                            format!("{what} of {cname}")
                         }
-                        None => "click a face in the viewport".into(),
+                        None => "click a face or edge in the viewport".into(),
                     }
                 };
                 ui.label(format!("A:  {}", describe(&spec.a)));
@@ -5499,7 +5611,7 @@ fn ui_system(
                     });
                 }
                 ui.checkbox(&mut spec.flip, "Flip").on_hover_text("Reverse which way the faces point at each other");
-                ui.label(egui::RichText::new("Pick one face on each component. Two flat faces \u{2192} flush; two round faces \u{2192} bolt-in-hole.").weak().small());
+                ui.label(egui::RichText::new("Pick a face or edge on each component. Two flat faces \u{2192} flush; a round face or a circular edge (a hole rim) \u{2192} bolt-in-hole (concentric).").weak().small());
                 if commit {
                     if let (Some(a), Some(b)) = (spec.a.clone(), spec.b.clone()) {
                         asm.0.add_mate(spec.kind, spec.value as f64, spec.flip, a, b);
@@ -19270,6 +19382,40 @@ mod tests {
         let (kind2, _, dir2) = classify_face_local(tri, cti, cp);
         assert_eq!(kind2, 0, "cap should classify as planar");
         assert!(dir2.z > 0.99, "cap normal should be +Z, got {dir2:?}");
+    }
+
+    #[test]
+    fn fit_circle_3d_recovers_a_tilted_hole_rim() {
+        // A tessellated circular edge (a hole rim) lying in a tilted plane: fit_circle_3d must
+        // recover the centre, the plane axis, and the radius — the geometry that makes a picked
+        // rim edge concentric-mateable, exactly like the cylindrical face.
+        let center = Vec3::new(2.0, -1.0, 3.0);
+        let axis = Vec3::new(1.0, 2.0, 2.0).normalize(); // arbitrary tilt
+        let u = axis.any_orthonormal_vector();
+        let v = axis.cross(u);
+        let radius = 4.0_f32;
+        let n = 48;
+        let pts: Vec<Vec3> = (0..n)
+            .map(|k| {
+                let a = std::f32::consts::TAU * k as f32 / n as f32;
+                center + (u * a.cos() + v * a.sin()) * radius
+            })
+            .collect();
+        let (c, ax, r) = fit_circle_3d(&pts).expect("a clean circle fits");
+        assert!(c.distance(center) < 1e-3, "centre off: {c:?} vs {center:?}");
+        assert!(ax.cross(axis).length() < 1e-3, "axis off: {ax:?} vs {axis:?}");
+        assert!((r - radius).abs() < 1e-3, "radius off: {r} vs {radius}");
+        // A square loop (four corners) is NOT a circle — must be rejected so a straight-edged
+        // rectangular rim falls through to the straight-edge axis path instead.
+        let square = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+            Vec3::new(4.0, 4.0, 0.0),
+            Vec3::new(0.0, 4.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        ];
+        assert!(fit_circle_3d(&square).is_none(), "a square loop must not read as a circle");
     }
 
     #[test]
