@@ -247,6 +247,10 @@ struct AsmRender {
 struct AsmDrag {
     comp: u64,
     axis: u8,
+    /// Fixed axis anchor captured at grab time. The cursor parameter must be measured
+    /// against a point that does NOT move with the component — anchoring on the live
+    /// centre made each frame's delta subtract the previous frame's motion (jitter).
+    anchor: Vec3,
     last_t: f32,
     faces: Vec<f64>,
     targets: Vec<f64>,
@@ -523,7 +527,7 @@ fn asm_interaction(
                                             targets.extend(axis_face_planes(&og.tri, &comp_transform(other), dir));
                                         }
                                     }
-                                    ui_state.asm_drag = Some(AsmDrag { comp: id, axis: k as u8, last_t: t0, faces, targets });
+                                    ui_state.asm_drag = Some(AsmDrag { comp: id, axis: k as u8, anchor: base, last_t: t0, faces, targets });
                                 }
                                 break;
                             }
@@ -535,11 +539,10 @@ fn asm_interaction(
     }
     if let Some(drag) = ui_state.asm_drag.clone() {
         if pressed {
-            if let Some(comp) = asm.0.component(drag.comp) {
-                if let Some(geom) = render.cache.get(&asm_geom_key(comp)) {
+            if asm.0.component(drag.comp).is_some() {
+                {
                     let dir = [Vec3::X, Vec3::Y, Vec3::Z][drag.axis as usize];
-                    let base = asm_comp_center(comp, geom);
-                    let t = closest_t_on_axis(base, dir, ray.origin, ray.direction.as_vec3());
+                    let t = closest_t_on_axis(drag.anchor, dir, ray.origin, ray.direction.as_vec3());
                     if t.is_finite() {
                         let delta = (t - drag.last_t) as f64;
                         if let Some(comp) = asm.0.component_mut(drag.comp) {
