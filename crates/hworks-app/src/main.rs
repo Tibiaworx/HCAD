@@ -190,7 +190,7 @@ fn main() {
                     draw_measure,
                     draw_body_edges,
                     draw_feature_previews,
-                    (draw_selected_feature, draw_sketch, persist_settings),
+                    (draw_selected_feature, draw_sketch, persist_settings, draw_section_gizmo),
                     tick_edge_flash,
                     draw_edge_selection,
                 ),
@@ -1704,6 +1704,18 @@ fn ui_system(
                     .changed()
                 {
                     ui_state.regen = true; // rebuild with the chosen kernel
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(ui_state.section.is_some(), "Section")
+                    .on_hover_text("Section view: cut the part with a plane (drag the arrow to slide the cut)")
+                    .clicked()
+                {
+                    if ui_state.section.is_some() {
+                        ui_state.section = None;
+                    } else {
+                        ui_state.section = Some((0, 0.0, false));
+                    }
                 }
                 ui.separator();
                 if ui.button("Fit").on_hover_text("Zoom to fit the part").clicked() {
@@ -7134,6 +7146,9 @@ fn sketch_interaction(
     // Reference-plane creation: drag the offset arrow, or click a face / datum plane to set the
     // base to offset from. (Swallows viewport interaction while the Plane PM is open.)
     if ui_state.plane_spec.is_some() && session.plane.is_none() {
+        if section_arrow_drag(&mut session, &mut ui_state, &part, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
+            return;
+        }
         if plane_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
@@ -14252,6 +14267,98 @@ fn closest_t_on_axis(base: Vec3, n: Vec3, ro: Vec3, rd: Vec3) -> f32 {
 /// Drag the reference-plane creation arrow (along the base normal) to set the offset live — the
 /// plane analogue of [`extrude_arrow_drag`]. The drag sign sets the `flip` flag, so a wobble past
 /// the base flips sides cleanly. Returns true while dragging (so the caller swallows the click).
+/// Geometry of the on-screen section-plane gizmo: (rect centre at the current offset, plane
+/// normal, arrow tip, rect half-extent). Shared by the drawing and the drag hit-test so the
+/// grab target always matches what's on screen.
+fn section_gizmo_geom(part: &Part, which: u8, offset: f32, flip: bool) -> Option<(Vec3, Vec3, Vec3, f32)> {
+    let mesh = part.mesh.as_ref()?;
+    if mesh.positions.is_empty() {
+        return None;
+    }
+    let (lo, hi) = mesh_bbox(mesh);
+    let c = (lo + hi) * 0.5;
+    let pr = standard_plane_ref(which);
+    let n = Vec3::new(pr.normal[0] as f32, pr.normal[1] as f32, pr.normal[2] as f32);
+    let base = c - n * (c.dot(n) - offset); // bbox centre projected onto the section plane
+    let diag = (hi - lo).length().max(1.0);
+    let dir = if flip { -n } else { n }; // points toward the DISCARDED side (the view direction)
+    let tip = base + dir * (diag * 0.28);
+    Some((base, n, tip, diag * 0.55))
+}
+
+/// Drag the section plane's normal arrow to slide the cut through the part (view mode).
+#[allow(clippy::too_many_arguments)]
+fn section_arrow_drag(
+    session: &mut SketchSession,
+    ui_state: &mut UiState,
+    part: &Part,
+    window: &Window,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    ray: &Ray3d,
+    just_pressed: bool,
+    pressed: bool,
+    just_released: bool,
+) -> bool {
+    let Some((which, offset, flip)) = ui_state.section else { return false };
+    let Some((base, n, tip, _half)) = section_gizmo_geom(part, which, offset, flip) else { return false };
+    if just_pressed {
+        if let Some(cursor) = window.cursor_position() {
+            let near_shaft = segment_screen_dist(camera, cam_gt, cursor, base, tip).is_some_and(|d| d < 22.0);
+            let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 26.0).unwrap_or(false);
+            if near_shaft || near_tip {
+                session.arrow_drag = true;
+            }
+        }
+    }
+    if session.arrow_drag && pressed {
+        // The axis through the plane's zero position: t along `n` IS the offset.
+        let base0 = base - n * offset;
+        let t = closest_t_on_axis(base0, n, ray.origin, ray.direction.as_vec3());
+        if t.is_finite() {
+            ui_state.section = Some((which, t, flip));
+        }
+        if just_released {
+            session.arrow_drag = false;
+        }
+        return true;
+    }
+    if just_released {
+        session.arrow_drag = false;
+    }
+    false
+}
+
+/// Draw the section-plane gizmo: the cutting rectangle + a direction arrow (drag it to slide the
+/// cut; the arrow points at the discarded side, SolidWorks-style).
+fn draw_section_gizmo(mut overlay: Gizmos<OverlayGizmos>, ui_state: Res<UiState>, part: Res<Part>, session: Res<SketchSession>) {
+    let Some((which, offset, flip)) = ui_state.section else { return };
+    let Some((base, _n, tip, half)) = section_gizmo_geom(&part, which, offset, flip) else { return };
+    let pr = standard_plane_ref(which);
+    let u = Vec3::new(pr.u[0] as f32, pr.u[1] as f32, pr.u[2] as f32) * half;
+    let v = Vec3::new(pr.v[0] as f32, pr.v[1] as f32, pr.v[2] as f32) * half;
+    let col = Color::srgba(1.0, 0.6, 0.15, 0.9);
+    let faint = Color::srgba(1.0, 0.6, 0.15, 0.25);
+    // The cutting rectangle + corner-to-corner cross so the plane reads as a surface.
+    let corners = [base - u - v, base + u - v, base + u + v, base - u + v];
+    for k in 0..4 {
+        overlay.line(corners[k], corners[(k + 1) % 4], col);
+    }
+    overlay.line(corners[0], corners[2], faint);
+    overlay.line(corners[1], corners[3], faint);
+    // The offset arrow (highlighted while dragging).
+    let acol = if session.arrow_drag { Color::srgb(1.0, 1.0, 0.5) } else { col };
+    overlay.line(base, tip, acol);
+    let d = (tip - base).normalize_or_zero();
+    let side = d.any_orthonormal_vector() * (half * 0.06);
+    let back = tip - d * (half * 0.12);
+    overlay.line(tip, back + side, acol);
+    overlay.line(tip, back - side, acol);
+    let side2 = d.cross(side.normalize_or_zero()) * (half * 0.06);
+    overlay.line(tip, back + side2, acol);
+    overlay.line(tip, back - side2, acol);
+}
+
 fn plane_arrow_drag(
     session: &mut SketchSession,
     ui_state: &mut UiState,
