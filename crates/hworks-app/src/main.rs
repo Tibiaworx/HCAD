@@ -176,7 +176,7 @@ fn main() {
                     thread_ghost,
                 ),
                 (
-                    (handle_new_part, asm_regenerate, asm_interaction, asm_solve_mates, check_interference, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
+                    (handle_new_part, asm_regenerate, mate_hover_highlight, asm_interaction, asm_solve_mates, check_interference, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
                     highlight_face,
                     hover_body_edge,
                     sync_ref_planes,
@@ -315,11 +315,15 @@ struct MateSpec {
     flip: bool,
     /// While true the kind auto-suggests from the picked face types; a manual radio unsets it.
     auto_kind: bool,
+    /// The picked faces'/edges' outline segments in PART-LOCAL space (comp id + segments),
+    /// kept lit up in the viewport while the PM is open — A blue, B orange.
+    a_hl: Option<(u64, Vec<[[f32; 3]; 2]>)>,
+    b_hl: Option<(u64, Vec<[[f32; 3]; 2]>)>,
 }
 
 impl Default for MateSpec {
     fn default() -> Self {
-        Self { a: None, b: None, kind: 0, value: 5.0, flip: false, auto_kind: true }
+        Self { a: None, b: None, kind: 0, value: 5.0, flip: false, auto_kind: true, a_hl: None, b_hl: None }
     }
 }
 
@@ -408,15 +412,61 @@ fn solve_mates(asm: &mut Assembly) {
     }
 }
 
-/// Classify the smooth face patch around a clicked triangle as planar or cylindrical, in
-/// PART-LOCAL space. Returns `(kind, point, dir)` shaped like [`MateRef`]: planar = (0, the
-/// hit point, the face normal); cylindrical = (1, a point on the fitted axis, the axis).
-///
-/// The patch grows by BFS over shared vertices while normals stay within a step angle. A
-/// near-zero smallest eigenvalue of the normal covariance with a wide normal spread reads as
-/// a cylinder (all side normals ⊥ one axis); the axis position comes from a Kasa circle fit
-/// of the patch vertices projected along it.
-fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, Vec3) {
+/// How far a mate is from satisfied at the components' CURRENT placements:
+/// `(angle_error_rad, distance_error_mm)`, measuring exactly the targets [`solve_mates`]
+/// drives to (so "satisfied" here means the solver genuinely converged, not merely that it
+/// stopped). `None` if either side's component no longer exists.
+fn mate_residual(asm: &Assembly, m: &Mate) -> Option<(f32, f32)> {
+    let (pa, na) = mate_ref_world(asm, &m.a)?;
+    let (pb, nb) = mate_ref_world(asm, &m.b)?;
+    // The residual is symmetric in the two sides; measure b against a (the solver's default
+    // mover/target roles).
+    let (mv_p, mv_n, tgt_p, tgt_n) = (pb, nb, pa, na);
+    Some(match m.kind {
+        // Planes: facing error (normals opposed; flip = same way) + gap along the target
+        // normal vs 0 (coincident) or `value` (distance). Parallel is the angle only.
+        0 | 1 | 3 => {
+            let want = if m.flip { tgt_n } else { -tgt_n };
+            let ang = mv_n.angle_between(want);
+            let dist = if m.kind == 3 {
+                0.0
+            } else {
+                let target = if m.kind == 1 { m.value as f32 } else { 0.0 };
+                ((mv_p - tgt_p).dot(tgt_n) - target).abs()
+            };
+            (ang, dist)
+        }
+        // Concentric: axis misalignment (nearest sense; flip reverses) + the perpendicular
+        // offset between the two axis lines (sliding along the axis is free, so it's not error).
+        2 => {
+            let mut want = tgt_n;
+            if mv_n.dot(want) < 0.0 {
+                want = -want;
+            }
+            if m.flip {
+                want = -want;
+            }
+            let ang = mv_n.angle_between(want);
+            let d = tgt_p - mv_p;
+            let perp = (d - want * d.dot(want)).length();
+            (ang, perp)
+        }
+        _ => (0.0, 0.0),
+    })
+}
+
+/// Whether a measured mate residual counts as satisfied: within ~0.6° and 0.05 mm. The
+/// solver converges to far tighter than both, so anything outside means the mate genuinely
+/// couldn't be met — conflicting mates, or both parts Fixed.
+fn mate_satisfied(res: (f32, f32)) -> bool {
+    res.0 < 0.01 && res.1 < 0.05
+}
+
+/// Grow the smooth face patch around `hit_tri`: BFS over shared (welded) vertices while the
+/// step angle between triangle normals stays gentle. The patch is what mate picking treats
+/// as "the face" — shared by [`classify_face_local`] (fits plane/cylinder to it) and the
+/// Mate PM's hover/pick highlight (draws its outline).
+fn face_patch(tri: &TriMesh, hit_tri: usize) -> Vec<usize> {
     let ntri = tri.indices.len() / 3;
     let tn = |ti: usize| -> Vec3 {
         let t = &tri.indices[ti * 3..ti * 3 + 3];
@@ -425,7 +475,6 @@ fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, V
         let c = Vec3::from_array(tri.positions[t[2] as usize]);
         (b - a).cross(c - a) // area-weighted
     };
-    let hit_n = tn(hit_tri).normalize_or_zero();
     // Vertex-position welding → triangle adjacency.
     let (lo, hi) = mesh_bbox(tri);
     let q = ((hi - lo).length() * 1e-5).max(1e-6);
@@ -457,6 +506,46 @@ fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, V
             }
         }
     }
+    patch
+}
+
+/// The boundary outline of a face patch (LOCAL space): the welded edges used by exactly one
+/// patch triangle — the face's silhouette, for the Mate PM's orange face highlight.
+fn patch_outline(tri: &TriMesh, patch: &[usize]) -> Vec<[[f32; 3]; 2]> {
+    let (lo, hi) = mesh_bbox(tri);
+    let q = ((hi - lo).length() * 1e-5).max(1e-6);
+    let key = |p: [f32; 3]| ((p[0] / q).round() as i64, (p[1] / q).round() as i64, (p[2] / q).round() as i64);
+    let mut count: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), ([f32; 3], [f32; 3], u32)> =
+        std::collections::HashMap::new();
+    for &ti in patch {
+        let t = &tri.indices[ti * 3..ti * 3 + 3];
+        for k in 0..3 {
+            let a = tri.positions[t[k] as usize];
+            let b = tri.positions[t[(k + 1) % 3] as usize];
+            let (ka, kb) = (key(a), key(b));
+            let ek = if ka < kb { (ka, kb) } else { (kb, ka) };
+            count.entry(ek).or_insert((a, b, 0)).2 += 1;
+        }
+    }
+    count.into_values().filter(|(_, _, c)| *c == 1).map(|(a, b, _)| [a, b]).collect()
+}
+
+/// Classify the smooth face patch around a clicked triangle as planar or cylindrical, in
+/// PART-LOCAL space. Returns `(kind, point, dir)` shaped like [`MateRef`]: planar = (0, the
+/// hit point, the face normal); cylindrical = (1, a point on the fitted axis, the axis).
+/// A near-zero smallest eigenvalue of the normal covariance with a wide normal spread reads
+/// as a cylinder (all side normals ⊥ one axis); the axis position comes from a Kasa circle
+/// fit of the patch vertices projected along it.
+fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, Vec3) {
+    let tn = |ti: usize| -> Vec3 {
+        let t = &tri.indices[ti * 3..ti * 3 + 3];
+        let a = Vec3::from_array(tri.positions[t[0] as usize]);
+        let b = Vec3::from_array(tri.positions[t[1] as usize]);
+        let c = Vec3::from_array(tri.positions[t[2] as usize]);
+        (b - a).cross(c - a) // area-weighted
+    };
+    let hit_n = tn(hit_tri).normalize_or_zero();
+    let patch = face_patch(tri, hit_tri);
     // Area-weighted normal covariance + spread.
     let mut m = [[0.0f64; 3]; 3];
     let mut mean = Vec3::ZERO;
@@ -538,6 +627,10 @@ fn classify_face_local(tri: &TriMesh, hit_tri: usize, hit: Vec3) -> (u8, Vec3, V
     let mut syz = 0.0f64;
     let mut sz = 0.0f64;
     let mut np = 0.0f64;
+    // Same bbox-relative weld grid the patch BFS uses, to dedup shared vertices.
+    let (lo, hi) = mesh_bbox(tri);
+    let q = ((hi - lo).length() * 1e-5).max(1e-6);
+    let key = |p: [f32; 3]| ((p[0] / q).round() as i64, (p[1] / q).round() as i64, (p[2] / q).round() as i64);
     let mut seen: std::collections::HashSet<(i64, i64, i64)> = std::collections::HashSet::new();
     for &ti in &patch {
         for k in 0..3 {
@@ -624,7 +717,7 @@ fn pick_mate_edge(
     cam_gt: &GlobalTransform,
     cursor: Vec2,
     thresh: f32,
-) -> Option<(u64, MateRef)> {
+) -> Option<(u64, MateRef, Vec<Vec3>)> {
     // Nearest edge across all visible components, in world space.
     let mut best: Option<(f32, u64, Vec<Vec3>, bool)> = None; // (screen dist, comp, world chain, closed)
     for comp in &asm.components {
@@ -659,14 +752,72 @@ fn pick_mate_edge(
     };
     if closed {
         if let Some((c, axis, _r)) = fit_circle_3d(&local) {
-            return Some((cid, mk(c, axis)));
+            return Some((cid, mk(c, axis), local));
         }
     }
     // Straight edge → the line along it.
     let a = *local.first()?;
     let b = *local.last()?;
     let dir = (b - a).normalize_or_zero();
-    (dir.length_squared() > 0.5).then(|| (cid, mk(a, dir)))
+    (dir.length_squared() > 0.5).then(|| (cid, mk(a, dir), local))
+}
+
+/// What the Mate PM would grab at the cursor: the component, the mate reference, and the
+/// PART-LOCAL highlight segments — the edge chain, or the smooth face patch's outline —
+/// used by both the click (to store the pick with its lit-up outline) and the hover
+/// pre-highlight, so what lights up is exactly what a click takes.
+fn mate_pick_at(
+    asm: &Assembly,
+    render: &AsmRender,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    cursor: Vec2,
+    ray: &Ray3d,
+) -> Option<(u64, MateRef, Vec<[[f32; 3]; 2]>)> {
+    // Edge first (12 px): a more specific target than the face behind it (a hole's rim →
+    // concentric; a straight edge → an alignment axis).
+    if let Some((cid, r, chain)) = pick_mate_edge(asm, render, camera, cam_gt, cursor, 12.0) {
+        let mut segs: Vec<[[f32; 3]; 2]> = chain.windows(2).map(|w| [w[0].to_array(), w[1].to_array()]).collect();
+        if chain.len() > 2 {
+            // A closed circular chain from edge_chain omits the closing segment — add it so
+            // the highlight ring doesn't show a gap.
+            segs.push([chain[chain.len() - 1].to_array(), chain[0].to_array()]);
+        }
+        return Some((cid, r, segs));
+    }
+    // Face ray-cast fallback: nearest triangle hit across all visible components.
+    let mut best: Option<(f32, u64, usize, Vec3)> = None; // (t, comp, tri index, local hit)
+    for comp in &asm.components {
+        if comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        let tf = comp_transform(comp);
+        let inv = tf.compute_affine().inverse();
+        let lo = inv.transform_point3(ray.origin);
+        let ld = inv.transform_vector3(*ray.direction).normalize_or_zero();
+        for (ti, tri) in geom.tri.indices.chunks_exact(3).enumerate() {
+            let a = Vec3::from_array(geom.tri.positions[tri[0] as usize]);
+            let b = Vec3::from_array(geom.tri.positions[tri[1] as usize]);
+            let c = Vec3::from_array(geom.tri.positions[tri[2] as usize]);
+            if let Some(t) = ray_triangle(lo, ld, a, b, c) {
+                if best.map_or(true, |(bt, _, _, _)| t < bt) {
+                    best = Some((t, comp.id, ti, lo + ld * t));
+                }
+            }
+        }
+    }
+    let (_, cid, ti, lp) = best?;
+    let geom = asm.component(cid).and_then(|c| render.cache.get(&asm_geom_key(c)))?;
+    let (kind, point, dir) = classify_face_local(&geom.tri, ti, lp);
+    let outline = patch_outline(&geom.tri, &face_patch(&geom.tri, ti));
+    let r = MateRef {
+        comp: cid,
+        kind,
+        point: [point.x as f64, point.y as f64, point.z as f64],
+        dir: [dir.x as f64, dir.y as f64, dir.z as f64],
+    };
+    Some((cid, r, outline))
 }
 
 /// Signed volume of a triangle mesh (divergence theorem), mm^3.
@@ -971,6 +1122,23 @@ fn draw_asm_gizmo(
     }
     // Mate PM pick markers: a ring + normal tick on planar picks, an axis line on cylinders.
     if let Some(spec) = &ui_state.mate_spec {
+        // Lit-up outlines: the hovered face/edge glows orange (what a click would take);
+        // the committed picks stay lit in their marker colours (A blue, B orange).
+        let draw_hl = |overlay: &mut Gizmos<OverlayGizmos>, cid: u64, segs: &[[[f32; 3]; 2]], col: Color| {
+            let Some(c) = asm.0.component(cid) else { return };
+            let tf = comp_transform(c);
+            for s in segs {
+                overlay.line(tf.transform_point(Vec3::from_array(s[0])), tf.transform_point(Vec3::from_array(s[1])), col);
+            }
+        };
+        if let Some((cid, segs)) = &ui_state.mate_hover {
+            draw_hl(&mut overlay, *cid, segs, Color::srgb(1.0, 0.55, 0.1));
+        }
+        for (hl, col) in [(&spec.a_hl, Color::srgb(0.3, 0.85, 1.0)), (&spec.b_hl, Color::srgb(1.0, 0.6, 0.15))] {
+            if let Some((cid, segs)) = hl {
+                draw_hl(&mut overlay, *cid, segs, col);
+            }
+        }
         for (r, col) in [(&spec.a, Color::srgb(0.3, 0.85, 1.0)), (&spec.b, Color::srgb(1.0, 0.6, 0.15))] {
             let Some(r) = r else { continue };
             let Some((p, d)) = mate_ref_world(&asm.0, r) else { continue };
@@ -1107,6 +1275,34 @@ fn sync_asm_ghosts(
     *shown = true;
 }
 
+/// While the Mate PM is open, pre-highlight the face/edge under the cursor (SolidWorks-style
+/// orange glow) so you see exactly what a click would pick — computed with the same
+/// [`mate_pick_at`] the click uses, so the glow never lies.
+fn mate_hover_highlight(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    mode: Res<DocMode>,
+    asm: Res<AsmRes>,
+    render: Res<AsmRender>,
+    mut ui_state: ResMut<UiState>,
+) {
+    if *mode != DocMode::Assembly || ui_state.mate_spec.is_none() || ui_state.explode > 1e-3 {
+        if ui_state.mate_hover.is_some() {
+            ui_state.mate_hover = None;
+        }
+        return;
+    }
+    let hit = (|| {
+        let window = windows.single().ok()?;
+        let cursor = window.cursor_position()?;
+        let (camera, cam_gt) = cam.single().ok()?;
+        let ray = camera.viewport_to_world(cam_gt, cursor).ok()?;
+        let (cid, _r, segs) = mate_pick_at(&asm.0, &render, camera, cam_gt, cursor, &ray)?;
+        Some((cid, segs))
+    })();
+    ui_state.mate_hover = hit;
+}
+
 /// Assembly-mode viewport clicks: select the component under the cursor (nearest hit wins;
 /// empty space clears the selection).
 fn asm_interaction(
@@ -1142,16 +1338,28 @@ fn asm_interaction(
         if !just_pressed {
             return;
         }
-        // Edge pick first: a body edge under the cursor is a more specific target than the
-        // face behind it (a hole's rim → concentric, a straight edge → an alignment axis).
-        // Only when no edge is close enough do we fall through to the face ray-cast below.
-        if let Some((cid, r)) = pick_mate_edge(&asm.0, &render, camera, cam_gt, cursor, 12.0) {
+        // Edge first (a hole's rim → concentric, a straight edge → an alignment axis),
+        // then the face under the cursor. The picked face/edge outline is kept so it
+        // stays lit up in the viewport (A blue, B orange) while the PM is open.
+        if let Some((cid, r, hl)) = mate_pick_at(&asm.0, &render, camera, cam_gt, cursor, &ray) {
             if let Some(spec) = ui_state.mate_spec.as_mut() {
                 match (&spec.a, &spec.b) {
-                    (None, _) => spec.a = Some(r),
-                    (Some(a), None) if a.comp != cid => spec.b = Some(r),
-                    (Some(_), None) => spec.a = Some(r),
-                    (Some(_), Some(_)) => spec.b = Some(r),
+                    (None, _) => {
+                        spec.a = Some(r);
+                        spec.a_hl = Some((cid, hl));
+                    }
+                    (Some(a), None) if a.comp != cid => {
+                        spec.b = Some(r);
+                        spec.b_hl = Some((cid, hl));
+                    }
+                    (Some(_), None) => {
+                        spec.a = Some(r); // same component again → re-pick A
+                        spec.a_hl = Some((cid, hl));
+                    }
+                    (Some(_), Some(_)) => {
+                        spec.b = Some(r); // replace B
+                        spec.b_hl = Some((cid, hl));
+                    }
                 }
                 if spec.auto_kind {
                     if let (Some(a), Some(b)) = (&spec.a, &spec.b) {
@@ -1160,56 +1368,6 @@ fn asm_interaction(
                             (0, 0) => 0, // two planes → coincident
                             _ => 3,      // mixed → parallel
                         };
-                    }
-                }
-            }
-            return;
-        }
-        let mut best: Option<(f32, u64, usize, Vec3)> = None; // (t, comp, tri index, local hit)
-        for comp in &asm.0.components {
-            if comp.hidden {
-                continue;
-            }
-            let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
-            let tf = comp_transform(comp);
-            let inv = tf.compute_affine().inverse();
-            let lo = inv.transform_point3(ray.origin);
-            let ld = inv.transform_vector3(*ray.direction).normalize_or_zero();
-            for (ti, tri) in geom.tri.indices.chunks_exact(3).enumerate() {
-                let a = Vec3::from_array(geom.tri.positions[tri[0] as usize]);
-                let b = Vec3::from_array(geom.tri.positions[tri[1] as usize]);
-                let c = Vec3::from_array(geom.tri.positions[tri[2] as usize]);
-                if let Some(t) = ray_triangle(lo, ld, a, b, c) {
-                    if best.map_or(true, |(bt, _, _, _)| t < bt) {
-                        best = Some((t, comp.id, ti, lo + ld * t));
-                    }
-                }
-            }
-        }
-        if let Some((_, cid, ti, lp)) = best {
-            if let Some(geom) = asm.0.component(cid).and_then(|c| render.cache.get(&asm_geom_key(c))) {
-                let (kind, point, dir) = classify_face_local(&geom.tri, ti, lp);
-                let r = MateRef {
-                    comp: cid,
-                    kind,
-                    point: [point.x as f64, point.y as f64, point.z as f64],
-                    dir: [dir.x as f64, dir.y as f64, dir.z as f64],
-                };
-                if let Some(spec) = ui_state.mate_spec.as_mut() {
-                    match (&spec.a, &spec.b) {
-                        (None, _) => spec.a = Some(r),
-                        (Some(a), None) if a.comp != cid => spec.b = Some(r),
-                        (Some(_), None) => spec.a = Some(r), // same component again → re-pick A
-                        (Some(_), Some(_)) => spec.b = Some(r), // replace B
-                    }
-                    if spec.auto_kind {
-                        if let (Some(a), Some(b)) = (&spec.a, &spec.b) {
-                            spec.kind = match (a.kind, b.kind) {
-                                (1, 1) => 2, // two cylinders → concentric
-                                (0, 0) => 0, // two planes → coincident
-                                _ => 3,      // mixed → parallel
-                            };
-                        }
                     }
                 }
             }
@@ -1841,6 +1999,9 @@ struct UiState {
     asm_return_file: Option<std::path::PathBuf>,
     /// The Mate PM state while it's open (viewport clicks pick faces A then B).
     mate_spec: Option<MateSpec>,
+    /// While the Mate PM is open: the face/edge outline under the cursor (comp id + LOCAL
+    /// segments), pre-highlighted orange so you see exactly what a click will pick.
+    mate_hover: Option<(u64, Vec<[[f32; 3]; 2]>)>,
     /// One-shot: run the mate solver over the assembly.
     asm_solve: bool,
     /// Exploded-view factor (0 = assembled .. 1 = fully spread). Display-only.
@@ -5595,6 +5756,8 @@ fn ui_system(
                 if (spec.a.is_some() || spec.b.is_some()) && ui.small_button("Clear picks").clicked() {
                     spec.a = None;
                     spec.b = None;
+                    spec.a_hl = None;
+                    spec.b_hl = None;
                 }
                 ui.horizontal_wrapped(|ui| {
                     for (k, name) in [(0u8, "Coincident"), (1, "Distance"), (2, "Concentric"), (3, "Parallel")] {
@@ -5720,7 +5883,30 @@ fn ui_system(
                     } else {
                         format!("{kind_name}  {} \u{2194} {}", cname(m.a.comp), cname(m.b.comp))
                     };
-                    let resp = ui.selectable_label(false, egui::RichText::new(label).small());
+                    // Status: measure the mate at the current placements. A mate the solver
+                    // couldn't satisfy reads red, with the miss and the likely reason on hover
+                    // — like the sketch's over-defined diagnostics, so a part that won't seat
+                    // isn't a guessing game.
+                    let res = mate_residual(&asm.0, m);
+                    let ok = res.map_or(true, mate_satisfied);
+                    let mut rt = egui::RichText::new(label).small();
+                    if !ok {
+                        rt = rt.color(egui::Color32::from_rgb(235, 90, 90));
+                    }
+                    let resp = ui.selectable_label(false, rt);
+                    let resp = match res {
+                        Some((ang, dist)) if !ok => {
+                            let both_fixed = asm.0.component(m.a.comp).is_some_and(|c| c.fixed)
+                                && asm.0.component(m.b.comp).is_some_and(|c| c.fixed);
+                            let why = if both_fixed {
+                                "both parts are Fixed — nothing can move to satisfy it"
+                            } else {
+                                "conflicts with other mates (the solver couldn't satisfy them all)"
+                            };
+                            resp.on_hover_text(format!("Not satisfied — off by {:.2}° / {:.2} mm: {why}", ang.to_degrees(), dist))
+                        }
+                        _ => resp,
+                    };
                     resp.context_menu(|ui| {
                         if ui.button("Flip").clicked() {
                             flip_mate = Some(m.id);
@@ -19382,6 +19568,55 @@ mod tests {
         let (kind2, _, dir2) = classify_face_local(tri, cti, cp);
         assert_eq!(kind2, 0, "cap should classify as planar");
         assert!(dir2.z > 0.99, "cap normal should be +Z, got {dir2:?}");
+    }
+
+    #[test]
+    fn mate_residual_flags_conflicts_and_passes_solved_mates() {
+        // A solved coincident mate measures satisfied; adding a CONTRADICTORY second mate on
+        // the same faces (distance 10 where coincident wants 0) leaves at least one of them
+        // measurably unsatisfied — the red-row diagnostic that tells the user *which* mate
+        // is fighting instead of the solver silently giving up.
+        let mut part = Document::with_default_planes();
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("b".into(), String::new(), part.clone(), [3.0, 7.0, 40.0]);
+        let ra = MateRef { comp: a, kind: 0, point: [5.0, 5.0, 5.0], dir: [0.0, 0.0, 1.0] };
+        let rb = MateRef { comp: b, kind: 0, point: [5.0, 5.0, 0.0], dir: [0.0, 0.0, -1.0] };
+        asm.add_mate(0, 0.0, false, ra.clone(), rb.clone());
+        solve_mates(&mut asm);
+        let res = mate_residual(&asm, &asm.mates[0]).expect("residual measures");
+        assert!(mate_satisfied(res), "a cleanly solved mate must read satisfied, got {res:?}");
+
+        // Now the contradiction: the same two faces also demanded 10 mm apart.
+        asm.add_mate(1, 10.0, false, ra, rb);
+        solve_mates(&mut asm);
+        let bad = asm.mates.iter().filter(|m| mate_residual(&asm, m).is_some_and(|r| !mate_satisfied(r))).count();
+        assert!(bad >= 1, "contradictory mates must leave at least one measurably unsatisfied");
+    }
+
+    #[test]
+    fn mate_between_two_fixed_parts_reads_unsatisfied() {
+        // Both parts Fixed with an unmet coincident mate: the solver can't move anything, and
+        // the mate must read unsatisfied (with the both-fixed hint in the UI).
+        let mut part = Document::with_default_planes();
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("b".into(), String::new(), part.clone(), [3.0, 7.0, 40.0]);
+        for c in &mut asm.components {
+            c.fixed = true;
+        }
+        asm.add_mate(
+            0,
+            0.0,
+            false,
+            MateRef { comp: a, kind: 0, point: [5.0, 5.0, 5.0], dir: [0.0, 0.0, 1.0] },
+            MateRef { comp: b, kind: 0, point: [5.0, 5.0, 0.0], dir: [0.0, 0.0, -1.0] },
+        );
+        solve_mates(&mut asm);
+        let res = mate_residual(&asm, &asm.mates[0]).expect("residual measures");
+        assert!(!mate_satisfied(res), "an unmet mate between two Fixed parts must read unsatisfied, got {res:?}");
     }
 
     #[test]
