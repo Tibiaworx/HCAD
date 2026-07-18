@@ -142,6 +142,11 @@ pub enum FeatureKind {
         rot_deg: [f64; 3],
         #[serde(default)]
         offset: [f64; 3],
+        /// Voxel-remesh resolution for making a non-manifold scan cuttable. 0 = off (use the
+        /// raw+repaired mesh); >0 = rebuild as a watertight solid at this voxel resolution
+        /// (voxels on the longest axis). Lossy but robust — the fix for cutting into scans.
+        #[serde(default)]
+        solidify: u32,
     },
     /// An imported triangle mesh as **reference only** — a 3D scan to build parts onto or
     /// reverse-engineer. Renders as a translucent ghost, contributes NOTHING to the solid,

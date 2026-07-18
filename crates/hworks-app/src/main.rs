@@ -26,7 +26,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, M
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, repair_mesh, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -2483,7 +2483,7 @@ struct RefMeshEnt {
 /// result still lands, then a fresh rebuild starts from the newest document.
 #[derive(Resource, Default)]
 struct RegenJob {
-    task: Option<bevy::tasks::Task<(Option<(Tessellation, Vec<[[f32; 3]; 2]>)>, u32)>>,
+    task: Option<bevy::tasks::Task<(Option<(Tessellation, Vec<[[f32; 3]; 2]>)>, u32, u32)>>,
     rerun: bool,
 }
 
@@ -5293,13 +5293,13 @@ fn ui_system(
         // and ×1000 (metre) fix-ups are the first thing many imports need.
         if let Some(idx) = ui_state.mesh_edit {
             let cur = doc.0.features.get(idx).and_then(|f| match &f.kind {
-                FeatureKind::ImportMesh { name, scale, rot_deg, offset, .. } => Some((name.clone(), *scale, *rot_deg, *offset, None, None)),
+                FeatureKind::ImportMesh { name, scale, rot_deg, offset, solidify, .. } => Some((name.clone(), *scale, *rot_deg, *offset, None, None, Some(*solidify))),
                 FeatureKind::RefMesh { name, scale, rot_deg, offset, opacity, section_tol, .. } => {
-                    Some((name.clone(), *scale, *rot_deg, *offset, Some(*opacity), Some(*section_tol)))
+                    Some((name.clone(), *scale, *rot_deg, *offset, Some(*opacity), Some(*section_tol), None))
                 }
                 _ => None,
             });
-            if let Some((name, mut scale, mut rot_deg, mut offset, mut opacity, mut section_tol)) = cur {
+            if let Some((name, mut scale, mut rot_deg, mut offset, mut opacity, mut section_tol, mut solidify)) = cur {
                 ui.heading(if opacity.is_some() { "Reference Mesh" } else { "Imported Mesh" });
                 let mut close = false;
                 let mut delete = false;
@@ -5441,14 +5441,47 @@ fn ui_system(
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Sketch on any plane through the scan to trace its cross-section.").italics().weak().small());
                 }
+                // Solidify (editable imports only): voxel-remesh a non-manifold scan into a
+                // watertight solid so it can be CUT. Off by default (it's lossy); the fix when
+                // an extrude cut won't apply to a scan.
+                if let Some(res) = solidify.as_mut() {
+                    ui.separator();
+                    let mut on = *res > 0;
+                    if ui
+                        .checkbox(&mut on, "Solidify for cutting")
+                        .on_hover_text("Rebuild this mesh as a watertight solid (voxel remesh) so extrude-cuts work.\nNeeded for scans, which aren't closed solids. Lossy — higher resolution keeps more detail.")
+                        .changed()
+                    {
+                        *res = if on { 128 } else { 0 };
+                        changed = true;
+                    }
+                    if *res > 0 {
+                        ui.horizontal(|ui| {
+                            ui.label("Resolution");
+                            let mut r = *res;
+                            if ui
+                                .add(egui::Slider::new(&mut r, 48..=256).suffix(" vox"))
+                                .on_hover_text("Voxels along the longest side. Higher = finer detail but slower and heavier.")
+                                .changed()
+                            {
+                                *res = r;
+                                changed = true;
+                            }
+                        });
+                        ui.label(egui::RichText::new("Higher resolution = more detail, slower rebuild.").italics().weak().small());
+                    }
+                }
                 if changed {
                     let is_import = opacity.is_none();
                     if let Some(f) = doc.0.features.get_mut(idx) {
                         match &mut f.kind {
-                            FeatureKind::ImportMesh { scale: s, rot_deg: r, offset: o, .. } => {
+                            FeatureKind::ImportMesh { scale: s, rot_deg: r, offset: o, solidify: sv, .. } => {
                                 *s = scale;
                                 *r = rot_deg;
                                 *o = offset;
+                                if let Some(new_sv) = solidify {
+                                    *sv = new_sv;
+                                }
                             }
                             FeatureKind::RefMesh { scale: s, rot_deg: r, offset: o, opacity: op, section_tol: st, .. } => {
                                 *s = scale;
@@ -9294,8 +9327,8 @@ fn sketch_interaction(
         if buttons.just_pressed(MouseButton::Left) {
             if let (Some(cursor), Some(idx)) = (window.cursor_position(), ui_state.mesh_edit) {
                 let placed = doc.0.features.get(idx).and_then(|f| match &f.kind {
-                    FeatureKind::ImportMesh { data, scale, rot_deg, offset, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, true),
-                    FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, false),
+                    FeatureKind::ImportMesh { data, scale, rot_deg, offset, solidify, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, true, *solidify),
+                    FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0),
                     _ => None,
                 });
                 if let Some(hit) = placed.and_then(|m| pick_face_point(&m, camera, cam_gt, cursor).map(|(h, _)| h)) {
@@ -9326,7 +9359,7 @@ fn sketch_interaction(
                         if f.hidden {
                             continue;
                         }
-                        if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false) {
+                        if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0) {
                             if let Some((hit, _)) = pick_face_point(&m, camera, cam_gt, cursor) {
                                 let d = cam_gt.translation().distance(hit);
                                 if best.is_none_or(|(bd, _)| d < bd) {
@@ -9506,7 +9539,7 @@ fn sketch_interaction(
                         continue;
                     }
                     let mut raw_uv: Vec<[[f32; 2]; 2]> = Vec::new();
-                    if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false) {
+                    if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0) {
                         for s in mesh_plane_section(&m, ap.origin.to_array(), ap.n.to_array()) {
                             let uv = |w: [f32; 3]| {
                                 let d = Vec3::from_array(w) - ap.origin;
@@ -13452,7 +13485,7 @@ fn handle_file_io(
                                     6.0,
                                 ));
                             }
-                            doc.0.add_feature(FeatureKind::ImportMesh { data, name: name.clone(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3] });
+                            doc.0.add_feature(FeatureKind::ImportMesh { data, name: name.clone(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3], solidify: 0 });
                             ui_state.toasts.push((format!("Imported {name} ({} triangles)", mesh.indices.len() / 3), 3.0));
                         }
                         // Open the mesh PM right away — the first thing most imports need
@@ -14163,7 +14196,7 @@ fn decode_mesh_blob(b64: &str) -> Option<Vec<u8>> {
 /// (XYZ Euler about the origin, degrees), then offset — memoized by content+placement hash:
 /// scans are large and `regenerate_mesh` replays the whole timeline on every edit, so
 /// decompressing/parsing megabytes per regen would make editing crawl. Small bounded cache.
-fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3], repair: bool) -> Option<TriMesh> {
+fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3], repair: bool, solidify: u32) -> Option<TriMesh> {
     use std::hash::{Hash, Hasher};
     static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, TriMesh>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -14171,6 +14204,7 @@ fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3
     data.hash(&mut h);
     scale.to_bits().hash(&mut h);
     repair.hash(&mut h);
+    solidify.hash(&mut h);
     for v in rot_deg.iter().chain(offset.iter()) {
         v.to_bits().hash(&mut h);
     }
@@ -14180,7 +14214,11 @@ fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3
     }
     let stl = decode_mesh_blob(data)?;
     let mut m = import_stl(&stl)?;
-    if repair {
+    if solidify > 0 {
+        // Voxel-remesh into a watertight solid — the robust fix for cutting a scan that
+        // isn't manifold. Falls back to the raw mesh if the remesh degenerates.
+        m = remesh_solid(&m, solidify as usize).unwrap_or(m);
+    } else if repair {
         // Editable imports go through booleans, which need closed meshes — always run the
         // conservative repair (a clean mesh passes through topologically unchanged).
         m = repair_mesh(&m).0;
@@ -14227,8 +14265,8 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
             FeatureKind::RefMesh { .. } => {}
             // An imported mesh IS a body: first feature becomes the body, later ones union in
             // (like a boss) — everything downstream then cuts/fillets/booleans it normally.
-            FeatureKind::ImportMesh { data, name, scale, rot_deg, offset } => {
-                match import_mesh_cached(data, *scale, *rot_deg, *offset, true) {
+            FeatureKind::ImportMesh { data, name, scale, rot_deg, offset, solidify } => {
+                match import_mesh_cached(data, *scale, *rot_deg, *offset, true, *solidify) {
                     Some(m) => {
                         feat_tools.insert(fi, (vec![m.clone()], false));
                         body = Some(match body.take() {
@@ -14768,6 +14806,7 @@ fn do_regenerate(
             let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc_clone)))
                 .unwrap_or(None);
             let fallbacks = take_fallback_count(); // booleans Manifold couldn't do (→ lossy BSP)
+            let dense_skips = take_dense_skip_count(); // cuts skipped: mesh too dense + not solid
             // Tessellation + seam clipping are heavy too — keep them off-thread. (Seam edges:
             // the face-boundary detector reports every real sharp edge; the bevel's own edges
             // cover a fillet's tangent boundary — clipped to the final surface so a later cut
@@ -14777,7 +14816,7 @@ fn do_regenerate(
                 let seams = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
                 (tess, seams)
             });
-            (out, fallbacks)
+            (out, fallbacks, dense_skips)
         }));
         return;
     }
@@ -14889,7 +14928,7 @@ fn finish_regen_job(
     existing: Query<Entity, With<SolidPart>>,
 ) {
     let Some(task) = job.task.as_mut() else { return };
-    let Some((result, fallbacks)) =
+    let Some((result, fallbacks, dense_skips)) =
         bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))
     else {
         return; // still crunching — UI keeps running
@@ -14912,10 +14951,18 @@ fn finish_regen_job(
             part.tangent_edges = tess.tangent_edges.clone();
             spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
             part.solid = None; // mesh body has no B-rep handle
-            ui_state.last_error = (fallbacks > 0).then(|| {
-                warn!("{fallbacks} boolean(s) fell back to the lossy BSP CSG — surface may be torn.");
-                format!("⚠ {fallbacks} boolean(s) used the lossy fallback (Manifold rejected them) — the surface may be torn. Likely an exact tangent/coincident face: check the revolve axis is centred and the profile isn't flush with the boss wall.")
-            });
+            // A dense-skip means a cut couldn't apply because the imported mesh isn't a closed
+            // solid — point the user at Solidify (the actionable fix) rather than the generic
+            // torn-surface warning.
+            ui_state.last_error = if dense_skips > 0 {
+                warn!("{dense_skips} boolean(s) skipped — imported mesh isn't a closed solid.");
+                Some("⚠ The cut couldn't apply — this imported mesh isn't a closed solid. Open its mesh properties and turn on \"Solidify for cutting\" to make it cuttable.".to_string())
+            } else {
+                (fallbacks > 0).then(|| {
+                    warn!("{fallbacks} boolean(s) fell back to the lossy BSP CSG — surface may be torn.");
+                    format!("⚠ {fallbacks} boolean(s) used the lossy fallback (Manifold rejected them) — the surface may be torn. Likely an exact tangent/coincident face: check the revolve axis is centred and the profile isn't flush with the boss wall.")
+                })
+            };
         }
         None => {
             part.solid = None;
@@ -16756,7 +16803,7 @@ fn sync_ref_meshes(
             if keep.contains(&f.id.0) {
                 continue;
             }
-            let Some(tri) = import_mesh_cached(data, *scale, *rot_deg, *offset, false) else {
+            let Some(tri) = import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0) else {
                 warn!("Reference mesh {name}: could not decode the embedded data.");
                 continue;
             };
@@ -19122,7 +19169,7 @@ mod tests {
         // Arbitrary initial placement.
         let rot0 = [31.0, -14.0, 57.0];
         let off0 = [3.0, -7.0, 11.0];
-        let placed = import_mesh_cached(&blob, 1.0, rot0, off0, true).expect("placed");
+        let placed = import_mesh_cached(&blob, 1.0, rot0, off0, true, 0).expect("placed");
         // "Pick" three points on the placed top face (local z = 20): transform three local
         // face points through the same placement the app uses.
         let place = |local: [f32; 3]| {
@@ -19164,7 +19211,7 @@ mod tests {
         assert!((d(q1, q2) - d(picks[0], picks[1])).abs() < 1e-3);
         assert!((d(q2, q3) - d(picks[1], picks[2])).abs() < 1e-3);
         // The whole placed cube keeps its volume through the align.
-        let placed2 = import_mesh_cached(&blob, 1.0, rot1, off1, true).expect("re-placed");
+        let placed2 = import_mesh_cached(&blob, 1.0, rot1, off1, true, 0).expect("re-placed");
         assert!((mesh_volume(&placed2) - mesh_volume(&placed)).abs() < mesh_volume(&placed) * 0.01);
     }
 
@@ -19178,13 +19225,13 @@ mod tests {
         let stl = export_stl(&cube);
         let blob = encode_mesh_blob(&stl);
         assert_eq!(decode_mesh_blob(&blob).expect("decode"), stl, "blob must roundtrip byte-exactly");
-        let m1 = import_mesh_cached(&blob, 1.0, [0.0; 3], [0.0; 3], true).expect("parse at 1×");
-        let m2 = import_mesh_cached(&blob, 2.0, [0.0; 3], [0.0; 3], true).expect("parse at 2×");
+        let m1 = import_mesh_cached(&blob, 1.0, [0.0; 3], [0.0; 3], true, 0).expect("parse at 1×");
+        let m2 = import_mesh_cached(&blob, 2.0, [0.0; 3], [0.0; 3], true, 0).expect("parse at 2×");
         let (v1, v2) = (mesh_volume(&m1), mesh_volume(&m2));
         assert!((v1 - 8000.0).abs() < 8000.0 * 0.01, "20mm cube volume, got {v1:.1}");
         assert!((v2 - 8.0 * v1).abs() < v2 * 0.01, "2× scale should give 8× the volume, got {v2:.1}");
         // Placement: rotate 90° about X (cube z∈[0,20] → y∈[-20,0]) then move +5 in x.
-        let m3 = import_mesh_cached(&blob, 1.0, [90.0, 0.0, 0.0], [5.0, 0.0, 0.0], true).expect("placed");
+        let m3 = import_mesh_cached(&blob, 1.0, [90.0, 0.0, 0.0], [5.0, 0.0, 0.0], true, 0).expect("placed");
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &m3.positions {
             for k in 0..3 {
@@ -19208,7 +19255,7 @@ mod tests {
         let blob = encode_mesh_blob(&export_stl(&cube));
 
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::ImportMesh { data: blob.clone(), name: "cube".into(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3] });
+        doc.add_feature(FeatureKind::ImportMesh { data: blob.clone(), name: "cube".into(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3], solidify: 0 });
         let (body, _) = regenerate_mesh(&doc).expect("import regenerates");
         let v = mesh_volume(&body);
         assert!((v - 8000.0).abs() < 8000.0 * 0.01, "imported cube volume, got {v:.1}");
@@ -19244,6 +19291,83 @@ mod tests {
         ref_doc.add_feature(FeatureKind::RefMesh { data: blob, name: "scan".into(), scale: 1.0, opacity: 0.35, rot_deg: [0.0; 3], offset: [0.0; 3], section_tol: 0.05 });
         assert!(regenerate_mesh(&ref_doc).is_none() || regenerate_mesh(&ref_doc).unwrap().0.positions.is_empty(),
             "a reference scan must not produce a body");
+    }
+
+    /// The scan-cutting fix, end to end through `regenerate_mesh`: an OPEN (non-manifold)
+    /// import can't be cut and leaves the body uncut with a dense-skip recorded; turning on
+    /// `solidify` rebuilds it watertight so the very same cut applies. This is the exact flow
+    /// a user hits when an extrude-cut won't bite into a scan.
+    #[test]
+    fn solidify_makes_a_nonmanifold_import_cuttable() {
+        // A closed box's surface, densely subdivided and with its top removed → open, and big
+        // enough (>20k tris) to trip the dense-skip guard instead of the BSP grind.
+        let g = 72usize;
+        let mut open = TriMesh::default();
+        let s = 10.0f32;
+        let push = |m: &mut TriMesh, a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            let base = m.positions.len() as u32;
+            for p in [a, b, c] {
+                m.positions.push(p);
+                m.normals.push([0.0, 0.0, 1.0]);
+            }
+            m.indices.extend([base, base + 1, base + 2]);
+        };
+        // Six faces of a cube [-s,s]³, each an g×g grid — but SKIP the +Z (top) face so it's open.
+        let faces: [(usize, f32); 5] = [(2, -s), (0, -s), (0, s), (1, -s), (1, s)]; // axis, level (z-top omitted)
+        for (axis, level) in faces {
+            let (u_ax, v_ax) = ((axis + 1) % 3, (axis + 2) % 3);
+            for i in 0..g {
+                for j in 0..g {
+                    let corner = |di: usize, dj: usize| {
+                        let mut p = [0.0f32; 3];
+                        p[axis] = level;
+                        p[u_ax] = -s + 2.0 * s * (i + di) as f32 / g as f32;
+                        p[v_ax] = -s + 2.0 * s * (j + dj) as f32 / g as f32;
+                        p
+                    };
+                    push(&mut open, corner(0, 0), corner(1, 0), corner(1, 1));
+                    push(&mut open, corner(0, 0), corner(1, 1), corner(0, 1));
+                }
+            }
+        }
+        assert!(open.indices.len() / 3 > 20_000, "must exceed the dense-skip guard");
+        assert!(!is_manifold(&open), "open box is non-manifold");
+        let blob = encode_mesh_blob(&export_stl(&open));
+
+        // Build a cut that would remove a corner.
+        let cut_sq = [[0.0, 0.0], [12.0, 0.0], [12.0, 12.0], [0.0, 12.0]];
+        let mk_cut = || {
+            let mut sk = Sketch::default();
+            let p: Vec<usize> = cut_sq.iter().map(|q| sk.add_point(q[0], q[1])).collect();
+            for k in 0..4 {
+                sk.add_line(p[k], p[(k + 1) % 4], false);
+            }
+            FeatureKind::Cut { sketch: sk, regions: vec![0], plane: standard_plane_ref(0), distance: 30.0, back: 30.0, thin: 0.0, thin_side: 0 }
+        };
+
+        // solidify = 0: the cut can't apply (dense non-manifold) → skip recorded, body ≈ uncut.
+        let _ = take_dense_skip_count();
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::ImportMesh { data: blob.clone(), name: "scan".into(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3], solidify: 0 });
+        doc.add_feature(mk_cut());
+        let raw = regenerate_mesh(&doc).map(|(m, _)| m);
+        assert!(take_dense_skip_count() >= 1, "the cut on a non-solid dense mesh must be skipped, not run through BSP");
+
+        // The unsolidified cut returned the base unchanged (skip), not an empty/garbage body.
+        assert!(raw.is_some_and(|m| !m.positions.is_empty()), "skipped cut keeps the body, doesn't clear it");
+
+        // solidify = 64: the import becomes watertight, the SAME cut now applies and removes material.
+        let _ = take_dense_skip_count();
+        let mut doc2 = Document::with_default_planes();
+        doc2.add_feature(FeatureKind::ImportMesh { data: blob, name: "scan".into(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3], solidify: 64 });
+        let (solid, _) = regenerate_mesh(&doc2).expect("solidified import regenerates");
+        assert!(is_manifold(&solid), "solidified import is manifold");
+        let v_solid = mesh_volume(&solid);
+        doc2.add_feature(mk_cut());
+        let (cut, _) = regenerate_mesh(&doc2).expect("cut applies after solidify");
+        assert_eq!(take_dense_skip_count(), 0, "a solidified body must actually cut");
+        assert!(is_manifold(&cut), "cut result stays manifold");
+        assert!(mesh_volume(&cut) < v_solid * 0.98, "the cut must remove material after solidify ({v_solid:.0} → {:.0})", mesh_volume(&cut));
     }
 
     /// A thin-feature extrude of a square profile must produce a hollow box shell whose volume is the

@@ -36,6 +36,31 @@ Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is mem
 - **Section fit tolerance** slider (scan PM, 0.01–1 mm log scale, per scan): coarse for
   noisy scans → fewer, smoother fitted shapes; each scan fits with its own tolerance.
 
+**Cutting into scans / dense meshes (2026-07):**
+- **Root cause found**: a real scan (e.g. `saved files/0707_01_mesh.stl`, 149k tris) has
+  hundreds of non-manifold edges + holes, so Manifold declines every boolean and the cut
+  fell back to the O(n²) BSP CSG — a multi-minute grind that looked like a hang.
+- **Guard (A)**: when Manifold declines and the combined operand is dense (`BSP_MAX_TRIS` =
+  20k tris), the boolean now SKIPS BSP entirely, returns the base uncut, and bumps a
+  dense-skip counter. The app turns that into an actionable banner pointing at Solidify —
+  instant honest failure instead of a hang.
+- **Solidify (B)**: `remesh_solid` voxel-remeshes a mesh into a guaranteed watertight
+  2-manifold solid (rasterize → morphological close → flood-fill inside/outside → signed
+  distance field → Manifold `from_sdf` level-set surfacer). Exposed as "Solidify for
+  cutting" in the mesh PM (`ImportMesh.solidify` = voxel resolution, 0 = off). Once on, the
+  scan cuts via the fast Manifold path. Lossy (resolution-limited); default 128 vox.
+  Measured: the cat becomes manifold at res 96 in ~1.4s, res 160 in ~3.8s.
+
+**Solidify — remaining edges.**
+- Holes larger than the 1-voxel morphological close leak the flood fill (interior lost);
+  raise resolution or pre-repair. A generalized-winding-number fill would be hole-robust.
+- Output triangle count is high (res 96 → ~275k for the cat); a decimation pass on the
+  remesh output, or a coarser `from_sdf` edge_length, would trim it.
+- Remesh re-runs on any placement change (cached by full key incl. rot/offset); could cache
+  the shape separately from placement so a move doesn't re-voxelize.
+- Sharp edges soften at the voxel scale (inherent to voxel remesh); fine for organic scans,
+  less so for mechanical parts — those usually import clean and don't need Solidify anyway.
+
 **Responsiveness (2026-07):**
 - Mesh-kernel rebuilds (Seamless / fillets / imports) run on a **background thread**
   (`RegenJob` + `finish_regen_job`): the old body stays visible and interactive, a status-bar

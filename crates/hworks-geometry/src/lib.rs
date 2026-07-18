@@ -17,7 +17,7 @@ mod fillet;
 mod mesh_bool;
 pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_and_edges, bevel_mesh_selected};
 pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
-pub use mesh_bool::{feature_edges_by_face, is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, take_fallback_count};
+pub use mesh_bool::{feature_edges_by_face, is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, remesh_solid, take_dense_skip_count, take_fallback_count};
 
 /// A tessellated triangle mesh handed up to the renderer.
 #[derive(Debug, Default, Clone)]
@@ -2407,6 +2407,39 @@ pub fn shell_tool(body: &TriMesh, thickness: f64, open: &[([f64; 3], [f64; 3])],
 mod tests {
     use super::*;
 
+    /// Diagnostic: load a real scan and report why it won't cut. Run with:
+    ///   cargo test -p hworks-geometry diag_scan_topology -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_scan_topology() {
+        let path = std::env::var("HCAD_STL").unwrap_or_else(|_| "../../saved files/0707_01_mesh.stl".to_string());
+        let bytes = std::fs::read(&path).expect("read STL");
+        let m = import_stl(&bytes).expect("parse STL");
+        let (v, t, bnd, nonman) = crate::mesh_bool::weld_edge_stats(&m);
+        eprintln!("RAW: {} tris | welded {v} verts, {t} tris | boundary edges {bnd} | non-manifold edges {nonman}", m.indices.len() / 3);
+        eprintln!("RAW is_manifold (Manifold ingest): {}", is_manifold(&m));
+        let t0 = std::time::Instant::now();
+        let (r, rep) = repair_mesh(&m);
+        eprintln!("repair took {:?}: {rep:?}", t0.elapsed());
+        let (v2, t2, bnd2, nonman2) = crate::mesh_bool::weld_edge_stats(&r);
+        eprintln!("REPAIRED: welded {v2} verts, {t2} tris | boundary edges {bnd2} | non-manifold edges {nonman2}");
+        eprintln!("REPAIRED is_manifold: {}", is_manifold(&r));
+        for res in [96usize, 160] {
+            let t1 = std::time::Instant::now();
+            match remesh_solid(&m, res) {
+                Some(s) => {
+                    eprintln!(
+                        "REMESH res={res}: {} tris in {:?} | is_manifold {}",
+                        s.indices.len() / 3,
+                        t1.elapsed(),
+                        is_manifold(&s)
+                    );
+                }
+                None => eprintln!("REMESH res={res}: FAILED"),
+            }
+        }
+    }
+
     fn xy_plane() -> PlaneBasis {
         PlaneBasis {
             origin: [0.0, 0.0, 0.0],
@@ -2569,6 +2602,101 @@ mod tests {
         assert!((total - 80.0).abs() < 0.5, "section length {total:.2} should be the 80 mm perimeter");
         // Off the body entirely → nothing.
         assert!(mesh_plane_section(&cube, [0.0, 0.0, 50.0], [0.0, 0.0, 1.0]).is_empty());
+    }
+
+    /// A dense NON-manifold mesh (an open subdivided sheet, >20k tris) must NOT drag the cut
+    /// into the O(n²) BSP fallback — the boolean skips it, returns the base unchanged, and
+    /// bumps the dense-skip counter so the app can warn instead of hanging.
+    #[test]
+    fn dense_nonmanifold_cut_skips_bsp_instead_of_hanging() {
+        // A flat sheet subdivided into a grid — all boundary edges, so Manifold declines it.
+        let g = 120usize; // 2*g*g = 28 800 triangles > BSP_MAX_TRIS
+        let mut sheet = TriMesh::default();
+        let step = 1.0f32;
+        let vid = |x: usize, y: usize| (y * (g + 1) + x) as u32;
+        for y in 0..=g {
+            for x in 0..=g {
+                sheet.positions.push([x as f32 * step, y as f32 * step, 0.0]);
+                sheet.normals.push([0.0, 0.0, 1.0]);
+            }
+        }
+        for y in 0..g {
+            for x in 0..g {
+                sheet.indices.extend([vid(x, y), vid(x + 1, y), vid(x + 1, y + 1)]);
+                sheet.indices.extend([vid(x, y), vid(x + 1, y + 1), vid(x, y + 1)]);
+            }
+        }
+        assert!(sheet.indices.len() / 3 > 20_000, "sheet must exceed the BSP guard");
+        assert!(!is_manifold(&sheet), "an open sheet isn't manifold");
+        let _ = take_dense_skip_count(); // clear
+        // A tool box overlapping the sheet.
+        let sq = [[10.0, 10.0], [40.0, 10.0], [40.0, 40.0], [10.0, 40.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, -5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let tool = extrude_tool_mesh(&sq, &[], &basis, 0.0, 10.0).expect("tool");
+        let t0 = std::time::Instant::now();
+        let out = mesh_difference(&sheet, &tool);
+        let elapsed = t0.elapsed();
+        assert!(elapsed.as_secs() < 2, "must fail fast, not grind BSP (took {elapsed:?})");
+        assert_eq!(out.indices.len(), sheet.indices.len(), "base returned unchanged");
+        assert_eq!(take_dense_skip_count(), 1, "the skip must be recorded for the app to warn");
+    }
+
+    /// `remesh_solid` must turn a non-manifold/open mesh into a watertight solid that CUTS via
+    /// the fast Manifold path: remesh an open box, confirm it's manifold, then difference a
+    /// tool through it and confirm the volume actually dropped (the cut applied, no skip).
+    #[test]
+    fn remesh_solid_makes_an_open_mesh_cuttable() {
+        // A cube with its top face removed → open (boundary loop) → non-manifold.
+        let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
+        // Drop triangles whose all-three vertices sit on the top plane (z ≈ 20).
+        let mut open = TriMesh::default();
+        for t in cube.indices.chunks_exact(3) {
+            let ps = [cube.positions[t[0] as usize], cube.positions[t[1] as usize], cube.positions[t[2] as usize]];
+            if ps.iter().all(|p| (p[2] - 20.0).abs() < 1e-3) {
+                continue; // this is a top-face triangle — remove it
+            }
+            let base = open.positions.len() as u32;
+            for p in ps {
+                open.positions.push(p);
+                open.normals.push([0.0, 0.0, 1.0]);
+            }
+            open.indices.extend([base, base + 1, base + 2]);
+        }
+        assert!(!is_manifold(&open), "the open-topped box must be non-manifold");
+
+        let solid = remesh_solid(&open, 40).expect("remesh");
+        assert!(is_manifold(&solid), "remeshed body must be a clean manifold");
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let p = |i: u32| {
+                    let q = m.positions[i as usize];
+                    [q[0] as f64, q[1] as f64, q[2] as f64]
+                };
+                let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                v += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2]) + a[2] * (b[0] * c[1] - c[0] * b[1])) / 6.0;
+            }
+            v.abs()
+        };
+        // The remeshed box should be a FILLED solid roughly the size of the 20³ = 8000 cube.
+        // A coarse voxel remesh (res 40) doesn't preserve volume precisely — it inflates by
+        // ~1 voxel/side (close + level-set bias) — so the band is wide on purpose; the point
+        // is "closed and roughly right-sized", not metrology. Accuracy improves with res.
+        let vs = vol(&solid);
+        assert!(vs > 8000.0 * 0.6 && vs < 8000.0 * 1.7, "remeshed volume {vs:.0} near 8000");
+
+        // Now CUT it — a tool box removing a corner — and confirm the volume dropped (cut
+        // applied via Manifold) with no dense-skip.
+        let _ = take_dense_skip_count();
+        let tsq = [[0.0, 0.0], [12.0, 0.0], [12.0, 12.0], [0.0, 12.0]];
+        let tbasis = PlaneBasis { origin: [0.0, 0.0, -1.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let tool = extrude_tool_mesh(&tsq, &[], &tbasis, 0.0, 25.0).expect("tool");
+        let cut = mesh_difference(&solid, &tool);
+        assert_eq!(take_dense_skip_count(), 0, "a manifold body must cut, not skip");
+        assert!(is_manifold(&cut), "cut result stays manifold");
+        assert!(vol(&cut) < vs * 0.95, "the cut must actually remove material ({:.0} → {:.0})", vs, vol(&cut));
     }
 
     /// Repair must close a punctured cube: delete two triangles (one quad face hole), then

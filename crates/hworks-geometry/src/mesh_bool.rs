@@ -307,9 +307,32 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     None
 }
 
+/// Above this combined triangle count, the O(n²)-ish BSP CSG fallback is a multi-minute
+/// grind (or an OOM) that looks like a hang — so when Manifold declines a dense operand we
+/// SKIP the BSP entirely and count it (see [`take_dense_skip_count`]). The app turns that
+/// count into "this mesh isn't a closed solid — Solidify it to cut" rather than freezing.
+const BSP_MAX_TRIS: usize = 20_000;
+
+/// Count of booleans SKIPPED because Manifold declined a mesh too dense for the BSP fallback.
+static DENSE_SKIPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Read and reset the dense-skip counter (booleans skipped to avoid a BSP hang on a big
+/// non-manifold mesh). The app warns the user and points them at Solidify.
+pub fn take_dense_skip_count() -> u32 {
+    DENSE_SKIPS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn too_dense_for_bsp(a: &TriMesh, b: &TriMesh) -> bool {
+    (a.indices.len() + b.indices.len()) / 3 > BSP_MAX_TRIS
+}
+
 /// Boolean **union** of two triangle meshes (Manifold; lossy BSP CSG fallback as last resort).
 pub fn mesh_union(a: &TriMesh, b: &TriMesh) -> TriMesh {
     manifold_boolean(a, b, Op::Union).unwrap_or_else(|| {
+        if too_dense_for_bsp(a, b) {
+            DENSE_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return a.clone(); // don't grind BSP on a dense mesh — keep the base, warn upstream
+        }
         BSP_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         csg::bsp_union(a, b)
     })
@@ -318,6 +341,10 @@ pub fn mesh_union(a: &TriMesh, b: &TriMesh) -> TriMesh {
 /// Boolean **difference** `a − b` of two triangle meshes (Manifold; lossy BSP CSG last resort).
 pub fn mesh_difference(a: &TriMesh, b: &TriMesh) -> TriMesh {
     manifold_boolean(a, b, Op::Difference).unwrap_or_else(|| {
+        if too_dense_for_bsp(a, b) {
+            DENSE_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return a.clone(); // cut can't apply to a non-solid dense mesh — keep the base uncut
+        }
         BSP_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         csg::bsp_difference(a, b)
     })
@@ -326,6 +353,240 @@ pub fn mesh_difference(a: &TriMesh, b: &TriMesh) -> TriMesh {
 /// Boolean **intersection** `a ∩ b` of two triangle meshes (Manifold; empty on failure).
 pub fn mesh_intersection(a: &TriMesh, b: &TriMesh) -> TriMesh {
     manifold_boolean(a, b, Op::Intersection).unwrap_or_default()
+}
+
+/// Voxel-remesh a triangle mesh into a **watertight, 2-manifold solid** so a scan (or any
+/// non-manifold soup) can be cut. `res` is the voxel count on the longest bounding-box axis
+/// (≈ 64 fast/coarse … 256 slow/fine). Pipeline: rasterize the surface into an occupancy grid
+/// → morphological close (seal small holes) → flood-fill outside → fill the interior → signed
+/// distance transform → hand the SDF to Manifold's level-set surfacer (guaranteed-manifold
+/// output). Lossy (resolution-limited, softens sharp detail), which is the right trade for
+/// making a scan solid. `None` on a degenerate/empty mesh.
+pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
+    if m.indices.len() < 3 || m.positions.is_empty() {
+        return None;
+    }
+    let res = res.clamp(16, 400);
+    // Padded bounding box (2-voxel margin so the surface never touches the grid border —
+    // the flood fill needs a guaranteed-outside shell of empty voxels).
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let extent = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let longest = extent[0].max(extent[1]).max(extent[2]);
+    if !(longest.is_finite() && longest > 0.0) {
+        return None;
+    }
+    let h = longest / res as f32; // voxel size
+    let pad = 3;
+    let origin = [lo[0] - pad as f32 * h, lo[1] - pad as f32 * h, lo[2] - pad as f32 * h];
+    let dim = |e: f32| ((e / h).ceil() as usize) + 2 * pad + 1;
+    let (nx, ny, nz) = (dim(extent[0]), dim(extent[1]), dim(extent[2]));
+    let n = nx * ny * nz;
+    // Guard against a pathological grid (a very thin, huge part at high res).
+    if n > 64_000_000 {
+        return None;
+    }
+    let at = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
+    let vox = |p: [f32; 3]| {
+        [
+            ((p[0] - origin[0]) / h) as i64,
+            ((p[1] - origin[1]) / h) as i64,
+            ((p[2] - origin[2]) / h) as i64,
+        ]
+    };
+
+    // 1) Rasterize the surface: sample each triangle on a barycentric grid fine enough that
+    // consecutive samples are ≤ 1 voxel apart, marking each sample's voxel as wall.
+    let mut wall = vec![false; n];
+    for t in m.indices.chunks_exact(3) {
+        let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+        let elen = |p: [f32; 3], q: [f32; 3]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+        let steps = ((elen(a, b).max(elen(a, c)).max(elen(b, c)) / h).ceil() as usize + 1).max(1);
+        for i in 0..=steps {
+            for j in 0..=(steps - i) {
+                let (u, v) = (i as f32 / steps as f32, j as f32 / steps as f32);
+                let p = [
+                    a[0] + (b[0] - a[0]) * u + (c[0] - a[0]) * v,
+                    a[1] + (b[1] - a[1]) * u + (c[1] - a[1]) * v,
+                    a[2] + (b[2] - a[2]) * u + (c[2] - a[2]) * v,
+                ];
+                let g = vox(p);
+                if (0..3).all(|k| g[k] >= 0) {
+                    let (x, y, z) = (g[0] as usize, g[1] as usize, g[2] as usize);
+                    if x < nx && y < ny && z < nz {
+                        wall[at(x, y, z)] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Morphological close: dilate the wall by 1 voxel (seals holes/cracks up to ~2 voxels
+    // wide, the common scan defect), so the flood fill can't leak through a hole.
+    let dilate = |src: &[bool]| {
+        let mut out = src.to_vec();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if src[at(x, y, z)] {
+                        continue;
+                    }
+                    let near = (x > 0 && src[at(x - 1, y, z)])
+                        || (x + 1 < nx && src[at(x + 1, y, z)])
+                        || (y > 0 && src[at(x, y - 1, z)])
+                        || (y + 1 < ny && src[at(x, y + 1, z)])
+                        || (z > 0 && src[at(x, y, z - 1)])
+                        || (z + 1 < nz && src[at(x, y, z + 1)]);
+                    if near {
+                        out[at(x, y, z)] = true;
+                    }
+                }
+            }
+        }
+        out
+    };
+    let wall_d = dilate(&wall);
+
+    // 3) Flood-fill "outside" from the (guaranteed-empty) corner through non-wall voxels.
+    let mut outside = vec![false; n];
+    let mut stack = vec![at(0, 0, 0)];
+    outside[at(0, 0, 0)] = true;
+    while let Some(idx) = stack.pop() {
+        let z = idx / (nx * ny);
+        let y = (idx % (nx * ny)) / nx;
+        let x = idx % nx;
+        let push = |x: usize, y: usize, z: usize, stack: &mut Vec<usize>, outside: &mut Vec<bool>| {
+            let i = at(x, y, z);
+            if !outside[i] && !wall_d[i] {
+                outside[i] = true;
+                stack.push(i);
+            }
+        };
+        if x > 0 { push(x - 1, y, z, &mut stack, &mut outside); }
+        if x + 1 < nx { push(x + 1, y, z, &mut stack, &mut outside); }
+        if y > 0 { push(x, y - 1, z, &mut stack, &mut outside); }
+        if y + 1 < ny { push(x, y + 1, z, &mut stack, &mut outside); }
+        if z > 0 { push(x, y, z - 1, &mut stack, &mut outside); }
+        if z + 1 < nz { push(x, y, z + 1, &mut stack, &mut outside); }
+    }
+
+    // 4) Solid = everything the outside flood couldn't reach (wall + enclosed interior), then
+    // erode by 1 to undo the dilation — net effect: holes sealed, original size preserved.
+    let solid_dilated: Vec<bool> = (0..n).map(|i| !outside[i]).collect();
+    let erode = |src: &[bool]| {
+        let mut out = src.to_vec();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if !src[at(x, y, z)] {
+                        continue;
+                    }
+                    let exposed = x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || z == 0 || z + 1 == nz
+                        || !src[at(x - 1, y, z)] || !src[at(x + 1, y, z)]
+                        || !src[at(x, y - 1, z)] || !src[at(x, y + 1, z)]
+                        || !src[at(x, y, z - 1)] || !src[at(x, y, z + 1)];
+                    if exposed {
+                        out[at(x, y, z)] = false;
+                    }
+                }
+            }
+        }
+        out
+    };
+    let solid = erode(&solid_dilated);
+    if !solid.iter().any(|&s| s) {
+        return None; // nothing enclosed — likely a hole bigger than the close could seal
+    }
+
+    // 5) Signed distance field: unsigned chamfer distance to the solid/empty boundary, signed
+    // negative inside. Multi-source BFS from every boundary voxel (distance in voxel units).
+    let mut dist = vec![u32::MAX; n];
+    let mut q = std::collections::VecDeque::new();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let i = at(x, y, z);
+                let s = solid[i];
+                let boundary = (x > 0 && solid[at(x - 1, y, z)] != s)
+                    || (x + 1 < nx && solid[at(x + 1, y, z)] != s)
+                    || (y > 0 && solid[at(x, y - 1, z)] != s)
+                    || (y + 1 < ny && solid[at(x, y + 1, z)] != s)
+                    || (z > 0 && solid[at(x, y, z - 1)] != s)
+                    || (z + 1 < nz && solid[at(x, y, z + 1)] != s);
+                if boundary {
+                    dist[i] = 0;
+                    q.push_back(i);
+                }
+            }
+        }
+    }
+    while let Some(idx) = q.pop_front() {
+        let d = dist[idx] + 1;
+        let z = idx / (nx * ny);
+        let y = (idx % (nx * ny)) / nx;
+        let x = idx % nx;
+        let relax = |x: usize, y: usize, z: usize, dist: &mut Vec<u32>, q: &mut std::collections::VecDeque<usize>| {
+            let i = at(x, y, z);
+            if d < dist[i] {
+                dist[i] = d;
+                q.push_back(i);
+            }
+        };
+        if x > 0 { relax(x - 1, y, z, &mut dist, &mut q); }
+        if x + 1 < nx { relax(x + 1, y, z, &mut dist, &mut q); }
+        if y > 0 { relax(x, y - 1, z, &mut dist, &mut q); }
+        if y + 1 < ny { relax(x, y + 1, z, &mut dist, &mut q); }
+        if z > 0 { relax(x, y, z - 1, &mut dist, &mut q); }
+        if z + 1 < nz { relax(x, y, z + 1, &mut dist, &mut q); }
+    }
+    // Signed field in world units: negative inside, positive outside, ~0 at the surface.
+    let sdf: Vec<f32> = (0..n)
+        .map(|i| {
+            let d = if dist[i] == u32::MAX { res as f32 } else { dist[i] as f32 };
+            (if solid[i] { -d } else { d }) * h
+        })
+        .collect();
+
+    // 6) Surface the level set with Manifold (guaranteed 2-manifold output). The closure
+    // trilinearly samples the SDF grid; outside the grid it returns a large positive value.
+    let sample = move |x: f64, y: f64, z: f64| -> f64 {
+        let gx = (x as f32 - origin[0]) / h;
+        let gy = (y as f32 - origin[1]) / h;
+        let gz = (z as f32 - origin[2]) / h;
+        if gx < 0.0 || gy < 0.0 || gz < 0.0 || gx >= (nx - 1) as f32 || gy >= (ny - 1) as f32 || gz >= (nz - 1) as f32 {
+            return longest as f64; // safely outside
+        }
+        let (x0, y0, z0) = (gx as usize, gy as usize, gz as usize);
+        let (fx, fy, fz) = (gx - x0 as f32, gy - y0 as f32, gz - z0 as f32);
+        let s = |x: usize, y: usize, z: usize| sdf[at(x, y, z)];
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let c00 = lerp(s(x0, y0, z0), s(x0 + 1, y0, z0), fx);
+        let c10 = lerp(s(x0, y0 + 1, z0), s(x0 + 1, y0 + 1, z0), fx);
+        let c01 = lerp(s(x0, y0, z0 + 1), s(x0 + 1, y0, z0 + 1), fx);
+        let c11 = lerp(s(x0, y0 + 1, z0 + 1), s(x0 + 1, y0 + 1, z0 + 1), fx);
+        let c0 = lerp(c00, c10, fy);
+        let c1 = lerp(c01, c11, fy);
+        lerp(c0, c1, fz) as f64
+    };
+    let bounds = (
+        [origin[0] as f64, origin[1] as f64, origin[2] as f64],
+        [
+            (origin[0] + nx as f32 * h) as f64,
+            (origin[1] + ny as f32 * h) as f64,
+            (origin[2] + nz as f32 * h) as f64,
+        ],
+    );
+    let man = Manifold::from_sdf(sample, bounds, h as f64, 0.0, (h * 0.25) as f64);
+    if man.status().is_err() {
+        return None;
+    }
+    let out = from_manifold(&man);
+    (!out.indices.is_empty()).then_some(out)
 }
 
 /// Reflect a mesh across the plane through `origin` with `normal`. Reflection reverses
