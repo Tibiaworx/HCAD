@@ -26,7 +26,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, M
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, repair_mesh, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -2070,6 +2070,9 @@ struct UiState {
     scan_circles: Vec<(Vec2, f32)>,
     /// Which mesh feature (ImportMesh/RefMesh index) has its PropertyManager open.
     mesh_edit: Option<usize>,
+    /// Active 3-point-align session for the mesh being edited (points picked so far,
+    /// target datum plane, whether the first point becomes the origin).
+    mesh_align: Option<MeshAlign>,
     /// One-shot request to start editing a component's part in place.
     edit_component_request: Option<u64>,
     /// One-shot request to finish the in-place edit: `Some(true)` = save back, `Some(false)` = discard.
@@ -2466,6 +2469,63 @@ impl ActivePlane {
 struct RefMeshEnt {
     id: FeatureId,
     placement_fp: u64,
+}
+
+/// A 3-point-align session on a mesh feature: three surface points define a plane that is
+/// mapped onto a chosen datum plane (Front/Top/Right); the first point can become the origin.
+#[derive(Clone)]
+struct MeshAlign {
+    pts: Vec<Vec3>,
+    /// Target datum: 0 = Front (XY), 1 = Top, 2 = Right (matches `standard_plane_ref`).
+    target: u8,
+    origin_from_first: bool,
+}
+
+/// Compute the new (rot_deg, offset) placement that maps three picked surface points onto a
+/// target datum plane: the points' plane lands on the datum (normal → datum normal, p1→p2
+/// direction → datum u), and p1 optionally becomes the origin. `None` if the points are
+/// collinear. Composes ON TOP of the existing placement (the picked points are world-placed).
+fn align_placement(
+    pts: [Vec3; 3],
+    target: u8,
+    origin_from_first: bool,
+    rot_deg: [f64; 3],
+    offset: [f64; 3],
+) -> Option<([f64; 3], [f64; 3])> {
+    let (p1, p2, p3) = (pts[0], pts[1], pts[2]);
+    let raw_n = (p2 - p1).cross(p3 - p1);
+    if raw_n.length() < 1e-6 {
+        return None;
+    }
+    let n = raw_n.normalize();
+    let u_s = ((p2 - p1) - n * (p2 - p1).dot(n)).normalize();
+    let v_s = n.cross(u_s);
+    let tp = standard_plane_ref(target);
+    let (u_t, v_t, n_t) = (
+        Vec3::new(tp.u[0] as f32, tp.u[1] as f32, tp.u[2] as f32),
+        Vec3::new(tp.v[0] as f32, tp.v[1] as f32, tp.v[2] as f32),
+        Vec3::new(tp.normal[0] as f32, tp.normal[1] as f32, tp.normal[2] as f32),
+    );
+    // R maps the picked basis onto the target plane's basis.
+    let r = Mat3::from_cols(u_t, v_t, n_t) * Mat3::from_cols(u_s, v_s, n).transpose();
+    let rq = Quat::from_mat3(&r);
+    // Stored placement applies X-, then Y-, then Z-rotation, i.e. Rz·Ry·Rx — glam's ZYX
+    // Euler order both ways.
+    let r_old = Quat::from_euler(
+        EulerRot::ZYX,
+        rot_deg[2].to_radians() as f32,
+        rot_deg[1].to_radians() as f32,
+        rot_deg[0].to_radians() as f32,
+    );
+    let new_rot = rq * r_old;
+    let t_old = Vec3::new(offset[0] as f32, offset[1] as f32, offset[2] as f32);
+    let target_origin = if origin_from_first { Vec3::ZERO } else { p1 };
+    let t_new = rq * (t_old - p1) + target_origin;
+    let (ez, ey, ex) = new_rot.to_euler(EulerRot::ZYX);
+    Some((
+        [ex.to_degrees() as f64, ey.to_degrees() as f64, ez.to_degrees() as f64],
+        [t_new.x as f64, t_new.y as f64, t_new.z as f64],
+    ))
 }
 
 /// Hash of a mesh feature's placement (scale + rotation + offset), for change detection.
@@ -5217,11 +5277,13 @@ fn ui_system(
         // and ×1000 (metre) fix-ups are the first thing many imports need.
         if let Some(idx) = ui_state.mesh_edit {
             let cur = doc.0.features.get(idx).and_then(|f| match &f.kind {
-                FeatureKind::ImportMesh { name, scale, rot_deg, offset, .. } => Some((name.clone(), *scale, *rot_deg, *offset, None)),
-                FeatureKind::RefMesh { name, scale, rot_deg, offset, opacity, .. } => Some((name.clone(), *scale, *rot_deg, *offset, Some(*opacity))),
+                FeatureKind::ImportMesh { name, scale, rot_deg, offset, .. } => Some((name.clone(), *scale, *rot_deg, *offset, None, None)),
+                FeatureKind::RefMesh { name, scale, rot_deg, offset, opacity, section_tol, .. } => {
+                    Some((name.clone(), *scale, *rot_deg, *offset, Some(*opacity), Some(*section_tol)))
+                }
                 _ => None,
             });
-            if let Some((name, mut scale, mut rot_deg, mut offset, mut opacity)) = cur {
+            if let Some((name, mut scale, mut rot_deg, mut offset, mut opacity, mut section_tol)) = cur {
                 ui.heading(if opacity.is_some() { "Reference Mesh" } else { "Imported Mesh" });
                 let mut close = false;
                 let mut delete = false;
@@ -5282,6 +5344,62 @@ fn ui_system(
                         }
                     });
                 }
+                // 3-point align: pick three points on the mesh surface → they define a plane
+                // that gets mapped onto Front/Top/Right (first picked point optionally → origin).
+                ui.separator();
+                match ui_state.mesh_align.clone() {
+                    None => {
+                        if ui
+                            .button("📐  3-point align…")
+                            .on_hover_text("Click 3 points on the mesh — the plane they define snaps onto a datum plane")
+                            .clicked()
+                        {
+                            ui_state.mesh_align = Some(MeshAlign { pts: Vec::new(), target: 0, origin_from_first: true });
+                        }
+                    }
+                    Some(mut al) => {
+                        ui.label(egui::RichText::new("Align: click 3 points on the mesh.").strong());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Picked {}/3 — go counter-clockwise as seen from the side that should face you.",
+                                al.pts.len()
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Onto");
+                            for (t, lbl) in [(0u8, "Front"), (1, "Top"), (2, "Right")] {
+                                if ui.selectable_label(al.target == t, lbl).clicked() {
+                                    al.target = t;
+                                }
+                            }
+                        });
+                        ui.checkbox(&mut al.origin_from_first, "First point → origin");
+                        let mut done = false;
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(al.pts.len() == 3, egui::Button::new("Apply alignment")).clicked() {
+                                match align_placement([al.pts[0], al.pts[1], al.pts[2]], al.target, al.origin_from_first, rot_deg, offset) {
+                                    Some((nr, no)) => {
+                                        rot_deg = nr;
+                                        offset = no;
+                                        changed = true;
+                                        done = true;
+                                        ui_state.toasts.push(("Mesh aligned.".into(), 2.5));
+                                    }
+                                    None => {
+                                        ui_state.toasts.push(("Those three points are collinear — pick again.".into(), 4.0));
+                                        al.pts.clear();
+                                    }
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                done = true;
+                            }
+                        });
+                        ui_state.mesh_align = if done { None } else { Some(al) };
+                    }
+                }
                 if let Some(op) = opacity.as_mut() {
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -5290,6 +5408,20 @@ fn ui_system(
                             changed = true;
                         }
                     });
+                    if let Some(tol) = section_tol.as_mut() {
+                        ui.horizontal(|ui| {
+                            ui.label("Section fit")
+                                .on_hover_text("How closely section circles/arcs/lines must follow the raw cross-section.\nClean exports → fine; noisy scans → coarse (fewer, smoother shapes).");
+                            let mut t = *tol as f32;
+                            if ui
+                                .add(egui::Slider::new(&mut t, 0.01..=1.0).logarithmic(true).suffix(" mm").fixed_decimals(2))
+                                .changed()
+                            {
+                                *tol = t as f64;
+                                changed = true;
+                            }
+                        });
+                    }
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Sketch on any plane through the scan to trace its cross-section.").italics().weak().small());
                 }
@@ -5302,12 +5434,15 @@ fn ui_system(
                                 *r = rot_deg;
                                 *o = offset;
                             }
-                            FeatureKind::RefMesh { scale: s, rot_deg: r, offset: o, opacity: op, .. } => {
+                            FeatureKind::RefMesh { scale: s, rot_deg: r, offset: o, opacity: op, section_tol: st, .. } => {
                                 *s = scale;
                                 *r = rot_deg;
                                 *o = offset;
                                 if let Some(new_op) = opacity {
                                     *op = new_op;
+                                }
+                                if let Some(new_tol) = section_tol {
+                                    *st = new_tol;
                                 }
                             }
                             _ => {}
@@ -5326,12 +5461,15 @@ fn ui_system(
                         }
                     }
                     ui_state.mesh_edit = None;
+                    ui_state.mesh_align = None;
                     ui_state.regen = true;
                 } else if close {
                     ui_state.mesh_edit = None;
+                    ui_state.mesh_align = None;
                 }
             } else {
                 ui_state.mesh_edit = None;
+                ui_state.mesh_align = None;
             }
         }
         if let Some(profiles) = ui_state.loft_spec.clone() {
@@ -9126,12 +9264,56 @@ fn sketch_interaction(
         return;
     }
 
+    // 3-point align (view mode, while the mesh PM's align session is active): click points on
+    // the edited mesh feature's own surface — its placed TriMesh, not the body.
+    if ui_state.mesh_align.is_some() && session.plane.is_none() && !blocking.0 {
+        if buttons.just_pressed(MouseButton::Left) {
+            if let (Some(cursor), Some(idx)) = (window.cursor_position(), ui_state.mesh_edit) {
+                let placed = doc.0.features.get(idx).and_then(|f| match &f.kind {
+                    FeatureKind::ImportMesh { data, scale, rot_deg, offset, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, true),
+                    FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, false),
+                    _ => None,
+                });
+                if let Some(hit) = placed.and_then(|m| pick_face_point(&m, camera, cam_gt, cursor).map(|(h, _)| h)) {
+                    if let Some(al) = ui_state.mesh_align.as_mut() {
+                        if al.pts.len() >= 3 {
+                            al.pts.clear(); // 4th click restarts the pick
+                        }
+                        al.pts.push(hit);
+                    }
+                }
+            }
+            return; // consume the click — don't also select faces/edges underneath
+        }
+    }
+
     // Measure tool (view mode): click body feature points (vertex / edge midpoint, else the surface
     // hit); two points give a distance (shown in the status bar). A third click starts a new pair.
     if ui_state.measuring && session.plane.is_none() && !blocking.0 {
         if buttons.just_pressed(MouseButton::Left) {
             if let Some(cursor) = window.cursor_position() {
-                if let Some(p) = nearest_measure_point(&part, camera, cam_gt, cursor) {
+                // Body first (with its vertex/midpoint snapping); reference-scan surfaces are
+                // the fallback, so scan dimensions can be taken before any body exists.
+                let scan_hit = || {
+                    let end = doc.0.rollback.min(doc.0.features.len());
+                    let mut best: Option<(f32, Vec3)> = None;
+                    for f in &doc.0.features[..end] {
+                        let FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } = &f.kind else { continue };
+                        if f.hidden {
+                            continue;
+                        }
+                        if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false) {
+                            if let Some((hit, _)) = pick_face_point(&m, camera, cam_gt, cursor) {
+                                let d = cam_gt.translation().distance(hit);
+                                if best.is_none_or(|(bd, _)| d < bd) {
+                                    best = Some((d, hit));
+                                }
+                            }
+                        }
+                    }
+                    best.map(|(_, p)| p)
+                };
+                if let Some(p) = nearest_measure_point(&part, camera, cam_gt, cursor).or_else(scan_hit) {
                     if ui_state.measure_pts.len() >= 2 {
                         ui_state.measure_pts.clear();
                     }
@@ -9277,10 +9459,11 @@ fn sketch_interaction(
             }
             let end = doc.0.rollback.min(doc.0.features.len());
             for f in &doc.0.features[..end] {
-                if let FeatureKind::RefMesh { scale, rot_deg, offset, .. } = &f.kind {
+                if let FeatureKind::RefMesh { scale, rot_deg, offset, section_tol, .. } = &f.kind {
                     if !f.hidden {
                         f.id.0.hash(&mut h);
                         mesh_placement_fp(*scale, *rot_deg, *offset).hash(&mut h);
+                        section_tol.to_bits().hash(&mut h);
                     }
                 }
             }
@@ -9290,13 +9473,16 @@ fn sketch_interaction(
                 ui_state.scan_shapes.clear();
                 ui_state.scan_circles.clear();
                 ui_state.scan_section_edges.clear();
-                let mut raw_uv: Vec<[[f32; 2]; 2]> = Vec::new();
+                // Fit each scan with its OWN tolerance (clean export vs noisy scan), then
+                // pool the recognized shapes.
+                let mut shapes: Vec<SectionShape> = Vec::new();
                 for f in &doc.0.features[..end] {
-                    let FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } = &f.kind else { continue };
+                    let FeatureKind::RefMesh { data, scale, rot_deg, offset, section_tol, .. } = &f.kind else { continue };
                     if f.hidden {
                         continue;
                     }
-                    if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset) {
+                    let mut raw_uv: Vec<[[f32; 2]; 2]> = Vec::new();
+                    if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false) {
                         for s in mesh_plane_section(&m, ap.origin.to_array(), ap.n.to_array()) {
                             let uv = |w: [f32; 3]| {
                                 let d = Vec3::from_array(w) - ap.origin;
@@ -9305,10 +9491,8 @@ fn sketch_interaction(
                             raw_uv.push([uv(s[0]), uv(s[1])]);
                         }
                     }
+                    shapes.extend(fit_section_shapes(&raw_uv, *section_tol as f32));
                 }
-                // Fit tolerance: generous enough to absorb scan tessellation noise, tight
-                // enough not to invent geometry (0.05 mm).
-                let shapes = fit_section_shapes(&raw_uv, 0.05);
                 // Rebuild the world-space segment list (draw + pick + endpoint snapping)
                 // from the FITTED shapes — decimated, so the per-frame pool stays small.
                 let w = |p: [f32; 2]| ap.origin + ap.u * p[0] + ap.v * p[1];
@@ -13213,15 +13397,34 @@ fn handle_file_io(
                         let data = encode_mesh_blob(&bytes);
                         history.snapshot(&doc.0);
                         if as_reference {
-                            doc.0.add_feature(FeatureKind::RefMesh { data, name: name.clone(), scale: 1.0, opacity: 0.35, rot_deg: [0.0; 3], offset: [0.0; 3] });
+                            doc.0.add_feature(FeatureKind::RefMesh {
+                                data,
+                                name: name.clone(),
+                                scale: 1.0,
+                                opacity: 0.35,
+                                rot_deg: [0.0; 3],
+                                offset: [0.0; 3],
+                                section_tol: 0.05,
+                            });
                             ui_state.toasts.push((format!("Reference mesh {name} added — model against it, it won't join the solid"), 4.0));
                         } else {
-                            // Non-watertight scans make every downstream boolean fragile; steer
-                            // those to reference import but still allow it (user may just want
-                            // to look at or repair-by-remodel it).
-                            if !is_manifold(&mesh) {
+                            // Editable imports always get the conservative auto-repair (weld +
+                            // small-hole fill) — report what it did, and warn honestly if the
+                            // mesh is STILL open, since booleans on it will be fragile.
+                            let (repaired, rep) = repair_mesh(&mesh);
+                            if rep.welded > 0 || rep.holes_filled > 0 {
                                 ui_state.toasts.push((
-                                    "Note: this STL isn't watertight — booleans on it may fail. Consider Reference Mesh instead.".into(),
+                                    format!("Repaired {name}: welded {} vertices, filled {} hole{}", rep.welded, rep.holes_filled, if rep.holes_filled == 1 { "" } else { "s" }),
+                                    4.0,
+                                ));
+                            }
+                            if rep.open_edges_left > 0 || !is_manifold(&repaired) {
+                                ui_state.toasts.push((
+                                    format!(
+                                        "Note: {name} still has {} open edge{} — booleans on it may fail. Consider Reference Mesh instead.",
+                                        rep.open_edges_left,
+                                        if rep.open_edges_left == 1 { "" } else { "s" }
+                                    ),
                                     6.0,
                                 ));
                             }
@@ -13936,13 +14139,14 @@ fn decode_mesh_blob(b64: &str) -> Option<Vec<u8>> {
 /// (XYZ Euler about the origin, degrees), then offset — memoized by content+placement hash:
 /// scans are large and `regenerate_mesh` replays the whole timeline on every edit, so
 /// decompressing/parsing megabytes per regen would make editing crawl. Small bounded cache.
-fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3]) -> Option<TriMesh> {
+fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3], repair: bool) -> Option<TriMesh> {
     use std::hash::{Hash, Hasher};
     static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, TriMesh>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
     scale.to_bits().hash(&mut h);
+    repair.hash(&mut h);
     for v in rot_deg.iter().chain(offset.iter()) {
         v.to_bits().hash(&mut h);
     }
@@ -13952,6 +14156,11 @@ fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3
     }
     let stl = decode_mesh_blob(data)?;
     let mut m = import_stl(&stl)?;
+    if repair {
+        // Editable imports go through booleans, which need closed meshes — always run the
+        // conservative repair (a clean mesh passes through topologically unchanged).
+        m = repair_mesh(&m).0;
+    }
     if (scale - 1.0).abs() > 1e-12 {
         for p in &mut m.positions {
             for k in 0..3 {
@@ -13995,7 +14204,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
             // An imported mesh IS a body: first feature becomes the body, later ones union in
             // (like a boss) — everything downstream then cuts/fillets/booleans it normally.
             FeatureKind::ImportMesh { data, name, scale, rot_deg, offset } => {
-                match import_mesh_cached(data, *scale, *rot_deg, *offset) {
+                match import_mesh_cached(data, *scale, *rot_deg, *offset, true) {
                     Some(m) => {
                         feat_tools.insert(fi, (vec![m.clone()], false));
                         body = Some(match body.take() {
@@ -16438,11 +16647,11 @@ fn sync_ref_meshes(
             }
         }
         for f in &doc.0.features {
-            let FeatureKind::RefMesh { data, name, scale, opacity, rot_deg, offset } = &f.kind else { continue };
+            let FeatureKind::RefMesh { data, name, scale, opacity, rot_deg, offset, .. } = &f.kind else { continue };
             if keep.contains(&f.id.0) {
                 continue;
             }
-            let Some(tri) = import_mesh_cached(data, *scale, *rot_deg, *offset) else {
+            let Some(tri) = import_mesh_cached(data, *scale, *rot_deg, *offset, false) else {
                 warn!("Reference mesh {name}: could not decode the embedded data.");
                 continue;
             };
@@ -18355,11 +18564,9 @@ fn nearest_measure_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform,
     part.mesh.as_ref().and_then(|m| pick_face_point(m, camera, cam_gt, cursor).map(|(hit, _)| hit))
 }
 
-/// Draw the measure tool's picked points (small 3D crosses) and the line between two of them.
+/// Draw the measure tool's picked points (small 3D crosses) and the line between two of them —
+/// plus the 3-point-align session's picked points (teal, numbered by triangle fan) when active.
 fn draw_measure(mut gizmos: Gizmos, ui_state: Res<UiState>, cam_q: Query<&OrbitCamera>) {
-    if ui_state.measure_pts.is_empty() {
-        return;
-    }
     let r = cam_q.single().map(|c| c.radius).unwrap_or(12.0);
     let s = (r * 0.012).max(0.05);
     let col = Color::srgb(1.0, 0.85, 0.3);
@@ -18370,6 +18577,22 @@ fn draw_measure(mut gizmos: Gizmos, ui_state: Res<UiState>, cam_q: Query<&OrbitC
     }
     if ui_state.measure_pts.len() == 2 {
         gizmos.line(ui_state.measure_pts[0], ui_state.measure_pts[1], col);
+    }
+    if let Some(al) = &ui_state.mesh_align {
+        let teal = Color::srgb(0.25, 0.85, 0.9);
+        for (i, &p) in al.pts.iter().enumerate() {
+            // Growing cross size = pick order (1st smallest), so order is visible.
+            let ss = s * (1.0 + i as f32 * 0.5);
+            gizmos.line(p - Vec3::X * ss, p + Vec3::X * ss, teal);
+            gizmos.line(p - Vec3::Y * ss, p + Vec3::Y * ss, teal);
+            gizmos.line(p - Vec3::Z * ss, p + Vec3::Z * ss, teal);
+        }
+        for w in al.pts.windows(2) {
+            gizmos.line(w[0], w[1], teal);
+        }
+        if al.pts.len() == 3 {
+            gizmos.line(al.pts[2], al.pts[0], teal);
+        }
     }
 }
 
@@ -18782,6 +19005,64 @@ mod tests {
         }
     }
 
+    /// 3-point align, end to end: place a cube at an arbitrary rotation+offset, pick three
+    /// points on one of its (placed) faces, apply — re-placing with the returned values must
+    /// land those points exactly on the target datum plane, with the first at the origin.
+    #[test]
+    fn three_point_align_lands_the_picked_plane_on_the_datum() {
+        let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
+        let blob = encode_mesh_blob(&export_stl(&cube));
+        // Arbitrary initial placement.
+        let rot0 = [31.0, -14.0, 57.0];
+        let off0 = [3.0, -7.0, 11.0];
+        let placed = import_mesh_cached(&blob, 1.0, rot0, off0, true).expect("placed");
+        // "Pick" three points on the placed top face (local z = 20): transform three local
+        // face points through the same placement the app uses.
+        let place = |local: [f32; 3]| {
+            let m = TriMesh { positions: vec![local], normals: vec![[0.0, 0.0, 1.0]], indices: vec![] };
+            let m = {
+                let mut m = m;
+                for (axis_i, deg) in rot0.iter().enumerate() {
+                    let mut axis = [0.0; 3];
+                    axis[axis_i] = 1.0;
+                    m = rotate_mesh(&m, [0.0; 3], axis, deg.to_radians());
+                }
+                translate_mesh(&m, off0)
+            };
+            Vec3::from_array(m.positions[0])
+        };
+        let picks = [place([-5.0, -5.0, 20.0]), place([5.0, -5.0, 20.0]), place([0.0, 5.0, 20.0])];
+        let (rot1, off1) = align_placement(picks, 0, true, rot0, off0).expect("non-collinear");
+        // Re-place with the aligned values; the three local points must now sit on Front
+        // (z = 0 — CCW picks looking down the +z top face put its outward normal on +Z,
+        // i.e. the face becomes the XY plane) with the first pick at the origin.
+        let re_place = |local: [f32; 3]| {
+            let m = TriMesh { positions: vec![local], normals: vec![[0.0, 0.0, 1.0]], indices: vec![] };
+            let mut m = m;
+            for (axis_i, deg) in rot1.iter().enumerate() {
+                let mut axis = [0.0; 3];
+                axis[axis_i] = 1.0;
+                m = rotate_mesh(&m, [0.0; 3], axis, deg.to_radians());
+            }
+            m = translate_mesh(&m, off1);
+            Vec3::from_array(m.positions[0])
+        };
+        let q1 = re_place([-5.0, -5.0, 20.0]);
+        let q2 = re_place([5.0, -5.0, 20.0]);
+        let q3 = re_place([0.0, 5.0, 20.0]);
+        assert!(q1.length() < 1e-3, "first pick must land on the origin, got {q1:?}");
+        assert!(q2.z.abs() < 1e-3 && q3.z.abs() < 1e-3, "picked plane must lie on z=0, got {q2:?} {q3:?}");
+        // Rigidity: pairwise distances survive.
+        let d = |a: Vec3, b: Vec3| a.distance(b);
+        assert!((d(q1, q2) - d(picks[0], picks[1])).abs() < 1e-3);
+        assert!((d(q2, q3) - d(picks[1], picks[2])).abs() < 1e-3);
+        // The whole placed cube keeps its volume through the align.
+        let placed2 = import_mesh_cached(&blob, 1.0, rot1, off1, true).expect("re-placed");
+        assert!((mesh_volume(&placed2) - mesh_volume(&placed)).abs() < mesh_volume(&placed) * 0.01);
+    }
+
     /// The embedded-mesh blob (deflate + base64) must roundtrip byte-exactly, and
     /// `import_mesh_cached` must apply the scale factor to the decoded mesh.
     #[test]
@@ -18792,13 +19073,13 @@ mod tests {
         let stl = export_stl(&cube);
         let blob = encode_mesh_blob(&stl);
         assert_eq!(decode_mesh_blob(&blob).expect("decode"), stl, "blob must roundtrip byte-exactly");
-        let m1 = import_mesh_cached(&blob, 1.0, [0.0; 3], [0.0; 3]).expect("parse at 1×");
-        let m2 = import_mesh_cached(&blob, 2.0, [0.0; 3], [0.0; 3]).expect("parse at 2×");
+        let m1 = import_mesh_cached(&blob, 1.0, [0.0; 3], [0.0; 3], true).expect("parse at 1×");
+        let m2 = import_mesh_cached(&blob, 2.0, [0.0; 3], [0.0; 3], true).expect("parse at 2×");
         let (v1, v2) = (mesh_volume(&m1), mesh_volume(&m2));
         assert!((v1 - 8000.0).abs() < 8000.0 * 0.01, "20mm cube volume, got {v1:.1}");
         assert!((v2 - 8.0 * v1).abs() < v2 * 0.01, "2× scale should give 8× the volume, got {v2:.1}");
         // Placement: rotate 90° about X (cube z∈[0,20] → y∈[-20,0]) then move +5 in x.
-        let m3 = import_mesh_cached(&blob, 1.0, [90.0, 0.0, 0.0], [5.0, 0.0, 0.0]).expect("placed");
+        let m3 = import_mesh_cached(&blob, 1.0, [90.0, 0.0, 0.0], [5.0, 0.0, 0.0], true).expect("placed");
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &m3.positions {
             for k in 0..3 {
@@ -18855,7 +19136,7 @@ mod tests {
 
         // A RefMesh, by contrast, must contribute NOTHING to the solid.
         let mut ref_doc = Document::with_default_planes();
-        ref_doc.add_feature(FeatureKind::RefMesh { data: blob, name: "scan".into(), scale: 1.0, opacity: 0.35, rot_deg: [0.0; 3], offset: [0.0; 3] });
+        ref_doc.add_feature(FeatureKind::RefMesh { data: blob, name: "scan".into(), scale: 1.0, opacity: 0.35, rot_deg: [0.0; 3], offset: [0.0; 3], section_tol: 0.05 });
         assert!(regenerate_mesh(&ref_doc).is_none() || regenerate_mesh(&ref_doc).unwrap().0.positions.is_empty(),
             "a reference scan must not produce a body");
     }

@@ -158,6 +158,10 @@ pub enum FeatureKind {
         rot_deg: [f64; 3],
         #[serde(default)]
         offset: [f64; 3],
+        /// Section-curve fit tolerance (mm): how far the fitted circles/arcs/lines may
+        /// deviate from the raw cross-section. Clean exports → small; noisy scans → larger.
+        #[serde(default = "default_section_tol")]
+        section_tol: f64,
     },
     /// Reference image ("sketch picture"): a raster pinned to `plane` to trace over — not geometry,
     /// just a visual underlay. `data` is the base64-encoded PNG/JPG; `px_w`/`px_h` the source pixel
@@ -353,6 +357,10 @@ fn default_mesh_scale() -> f64 {
 }
 fn default_ref_mesh_opacity() -> f32 {
     0.35
+}
+
+fn default_section_tol() -> f64 {
+    0.05
 }
 
 // ===================== Assemblies (Phase 1) =====================

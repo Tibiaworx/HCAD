@@ -811,6 +811,217 @@ pub fn mesh_plane_section(m: &TriMesh, origin: [f32; 3], normal: [f32; 3]) -> Ve
     out
 }
 
+/// What [`repair_mesh`] did, so the app can report it honestly ("welded 214 verts,
+/// filled 3 holes") and warn when a mesh is still open afterwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Vertices merged into a neighbour by the weld pass.
+    pub welded: usize,
+    /// Degenerate / duplicate triangles dropped.
+    pub degenerate_removed: usize,
+    /// Boundary loops closed by triangulation.
+    pub holes_filled: usize,
+    /// Boundary edges STILL open after repair (0 = watertight-topology).
+    pub open_edges_left: usize,
+}
+
+/// Best-effort repair of a triangle soup so real-world STLs (scans, hobby exports) survive
+/// booleans: weld near-coincident vertices, drop degenerate/duplicate faces, and close small
+/// boundary loops (≤ 64 edges) by ear-clip triangulation. Conservative on purpose — big
+/// openings are left alone (reported via `open_edges_left`) rather than papered over.
+pub fn repair_mesh(m: &TriMesh) -> (TriMesh, RepairReport) {
+    use std::collections::HashMap;
+    let mut rep = RepairReport::default();
+    if m.indices.len() < 3 {
+        return (m.clone(), rep);
+    }
+    // --- Weld: quantize by a bbox-relative tolerance (exporters emit per-triangle copies
+    // of every vertex; scans add real sub-micron jitter on top). ---
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let tol = (diag * 1.0e-5).max(1.0e-6);
+    let key = |p: [f32; 3]| ((p[0] / tol).round() as i64, (p[1] / tol).round() as i64, (p[2] / tol).round() as i64);
+    let mut uniq: Vec<[f32; 3]> = Vec::new();
+    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut remap = vec![0u32; m.positions.len()];
+    for (i, p) in m.positions.iter().enumerate() {
+        remap[i] = *map.entry(key(*p)).or_insert_with(|| {
+            uniq.push(*p);
+            (uniq.len() - 1) as u32
+        });
+    }
+    rep.welded = m.positions.len() - uniq.len();
+    // --- Faces: drop degenerate (repeated vertex after welding) and duplicate ones. ---
+    let mut faces: Vec<[u32; 3]> = Vec::new();
+    let mut seen: std::collections::HashSet<[u32; 3]> = std::collections::HashSet::new();
+    for t in m.indices.chunks_exact(3) {
+        let f = [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]];
+        if f[0] == f[1] || f[1] == f[2] || f[0] == f[2] {
+            rep.degenerate_removed += 1;
+            continue;
+        }
+        let mut k = f;
+        k.sort_unstable();
+        if !seen.insert(k) {
+            rep.degenerate_removed += 1;
+            continue;
+        }
+        faces.push(f);
+    }
+    // --- Boundary loops: an undirected edge with exactly one incident face is open.
+    // Chain the directed boundary edges (a→b as the face uses them) into loops. ---
+    let mut edge_count: HashMap<(u32, u32), u32> = HashMap::new();
+    for f in &faces {
+        for k in 0..3 {
+            let (a, b) = (f[k], f[(k + 1) % 3]);
+            *edge_count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    let mut next_of: HashMap<u32, u32> = HashMap::new();
+    for f in &faces {
+        for k in 0..3 {
+            let (a, b) = (f[k], f[(k + 1) % 3]);
+            if edge_count[&(a.min(b), a.max(b))] == 1 {
+                next_of.insert(a, b); // boundary edge, in face winding order
+            }
+        }
+    }
+    let mut fills: Vec<[u32; 3]> = Vec::new();
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let starts: Vec<u32> = {
+        let mut s: Vec<u32> = next_of.keys().copied().collect();
+        s.sort_unstable();
+        s
+    };
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut cycle = vec![start];
+        visited.insert(start);
+        let mut cur = start;
+        let closed = loop {
+            match next_of.get(&cur) {
+                Some(&nxt) if nxt == start => break true,
+                Some(&nxt) if !visited.contains(&nxt) && cycle.len() <= 64 => {
+                    visited.insert(nxt);
+                    cycle.push(nxt);
+                    cur = nxt;
+                }
+                _ => break false, // open path / junction / too large
+            }
+        };
+        if !closed || cycle.len() < 3 || cycle.len() > 64 {
+            continue;
+        }
+        // Patch triangles must traverse each boundary edge OPPOSITE to the existing face,
+        // so triangulate the REVERSED loop. Project on the loop's Newell normal, ear-clip.
+        cycle.reverse();
+        let pts3: Vec<[f32; 3]> = cycle.iter().map(|i| uniq[*i as usize]).collect();
+        let mut n = [0f64; 3];
+        for i in 0..pts3.len() {
+            let (p, q) = (pts3[i], pts3[(i + 1) % pts3.len()]);
+            n[0] += (p[1] as f64 - q[1] as f64) * (p[2] as f64 + q[2] as f64);
+            n[1] += (p[2] as f64 - q[2] as f64) * (p[0] as f64 + q[0] as f64);
+            n[2] += (p[0] as f64 - q[0] as f64) * (p[1] as f64 + q[1] as f64);
+        }
+        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if nl < 1e-12 {
+            continue;
+        }
+        let n = [n[0] / nl, n[1] / nl, n[2] / nl];
+        // 2D basis in the loop plane.
+        let pick = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+        let u = {
+            let c = [n[1] * pick[2] - n[2] * pick[1], n[2] * pick[0] - n[0] * pick[2], n[0] * pick[1] - n[1] * pick[0]];
+            let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+            [c[0] / l, c[1] / l, c[2] / l]
+        };
+        let v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+        let p2: Vec<[f64; 2]> = pts3
+            .iter()
+            .map(|p| {
+                let p = [p[0] as f64, p[1] as f64, p[2] as f64];
+                [p[0] * u[0] + p[1] * u[1] + p[2] * u[2], p[0] * v[0] + p[1] * v[1] + p[2] * v[2]]
+            })
+            .collect();
+        // Ear clipping (CCW in this projection by Newell construction); falls back to a fan
+        // if it stalls on numerically-nasty input.
+        let cross2 = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+        let mut order: Vec<usize> = (0..cycle.len()).collect();
+        let mut tris2: Vec<[usize; 3]> = Vec::new();
+        let mut guard = 0usize;
+        while order.len() > 3 && guard < 10_000 {
+            guard += 1;
+            let mut clipped = false;
+            for i in 0..order.len() {
+                let (pi, ci, ni) = (
+                    order[(i + order.len() - 1) % order.len()],
+                    order[i],
+                    order[(i + 1) % order.len()],
+                );
+                if cross2(p2[pi], p2[ci], p2[ni]) <= 1e-12 {
+                    continue; // reflex
+                }
+                let inside = order.iter().any(|&o| {
+                    o != pi
+                        && o != ci
+                        && o != ni
+                        && cross2(p2[pi], p2[ci], p2[o]) > 0.0
+                        && cross2(p2[ci], p2[ni], p2[o]) > 0.0
+                        && cross2(p2[ni], p2[pi], p2[o]) > 0.0
+                });
+                if inside {
+                    continue;
+                }
+                tris2.push([pi, ci, ni]);
+                order.remove(i);
+                clipped = true;
+                break;
+            }
+            if !clipped {
+                break; // stalled — fan the rest
+            }
+        }
+        if order.len() == 3 {
+            tris2.push([order[0], order[1], order[2]]);
+        } else {
+            for i in 1..order.len() - 1 {
+                tris2.push([order[0], order[i], order[i + 1]]);
+            }
+        }
+        for t in tris2 {
+            fills.push([cycle[t[0]], cycle[t[1]], cycle[t[2]]]);
+        }
+        rep.holes_filled += 1;
+    }
+    faces.extend(fills);
+    // --- Rebuild with fresh flat normals; count what's still open. ---
+    let mut out = TriMesh::default();
+    for f in &faces {
+        let p = |i: u32| {
+            let q = uniq[i as usize];
+            [q[0] as f64, q[1] as f64, q[2] as f64]
+        };
+        push_tri(&mut out, p(f[0]), p(f[1]), p(f[2]));
+    }
+    let mut final_edges: HashMap<(u32, u32), u32> = HashMap::new();
+    for f in &faces {
+        for k in 0..3 {
+            let (a, b) = (f[k], f[(k + 1) % 3]);
+            *final_edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    rep.open_edges_left = final_edges.values().filter(|c| **c == 1).count();
+    (out, rep)
+}
+
 /// A recognized curve in a mesh cross-section, in the sketch plane's 2D (uv) space.
 /// Produced by [`fit_section_shapes`] from the raw triangle-crossing segments of
 /// [`mesh_plane_section`] — tessellation chords become real circles/arcs/polylines the
@@ -2358,6 +2569,56 @@ mod tests {
         assert!((total - 80.0).abs() < 0.5, "section length {total:.2} should be the 80 mm perimeter");
         // Off the body entirely → nothing.
         assert!(mesh_plane_section(&cube, [0.0, 0.0, 50.0], [0.0, 0.0, 1.0]).is_empty());
+    }
+
+    /// Repair must close a punctured cube: delete two triangles (one quad face hole), then
+    /// `repair_mesh` welds, fills the loop, and the result is manifold with ~unchanged volume.
+    /// An already-clean mesh must pass through unharmed.
+    #[test]
+    fn repair_mesh_closes_a_punctured_cube() {
+        let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let p = |i: u32| {
+                    let q = m.positions[i as usize];
+                    [q[0] as f64, q[1] as f64, q[2] as f64]
+                };
+                let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                v += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2]) + a[2] * (b[0] * c[1] - c[0] * b[1])) / 6.0;
+            }
+            v.abs()
+        };
+        let v0 = vol(&cube);
+        // Clean mesh: repair is a no-op topologically (weld dedupes exporter-duplicated
+        // verts, but fills nothing and stays manifold).
+        let (clean, rep) = repair_mesh(&cube);
+        assert_eq!(rep.holes_filled, 0, "clean cube needs no fill: {rep:?}");
+        assert_eq!(rep.open_edges_left, 0);
+        assert!(is_manifold(&clean), "clean cube must stay manifold");
+        assert!((vol(&clean) - v0).abs() < v0 * 0.001);
+        // Puncture: drop two triangles that share the cube's top-front corner region.
+        let mut holed = cube.clone();
+        let ntri = holed.indices.len() / 3;
+        let drop_a = 0usize;
+        let drop_b = 1usize;
+        let mut idx = Vec::new();
+        for (t, tri) in holed.indices.chunks_exact(3).enumerate() {
+            if t != drop_a && t != drop_b {
+                idx.extend_from_slice(tri);
+            }
+        }
+        holed.indices = idx;
+        assert!(!is_manifold(&holed), "puncturing must break manifoldness");
+        let (fixed, rep) = repair_mesh(&holed);
+        assert!(rep.holes_filled >= 1, "the hole must be filled: {rep:?}");
+        assert_eq!(rep.open_edges_left, 0, "nothing should remain open: {rep:?}");
+        assert!(is_manifold(&fixed), "repaired cube must be manifold");
+        let vf = vol(&fixed);
+        assert!((vf - v0).abs() < v0 * 0.01, "volume {vf:.1} vs original {v0:.1}");
+        assert_eq!(fixed.indices.len() / 3, ntri, "hole filled with the same-shaped patch");
     }
 
     /// Chaining + fitting must turn raw section chords into recognized shapes: a square's

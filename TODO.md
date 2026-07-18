@@ -22,15 +22,28 @@ Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is mem
 - **Trace Section** button (sketch tab, shown when a scan crosses the plane): converts the
   fitted shapes into real sketch entities (circles/arcs/lines) in one click, undoable.
 
+**v3 (2026-07):**
+- **3-point align** (mesh PM): click three points on the mesh (its own placed surface, teal
+  markers sized by pick order) → their plane maps onto Front/Top/Right, first point
+  optionally → origin. `align_placement` composes onto the existing placement; verified
+  end-to-end by test (picked plane lands exactly on the datum, rigid, volume-preserving).
+- **Auto mesh repair** on every editable import (`repair_mesh`): weld (bbox-relative tol),
+  drop degenerate/duplicate faces, ear-clip-fill boundary loops ≤ 64 edges; conservative —
+  larger openings are reported (`open_edges_left`), not papered over. Toasts report what
+  was done; still-open meshes warn toward Reference import.
+- **Measure on scans**: the measure tool falls back to reference-scan surfaces (nearest
+  scan hit) when the click misses the body — size features off the scan before modelling.
+- **Section fit tolerance** slider (scan PM, 0.01–1 mm log scale, per scan): coarse for
+  noisy scans → fewer, smoother fitted shapes; each scan fits with its own tolerance.
+
 **Remaining edges.**
-- Non-watertight imports get a warning toast steering to Reference, but an editable import
-  of one may still fail downstream booleans (Manifold needs closed meshes). No mesh repair.
 - Scan sections come only from `RefMesh`; sectioning the solid body itself (imported or not)
   through a sketch plane could reuse the same helper (`mesh_plane_section`).
-- Fit tolerance is fixed at 0.05 mm; noisy real-world scans may want it exposed in the PM.
-- Rotation UI is XYZ Euler about the world origin — fine for axis-aligning exports, clumsy
-  for freely-scanned data; a "3-point align" (pick 3 scan points → plane) would be better.
-- No measure tool on reference-scan surfaces yet; no decimated display copy for huge scans.
+- Measure prefers the body: a scan surface in FRONT of body geometry can't be measure-picked
+  (body hit wins). Fine until parts closely wrap the scan.
+- Repair fills planar-ish loops ≤ 64 edges; big scan holes stay open (reported honestly).
+- No decimated display copy for huge scans; no external-file linking (blob always embedded).
+- Fit primitives to scan REGIONS (click a scanned cylinder → axis datum) still future work.
 
 ## Exact-radius reference snapping (concentric-boss seam) — largely fixed
 
