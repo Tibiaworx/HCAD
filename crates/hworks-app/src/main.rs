@@ -304,6 +304,66 @@ fn comp_transform(c: &hworks_document::Component) -> Transform {
     }
 }
 
+/// The OTHER components' feature edges, transformed into component `eid`'s LOCAL frame —
+/// the reference geometry an in-context part edit snaps to (endpoints, midpoints, circular
+/// rims), exactly like the edited part's own body edges. Computed once at edit entry:
+/// components can't move while a part is being edited in place, so the set is static.
+fn ghost_edges_local(asm: &Assembly, render: &AsmRender, eid: u64) -> Vec<[[f32; 3]; 2]> {
+    let Some(edited) = asm.component(eid) else { return Vec::new() };
+    let inv = comp_transform(edited).to_matrix().inverse();
+    let mut out = Vec::new();
+    for comp in &asm.components {
+        if comp.id == eid || comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        let rel = inv * comp_transform(comp).to_matrix();
+        for e in &geom.edges {
+            let a = rel.transform_point3(Vec3::from_array(e[0]));
+            let b = rel.transform_point3(Vec3::from_array(e[1]));
+            out.push([a.to_array(), b.to_array()]);
+        }
+    }
+    out
+}
+
+/// Ray-pick a planar face on the assembly GHOSTS around an in-context edit (every component
+/// except `eid`), returning `(t, plane)` in the edited part's LOCAL frame — so a new part
+/// can start a sketch directly on an existing part's face, SolidWorks-style. The ray is in
+/// the edited frame (= the viewport, since the context is drawn relative to the edited part).
+fn pick_ghost_face(asm: &Assembly, render: &AsmRender, eid: u64, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
+    let edited = asm.component(eid)?;
+    let inv = comp_transform(edited).to_matrix().inverse();
+    let mut best: Option<(f32, ActivePlane)> = None;
+    for comp in &asm.components {
+        if comp.id == eid || comp.hidden {
+            continue;
+        }
+        let Some(geom) = render.cache.get(&asm_geom_key(comp)) else { continue };
+        let rel = inv * comp_transform(comp).to_matrix();
+        let rel_inv = rel.inverse();
+        // The ray in this component's own space (rigid transforms preserve `t`).
+        let lo = rel_inv.transform_point3(ray.origin);
+        let ld = rel_inv.transform_vector3(ray.direction.as_vec3()).normalize_or_zero();
+        let Ok(ldir) = Dir3::new(ld) else { continue };
+        if let Some((t, ap)) = pick_face(&geom.tri, &Ray3d::new(lo, ldir)) {
+            if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                // Map the picked plane back into the edited part's frame.
+                let plane = ActivePlane {
+                    name: "Face".into(),
+                    origin: rel.transform_point3(ap.origin),
+                    u: rel.transform_vector3(ap.u).normalize_or_zero(),
+                    v: rel.transform_vector3(ap.v).normalize_or_zero(),
+                    n: rel.transform_vector3(ap.n).normalize_or_zero(),
+                    datum: false,
+                };
+                best = Some((t, plane));
+            }
+        }
+    }
+    best
+}
+
 /// The Mate PM state: two picked face references, the mate type and its parameters.
 /// `kind`: 0 = Coincident, 1 = Distance, 2 = Concentric, 3 = Parallel.
 #[derive(Clone, PartialEq)]
@@ -1991,6 +2051,13 @@ struct UiState {
     asm_rot: Option<(u64, u8, Vec3, Vec3)>,
     /// Edit-in-place: the assembly component whose part is loaded in Part mode right now.
     editing_component: Option<u64>,
+    /// Request: create a brand-new empty part as an assembly component and open it for
+    /// in-context editing (sketch on ghost faces, snap to ghost geometry).
+    new_part_in_asm_request: bool,
+    /// The surrounding components' feature edges in the edited part's LOCAL frame, cached
+    /// at in-context edit entry — merged into the sketcher's reference-snap pool so a new
+    /// part's sketches snap to the ghosts' geometry. Empty outside in-context editing.
+    ghost_ref_edges: Vec<[[f32; 3]; 2]>,
     /// One-shot request to start editing a component's part in place.
     edit_component_request: Option<u64>,
     /// One-shot request to finish the in-place edit: `Some(true)` = save back, `Some(false)` = discard.
@@ -3184,6 +3251,10 @@ fn ui_system(
             ui.menu_button("Insert", |ui| {
                 if ui.add_enabled(in_asm, egui::Button::new("Component…")).on_hover_text("Insert saved part files (.hcad) into the assembly").clicked() {
                     ui_state.insert_component_request = true;
+                    ui.close();
+                }
+                if ui.add_enabled(in_asm, egui::Button::new("New Part (in context)")).on_hover_text("Create a new part inside this assembly and model it in place, referencing the other parts' geometry").clicked() {
+                    ui_state.new_part_in_asm_request = true;
                     ui.close();
                 }
                 if ui
@@ -5722,9 +5793,14 @@ fn ui_system(
                 });
             });
             ui.separator();
-            if ui.button("\u{2795} Insert Component…").clicked() {
-                ui_state.insert_component_request = true;
-            }
+            ui.horizontal(|ui| {
+                if ui.button("\u{2795} Insert Component…").clicked() {
+                    ui_state.insert_component_request = true;
+                }
+                if ui.button("\u{2726} New Part").on_hover_text("Create a new part inside this assembly and model it in place — sketch on the other parts' faces and snap to their geometry (they show as ghosts)").clicked() {
+                    ui_state.new_part_in_asm_request = true;
+                }
+            });
             if let Some(mut spec) = ui_state.mate_spec.clone() {
                 ui.separator();
                 ui.heading("Mate");
@@ -8716,6 +8792,8 @@ fn sketch_interaction(
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
     doc: Res<DocRes>,
     part: Res<Part>,
+    asm: Res<AsmRes>,
+    asm_render: Res<AsmRender>,
     mut session: ResMut<SketchSession>,
     mut edge_sel: ResMut<EdgeSelection>,
     mut ui_state: ResMut<UiState>,
@@ -8898,10 +8976,20 @@ fn sketch_interaction(
         // bosses snap exactly. A fit circle is refined to the nearest matching exact one.
         let exact = exact_plane_circles(&doc.0, &ap);
         let refine = |c: Vec2, r: f32| refine_circle(&exact, c, r);
+        // The snap pool: the body's own edges, plus — during an in-context assembly edit —
+        // the GHOST components' edges (already cached in the edited part's frame), so a new
+        // part's sketches snap to the surrounding parts' geometry too.
+        let ref_edges: std::borrow::Cow<[[[f32; 3]; 2]]> = if ui_state.ghost_ref_edges.is_empty() {
+            std::borrow::Cow::Borrowed(&part.edges)
+        } else {
+            let mut v = part.edges.clone();
+            v.extend_from_slice(&ui_state.ghost_ref_edges);
+            std::borrow::Cow::Owned(v)
+        };
         // Vertices already accounted for by a detected circular edge (full circle or
         // arc), so its many tessellation segments aren't each emitted as straight points.
         let mut circle_verts: Vec<Vec3> = Vec::new();
-        for (i, e) in part.edges.iter().enumerate() {
+        for (i, e) in ref_edges.iter().enumerate() {
             let (a, b) = (Vec3::from_array(e[0]), Vec3::from_array(e[1]));
             if !in_plane(a) || !in_plane(b) || a.distance(b) < 1e-6 {
                 continue;
@@ -8912,7 +9000,7 @@ fn sketch_interaction(
             if on_circle(a) && on_circle(b) {
                 continue;
             }
-            let (chain, closed) = edge_chain(&part.edges, i);
+            let (chain, closed) = edge_chain(&ref_edges, i);
             let uvs: Vec<Vec2> = chain.iter().map(|p| to_uv(*p)).collect();
             // Fast path: a whole closed circle → centre + 4 quadrant points.
             let whole_circle = if closed && uvs.len() >= 8 {
@@ -9521,6 +9609,16 @@ fn sketch_interaction(
                     }
                 }
             }
+            // In-context editing: the surrounding GHOST components' faces are sketchable
+            // too, so a new part can start directly on an existing part's face —
+            // SolidWorks-style in-context reference. Nearest hit wins against the body.
+            if let Some(eid) = ui_state.editing_component {
+                if let Some((t, ap)) = pick_ghost_face(&asm.0, &asm_render, eid, &ray) {
+                    if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                        best = Some((t, ap));
+                    }
+                }
+            }
             if let Some((_, ap)) = best {
                 // Snap face-on, but via the orbit state so the user can keep orbiting.
                 edge_sel.clear();
@@ -9700,7 +9798,8 @@ fn sketch_interaction(
                                 session.selected_contours.push(r);
                             }
                         } else {
-                            // Nothing in the sketch under the cursor — try a 3D body edge.
+                            // Nothing in the sketch under the cursor — try a 3D body edge
+                            // (or, during an in-context assembly edit, a GHOST part's edge).
                             // Project it into the plane as a locked reference line and
                             // select it (so it can be made parallel/perp/distance to a line).
                             let picked = window.cursor_position().and_then(|cur| {
@@ -9709,6 +9808,10 @@ fn sketch_interaction(
                                     .or_else(|| {
                                         pick_edge(&part.tangent_edges, camera, cam_gt, cur, 10.0)
                                             .map(|i| part.tangent_edges[i])
+                                    })
+                                    .or_else(|| {
+                                        pick_edge(&ui_state.ghost_ref_edges, camera, cam_gt, cur, 10.0)
+                                            .map(|i| ui_state.ghost_ref_edges[i])
                                     })
                             });
                             if let (Some(seg), Some(ap)) = (picked, session.plane.clone()) {
@@ -12255,6 +12358,11 @@ fn handle_file_io(
                 ui_state.asm_return_file = ui_state.current_file.take();
                 ui_state.current_file = part_file;
                 ui_state.editing_component = Some(id);
+                // Cache the ghosts' feature edges in the edited part's frame: the sketcher
+                // merges them into its reference-snap pool, so sketches here snap to the
+                // surrounding parts' geometry. Once is enough — components can't move
+                // during an in-place edit.
+                ui_state.ghost_ref_edges = ghost_edges_local(&asm.0, &asm_render, id);
                 *mode = DocMode::Part;
                 asm_render.dirty = true; // clears the assembly entities (the ghosts take over)
                 ui_state.regen = true;
@@ -12293,6 +12401,7 @@ fn handle_file_io(
             *mode = DocMode::Assembly;
             ui_state.current_file = ui_state.asm_return_file.take();
             ui_state.asm_selected = Some(id);
+            ui_state.ghost_ref_edges.clear();
             asm_render.dirty = true;
             // Park the part world again.
             doc.0 = Document::with_default_planes();
@@ -12329,6 +12438,23 @@ fn handle_file_io(
         ui_state.current_file = None;
         ui_state.regen = true;
         ui_state.toasts.push(("New assembly — Insert Component to add parts".into(), 3.0));
+    }
+    // ---- New Part (in context): an empty embedded component, opened for in-place editing ----
+    if ui_state.new_part_in_asm_request {
+        ui_state.new_part_in_asm_request = false;
+        if *mode == DocMode::Assembly && ui_state.editing_component.is_none() {
+            let n = (1..).find(|i| !asm.0.components.iter().any(|c| c.name == format!("Part{i}"))).unwrap_or(1);
+            let name = format!("Part{n}");
+            // Identity placement: the new part is modelled in assembly coordinates, so the
+            // ghost context sits exactly where the parts are (and geometry referenced off
+            // them lands in the right place without any transform gymnastics).
+            let id = asm.0.add_component(name.clone(), String::new(), Document::with_default_planes(), [0.0, 0.0, 0.0]);
+            ui_state.asm_selected = Some(id);
+            // Enter edit-in-place next frame via the normal path (ghosts, Save & Return).
+            ui_state.edit_component_request = Some(id);
+            ui_state.toasts.push((format!("{name}: sketch on a ghost face or a datum plane — Save & Return when done"), 4.5));
+            asm_render.dirty = true;
+        }
     }
     if ui_state.insert_component_request {
         ui_state.insert_component_request = false;
@@ -19617,6 +19743,59 @@ mod tests {
         solve_mates(&mut asm);
         let res = mate_residual(&asm, &asm.mates[0]).expect("residual measures");
         assert!(!mate_satisfied(res), "an unmet mate between two Fixed parts must read unsatisfied, got {res:?}");
+    }
+
+    #[test]
+    fn ghost_face_pick_maps_into_the_edited_frame() {
+        // In-context editing: a 10x10x5 box component placed at x=+20, and a NEW empty part
+        // at identity being edited in place. A ray fired down at the box's top face must pick
+        // it as a sketchable plane, expressed in the edited part's (= assembly, identity)
+        // frame: origin on the top face near its centre, normal +Z.
+        let mut box_part = Document::with_default_planes();
+        box_part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut asm = Assembly::default();
+        let bx = asm.add_component("box".into(), String::new(), box_part.clone(), [20.0, 0.0, 0.0]);
+        let newp = asm.add_component("Part1".into(), String::new(), Document::with_default_planes(), [0.0, 0.0, 0.0]);
+
+        // Fabricate the render cache the way the assembly renderer would (local tessellation).
+        let tess = component_tessellation(&box_part).expect("box tessellates");
+        let mut render = AsmRender::default();
+        let bc = asm.component(bx).unwrap();
+        render.cache.insert(
+            asm_geom_key(bc),
+            AsmGeom { mesh: Handle::default(), tri: tess.mesh.clone(), edges: tess.edges.clone() },
+        );
+
+        // Ray straight down onto the box top (world x=25, y=5 → local x=5, y=5, z=5 top).
+        let ray = Ray3d::new(Vec3::new(25.0, 5.0, 50.0), Dir3::NEG_Z);
+        let (_, ap) = pick_ghost_face(&asm, &render, newp, &ray).expect("ghost top face picks");
+        assert!((ap.origin.z - 5.0).abs() < 1e-3, "plane on the top face, z={}", ap.origin.z);
+        assert!(ap.origin.x > 20.0 - 1e-3 && ap.origin.x < 30.0 + 1e-3, "origin within the box footprint in ASSEMBLY coords, x={}", ap.origin.x);
+        assert!(ap.n.dot(Vec3::Z) > 0.99, "top-face normal is +Z, got {:?}", ap.n);
+        assert!(!ap.datum, "a ghost face is a face, not a datum plane");
+    }
+
+    #[test]
+    fn ghost_edges_transform_into_the_edited_frame() {
+        // The same setup's cached edges must land at the component's ASSEMBLY position when
+        // gathered for an identity-placed edited part (translation +20 applied).
+        let mut box_part = Document::with_default_planes();
+        box_part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut asm = Assembly::default();
+        let bx = asm.add_component("box".into(), String::new(), box_part.clone(), [20.0, 0.0, 0.0]);
+        let newp = asm.add_component("Part1".into(), String::new(), Document::with_default_planes(), [0.0, 0.0, 0.0]);
+        let mut render = AsmRender::default();
+        let bc = asm.component(bx).unwrap();
+        render.cache.insert(
+            asm_geom_key(bc),
+            AsmGeom { mesh: Handle::default(), tri: TriMesh::default(), edges: vec![[[0.0, 0.0, 5.0], [10.0, 0.0, 5.0]]] },
+        );
+        let edges = ghost_edges_local(&asm, &render, newp);
+        assert_eq!(edges.len(), 1);
+        assert!((edges[0][0][0] - 20.0).abs() < 1e-4 && (edges[0][1][0] - 30.0).abs() < 1e-4, "edge shifted to x∈[20,30]: {:?}", edges[0]);
+        // And the edited part itself contributes nothing (it's excluded).
+        let none = ghost_edges_local(&asm, &render, bx);
+        assert!(none.is_empty(), "the edited component's own edges are not ghost references");
     }
 
     #[test]
