@@ -811,6 +811,273 @@ pub fn mesh_plane_section(m: &TriMesh, origin: [f32; 3], normal: [f32; 3]) -> Ve
     out
 }
 
+/// A recognized curve in a mesh cross-section, in the sketch plane's 2D (uv) space.
+/// Produced by [`fit_section_shapes`] from the raw triangle-crossing segments of
+/// [`mesh_plane_section`] — tessellation chords become real circles/arcs/polylines the
+/// sketcher can snap to and convert into sketch entities.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SectionShape {
+    /// A decimated polyline (straight runs collapsed); `closed` means last→first connects.
+    Poly { pts: Vec<[f32; 2]>, closed: bool },
+    /// A full circle (a closed loop whose points all sit on one circle).
+    Circle { center: [f32; 2], radius: f32 },
+    /// A circular arc from `start` to `end` about `center` (`ccw` = counter-clockwise).
+    Arc { center: [f32; 2], radius: f32, start: [f32; 2], end: [f32; 2], ccw: bool },
+}
+
+/// Least-squares (Kasa) circle through 2D points: minimizes Σ(x²+y²+Dx+Ey+F)². Returns
+/// (center, radius, max |dist−r| deviation), or None if degenerate (collinear/too few).
+fn kasa_circle_2d(pts: &[[f32; 2]]) -> Option<([f32; 2], f32, f32)> {
+    if pts.len() < 3 {
+        return None;
+    }
+    let (mut sxx, mut sxy, mut syy, mut sx, mut sy, mut sxz, mut syz, mut sz, n) =
+        (0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64, 0f64, pts.len() as f64);
+    for p in pts {
+        let (x, y) = (p[0] as f64, p[1] as f64);
+        let z = x * x + y * y;
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+        sx += x;
+        sy += y;
+        sxz += x * z;
+        syz += y * z;
+        sz += z;
+    }
+    // Normal equations for [D, E, F] in x²+y² + Dx + Ey + F = 0.
+    let m = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]];
+    let rhs = [-sxz, -syz, -sz];
+    let det3 = |m: &[[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det3(&m);
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let col = |k: usize| {
+        let mut mm = m;
+        for r in 0..3 {
+            mm[r][k] = rhs[r];
+        }
+        det3(&mm) / d
+    };
+    let (dd, ee, ff) = (col(0), col(1), col(2));
+    let (cx, cy) = (-dd / 2.0, -ee / 2.0);
+    let r2 = cx * cx + cy * cy - ff;
+    if r2 <= 0.0 {
+        return None;
+    }
+    let r = r2.sqrt();
+    let mut dev = 0f64;
+    for p in pts {
+        let dist = ((p[0] as f64 - cx).powi(2) + (p[1] as f64 - cy).powi(2)).sqrt();
+        dev = dev.max((dist - r).abs());
+    }
+    Some(([cx as f32, cy as f32], r as f32, dev as f32))
+}
+
+/// Max perpendicular deviation of interior points from the chord first→last.
+fn line_dev(pts: &[[f32; 2]]) -> f32 {
+    let (a, b) = (pts[0], pts[pts.len() - 1]);
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-12 {
+        return 0.0;
+    }
+    let mut worst = 0f32;
+    for p in &pts[1..pts.len() - 1] {
+        worst = worst.max(((p[0] - a[0]) * dy - (p[1] - a[1]) * dx).abs() / len);
+    }
+    worst
+}
+
+/// Chain raw section segments into connected runs and fit clean shapes: full circles,
+/// arcs, and decimated polylines, everything within `tol` of the input points. This is
+/// what turns "5,000 chords across a scanned cylinder" into "a circle, r = 14.02".
+pub fn fit_section_shapes(segs: &[[[f32; 2]; 2]], tol: f32) -> Vec<SectionShape> {
+    use std::collections::HashMap;
+    let tol = tol.max(1e-6);
+    // --- Weld endpoints (quantized) and build node adjacency ---
+    let q = (tol * 0.25).max(1e-6);
+    let key = |p: [f32; 2]| ((p[0] / q).round() as i64, (p[1] / q).round() as i64);
+    let mut nodes: Vec<[f32; 2]> = Vec::new();
+    let mut idx: HashMap<(i64, i64), u32> = HashMap::new();
+    let mut node_of = |p: [f32; 2], nodes: &mut Vec<[f32; 2]>| -> u32 {
+        *idx.entry(key(p)).or_insert_with(|| {
+            nodes.push(p);
+            (nodes.len() - 1) as u32
+        })
+    };
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut edges: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    for s in segs {
+        let a = node_of(s[0], &mut nodes);
+        let b = node_of(s[1], &mut nodes);
+        if a == b {
+            continue; // welded-away sliver
+        }
+        let e = (a.min(b), a.max(b));
+        if !edges.insert(e) {
+            continue; // duplicate (e.g. coplanar-cap double cover)
+        }
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
+    }
+    // --- Walk chains: start at every non-degree-2 node, then sweep leftover loops ---
+    let mut used: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut chains: Vec<(Vec<u32>, bool)> = Vec::new();
+    let walk = |start: u32, first: u32, used: &mut std::collections::HashSet<(u32, u32)>, adj: &HashMap<u32, Vec<u32>>| {
+        let mut chain = vec![start, first];
+        used.insert((start.min(first), start.max(first)));
+        let (mut prev, mut cur) = (start, first);
+        loop {
+            let nexts = &adj[&cur];
+            if nexts.len() != 2 {
+                return (chain, false); // hit a junction/endpoint — open chain
+            }
+            let nxt = if nexts[0] == prev { nexts[1] } else { nexts[0] };
+            if !used.insert((cur.min(nxt), cur.max(nxt))) {
+                return (chain, false);
+            }
+            if nxt == chain[0] {
+                return (chain, true); // came home — closed loop
+            }
+            chain.push(nxt);
+            prev = cur;
+            cur = nxt;
+        }
+    };
+    let mut starts: Vec<u32> = adj.iter().filter(|(_, v)| v.len() != 2).map(|(k, _)| *k).collect();
+    starts.sort_unstable();
+    for s in starts {
+        for n in adj[&s].clone() {
+            if !used.contains(&(s.min(n), s.max(n))) {
+                chains.push(walk(s, n, &mut used, &adj));
+            }
+        }
+    }
+    let mut loop_starts: Vec<u32> = adj.keys().copied().collect();
+    loop_starts.sort_unstable();
+    for s in loop_starts {
+        for n in adj[&s].clone() {
+            if !used.contains(&(s.min(n), s.max(n))) {
+                chains.push(walk(s, n, &mut used, &adj));
+            }
+        }
+    }
+
+    // --- Fit each chain: circle (closed) → greedy arc/line runs → decimated polyline ---
+    let mut out = Vec::new();
+    for (chain, closed) in chains {
+        let pts: Vec<[f32; 2]> = chain.iter().map(|i| nodes[*i as usize]).collect();
+        if pts.len() < 2 {
+            continue;
+        }
+        // A closed loop that fits one circle IS that circle.
+        if closed && pts.len() >= 8 {
+            if let Some((c, r, dev)) = kasa_circle_2d(&pts) {
+                if dev < tol {
+                    out.push(SectionShape::Circle { center: c, radius: r });
+                    continue;
+                }
+            }
+        }
+        // Greedy segmentation: at each position take the longest run (line or arc) that
+        // stays within tol; straight runs accumulate into one polyline.
+        let ring: Vec<[f32; 2]> = if closed {
+            let mut v = pts.clone();
+            v.push(pts[0]);
+            v
+        } else {
+            pts.clone()
+        };
+        let mut poly: Vec<[f32; 2]> = Vec::new();
+        let flush = |poly: &mut Vec<[f32; 2]>, out: &mut Vec<SectionShape>| {
+            if poly.len() >= 2 {
+                out.push(SectionShape::Poly { pts: std::mem::take(poly), closed: false });
+            } else {
+                poly.clear();
+            }
+        };
+        let mut i = 0usize;
+        while i + 1 < ring.len() {
+            // Longest straight run from i.
+            let mut le = i + 1;
+            while le + 1 < ring.len() && line_dev(&ring[i..=le + 1]) < tol {
+                le += 1;
+            }
+            // Longest arc run from i (needs enough points to be trustworthy).
+            let mut ae = i + 1;
+            let mut arc: Option<([f32; 2], f32)> = None;
+            {
+                let mut e = i + 5;
+                while e < ring.len() {
+                    match kasa_circle_2d(&ring[i..=e]) {
+                        Some((c, r, dev)) if dev < tol && r > tol * 4.0 => {
+                            ae = e;
+                            arc = Some((c, r));
+                            e += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            if arc.is_some() && ae > le + 2 {
+                // Arc wins (covers meaningfully more points than the straight run).
+                let (c, r) = arc.unwrap();
+                flush(&mut poly, &mut out);
+                let (s, e) = (ring[i], ring[ae]);
+                // Orientation from the midpoint of the run.
+                let m = ring[(i + ae) / 2];
+                let ang = |p: [f32; 2]| (p[1] - c[1]).atan2(p[0] - c[0]);
+                let (a0, am, a1) = (ang(s), ang(m), ang(e));
+                let norm = |x: f32| {
+                    let t = x % (2.0 * std::f32::consts::PI);
+                    if t < 0.0 {
+                        t + 2.0 * std::f32::consts::PI
+                    } else {
+                        t
+                    }
+                };
+                let ccw = norm(am - a0) < norm(a1 - a0);
+                out.push(SectionShape::Arc { center: c, radius: r, start: s, end: e, ccw });
+                i = ae;
+            } else {
+                if poly.is_empty() {
+                    poly.push(ring[i]);
+                }
+                poly.push(ring[le]);
+                i = le;
+            }
+        }
+        // Close or emit the trailing polyline.
+        if !poly.is_empty() {
+            let is_whole = closed && out.is_empty() && poly.len() >= 3;
+            if is_whole {
+                let mut p = std::mem::take(&mut poly);
+                p.pop(); // last == first (ring wrap) — drop the duplicate
+                // The walk starts at an arbitrary loop node, often mid-edge — drop any
+                // vertex collinear (within tol) with its neighbours around the ring.
+                let mut k = 0;
+                while p.len() > 3 && k < p.len() {
+                    let (prev, next) = (p[(k + p.len() - 1) % p.len()], p[(k + 1) % p.len()]);
+                    if line_dev(&[prev, p[k], next]) < tol {
+                        p.remove(k);
+                    } else {
+                        k += 1;
+                    }
+                }
+                out.push(SectionShape::Poly { pts: p, closed: true });
+            } else {
+                flush(&mut poly, &mut out);
+            }
+        }
+    }
+    out
+}
+
 /// Reconstruct a **faceted** B-rep solid from a triangle mesh: weld coincident vertices, share an
 /// edge between adjacent triangles, and make each triangle a planar `Face`, assembled into a Shell
 /// → Solid. This lets a mesh-only body (loft, fillet, seamless boolean) still export to STEP — the
@@ -2091,6 +2358,98 @@ mod tests {
         assert!((total - 80.0).abs() < 0.5, "section length {total:.2} should be the 80 mm perimeter");
         // Off the body entirely → nothing.
         assert!(mesh_plane_section(&cube, [0.0, 0.0, 50.0], [0.0, 0.0, 1.0]).is_empty());
+    }
+
+    /// Chaining + fitting must turn raw section chords into recognized shapes: a square's
+    /// segments (subdivided, shuffled) become ONE closed 4-point polyline, and a 96-gon's
+    /// chords become ONE circle with the right centre/radius — not thousands of segments.
+    #[test]
+    fn section_shapes_recognize_squares_and_circles() {
+        // Square perimeter, each side chopped into 8 pieces, order scrambled.
+        let mut segs: Vec<[[f32; 2]; 2]> = Vec::new();
+        let corners = [[-10.0f32, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        for i in 0..4 {
+            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+            for k in 0..8 {
+                let t0 = k as f32 / 8.0;
+                let t1 = (k + 1) as f32 / 8.0;
+                let lerp = |t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                segs.push([lerp(t0), lerp(t1)]);
+            }
+        }
+        segs.reverse();
+        segs.swap(3, 17);
+        let shapes = fit_section_shapes(&segs, 0.05);
+        assert_eq!(shapes.len(), 1, "one shape for the square, got {shapes:?}");
+        match &shapes[0] {
+            SectionShape::Poly { pts, closed } => {
+                assert!(*closed, "square outline should close");
+                assert_eq!(pts.len(), 4, "decimated to the 4 corners, got {}", pts.len());
+                for p in pts {
+                    assert!((p[0].abs() - 10.0).abs() < 0.05 && (p[1].abs() - 10.0).abs() < 0.05, "corner off: {p:?}");
+                }
+            }
+            other => panic!("expected a closed polyline, got {other:?}"),
+        }
+
+        // 96-gon approximating a circle: centre (5, -3), r = 14.
+        let n = 96;
+        let circ: Vec<[[f32; 2]; 2]> = (0..n)
+            .map(|k| {
+                let p = |k: i32| {
+                    let a = k as f32 / n as f32 * std::f32::consts::TAU;
+                    [5.0 + 14.0 * a.cos(), -3.0 + 14.0 * a.sin()]
+                };
+                [p(k), p(k + 1)]
+            })
+            .collect();
+        let shapes = fit_section_shapes(&circ, 0.05);
+        assert_eq!(shapes.len(), 1, "one shape for the circle, got {shapes:?}");
+        match &shapes[0] {
+            SectionShape::Circle { center, radius } => {
+                assert!((center[0] - 5.0).abs() < 0.05 && (center[1] + 3.0).abs() < 0.05, "centre {center:?}");
+                assert!((radius - 14.0).abs() < 0.05, "radius {radius}");
+            }
+            other => panic!("expected a circle, got {other:?}"),
+        }
+    }
+
+    /// A stadium/slot outline (two straight sides + two semicircular ends, tessellated)
+    /// must come back as arcs AND lines — the mixed case the greedy segmentation exists for.
+    #[test]
+    fn section_shapes_split_a_slot_into_arcs_and_lines() {
+        let (r, half) = (5.0f32, 10.0f32); // slot: straight from x=-10..10, end caps r=5
+        let mut pts: Vec<[f32; 2]> = Vec::new();
+        for k in 0..=16 {
+            let t = k as f32 / 16.0;
+            pts.push([-half + 2.0 * half * t, -r]); // bottom edge left→right
+        }
+        for k in 1..=24 {
+            let a = -std::f32::consts::FRAC_PI_2 + k as f32 / 24.0 * std::f32::consts::PI;
+            pts.push([half + r * a.cos(), r * a.sin()]); // right cap, CCW
+        }
+        for k in 1..=16 {
+            let t = k as f32 / 16.0;
+            pts.push([half - 2.0 * half * t, r]); // top edge right→left
+        }
+        for k in 1..24 {
+            let a = std::f32::consts::FRAC_PI_2 + k as f32 / 24.0 * std::f32::consts::PI;
+            pts.push([-half + r * a.cos(), r * a.sin()]); // left cap, CCW (open: last≠first)
+        }
+        let segs: Vec<[[f32; 2]; 2]> = (0..pts.len())
+            .map(|i| [pts[i], pts[(i + 1) % pts.len()]])
+            .collect();
+        let shapes = fit_section_shapes(&segs, 0.05);
+        let arcs = shapes.iter().filter(|s| matches!(s, SectionShape::Arc { .. })).count();
+        let others = shapes.len() - arcs;
+        assert_eq!(arcs, 2, "two end-cap arcs, got {shapes:#?}");
+        assert!(others >= 1, "the straight sides must appear too, got {shapes:#?}");
+        for s in &shapes {
+            if let SectionShape::Arc { center, radius, .. } = s {
+                assert!((radius - r).abs() < 0.1, "cap radius {radius} (want {r})");
+                assert!((center[0].abs() - half).abs() < 0.1 && center[1].abs() < 0.1, "cap centre {center:?}");
+            }
+        }
     }
 
     #[test]

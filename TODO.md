@@ -10,16 +10,27 @@ Sketching on any plane through a reference scan shows the scan's **section outli
 and merges it into the snap pool (endpoints/midpoints/edge-pick), for tracing cross-sections.
 Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is memoized.
 
+**v2 (2026-07):**
+- **Mesh PropertyManager** (double-click / context-menu on a [mesh]/[scan] row; auto-opens on
+  import): scale with ×25.4 / ×1000 unit presets, XYZ rotation (about origin) + XYZ offset,
+  and opacity for scans. Placement is baked into the cached mesh (`import_mesh_cached`);
+  ghosts respawn via a placement fingerprint on `RefMeshEnt`.
+- **Section fitting** (`fit_section_shapes`): raw triangle chords are welded, chained, and
+  fitted into circles / arcs / decimated polylines (Kasa LSQ + greedy arc/line runs, 0.05 mm
+  tol). Fitted circles feed `reference_circles`, so radius/centre snapping on a scanned
+  bore is exact; the snap pool sees decimated segments, not thousands of chords.
+- **Trace Section** button (sketch tab, shown when a scan crosses the plane): converts the
+  fitted shapes into real sketch entities (circles/arcs/lines) in one click, undoable.
+
 **Remaining edges.**
-- No PropertyManager yet: `scale` (unit fix-ups, e.g. inch STLs ×25.4) and RefMesh `opacity`
-  exist in the document format but are only settable by editing the file. Add a PM.
-- Section curves are raw triangle crossings (one segment per triangle) — a very dense scan
-  puts many thousands of segments into the per-frame snap loop; chain + decimate them if
-  sketching near a big scan ever feels slow. No arc/circle detection on scan sections yet.
 - Non-watertight imports get a warning toast steering to Reference, but an editable import
-  of one may still fail downstream booleans (Manifold needs closed meshes).
+  of one may still fail downstream booleans (Manifold needs closed meshes). No mesh repair.
 - Scan sections come only from `RefMesh`; sectioning the solid body itself (imported or not)
   through a sketch plane could reuse the same helper (`mesh_plane_section`).
+- Fit tolerance is fixed at 0.05 mm; noisy real-world scans may want it exposed in the PM.
+- Rotation UI is XYZ Euler about the world origin — fine for axis-aligning exports, clumsy
+  for freely-scanned data; a "3-point align" (pick 3 scan points → plane) would be better.
+- No measure tool on reference-scan surfaces yet; no decimated display copy for huge scans.
 
 ## Exact-radius reference snapping (concentric-boss seam) — largely fixed
 

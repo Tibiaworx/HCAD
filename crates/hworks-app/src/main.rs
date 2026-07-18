@@ -26,7 +26,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, M
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, import_stl, is_manifold, loft_mesh, mesh_plane_section, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -2063,6 +2063,13 @@ struct UiState {
     scan_section_edges: Vec<[[f32; 3]; 2]>,
     /// Fingerprint (plane + scan set) the cached section curves were computed for.
     scan_section_fp: u64,
+    /// The fitted section shapes (uv space of the active sketch plane) — circles, arcs,
+    /// decimated polylines. Source for `scan_section_edges` and for Trace Section.
+    scan_shapes: Vec<SectionShape>,
+    /// Fitted scan circles/arc centres (uv) fed into the radius/centre snap pool.
+    scan_circles: Vec<(Vec2, f32)>,
+    /// Which mesh feature (ImportMesh/RefMesh index) has its PropertyManager open.
+    mesh_edit: Option<usize>,
     /// One-shot request to start editing a component's part in place.
     edit_component_request: Option<u64>,
     /// One-shot request to finish the in-place edit: `Some(true)` = save back, `Some(false)` = discard.
@@ -2452,10 +2459,24 @@ impl ActivePlane {
 
 /// Marker on a spawned reference-image quad, tagged with the document feature it mirrors so the
 /// sync system can match/despawn it and the update system can refresh its transform/opacity.
-/// Marker on a spawned reference-scan ghost (`RefMesh` feature), tagged with its feature id.
+/// Marker on a spawned reference-scan ghost (`RefMesh` feature), tagged with its feature id
+/// and the placement fingerprint (scale/rot/offset hash) its mesh was baked with — a
+/// mismatch tells the sync system to respawn it.
 #[derive(Component)]
 struct RefMeshEnt {
     id: FeatureId,
+    placement_fp: u64,
+}
+
+/// Hash of a mesh feature's placement (scale + rotation + offset), for change detection.
+fn mesh_placement_fp(scale: f64, rot_deg: [f64; 3], offset: [f64; 3]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scale.to_bits().hash(&mut h);
+    for v in rot_deg.iter().chain(offset.iter()) {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 #[derive(Component)]
@@ -3747,6 +3768,61 @@ fn ui_system(
                             session.hide_inference = !snap;
                         }
                     });
+                    // Convert the reference scan's fitted section curves (circles / arcs /
+                    // polylines) into REAL sketch entities — one click instead of tracing.
+                    if in_sketch && !ui_state.scan_shapes.is_empty() {
+                        ui.separator();
+                        if ui
+                            .add(egui::Button::new("Trace Section").fill(egui::Color32::from_rgb(35, 95, 105)))
+                            .on_hover_text(format!(
+                                "Convert the scan's cross-section ({} shape{}) into sketch geometry",
+                                ui_state.scan_shapes.len(),
+                                if ui_state.scan_shapes.len() == 1 { "" } else { "s" }
+                            ))
+                            .clicked()
+                        {
+                            let snap = session.sketch.clone();
+                            session.undo_sketch.push(snap);
+                            session.redo_sketch.clear();
+                            let mut added = 0usize;
+                            for shape in &ui_state.scan_shapes {
+                                match shape {
+                                    SectionShape::Circle { center, radius } => {
+                                        let c = session.sketch.add_point(center[0] as f64, center[1] as f64);
+                                        session.sketch.add_circle(c, *radius as f64);
+                                        added += 1;
+                                    }
+                                    SectionShape::Arc { center, radius: _, start, end, ccw } => {
+                                        let c = session.sketch.add_point(center[0] as f64, center[1] as f64);
+                                        let a = session.sketch.add_point(start[0] as f64, start[1] as f64);
+                                        let b = session.sketch.add_point(end[0] as f64, end[1] as f64);
+                                        session.sketch.add_arc(c, a, b, *ccw, false);
+                                        added += 1;
+                                    }
+                                    SectionShape::Poly { pts, closed } => {
+                                        if pts.len() < 2 {
+                                            continue;
+                                        }
+                                        let ids: Vec<usize> =
+                                            pts.iter().map(|p| session.sketch.add_point(p[0] as f64, p[1] as f64)).collect();
+                                        for w in ids.windows(2) {
+                                            session.sketch.add_line(w[0], w[1], false);
+                                            added += 1;
+                                        }
+                                        if *closed && ids.len() >= 3 {
+                                            session.sketch.add_line(ids[ids.len() - 1], ids[0], false);
+                                            added += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            session.sketch.solve();
+                            session.dirty = true;
+                            session.undo_baseline = Some(session.sketch.clone());
+                            session.undo_fp = sketch_fingerprint(&session.sketch);
+                            ui_state.toasts.push((format!("Traced {added} entities from the scan section"), 3.0));
+                        }
+                    }
                     if in_sketch {
                         ui.separator();
                         let confirm = if session.editing.is_some() { "Confirm edit" } else { "Finish sketch" };
@@ -5134,6 +5210,128 @@ fn ui_system(
             } else {
                 ui_state.image_edit = None;
                 ui_state.image_calib = None;
+            }
+        }
+        // Mesh PropertyManager (imported STL / reference scan): scale with unit presets,
+        // rotation, offset — and opacity for scans. STLs are unitless, so the ×25.4 (inch)
+        // and ×1000 (metre) fix-ups are the first thing many imports need.
+        if let Some(idx) = ui_state.mesh_edit {
+            let cur = doc.0.features.get(idx).and_then(|f| match &f.kind {
+                FeatureKind::ImportMesh { name, scale, rot_deg, offset, .. } => Some((name.clone(), *scale, *rot_deg, *offset, None)),
+                FeatureKind::RefMesh { name, scale, rot_deg, offset, opacity, .. } => Some((name.clone(), *scale, *rot_deg, *offset, Some(*opacity))),
+                _ => None,
+            });
+            if let Some((name, mut scale, mut rot_deg, mut offset, mut opacity)) = cur {
+                ui.heading(if opacity.is_some() { "Reference Mesh" } else { "Imported Mesh" });
+                let mut close = false;
+                let mut delete = false;
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("✔  Done").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                        close = true;
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("🗑  Delete").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                        delete = true;
+                    }
+                });
+                ui.separator();
+                ui.label(egui::RichText::new(&name).strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Scale ");
+                    let mut s = scale;
+                    if ui.add(egui::DragValue::new(&mut s).speed(0.01).range(1.0e-6..=1.0e6).fixed_decimals(4)).changed() && s > 0.0 {
+                        scale = s;
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("in → mm (×25.4)").on_hover_text("The STL was modelled in inches").clicked() {
+                        scale *= 25.4;
+                        changed = true;
+                    }
+                    if ui.button("m → mm (×1000)").on_hover_text("The STL was modelled in metres").clicked() {
+                        scale *= 1000.0;
+                        changed = true;
+                    }
+                    if ui.button("Reset").clicked() {
+                        scale = 1.0;
+                        changed = true;
+                    }
+                });
+                ui.separator();
+                ui.label("Rotate (about the origin)");
+                for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Rot {axis}"));
+                        let mut deg = rot_deg[k] as f32;
+                        if ui.add(egui::DragValue::new(&mut deg).speed(1.0).range(-360.0..=360.0).suffix("°")).changed() {
+                            rot_deg[k] = deg as f64;
+                            changed = true;
+                        }
+                    });
+                }
+                ui.label("Move");
+                for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Pos {axis}"));
+                        let mut v = offset[k] as f32;
+                        if unit_drag(ui, &mut v, ui_state.unit, 0.5, -100_000.0, 100_000.0).changed() {
+                            offset[k] = v as f64;
+                            changed = true;
+                        }
+                    });
+                }
+                if let Some(op) = opacity.as_mut() {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Opacity");
+                        if ui.add(egui::Slider::new(op, 0.05..=1.0).fixed_decimals(2)).changed() {
+                            changed = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Sketch on any plane through the scan to trace its cross-section.").italics().weak().small());
+                }
+                if changed {
+                    let is_import = opacity.is_none();
+                    if let Some(f) = doc.0.features.get_mut(idx) {
+                        match &mut f.kind {
+                            FeatureKind::ImportMesh { scale: s, rot_deg: r, offset: o, .. } => {
+                                *s = scale;
+                                *r = rot_deg;
+                                *o = offset;
+                            }
+                            FeatureKind::RefMesh { scale: s, rot_deg: r, offset: o, opacity: op, .. } => {
+                                *s = scale;
+                                *r = rot_deg;
+                                *o = offset;
+                                if let Some(new_op) = opacity {
+                                    *op = new_op;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if is_import {
+                        ui_state.regen = true; // the body itself moved/rescaled
+                    }
+                }
+                if delete {
+                    history.snapshot(&doc.0);
+                    if idx < doc.0.features.len() {
+                        doc.0.features.remove(idx);
+                        if doc.0.rollback > doc.0.features.len() {
+                            doc.0.rollback = doc.0.features.len();
+                        }
+                    }
+                    ui_state.mesh_edit = None;
+                    ui_state.regen = true;
+                } else if close {
+                    ui_state.mesh_edit = None;
+                }
+            } else {
+                ui_state.mesh_edit = None;
             }
         }
         if let Some(profiles) = ui_state.loft_spec.clone() {
@@ -6623,7 +6821,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                ui_state.mesh_edit = Some(i);
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit mesh (scale/position)").clicked() {
+                                    ui_state.mesh_edit = Some(i);
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -6643,7 +6848,14 @@ fn ui_system(
                             if resp.clicked() {
                                 ui_state.selected = Some(i);
                             }
+                            if resp.double_clicked() {
+                                ui_state.mesh_edit = Some(i);
+                            }
                             resp.context_menu(|ui| {
+                                if ui.button("Edit scan (scale/position/opacity)").clicked() {
+                                    ui_state.mesh_edit = Some(i);
+                                    ui.close();
+                                }
                                 if ui.button(if f.hidden { "Show scan" } else { "Hide scan" }).clicked() {
                                     toggle_hidden = Some(i);
                                     ui.close();
@@ -9053,8 +9265,9 @@ fn sketch_interaction(
         // the GHOST components' edges (already cached in the edited part's frame), so a new
         // part's sketches snap to the surrounding parts' geometry too.
         // Section curves of reference scans through this plane (Phase 3 of STL import):
-        // recompute only when the plane or scan set changes, then feed them into the pool
-        // below so scan cross-sections snap like body edges.
+        // recompute only when the plane or scan set/placement changes. Raw triangle chords
+        // are chained + fitted (circles/arcs/decimated polylines) so a dense scan yields a
+        // handful of clean, snappable, convertible shapes instead of thousands of segments.
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -9064,28 +9277,92 @@ fn sketch_interaction(
             }
             let end = doc.0.rollback.min(doc.0.features.len());
             for f in &doc.0.features[..end] {
-                if let FeatureKind::RefMesh { scale, .. } = &f.kind {
+                if let FeatureKind::RefMesh { scale, rot_deg, offset, .. } = &f.kind {
                     if !f.hidden {
                         f.id.0.hash(&mut h);
-                        scale.to_bits().hash(&mut h);
+                        mesh_placement_fp(*scale, *rot_deg, *offset).hash(&mut h);
                     }
                 }
             }
             let fp = h.finish();
             if fp != ui_state.scan_section_fp {
                 ui_state.scan_section_fp = fp;
+                ui_state.scan_shapes.clear();
+                ui_state.scan_circles.clear();
                 ui_state.scan_section_edges.clear();
+                let mut raw_uv: Vec<[[f32; 2]; 2]> = Vec::new();
                 for f in &doc.0.features[..end] {
-                    let FeatureKind::RefMesh { data, scale, .. } = &f.kind else { continue };
+                    let FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } = &f.kind else { continue };
                     if f.hidden {
                         continue;
                     }
-                    if let Some(m) = import_mesh_cached(data, *scale) {
-                        ui_state
-                            .scan_section_edges
-                            .extend(mesh_plane_section(&m, ap.origin.to_array(), ap.n.to_array()));
+                    if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset) {
+                        for s in mesh_plane_section(&m, ap.origin.to_array(), ap.n.to_array()) {
+                            let uv = |w: [f32; 3]| {
+                                let d = Vec3::from_array(w) - ap.origin;
+                                [d.dot(ap.u), d.dot(ap.v)]
+                            };
+                            raw_uv.push([uv(s[0]), uv(s[1])]);
+                        }
                     }
                 }
+                // Fit tolerance: generous enough to absorb scan tessellation noise, tight
+                // enough not to invent geometry (0.05 mm).
+                let shapes = fit_section_shapes(&raw_uv, 0.05);
+                // Rebuild the world-space segment list (draw + pick + endpoint snapping)
+                // from the FITTED shapes — decimated, so the per-frame pool stays small.
+                let w = |p: [f32; 2]| ap.origin + ap.u * p[0] + ap.v * p[1];
+                let mut edges: Vec<[[f32; 3]; 2]> = Vec::new();
+                let mut circles: Vec<(Vec2, f32)> = Vec::new();
+                for shape in &shapes {
+                    match shape {
+                        SectionShape::Poly { pts, closed } => {
+                            for i in 0..pts.len().saturating_sub(1) {
+                                edges.push([w(pts[i]).to_array(), w(pts[i + 1]).to_array()]);
+                            }
+                            if *closed && pts.len() >= 3 {
+                                edges.push([w(pts[pts.len() - 1]).to_array(), w(pts[0]).to_array()]);
+                            }
+                        }
+                        SectionShape::Circle { center, radius } => {
+                            circles.push((Vec2::from_array(*center), *radius));
+                            let n = 48;
+                            for k in 0..n {
+                                let a0 = k as f32 / n as f32 * std::f32::consts::TAU;
+                                let a1 = (k + 1) as f32 / n as f32 * std::f32::consts::TAU;
+                                let at = |a: f32| w([center[0] + radius * a.cos(), center[1] + radius * a.sin()]).to_array();
+                                edges.push([at(a0), at(a1)]);
+                            }
+                        }
+                        SectionShape::Arc { center, radius, start, end, ccw } => {
+                            circles.push((Vec2::from_array(*center), *radius));
+                            let ang = |p: &[f32; 2]| (p[1] - center[1]).atan2(p[0] - center[0]);
+                            let (a0, mut a1) = (ang(start), ang(end));
+                            if *ccw && a1 < a0 {
+                                a1 += std::f32::consts::TAU;
+                            }
+                            if !*ccw && a1 > a0 {
+                                a1 -= std::f32::consts::TAU;
+                            }
+                            let steps = (((a1 - a0).abs() / std::f32::consts::TAU * 48.0).ceil() as usize).max(2);
+                            for k in 0..steps {
+                                let t0 = a0 + (a1 - a0) * k as f32 / steps as f32;
+                                let t1 = a0 + (a1 - a0) * (k + 1) as f32 / steps as f32;
+                                let at = |a: f32| w([center[0] + radius * a.cos(), center[1] + radius * a.sin()]).to_array();
+                                edges.push([at(t0), at(t1)]);
+                            }
+                        }
+                    }
+                }
+                ui_state.scan_shapes = shapes;
+                ui_state.scan_section_edges = edges;
+                ui_state.scan_circles = circles;
+            }
+            // Fitted scan circles snap like body circles: centre + radius (concentric bores
+            // over a scanned cylinder land exactly).
+            for (c, r) in &ui_state.scan_circles {
+                session.reference_circles.push((*c, *r));
+                session.reference_points.push(*c);
             }
         }
         let extra = ui_state.ghost_ref_edges.len() + ui_state.scan_section_edges.len();
@@ -12936,7 +13213,7 @@ fn handle_file_io(
                         let data = encode_mesh_blob(&bytes);
                         history.snapshot(&doc.0);
                         if as_reference {
-                            doc.0.add_feature(FeatureKind::RefMesh { data, name: name.clone(), scale: 1.0, opacity: 0.35 });
+                            doc.0.add_feature(FeatureKind::RefMesh { data, name: name.clone(), scale: 1.0, opacity: 0.35, rot_deg: [0.0; 3], offset: [0.0; 3] });
                             ui_state.toasts.push((format!("Reference mesh {name} added — model against it, it won't join the solid"), 4.0));
                         } else {
                             // Non-watertight scans make every downstream boolean fragile; steer
@@ -12948,9 +13225,12 @@ fn handle_file_io(
                                     6.0,
                                 ));
                             }
-                            doc.0.add_feature(FeatureKind::ImportMesh { data, name: name.clone(), scale: 1.0 });
+                            doc.0.add_feature(FeatureKind::ImportMesh { data, name: name.clone(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3] });
                             ui_state.toasts.push((format!("Imported {name} ({} triangles)", mesh.indices.len() / 3), 3.0));
                         }
+                        // Open the mesh PM right away — the first thing most imports need
+                        // is a unit fix (×25.4) or an alignment nudge.
+                        ui_state.mesh_edit = Some(doc.0.features.len() - 1);
                         ui_state.regen = true;
                         info!("Imported STL {} (reference: {as_reference})", path.display());
                     }
@@ -13652,16 +13932,20 @@ fn decode_mesh_blob(b64: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decode + parse an embedded mesh blob into a scaled [`TriMesh`], memoized by content hash —
+/// Decode + parse an embedded mesh blob into a **placed** [`TriMesh`] — scaled, rotated
+/// (XYZ Euler about the origin, degrees), then offset — memoized by content+placement hash:
 /// scans are large and `regenerate_mesh` replays the whole timeline on every edit, so
 /// decompressing/parsing megabytes per regen would make editing crawl. Small bounded cache.
-fn import_mesh_cached(data: &str, scale: f64) -> Option<TriMesh> {
+fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3]) -> Option<TriMesh> {
     use std::hash::{Hash, Hasher};
     static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, TriMesh>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
     scale.to_bits().hash(&mut h);
+    for v in rot_deg.iter().chain(offset.iter()) {
+        v.to_bits().hash(&mut h);
+    }
     let key = h.finish();
     if let Some(m) = CACHE.lock().unwrap().get(&key) {
         return Some(m.clone());
@@ -13674,6 +13958,16 @@ fn import_mesh_cached(data: &str, scale: f64) -> Option<TriMesh> {
                 p[k] *= scale as f32;
             }
         }
+    }
+    for (axis_i, deg) in rot_deg.iter().enumerate() {
+        if deg.abs() > 1e-9 {
+            let mut axis = [0.0; 3];
+            axis[axis_i] = 1.0;
+            m = rotate_mesh(&m, [0.0; 3], axis, deg.to_radians());
+        }
+    }
+    if offset.iter().any(|v| v.abs() > 1e-12) {
+        m = translate_mesh(&m, offset);
     }
     let mut cache = CACHE.lock().unwrap();
     if cache.len() > 8 {
@@ -13700,8 +13994,8 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
             FeatureKind::RefMesh { .. } => {}
             // An imported mesh IS a body: first feature becomes the body, later ones union in
             // (like a boss) — everything downstream then cuts/fillets/booleans it normally.
-            FeatureKind::ImportMesh { data, name, scale } => {
-                match import_mesh_cached(data, *scale) {
+            FeatureKind::ImportMesh { data, name, scale, rot_deg, offset } => {
+                match import_mesh_cached(data, *scale, *rot_deg, *offset) {
                     Some(m) => {
                         feat_tools.insert(fi, (vec![m.clone()], false));
                         body = Some(match body.take() {
@@ -16120,27 +16414,35 @@ fn sync_ref_meshes(
     mode: Res<DocMode>,
     mut existing: Query<(Entity, &RefMeshEnt, &MeshMaterial3d<StandardMaterial>, &mut Visibility)>,
 ) {
-    use std::collections::HashSet;
-    let want: HashSet<u64> = doc
+    use std::collections::{HashMap, HashSet};
+    // Wanted set: feature id → placement fingerprint (a changed placement = respawn).
+    let want: HashMap<u64, u64> = doc
         .0
         .features
         .iter()
-        .filter(|f| matches!(f.kind, FeatureKind::RefMesh { .. }))
-        .map(|f| f.id.0)
+        .filter_map(|f| match &f.kind {
+            FeatureKind::RefMesh { scale, rot_deg, offset, .. } => Some((f.id.0, mesh_placement_fp(*scale, *rot_deg, *offset))),
+            _ => None,
+        })
         .collect();
-    let have: HashSet<u64> = existing.iter().map(|(_, r, _, _)| r.id.0).collect();
+    let have: HashMap<u64, u64> = existing.iter().map(|(_, r, _, _)| (r.id.0, r.placement_fp)).collect();
     if want != have {
+        let keep: HashSet<u64> = existing
+            .iter()
+            .filter(|(_, r, _, _)| want.get(&r.id.0) == Some(&r.placement_fp))
+            .map(|(_, r, _, _)| r.id.0)
+            .collect();
         for (e, r, _, _) in &existing {
-            if !want.contains(&r.id.0) {
+            if !keep.contains(&r.id.0) {
                 commands.entity(e).despawn();
             }
         }
         for f in &doc.0.features {
-            let FeatureKind::RefMesh { data, name, scale, opacity } = &f.kind else { continue };
-            if have.contains(&f.id.0) {
+            let FeatureKind::RefMesh { data, name, scale, opacity, rot_deg, offset } = &f.kind else { continue };
+            if keep.contains(&f.id.0) {
                 continue;
             }
-            let Some(tri) = import_mesh_cached(data, *scale) else {
+            let Some(tri) = import_mesh_cached(data, *scale, *rot_deg, *offset) else {
                 warn!("Reference mesh {name}: could not decode the embedded data.");
                 continue;
             };
@@ -16159,7 +16461,7 @@ fn sync_ref_meshes(
                 MeshMaterial3d(material),
                 Transform::IDENTITY,
                 Name::new(format!("Reference Mesh {name}")),
-                RefMeshEnt { id: f.id },
+                RefMeshEnt { id: f.id, placement_fp: mesh_placement_fp(*scale, *rot_deg, *offset) },
             ));
         }
     }
@@ -18490,11 +18792,24 @@ mod tests {
         let stl = export_stl(&cube);
         let blob = encode_mesh_blob(&stl);
         assert_eq!(decode_mesh_blob(&blob).expect("decode"), stl, "blob must roundtrip byte-exactly");
-        let m1 = import_mesh_cached(&blob, 1.0).expect("parse at 1×");
-        let m2 = import_mesh_cached(&blob, 2.0).expect("parse at 2×");
+        let m1 = import_mesh_cached(&blob, 1.0, [0.0; 3], [0.0; 3]).expect("parse at 1×");
+        let m2 = import_mesh_cached(&blob, 2.0, [0.0; 3], [0.0; 3]).expect("parse at 2×");
         let (v1, v2) = (mesh_volume(&m1), mesh_volume(&m2));
         assert!((v1 - 8000.0).abs() < 8000.0 * 0.01, "20mm cube volume, got {v1:.1}");
         assert!((v2 - 8.0 * v1).abs() < v2 * 0.01, "2× scale should give 8× the volume, got {v2:.1}");
+        // Placement: rotate 90° about X (cube z∈[0,20] → y∈[-20,0]) then move +5 in x.
+        let m3 = import_mesh_cached(&blob, 1.0, [90.0, 0.0, 0.0], [5.0, 0.0, 0.0]).expect("placed");
+        let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &m3.positions {
+            for k in 0..3 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        assert!((min[0] + 5.0).abs() < 1e-3 && (max[0] - 15.0).abs() < 1e-3, "x span {min:?}..{max:?}");
+        assert!((min[1] + 20.0).abs() < 1e-3 && max[1].abs() < 1e-3, "rotated z→-y, got y {}..{}", min[1], max[1]);
+        let v3 = mesh_volume(&m3);
+        assert!((v3 - v1).abs() < v1 * 0.01, "rigid placement keeps volume, got {v3:.1}");
     }
 
     /// An `ImportMesh` feature must become the body in `regenerate_mesh` — and a later cut
@@ -18507,7 +18822,7 @@ mod tests {
         let blob = encode_mesh_blob(&export_stl(&cube));
 
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::ImportMesh { data: blob.clone(), name: "cube".into(), scale: 1.0 });
+        doc.add_feature(FeatureKind::ImportMesh { data: blob.clone(), name: "cube".into(), scale: 1.0, rot_deg: [0.0; 3], offset: [0.0; 3] });
         let (body, _) = regenerate_mesh(&doc).expect("import regenerates");
         let v = mesh_volume(&body);
         assert!((v - 8000.0).abs() < 8000.0 * 0.01, "imported cube volume, got {v:.1}");
@@ -18540,7 +18855,7 @@ mod tests {
 
         // A RefMesh, by contrast, must contribute NOTHING to the solid.
         let mut ref_doc = Document::with_default_planes();
-        ref_doc.add_feature(FeatureKind::RefMesh { data: blob, name: "scan".into(), scale: 1.0, opacity: 0.35 });
+        ref_doc.add_feature(FeatureKind::RefMesh { data: blob, name: "scan".into(), scale: 1.0, opacity: 0.35, rot_deg: [0.0; 3], offset: [0.0; 3] });
         assert!(regenerate_mesh(&ref_doc).is_none() || regenerate_mesh(&ref_doc).unwrap().0.positions.is_empty(),
             "a reference scan must not produce a body");
     }

@@ -131,7 +131,18 @@ pub enum FeatureKind {
     /// booleans) applies to it like any other body. `data` is the deflate-compressed binary
     /// STL, base64 — self-contained in the file. `scale` multiplies the raw (unitless) STL
     /// coordinates into mm. Mesh-kernel only (no exact B-rep for a scan).
-    ImportMesh { data: String, name: String, #[serde(default = "default_mesh_scale")] scale: f64 },
+    /// `rot_deg` (XYZ Euler, degrees, about the origin) then `offset` (mm) place the mesh —
+    /// so a scan/import can be aligned to the datum planes without editing the source file.
+    ImportMesh {
+        data: String,
+        name: String,
+        #[serde(default = "default_mesh_scale")]
+        scale: f64,
+        #[serde(default)]
+        rot_deg: [f64; 3],
+        #[serde(default)]
+        offset: [f64; 3],
+    },
     /// An imported triangle mesh as **reference only** — a 3D scan to build parts onto or
     /// reverse-engineer. Renders as a translucent ghost, contributes NOTHING to the solid,
     /// and its sketch-plane cross-sections become snappable reference curves. Same embedded
@@ -143,6 +154,10 @@ pub enum FeatureKind {
         scale: f64,
         #[serde(default = "default_ref_mesh_opacity")]
         opacity: f32,
+        #[serde(default)]
+        rot_deg: [f64; 3],
+        #[serde(default)]
+        offset: [f64; 3],
     },
     /// Reference image ("sketch picture"): a raster pinned to `plane` to trace over — not geometry,
     /// just a visual underlay. `data` is the base64-encoded PNG/JPG; `px_w`/`px_h` the source pixel
