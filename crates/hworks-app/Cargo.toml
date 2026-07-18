@@ -20,6 +20,8 @@ rfd = "0.15"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
 winit = "0.30"
 base64 = "=0.22.1"
+# Deflate compression for embedded mesh blobs (STL import).
+flate2 = "1"
 ttf-parser = "0.25"
 ab_glyph = "0.2"
 hworks-document = { path = "../hworks-document" }

@@ -1,5 +1,26 @@
 # HCAD — known issues & planned fixes
 
+## STL import (editable + reference scan) — v1 shipped 2026-07
+
+Insert → **Import STL…** brings a mesh in as an editable body (`ImportMesh`): it unions into
+the timeline like a boss, and downstream cuts/fillets/booleans apply to it (mesh kernel is
+forced on, like fillets). Insert → **Reference Mesh (STL)…** brings it in as a translucent
+teal ghost (`RefMesh`) that never joins the solid — for building parts against a 3D scan.
+Sketching on any plane through a reference scan shows the scan's **section outline** in teal
+and merges it into the snap pool (endpoints/midpoints/edge-pick), for tracing cross-sections.
+Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is memoized.
+
+**Remaining edges.**
+- No PropertyManager yet: `scale` (unit fix-ups, e.g. inch STLs ×25.4) and RefMesh `opacity`
+  exist in the document format but are only settable by editing the file. Add a PM.
+- Section curves are raw triangle crossings (one segment per triangle) — a very dense scan
+  puts many thousands of segments into the per-frame snap loop; chain + decimate them if
+  sketching near a big scan ever feels slow. No arc/circle detection on scan sections yet.
+- Non-watertight imports get a warning toast steering to Reference, but an editable import
+  of one may still fail downstream booleans (Manifold needs closed meshes).
+- Scan sections come only from `RefMesh`; sectioning the solid body itself (imported or not)
+  through a sketch plane could reuse the same helper (`mesh_plane_section`).
+
 ## Exact-radius reference snapping (concentric-boss seam) — largely fixed
 
 **Symptom (historical).** Draw a circle that snaps to a body's rounded edge, extrude it

@@ -26,7 +26,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, M
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, loft_mesh, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, import_stl, is_manifold, loft_mesh, mesh_plane_section, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -181,8 +181,7 @@ fn main() {
                     hover_body_edge,
                     sync_ref_planes,
                     scale_ref_planes,
-                    sync_ref_images,
-                    update_ref_images,
+                    (sync_ref_images, update_ref_images, sync_ref_meshes),
                     update_window_title,
                     update_plane_visibility,
                     update_body_transparency,
@@ -2058,6 +2057,12 @@ struct UiState {
     /// at in-context edit entry — merged into the sketcher's reference-snap pool so a new
     /// part's sketches snap to the ghosts' geometry. Empty outside in-context editing.
     ghost_ref_edges: Vec<[[f32; 3]; 2]>,
+    /// Section curves of the reference scans (`RefMesh`) cut by the ACTIVE sketch plane —
+    /// merged into the sketcher's snap pool and drawn as an outline to trace. Recomputed
+    /// only when the plane or the set of scans changes (see `scan_section_fp`).
+    scan_section_edges: Vec<[[f32; 3]; 2]>,
+    /// Fingerprint (plane + scan set) the cached section curves were computed for.
+    scan_section_fp: u64,
     /// One-shot request to start editing a component's part in place.
     edit_component_request: Option<u64>,
     /// One-shot request to finish the in-place edit: `Some(true)` = save back, `Some(false)` = discard.
@@ -2099,6 +2104,8 @@ struct UiState {
     /// Request to insert a reference image: open a file dialog and place it on the
     /// currently-selected plane (or Front if none). Consumed by the file-IO system.
     insert_image_request: bool,
+    /// Some(false) = editable ImportMesh, Some(true) = reference RefMesh (scan).
+    import_stl_request: Option<bool>,
     /// Request to start a fresh sketch on an arbitrary stored plane (e.g. a reference image's plane,
     /// so you can trace it). Consumed by `handle_edit_sketch`.
     sketch_on_ref: Option<PlaneRef>,
@@ -2445,6 +2452,12 @@ impl ActivePlane {
 
 /// Marker on a spawned reference-image quad, tagged with the document feature it mirrors so the
 /// sync system can match/despawn it and the update system can refresh its transform/opacity.
+/// Marker on a spawned reference-scan ghost (`RefMesh` feature), tagged with its feature id.
+#[derive(Component)]
+struct RefMeshEnt {
+    id: FeatureId,
+}
+
 #[derive(Component)]
 struct RefImageEnt {
     id: FeatureId,
@@ -3263,6 +3276,22 @@ fn ui_system(
                     .clicked()
                 {
                     ui_state.insert_image_request = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!in_asm, egui::Button::new("Import STL…"))
+                    .on_hover_text("Import an STL as an editable body — it joins the part and downstream features (cuts, fillets…) apply to it")
+                    .clicked()
+                {
+                    ui_state.import_stl_request = Some(false);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!in_asm, egui::Button::new("Reference Mesh (STL)…"))
+                    .on_hover_text("Import an STL (e.g. a 3D scan) as a see-through reference — build parts against it without it joining the solid")
+                    .clicked()
+                {
+                    ui_state.import_stl_request = Some(true);
                     ui.close();
                 }
             });
@@ -6582,6 +6611,50 @@ fn ui_system(
                             });
                             resp.rect
                         }
+                        FeatureKind::ImportMesh { name, .. } => {
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    if eye_button(ui, f.hidden) {
+                                        toggle_hidden = Some(i);
+                                    }
+                                    ui.selectable_label(selected, styled(format!("[mesh]   {name}")))
+                                })
+                                .inner;
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
+                        FeatureKind::RefMesh { name, .. } => {
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    if eye_button(ui, f.hidden) {
+                                        toggle_hidden = Some(i);
+                                    }
+                                    ui.selectable_label(selected, styled(format!("[scan]   {name}")))
+                                })
+                                .inner;
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button(if f.hidden { "Show scan" } else { "Hide scan" }).clicked() {
+                                    toggle_hidden = Some(i);
+                                    ui.close();
+                                }
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
                     };
                     feat_rows.push((i, row));
                 }
@@ -8979,11 +9052,49 @@ fn sketch_interaction(
         // The snap pool: the body's own edges, plus — during an in-context assembly edit —
         // the GHOST components' edges (already cached in the edited part's frame), so a new
         // part's sketches snap to the surrounding parts' geometry too.
-        let ref_edges: std::borrow::Cow<[[[f32; 3]; 2]]> = if ui_state.ghost_ref_edges.is_empty() {
+        // Section curves of reference scans through this plane (Phase 3 of STL import):
+        // recompute only when the plane or scan set changes, then feed them into the pool
+        // below so scan cross-sections snap like body edges.
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in 0..3 {
+                ((ap.origin[k] * 1.0e4).round() as i64).hash(&mut h);
+                ((ap.n[k] * 1.0e4).round() as i64).hash(&mut h);
+            }
+            let end = doc.0.rollback.min(doc.0.features.len());
+            for f in &doc.0.features[..end] {
+                if let FeatureKind::RefMesh { scale, .. } = &f.kind {
+                    if !f.hidden {
+                        f.id.0.hash(&mut h);
+                        scale.to_bits().hash(&mut h);
+                    }
+                }
+            }
+            let fp = h.finish();
+            if fp != ui_state.scan_section_fp {
+                ui_state.scan_section_fp = fp;
+                ui_state.scan_section_edges.clear();
+                for f in &doc.0.features[..end] {
+                    let FeatureKind::RefMesh { data, scale, .. } = &f.kind else { continue };
+                    if f.hidden {
+                        continue;
+                    }
+                    if let Some(m) = import_mesh_cached(data, *scale) {
+                        ui_state
+                            .scan_section_edges
+                            .extend(mesh_plane_section(&m, ap.origin.to_array(), ap.n.to_array()));
+                    }
+                }
+            }
+        }
+        let extra = ui_state.ghost_ref_edges.len() + ui_state.scan_section_edges.len();
+        let ref_edges: std::borrow::Cow<[[[f32; 3]; 2]]> = if extra == 0 {
             std::borrow::Cow::Borrowed(&part.edges)
         } else {
             let mut v = part.edges.clone();
             v.extend_from_slice(&ui_state.ghost_ref_edges);
+            v.extend_from_slice(&ui_state.scan_section_edges);
             std::borrow::Cow::Owned(v)
         };
         // Vertices already accounted for by a detected circular edge (full circle or
@@ -9812,6 +9923,10 @@ fn sketch_interaction(
                                     .or_else(|| {
                                         pick_edge(&ui_state.ghost_ref_edges, camera, cam_gt, cur, 10.0)
                                             .map(|i| ui_state.ghost_ref_edges[i])
+                                    })
+                                    .or_else(|| {
+                                        pick_edge(&ui_state.scan_section_edges, camera, cam_gt, cur, 10.0)
+                                            .map(|i| ui_state.scan_section_edges[i])
                                     })
                             });
                             if let (Some(seg), Some(ap)) = (picked, session.plane.clone()) {
@@ -12809,6 +12924,48 @@ fn handle_file_io(
             }
         }
     }
+
+    // Import an STL — either as an editable body (ImportMesh) or a see-through reference
+    // scan (RefMesh). Both embed the file (deflate+base64) so the .hcad stays self-contained.
+    if let Some(as_reference) = ui_state.import_stl_request.take() {
+        if let Some(path) = rfd::FileDialog::new().add_filter("STL mesh", &["stl"]).pick_file() {
+            match std::fs::read(&path) {
+                Ok(bytes) => match import_stl(&bytes) {
+                    Some(mesh) => {
+                        let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("mesh").to_string();
+                        let data = encode_mesh_blob(&bytes);
+                        history.snapshot(&doc.0);
+                        if as_reference {
+                            doc.0.add_feature(FeatureKind::RefMesh { data, name: name.clone(), scale: 1.0, opacity: 0.35 });
+                            ui_state.toasts.push((format!("Reference mesh {name} added — model against it, it won't join the solid"), 4.0));
+                        } else {
+                            // Non-watertight scans make every downstream boolean fragile; steer
+                            // those to reference import but still allow it (user may just want
+                            // to look at or repair-by-remodel it).
+                            if !is_manifold(&mesh) {
+                                ui_state.toasts.push((
+                                    "Note: this STL isn't watertight — booleans on it may fail. Consider Reference Mesh instead.".into(),
+                                    6.0,
+                                ));
+                            }
+                            doc.0.add_feature(FeatureKind::ImportMesh { data, name: name.clone(), scale: 1.0 });
+                            ui_state.toasts.push((format!("Imported {name} ({} triangles)", mesh.indices.len() / 3), 3.0));
+                        }
+                        ui_state.regen = true;
+                        info!("Imported STL {} (reference: {as_reference})", path.display());
+                    }
+                    None => {
+                        warn!("Could not parse STL {}", path.display());
+                        ui_state.last_error = Some(format!("{} doesn't look like a valid STL file.", path.display()));
+                    }
+                },
+                Err(e) => {
+                    warn!("Could not read STL {}: {e}", path.display());
+                    ui_state.last_error = Some(format!("Could not read the file: {e}"));
+                }
+            }
+        }
+    }
 }
 
 /// Apply a requested undo/redo. While a sketch is open, undo/redo steps through the
@@ -13027,7 +13184,7 @@ fn handle_edit_sketch(
         | FeatureKind::Revolve { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::RefMesh { .. } => return,
     };
     // A revolve also remembers its axis (point + direction) — re-select the matching line so the
     // PropertyManager's Axis box is filled and the preview shows when reopening it.
@@ -13146,7 +13303,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::RefMesh { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -13199,7 +13356,7 @@ fn doc_has_text(doc: &Document) -> bool {
 fn doc_has_fillet(doc: &Document) -> bool {
     doc.features
         .iter()
-        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. }))
+        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. }))
 }
 
 /// True if any extrude/cut is a **thin feature** (wall thickness > 0). The exact B-rep path
@@ -13331,9 +13488,10 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
             }
             // These reshape the mesh, so a model with one always builds via the mesh path —
             // this exact-kernel path never runs with one present.
-            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } => {
-                failures.push("Fillet/chamfer/mirror/thread/loft/pattern/shell/sweep needs the mesh kernel.".into());
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } => {
+                failures.push("Fillet/chamfer/mirror/thread/loft/pattern/shell/sweep/mesh-import needs the mesh kernel.".into());
             }
+            FeatureKind::RefMesh { .. } => {} // reference only — no solid contribution
         }
     }
     (body, failures)
@@ -13472,6 +13630,59 @@ fn clip_edges_to_mesh(edges: &[([[f32; 3]; 2], [f32; 3])], mesh: &TriMesh, rel: 
         .collect()
 }
 
+/// Deflate-compress + base64 an STL blob for self-contained embedding in a `.hcad` file
+/// (scans are big; raw base64 of a 50 MB STL would bloat the RON badly — deflate typically
+/// takes triangle soups down 3-5×).
+fn encode_mesh_blob(stl: &[u8]) -> String {
+    use base64::Engine;
+    use std::io::Write;
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    let _ = enc.write_all(stl);
+    let compressed = enc.finish().unwrap_or_default();
+    base64::engine::general_purpose::STANDARD.encode(compressed)
+}
+
+/// Decode an embedded mesh blob (see [`encode_mesh_blob`]) back to raw STL bytes.
+fn decode_mesh_blob(b64: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    use std::io::Read;
+    let compressed = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let mut out = Vec::new();
+    flate2::read::DeflateDecoder::new(compressed.as_slice()).read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// Decode + parse an embedded mesh blob into a scaled [`TriMesh`], memoized by content hash —
+/// scans are large and `regenerate_mesh` replays the whole timeline on every edit, so
+/// decompressing/parsing megabytes per regen would make editing crawl. Small bounded cache.
+fn import_mesh_cached(data: &str, scale: f64) -> Option<TriMesh> {
+    use std::hash::{Hash, Hasher};
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, TriMesh>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    scale.to_bits().hash(&mut h);
+    let key = h.finish();
+    if let Some(m) = CACHE.lock().unwrap().get(&key) {
+        return Some(m.clone());
+    }
+    let stl = decode_mesh_blob(data)?;
+    let mut m = import_stl(&stl)?;
+    if (scale - 1.0).abs() > 1e-12 {
+        for p in &mut m.positions {
+            for k in 0..3 {
+                p[k] *= scale as f32;
+            }
+        }
+    }
+    let mut cache = CACHE.lock().unwrap();
+    if cache.len() > 8 {
+        cache.clear(); // bound memory across many opened files
+    }
+    cache.insert(key, m.clone());
+    Some(m)
+}
+
 /// Rebuild the mesh-kernel body, plus the selectable feature edges emitted by the *last*
 /// bevel (fillet/chamfer) if it's still the final body operation — those tangent/hard edges
 /// are otherwise invisible to angle-based edge extraction, so we plumb them out explicitly.
@@ -13485,6 +13696,22 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
     for (fi, feature) in doc.features[..end].iter().enumerate() {
         match &feature.kind {
             FeatureKind::Plane(_) | FeatureKind::Sketch { .. } | FeatureKind::RefImage { .. } => {}
+            // Reference scans contribute nothing to the solid.
+            FeatureKind::RefMesh { .. } => {}
+            // An imported mesh IS a body: first feature becomes the body, later ones union in
+            // (like a boss) — everything downstream then cuts/fillets/booleans it normally.
+            FeatureKind::ImportMesh { data, name, scale } => {
+                match import_mesh_cached(data, *scale) {
+                    Some(m) => {
+                        feat_tools.insert(fi, (vec![m.clone()], false));
+                        body = Some(match body.take() {
+                            Some(b) => mesh_union(&b, &m),
+                            None => m,
+                        });
+                    }
+                    None => warn!("Import {name}: embedded mesh data could not be decoded."),
+                }
+            }
             FeatureKind::Extrude { sketch, regions, plane, distance, back, thin, thin_side } => {
                 // A boss adds material elsewhere; it doesn't invalidate edges from an earlier
                 // fillet/chamfer, so keep them (don't clear here).
@@ -15882,6 +16109,79 @@ fn sync_ref_images(
     }
 }
 
+/// Keep reference-scan meshes (`RefMesh` features) in sync with the document: one translucent
+/// ghost per feature. The mesh is decoded once on spawn (via the same bounded cache the
+/// editable-import path uses); per-frame work is just visibility (eye toggle) and opacity.
+fn sync_ref_meshes(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    doc: Res<DocRes>,
+    mode: Res<DocMode>,
+    mut existing: Query<(Entity, &RefMeshEnt, &MeshMaterial3d<StandardMaterial>, &mut Visibility)>,
+) {
+    use std::collections::HashSet;
+    let want: HashSet<u64> = doc
+        .0
+        .features
+        .iter()
+        .filter(|f| matches!(f.kind, FeatureKind::RefMesh { .. }))
+        .map(|f| f.id.0)
+        .collect();
+    let have: HashSet<u64> = existing.iter().map(|(_, r, _, _)| r.id.0).collect();
+    if want != have {
+        for (e, r, _, _) in &existing {
+            if !want.contains(&r.id.0) {
+                commands.entity(e).despawn();
+            }
+        }
+        for f in &doc.0.features {
+            let FeatureKind::RefMesh { data, name, scale, opacity } = &f.kind else { continue };
+            if have.contains(&f.id.0) {
+                continue;
+            }
+            let Some(tri) = import_mesh_cached(data, *scale) else {
+                warn!("Reference mesh {name}: could not decode the embedded data.");
+                continue;
+            };
+            let material = materials.add(StandardMaterial {
+                // Scan-ghost teal — visually distinct from both the solid body and the
+                // orange assembly edit-context ghosts.
+                base_color: Color::srgba(0.45, 0.75, 0.80, *opacity),
+                alpha_mode: AlphaMode::Blend,
+                cull_mode: None,
+                double_sided: true,
+                perceptual_roughness: 0.9,
+                ..default()
+            });
+            commands.spawn((
+                Mesh3d(meshes.add(trimesh_to_bevy(tri))),
+                MeshMaterial3d(material),
+                Transform::IDENTITY,
+                Name::new(format!("Reference Mesh {name}")),
+                RefMeshEnt { id: f.id },
+            ));
+        }
+    }
+    // Per-frame: eye toggle + rollback suppression + opacity, and hide entirely in Assembly mode.
+    let end = doc.0.rollback.min(doc.0.features.len());
+    for (_, r, math, mut vis) in &mut existing {
+        let Some((fi, f)) = doc.0.features.iter().enumerate().find(|(_, f)| f.id.0 == r.id.0) else { continue };
+        let FeatureKind::RefMesh { opacity, .. } = &f.kind else { continue };
+        let show = !f.hidden && fi < end && *mode == DocMode::Part;
+        let want_vis = if show { Visibility::Visible } else { Visibility::Hidden };
+        if *vis != want_vis {
+            *vis = want_vis;
+        }
+        if let Some(m) = materials.get_mut(&math.0) {
+            let a = opacity.clamp(0.0, 1.0);
+            if m.base_color.alpha() != a {
+                m.base_color.set_alpha(a);
+            }
+        }
+    }
+}
+
 /// Cheaply refresh each reference-image quad every frame from its feature: position (centre on the
 /// plane), in-plane rotation, size (width × height via Transform scale), mirror (negative scale),
 /// and opacity (material alpha). No texture re-decode — that only happens in `sync_ref_images`.
@@ -16226,6 +16526,13 @@ fn draw_sketch(
         lifted = ActivePlane { name: ap.name.clone(), origin: ap.origin + lift, u: ap.u, v: ap.v, n: ap.n, datum: ap.datum };
         &lifted
     };
+
+    // Reference-scan section outline through this plane: drawn in the scan's teal so the
+    // user can trace/snap the cross-section (the segments are already in the snap pool).
+    let scan_col = Color::srgba(0.30, 0.75, 0.80, 0.9);
+    for e in &ui_state.scan_section_edges {
+        overlay.line(Vec3::from_array(e[0]), Vec3::from_array(e[1]), scan_col);
+    }
 
     // Adaptive grid: spacing snaps to a nice 1/2/5×10^k that's ~1/16 of the view,
     // with a bounded number of cells, so it stays usable from millimetres to metres. Each line is
@@ -18171,6 +18478,71 @@ mod tests {
                 plane.origin, rp.origin, refw.x, refw.y, refw.z
             );
         }
+    }
+
+    /// The embedded-mesh blob (deflate + base64) must roundtrip byte-exactly, and
+    /// `import_mesh_cached` must apply the scale factor to the decoded mesh.
+    #[test]
+    fn mesh_blob_roundtrips_and_scales() {
+        let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
+        let stl = export_stl(&cube);
+        let blob = encode_mesh_blob(&stl);
+        assert_eq!(decode_mesh_blob(&blob).expect("decode"), stl, "blob must roundtrip byte-exactly");
+        let m1 = import_mesh_cached(&blob, 1.0).expect("parse at 1×");
+        let m2 = import_mesh_cached(&blob, 2.0).expect("parse at 2×");
+        let (v1, v2) = (mesh_volume(&m1), mesh_volume(&m2));
+        assert!((v1 - 8000.0).abs() < 8000.0 * 0.01, "20mm cube volume, got {v1:.1}");
+        assert!((v2 - 8.0 * v1).abs() < v2 * 0.01, "2× scale should give 8× the volume, got {v2:.1}");
+    }
+
+    /// An `ImportMesh` feature must become the body in `regenerate_mesh` — and a later cut
+    /// must carve it like any native feature. This is the whole point of the editable import.
+    #[test]
+    fn imported_stl_regenerates_as_the_body_and_takes_a_cut() {
+        let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
+        let blob = encode_mesh_blob(&export_stl(&cube));
+
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::ImportMesh { data: blob.clone(), name: "cube".into(), scale: 1.0 });
+        let (body, _) = regenerate_mesh(&doc).expect("import regenerates");
+        let v = mesh_volume(&body);
+        assert!((v - 8000.0).abs() < 8000.0 * 0.01, "imported cube volume, got {v:.1}");
+        assert!(is_manifold(&body), "imported body must be manifold");
+
+        // Cut a 10×10 square through the middle: volume drops by 10×10×20 = 2000.
+        let mut cut_sketch = Sketch::default();
+        let hole = 5.0f64;
+        let a = cut_sketch.add_point(-hole, -hole);
+        let b = cut_sketch.add_point(hole, -hole);
+        let c = cut_sketch.add_point(hole, hole);
+        let d = cut_sketch.add_point(-hole, hole);
+        cut_sketch.add_line(a, b, false);
+        cut_sketch.add_line(b, c, false);
+        cut_sketch.add_line(c, d, false);
+        cut_sketch.add_line(d, a, false);
+        doc.add_feature(FeatureKind::Cut {
+            sketch: cut_sketch,
+            regions: vec![0],
+            plane: standard_plane_ref(0),
+            distance: 25.0,
+            back: 25.0,
+            thin: 0.0,
+            thin_side: 0,
+        });
+        let (carved, _) = regenerate_mesh(&doc).expect("cut applies to the import");
+        let vc = mesh_volume(&carved);
+        assert!((vc - 6000.0).abs() < 6000.0 * 0.02, "cut import volume, got {vc:.1} (want ~6000)");
+        assert!(is_manifold(&carved), "carved import must stay manifold");
+
+        // A RefMesh, by contrast, must contribute NOTHING to the solid.
+        let mut ref_doc = Document::with_default_planes();
+        ref_doc.add_feature(FeatureKind::RefMesh { data: blob, name: "scan".into(), scale: 1.0, opacity: 0.35 });
+        assert!(regenerate_mesh(&ref_doc).is_none() || regenerate_mesh(&ref_doc).unwrap().0.positions.is_empty(),
+            "a reference scan must not produce a body");
     }
 
     /// A thin-feature extrude of a square profile must produce a hollow box shell whose volume is the

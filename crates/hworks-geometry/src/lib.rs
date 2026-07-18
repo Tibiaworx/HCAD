@@ -699,6 +699,118 @@ pub fn export_stl(mesh: &TriMesh) -> Vec<u8> {
     out
 }
 
+/// Parse an STL blob — **binary or ASCII**, auto-detected — into a flat-shaded [`TriMesh`]
+/// (per-triangle normals recomputed from the winding; the file's stored normals are ignored,
+/// as they're unreliable in the wild). Degenerate (zero-area) triangles are dropped. `None`
+/// if the blob isn't a recognizable STL or holds no triangles.
+pub fn import_stl(bytes: &[u8]) -> Option<TriMesh> {
+    // ASCII files start with "solid" AND actually contain "facet" keywords (many binary
+    // exporters also write "solid" into the 80-byte header, so the keyword check decides).
+    let looks_ascii = bytes.len() >= 5
+        && bytes[..5].eq_ignore_ascii_case(b"solid")
+        && std::str::from_utf8(&bytes[..bytes.len().min(2048)]).is_ok_and(|s| s.contains("facet"));
+    let tris: Vec<[[f64; 3]; 3]> = if looks_ascii {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut tris = Vec::new();
+        let mut cur: Vec<[f64; 3]> = Vec::new();
+        for line in text.lines() {
+            let mut w = line.split_whitespace();
+            if w.next() == Some("vertex") {
+                let (x, y, z) = (w.next()?.parse().ok()?, w.next()?.parse().ok()?, w.next()?.parse().ok()?);
+                cur.push([x, y, z]);
+                if cur.len() == 3 {
+                    tris.push([cur[0], cur[1], cur[2]]);
+                    cur.clear();
+                }
+            }
+        }
+        tris
+    } else {
+        if bytes.len() < 84 {
+            return None;
+        }
+        let count = u32::from_le_bytes(bytes[80..84].try_into().ok()?) as usize;
+        // Guard against a corrupt count (each triangle is 50 bytes).
+        if count == 0 || bytes.len() < 84 + count * 50 {
+            return None;
+        }
+        let f = |off: usize| -> f64 { f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as f64 };
+        (0..count)
+            .map(|i| {
+                let base = 84 + i * 50 + 12; // skip the stored normal
+                [
+                    [f(base), f(base + 4), f(base + 8)],
+                    [f(base + 12), f(base + 16), f(base + 20)],
+                    [f(base + 24), f(base + 28), f(base + 32)],
+                ]
+            })
+            .collect()
+    };
+    let mut mesh = TriMesh::default();
+    for [a, b, c] in tris {
+        let (e1, e2) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+        let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() < 1e-14 {
+            continue; // zero-area sliver
+        }
+        push_tri(&mut mesh, a, b, c);
+    }
+    (mesh.indices.len() >= 3).then_some(mesh)
+}
+
+/// Intersect a triangle mesh with a plane, returning the crossing segments (world space, both
+/// endpoints exactly on the plane). Used to give sketches on a plane through an imported
+/// scan/mesh its **section outline** to trace and snap to (reverse engineering). Triangles
+/// coplanar with the plane contribute their edges, so a flat cap at the section height still
+/// yields its outline (interior duplicates are harmless for snapping).
+pub fn mesh_plane_section(m: &TriMesh, origin: [f32; 3], normal: [f32; 3]) -> Vec<[[f32; 3]; 2]> {
+    let n = normal;
+    let dist = |p: [f32; 3]| (p[0] - origin[0]) * n[0] + (p[1] - origin[1]) * n[1] + (p[2] - origin[2]) * n[2];
+    let mut out = Vec::new();
+    let eps = 1e-5_f32;
+    for t in m.indices.chunks_exact(3) {
+        let p = [m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]];
+        let d = [dist(p[0]), dist(p[1]), dist(p[2])];
+        if d.iter().all(|x| x.abs() < eps) {
+            // Coplanar triangle: emit its edges as section geometry.
+            out.push([p[0], p[1]]);
+            out.push([p[1], p[2]]);
+            out.push([p[2], p[0]]);
+            continue;
+        }
+        // Collect the crossing points of the three edges (vertex-on-plane counts once).
+        let mut pts: Vec<[f32; 3]> = Vec::new();
+        let mut add = |q: [f32; 3]| {
+            if !pts.iter().any(|e| (0..3).all(|k| (e[k] - q[k]).abs() < eps)) {
+                pts.push(q);
+            }
+        };
+        for i in 0..3 {
+            let j = (i + 1) % 3;
+            let (da, db) = (d[i], d[j]);
+            if da.abs() < eps {
+                add(p[i]);
+            }
+            if (da > eps && db < -eps) || (da < -eps && db > eps) {
+                let t01 = da / (da - db);
+                add([
+                    p[i][0] + (p[j][0] - p[i][0]) * t01,
+                    p[i][1] + (p[j][1] - p[i][1]) * t01,
+                    p[i][2] + (p[j][2] - p[i][2]) * t01,
+                ]);
+            }
+        }
+        if pts.len() == 2 {
+            let (a, b) = (pts[0], pts[1]);
+            let len2: f32 = (0..3).map(|k| (a[k] - b[k]) * (a[k] - b[k])).sum();
+            if len2 > eps * eps {
+                out.push([a, b]);
+            }
+        }
+    }
+    out
+}
+
 /// Reconstruct a **faceted** B-rep solid from a triangle mesh: weld coincident vertices, share an
 /// edge between adjacent triangles, and make each triangle a planar `Face`, assembled into a Shell
 /// → Solid. This lets a mesh-only body (loft, fillet, seamless boolean) still export to STEP — the
@@ -1956,6 +2068,49 @@ mod tests {
         let vol = mesh_vol(&tessellate(&torus, 0.02).mesh);
         let want = 2.0 * std::f64::consts::PI.powi(2) * 20.0 * 4.0;
         assert!((vol - want).abs() / want < 0.02, "torus volume {vol:.2}, want {want:.2}");
+    }
+
+    /// Sectioning a cube through its middle must yield exactly its square outline: every
+    /// segment on the plane, and the total length equal to the perimeter (4 × 20). Guards the
+    /// scan-tracing feature (sketch on a plane through a reference mesh, snap to the outline).
+    #[test]
+    fn mesh_plane_section_of_a_cube_is_its_square_outline() {
+        let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
+        let segs = mesh_plane_section(&cube, [0.0, 0.0, 10.0], [0.0, 0.0, 1.0]);
+        assert!(!segs.is_empty(), "mid-cube section must not be empty");
+        let mut total = 0.0f64;
+        for s in &segs {
+            for p in s {
+                assert!((p[2] - 10.0).abs() < 1e-4, "section point off the plane: {p:?}");
+                assert!(p[0].abs() < 10.0 + 1e-3 && p[1].abs() < 10.0 + 1e-3, "outside the cube: {p:?}");
+            }
+            total += (((s[0][0] - s[1][0]).powi(2) + (s[0][1] - s[1][1]).powi(2)) as f64).sqrt();
+        }
+        assert!((total - 80.0).abs() < 0.5, "section length {total:.2} should be the 80 mm perimeter");
+        // Off the body entirely → nothing.
+        assert!(mesh_plane_section(&cube, [0.0, 0.0, 50.0], [0.0, 0.0, 1.0]).is_empty());
+    }
+
+    #[test]
+    fn stl_import_roundtrips_a_cylinder_and_reads_ascii() {
+        // Binary: export a cylinder, re-import, and the triangle count and volume survive.
+        let cyl = extrude_solid(&circle(0.0, 0.0, 5.0, 32), &[], &plane_at(0.0), 10.0).unwrap();
+        let mesh = tessellate(&cyl, 0.1).mesh;
+        let blob = export_stl(&mesh);
+        let back = import_stl(&blob).expect("binary STL parses");
+        assert_eq!(back.indices.len(), mesh.indices.len(), "triangle count survives the roundtrip");
+        assert!((mesh_vol(&back) - mesh_vol(&mesh)).abs() < 1e-3, "volume survives the roundtrip");
+
+        // ASCII: a single-triangle solid in the text dialect.
+        let ascii = b"solid t\n facet normal 0 0 1\n  outer loop\n   vertex 0 0 0\n   vertex 1 0 0\n   vertex 0 1 0\n  endloop\n endfacet\nendsolid t\n";
+        let tri = import_stl(ascii).expect("ascii STL parses");
+        assert_eq!(tri.indices.len(), 3, "one triangle");
+        assert_eq!(tri.positions[1], [1.0, 0.0, 0.0]);
+
+        // Garbage in → None, not a panic.
+        assert!(import_stl(b"not an stl at all").is_none());
     }
 
     #[test]

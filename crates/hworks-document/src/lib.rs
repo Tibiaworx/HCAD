@@ -126,6 +126,24 @@ pub enum FeatureKind {
     /// `axis`, a thread of `major_d` × `pitch` over `depth`. `internal` taps a hole; false
     /// threads an existing boss. `rh` = right-handed.
     Thread { origin: [f64; 3], axis: [f64; 3], major_d: f64, pitch: f64, depth: f64, internal: bool, rh: bool },
+    /// An imported triangle mesh (an STL) as a **solid body feature**: the first solid feature
+    /// it becomes the body, later it unions in — and everything downstream (cuts, fillets,
+    /// booleans) applies to it like any other body. `data` is the deflate-compressed binary
+    /// STL, base64 — self-contained in the file. `scale` multiplies the raw (unitless) STL
+    /// coordinates into mm. Mesh-kernel only (no exact B-rep for a scan).
+    ImportMesh { data: String, name: String, #[serde(default = "default_mesh_scale")] scale: f64 },
+    /// An imported triangle mesh as **reference only** — a 3D scan to build parts onto or
+    /// reverse-engineer. Renders as a translucent ghost, contributes NOTHING to the solid,
+    /// and its sketch-plane cross-sections become snappable reference curves. Same embedded
+    /// `data` format as [`ImportMesh`].
+    RefMesh {
+        data: String,
+        name: String,
+        #[serde(default = "default_mesh_scale")]
+        scale: f64,
+        #[serde(default = "default_ref_mesh_opacity")]
+        opacity: f32,
+    },
     /// Reference image ("sketch picture"): a raster pinned to `plane` to trace over — not geometry,
     /// just a visual underlay. `data` is the base64-encoded PNG/JPG; `px_w`/`px_h` the source pixel
     /// size (for aspect ratio). `width`/`height` are the physical size on the plane (mm); `center` is
@@ -290,6 +308,8 @@ impl Document {
                 FeatureKind::RefImage { width, height, .. } => {
                     format!("[image]  Picture  {width:.0}×{height:.0}")
                 }
+                FeatureKind::ImportMesh { name, .. } => format!("[mesh]   {name}"),
+                FeatureKind::RefMesh { name, .. } => format!("[scan]   {name}"),
             })
             .collect()
     }
@@ -311,6 +331,13 @@ impl Document {
             _ => None,
         })
     }
+}
+
+fn default_mesh_scale() -> f64 {
+    1.0
+}
+fn default_ref_mesh_opacity() -> f32 {
+    0.35
 }
 
 // ===================== Assemblies (Phase 1) =====================
