@@ -148,6 +148,7 @@ fn main() {
         .init_resource::<FontPreviews>()
         .init_resource::<History>()
         .init_resource::<EdgeSelection>()
+        .init_resource::<RegenJob>()
         .add_systems(Startup, (setup, open_cli_file))
         .add_systems(EguiPrimaryContextPass, ui_system)
         .add_systems(
@@ -166,7 +167,7 @@ fn main() {
                     apply_chamfer,
                     (apply_mirror_feature, apply_pattern_feature, apply_shell_feature, apply_sweep_feature),
                     apply_thread,
-                    do_regenerate,
+                    (do_regenerate, finish_regen_job),
                     apply_section,
                     set_window_icon,
                     update_projection,
@@ -2073,6 +2074,11 @@ struct UiState {
     /// Active 3-point-align session for the mesh being edited (points picked so far,
     /// target datum plane, whether the first point becomes the origin).
     mesh_align: Option<MeshAlign>,
+    /// True while a mesh rebuild is running on a background thread (status-bar spinner).
+    rebuilding: bool,
+    /// Debounced regen: fire `regen` once this instant passes with no further edits —
+    /// so scrubbing a PM drag doesn't launch a full rebuild per tick.
+    regen_debounce: Option<std::time::Instant>,
     /// One-shot request to start editing a component's part in place.
     edit_component_request: Option<u64>,
     /// One-shot request to finish the in-place edit: `Some(true)` = save back, `Some(false)` = discard.
@@ -2469,6 +2475,16 @@ impl ActivePlane {
 struct RefMeshEnt {
     id: FeatureId,
     placement_fp: u64,
+}
+
+/// In-flight background mesh rebuild: the heavy work (booleans + tessellation + seam
+/// clipping) runs on the async compute pool so the UI never freezes on a big import.
+/// `rerun` remembers that the document changed again mid-rebuild — the finished (stale)
+/// result still lands, then a fresh rebuild starts from the newest document.
+#[derive(Resource, Default)]
+struct RegenJob {
+    task: Option<bevy::tasks::Task<(Option<(Tessellation, Vec<[[f32; 3]; 2]>)>, u32)>>,
+    rerun: bool,
 }
 
 /// A 3-point-align session on a mesh feature: three surface points define a plane that is
@@ -5449,7 +5465,9 @@ fn ui_system(
                         }
                     }
                     if is_import {
-                        ui_state.regen = true; // the body itself moved/rescaled
+                        // Debounced: scrubbing a drag field shouldn't fire a full (possibly
+                        // seconds-long) rebuild per tick — rebuild 0.3 s after the last change.
+                        ui_state.regen_debounce = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
                     }
                 }
                 if delete {
@@ -7296,6 +7314,12 @@ fn ui_system(
                     ui.separator();
                     ui.label(egui::RichText::new(h).italics().weak());
                 }
+            }
+            // Background rebuild in progress — the model on screen is the OLD state.
+            if ui_state.rebuilding || ui_state.regen_debounce.is_some() {
+                ui.separator();
+                ui.add(egui::Spinner::new().size(13.0));
+                ui.colored_label(egui::Color32::from_rgb(150, 190, 255), "Rebuilding…");
             }
             // Measure readout (when two points are picked).
             if ui_state.measure_pts.len() == 2 {
@@ -14703,18 +14727,21 @@ fn do_regenerate(
     mut ui_state: ResMut<UiState>,
     mut part: ResMut<Part>,
     mut edge_sel: ResMut<EdgeSelection>,
+    mut job: ResMut<RegenJob>,
     doc: Res<DocRes>,
     existing: Query<Entity, With<SolidPart>>,
 ) {
+    // Debounced requests (PM drags): fire once the quiet period passes.
+    if let Some(t) = ui_state.regen_debounce {
+        if std::time::Instant::now() >= t {
+            ui_state.regen_debounce = None;
+            ui_state.regen = true;
+        }
+    }
     if !ui_state.regen {
         return;
     }
     ui_state.regen = false;
-    // The rebuild replaces the displayed body with the FULL model — an active section view
-    // re-applies afterwards (apply_section keys off this reset).
-    ui_state.section_shown = None;
-    // Vertices move when the model rebuilds, so any edge selection is stale.
-    edge_sel.clear();
 
     // Text produces hundreds of tiny glyph faces; truck's recursive B-rep booleans can
     // *stack-overflow* on that (a hard abort `catch_unwind` can't trap), so any model
@@ -14725,44 +14752,41 @@ fn do_regenerate(
     // Seamless mode: build the whole model with the mesh kernel (Manifold), which fuses
     // coincident/coplanar faces so adjacent features merge without a seam. The exact
     // path's seams come from truck not merging shared faces; mesh has no such limit.
+    // The mesh rebuild runs on a BACKGROUND thread (`RegenJob`, landed by `finish_regen_job`):
+    // big imported meshes take seconds through the booleans and must not freeze the UI. The
+    // old body stays on screen (and interactive) until the new one is ready.
     if force_mesh {
-        let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc.0)))
-            .unwrap_or(None);
-        let fallbacks = take_fallback_count(); // booleans Manifold couldn't do (→ lossy BSP)
-        for e in &existing {
-            commands.entity(e).despawn();
+        if job.task.is_some() {
+            // A rebuild from an older document is still running — let it land, then
+            // immediately start over with the newest state (finish_regen_job re-arms regen).
+            job.rerun = true;
+            return;
         }
-        match mesh {
-            Some((m, bevel_edges)) if !m.positions.is_empty() => {
+        ui_state.rebuilding = true;
+        let doc_clone = doc.0.clone();
+        job.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+            let mesh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc_clone)))
+                .unwrap_or(None);
+            let fallbacks = take_fallback_count(); // booleans Manifold couldn't do (→ lossy BSP)
+            // Tessellation + seam clipping are heavy too — keep them off-thread. (Seam edges:
+            // the face-boundary detector reports every real sharp edge; the bevel's own edges
+            // cover a fillet's tangent boundary — clipped to the final surface so a later cut
+            // doesn't leave them floating in the void.)
+            let out = mesh.filter(|(m, _)| !m.positions.is_empty()).map(|(m, bevel_edges)| {
                 let tess = mesh_tessellation(m);
-                // The face-boundary detector already reports every real (sharp) edge, including a
-                // chamfer's flat-face boundaries. The bevel's own edges cover the *tangent* boundary
-                // of a fillet (a rounded edge, which the face detector merges away). They go in the
-                // dedicated SEAM set: drawn like real edges (a filleted rim keeps its boundary ring)
-                // and always selectable, without dragging in the exact path's facet lines. Clip to
-                // the final surface first so a later cut doesn't leave them floating in the void.
-                part.seam_edges = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
-                part.mesh = Some(tess.mesh.clone());
-                part.edges = tess.edges.clone();
-                part.tangent_edges = tess.tangent_edges.clone();
-                spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
-                part.solid = None; // mesh body has no B-rep handle
-                ui_state.last_error = (fallbacks > 0).then(|| {
-                    warn!("{fallbacks} boolean(s) fell back to the lossy BSP CSG — surface may be torn.");
-                    format!("⚠ {fallbacks} boolean(s) used the lossy fallback (Manifold rejected them) — the surface may be torn. Likely an exact tangent/coincident face: check the revolve axis is centred and the profile isn't flush with the boss wall.")
-                });
-            }
-            _ => {
-                part.solid = None;
-                part.mesh = None;
-                part.edges.clear();
-                part.tangent_edges.clear();
-                part.seam_edges.clear();
-                part.cut_hatch.clear();
-            }
-        }
+                let seams = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+                (tess, seams)
+            });
+            (out, fallbacks)
+        }));
         return;
     }
+
+    // The rebuild replaces the displayed body with the FULL model — an active section view
+    // re-applies afterwards (apply_section keys off this reset).
+    ui_state.section_shown = None;
+    // Vertices move when the model rebuilds, so any edge selection is stale.
+    edge_sel.clear();
 
     // The whole rebuild runs under a panic guard: a kernel panic deep in a boolean
     // or triangulation leaves the model empty rather than taking the app down.
@@ -14848,6 +14872,63 @@ fn do_regenerate(
                 }
             }
         }
+    }
+}
+
+/// Land a finished background mesh rebuild (see `do_regenerate`'s `force_mesh` branch): swap
+/// the displayed body for the new tessellation, clear now-stale selections, and — if the
+/// document changed again while this rebuild ran — immediately queue a fresh one.
+fn finish_regen_job(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ui_state: ResMut<UiState>,
+    mut part: ResMut<Part>,
+    mut edge_sel: ResMut<EdgeSelection>,
+    mut job: ResMut<RegenJob>,
+    existing: Query<Entity, With<SolidPart>>,
+) {
+    let Some(task) = job.task.as_mut() else { return };
+    let Some((result, fallbacks)) =
+        bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))
+    else {
+        return; // still crunching — UI keeps running
+    };
+    job.task = None;
+    ui_state.rebuilding = false;
+    // The rebuild replaces the displayed body with the FULL model — an active section view
+    // re-applies afterwards (apply_section keys off this reset).
+    ui_state.section_shown = None;
+    // Vertices move when the model rebuilds, so any edge selection is stale.
+    edge_sel.clear();
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    match result {
+        Some((tess, seams)) => {
+            part.seam_edges = seams;
+            part.mesh = Some(tess.mesh.clone());
+            part.edges = tess.edges.clone();
+            part.tangent_edges = tess.tangent_edges.clone();
+            spawn_solid(&mut commands, &mut meshes, &mut materials, tess);
+            part.solid = None; // mesh body has no B-rep handle
+            ui_state.last_error = (fallbacks > 0).then(|| {
+                warn!("{fallbacks} boolean(s) fell back to the lossy BSP CSG — surface may be torn.");
+                format!("⚠ {fallbacks} boolean(s) used the lossy fallback (Manifold rejected them) — the surface may be torn. Likely an exact tangent/coincident face: check the revolve axis is centred and the profile isn't flush with the boss wall.")
+            });
+        }
+        None => {
+            part.solid = None;
+            part.mesh = None;
+            part.edges.clear();
+            part.tangent_edges.clear();
+            part.seam_edges.clear();
+            part.cut_hatch.clear();
+        }
+    }
+    if job.rerun {
+        job.rerun = false;
+        ui_state.regen = true; // the doc moved on mid-rebuild — go again from the newest state
     }
 }
 
@@ -16622,6 +16703,7 @@ fn sync_ref_meshes(
     doc: Res<DocRes>,
     mode: Res<DocMode>,
     mut existing: Query<(Entity, &RefMeshEnt, &MeshMaterial3d<StandardMaterial>, &mut Visibility)>,
+    mut settle: Local<Option<(u64, std::time::Instant)>>,
 ) {
     use std::collections::{HashMap, HashSet};
     // Wanted set: feature id → placement fingerprint (a changed placement = respawn).
@@ -16636,6 +16718,29 @@ fn sync_ref_meshes(
         .collect();
     let have: HashMap<u64, u64> = existing.iter().map(|(_, r, _, _)| (r.id.0, r.placement_fp)).collect();
     if want != have {
+        // Debounce: while a PM drag is scrubbing the placement, `want` changes every frame —
+        // rebaking a big scan per tick would freeze the UI. Respawn only once the wanted
+        // state has been stable for a beat.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let mut pairs: Vec<(u64, u64)> = want.iter().map(|(k, v)| (*k, *v)).collect();
+            pairs.sort_unstable();
+            pairs.hash(&mut h);
+            h.finish()
+        };
+        match *settle {
+            Some((k, since)) if k == key => {
+                if since.elapsed() < std::time::Duration::from_millis(250) {
+                    return; // stable but still settling
+                }
+            }
+            _ => {
+                *settle = Some((key, std::time::Instant::now()));
+                return; // changed this frame — wait for it to settle
+            }
+        }
+        *settle = None;
         let keep: HashSet<u64> = existing
             .iter()
             .filter(|(_, r, _, _)| want.get(&r.id.0) == Some(&r.placement_fp))

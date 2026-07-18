@@ -36,6 +36,15 @@ Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is mem
 - **Section fit tolerance** slider (scan PM, 0.01–1 mm log scale, per scan): coarse for
   noisy scans → fewer, smoother fitted shapes; each scan fits with its own tolerance.
 
+**Responsiveness (2026-07):**
+- Mesh-kernel rebuilds (Seamless / fillets / imports) run on a **background thread**
+  (`RegenJob` + `finish_regen_job`): the old body stays visible and interactive, a status-bar
+  spinner shows "Rebuilding…", and a doc change mid-rebuild queues exactly one fresh run.
+- Mesh-PM drags are **debounced** (300 ms) before triggering a rebuild; scan-ghost respawns
+  settle 250 ms after the last placement change, so scrubbing scale/rot/offset stays smooth.
+- The exact (truck) path still rebuilds synchronously — it's fast for its feature set, but
+  could move onto the same job if it ever stalls.
+
 **Remaining edges.**
 - Scan sections come only from `RefMesh`; sectioning the solid body itself (imported or not)
   through a sketch plane could reuse the same helper (`mesh_plane_section`).
