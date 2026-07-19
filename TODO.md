@@ -1,5 +1,25 @@
 # HCAD — known issues & planned fixes
 
+## Reference planes: Free Plane + 3-Point Plane — v1 shipped 2026-07
+
+The Features-tab "Plane" flyout now has three tools:
+- **Offset Plane** — the original base + normal-offset flow (unchanged).
+- **Free Plane** — a plane placed anywhere: viewport gizmo (rectangle preview, normal
+  arrow = slide along normal, centre square = move in plane, edge diamonds = tilt about
+  the in-plane axes — same interaction grammar as the section gizmo) plus PM number
+  fields (Pos/Rot XYZ). Stored as `FeatureKind::Plane` with `offset: None`; re-editable
+  via the tree's "Edit plane (gizmos)" (Euler decomposition of the stored basis).
+- **3-Point Plane** — click three points on the body (vertex/edge-midpoint snapping) or a
+  reference scan surface; the plane through them (origin = centroid) is created on the
+  third click. Green pick markers; Esc cancels. Perfect for sectioning a scan at an angle.
+
+**Remaining edges.**
+- Free-plane tilt handles rotate about the CURRENT u/v (axes follow the plane as it
+  tilts); fine in practice, but a Shift-snap to 15° increments would help precision.
+- 3-point picks snap to body edge features but not to scan section curves or sketch
+  points; scan picks are raw surface hits.
+- Free planes don't remember a "size" — they draw at the global plane size.
+
 ## STL import (editable + reference scan) — v1 shipped 2026-07
 
 Insert → **Import STL…** brings a mesh in as an editable body (`ImportMesh`): it unions into

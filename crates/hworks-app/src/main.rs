@@ -193,7 +193,7 @@ fn main() {
                     draw_measure,
                     draw_body_edges,
                     draw_feature_previews,
-                    (draw_selected_feature, draw_sketch, persist_settings, draw_section_gizmo),
+                    (draw_selected_feature, draw_sketch, persist_settings, draw_section_gizmo, draw_free_plane_gizmo),
                     tick_edge_flash,
                     draw_edge_selection,
                 ),
@@ -2074,6 +2074,11 @@ struct UiState {
     /// Active 3-point-align session for the mesh being edited (points picked so far,
     /// target datum plane, whether the first point becomes the origin).
     mesh_align: Option<MeshAlign>,
+    /// Open Free Plane PM: a reference plane placed anywhere via gizmos/number fields.
+    free_plane: Option<FreePlaneSpec>,
+    /// Active 3-point-plane pick session: the reference points clicked so far (body
+    /// vertices/edges/surface or scan surfaces); the third click creates the plane.
+    plane_3pt: Option<Vec<Vec3>>,
     /// True while a mesh rebuild is running on a background thread (status-bar spinner).
     rebuilding: bool,
     /// Debounced regen: fire `regen` once this instant passes with no further edits —
@@ -2544,6 +2549,57 @@ fn align_placement(
     ))
 }
 
+/// A freely-placed reference plane being created/edited: world origin + XYZ Euler rotation
+/// (degrees; u = rotated X, v = rotated Y, normal = rotated Z). Placed with viewport gizmos
+/// (normal arrow, in-plane drag, edge rotation handles) and/or the PM's number fields.
+#[derive(Clone)]
+struct FreePlaneSpec {
+    origin: Vec3,
+    rot_deg: [f32; 3],
+    /// `Some(feature index)` when re-editing an existing free plane.
+    edit_target: Option<usize>,
+}
+
+impl FreePlaneSpec {
+    /// The plane basis this spec describes: (u, v, normal).
+    fn basis(&self) -> (Vec3, Vec3, Vec3) {
+        let q = Quat::from_euler(
+            EulerRot::ZYX,
+            self.rot_deg[2].to_radians(),
+            self.rot_deg[1].to_radians(),
+            self.rot_deg[0].to_radians(),
+        );
+        (q * Vec3::X, q * Vec3::Y, q * Vec3::Z)
+    }
+
+    /// Recover a spec from a stored plane's basis (Euler decomposition of [u v n]).
+    fn from_plane(p: &Plane, edit_target: Option<usize>) -> Self {
+        let (u, v) = (Vec3::from_array(p.u).normalize(), Vec3::from_array(p.v).normalize());
+        let n = u.cross(v).normalize();
+        let q = Quat::from_mat3(&Mat3::from_cols(u, v, n));
+        let (ez, ey, ex) = q.to_euler(EulerRot::ZYX);
+        FreePlaneSpec {
+            origin: Vec3::from_array(p.origin),
+            rot_deg: [ex.to_degrees(), ey.to_degrees(), ez.to_degrees()],
+            edit_target,
+        }
+    }
+}
+
+/// Plane through three points: (origin = centroid, u toward p2, v) — `None` if collinear.
+/// The normal follows the right-hand rule over the pick order (p1→p2→p3 counter-clockwise
+/// seen from the side the normal points at).
+fn plane_from_3pts(p1: Vec3, p2: Vec3, p3: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
+    let raw_n = (p2 - p1).cross(p3 - p1);
+    if raw_n.length() < 1e-6 {
+        return None;
+    }
+    let n = raw_n.normalize();
+    let u = ((p2 - p1) - n * (p2 - p1).dot(n)).normalize();
+    let v = n.cross(u);
+    Some(((p1 + p2 + p3) / 3.0, u, v))
+}
+
 /// Hash of a mesh feature's placement (scale + rotation + offset), for change detection.
 fn mesh_placement_fp(scale: f64, rot_deg: [f64; 3], offset: [f64; 3]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -2742,6 +2798,11 @@ struct SketchSession {
     /// Where on the arrow the section offset drag was grabbed: `offset - t(cursor)` at grab
     /// time, added back during the drag so the plane doesn't jump to the click point.
     section_grab: f32,
+    /// Free-plane gizmo drags: rotation handle (idx, frozen world axis, last clock-hand dir),
+    /// normal-arrow grab (origin·n − t at grab), and in-plane move grab (origin − hit at grab).
+    fp_rot: Option<(u8, Vec3, Vec3)>,
+    fp_arrow: Option<f32>,
+    fp_move: Option<Vec3>,
     /// If editing an existing feature's sketch, its feature index (else a new sketch).
     editing: Option<usize>,
     /// Request to leave sketch mode and commit the sketch to the timeline.
@@ -3221,7 +3282,7 @@ fn ui_system(
     // While a 3D gizmo arrow is being dragged, drop egui keyboard focus: a focused DragValue
     // (e.g. the PM's depth field) keeps its own text buffer and COMMITS the stale value when
     // focus later drops — snapping an arrow-dragged depth back to where it started.
-    if session.arrow_drag || session.arrow_drag2 || session.section_rot.is_some() {
+    if session.arrow_drag || session.arrow_drag2 || session.section_rot.is_some() || session.fp_rot.is_some() || session.fp_arrow.is_some() || session.fp_move.is_some() {
         ctx.memory_mut(|m| {
             if let Some(f) = m.focused() {
                 m.surrender_focus(f);
@@ -4024,11 +4085,27 @@ fn ui_system(
                     });
                     ui.separator();
                     // Reference geometry — always available (you can build a plane with no body yet).
-                    if ui.button("Plane").on_hover_text("Create a reference plane offset from a plane or a picked face — then sketch on it (e.g. stacked loft profiles)").clicked() {
-                        if let Some((_, p)) = doc.0.planes().next() {
-                            ui_state.plane_spec = Some(PlaneSpec { base: ActivePlane::from_doc(p), base_name: p.name.clone(), offset: 10.0, flip: false, edit_target: None });
+                    flyout_menu(ui, "Plane", |ui| {
+                        if ui.button("Offset Plane").on_hover_text("A plane parallel to a datum plane or picked face, offset along its normal (e.g. stacked loft profiles)").clicked() {
+                            if let Some((_, p)) = doc.0.planes().next() {
+                                ui_state.plane_spec = Some(PlaneSpec { base: ActivePlane::from_doc(p), base_name: p.name.clone(), offset: 10.0, flip: false, edit_target: None });
+                            }
+                            ui.close();
                         }
-                    }
+                        if ui.button("Free Plane").on_hover_text("A plane placed anywhere — drag it with the viewport gizmos (arrow = along normal, centre = in plane, edge diamonds = tilt)").clicked() {
+                            // Start at the body's centre (or the origin with no body yet).
+                            let origin = part.mesh.as_ref().map(|m| {
+                                let (lo, hi) = mesh_bbox(m);
+                                (lo + hi) * 0.5
+                            }).unwrap_or(Vec3::ZERO);
+                            ui_state.free_plane = Some(FreePlaneSpec { origin, rot_deg: [0.0; 3], edit_target: None });
+                            ui.close();
+                        }
+                        if ui.button("3-Point Plane").on_hover_text("Click three points on the body or a reference scan — the plane through them is created (great for sectioning a scan at an angle)").clicked() {
+                            ui_state.plane_3pt = Some(Vec::new());
+                            ui.close();
+                        }
+                    });
                 }
             }
         });
@@ -5123,6 +5200,82 @@ fn ui_system(
                 keep = false;
             }
             ui_state.plane_spec = if keep { Some(spec) } else { None };
+        }
+        // Free-plane PropertyManager: place a reference plane anywhere. The viewport gizmo
+        // (rectangle + normal arrow + centre handle + edge tilt diamonds) does the same edits
+        // as these number fields.
+        if let Some(mut spec) = ui_state.free_plane.clone() {
+            ui.heading("Free Plane");
+            let mut keep = true;
+            let mut create = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("✔  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    create = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("✖  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    keep = false;
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("Drag in the viewport: arrow = along the normal, centre square = in the plane, edge diamonds = tilt.").italics().weak().small());
+            ui.add_space(4.0);
+            ui.label("Position");
+            for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Pos {axis}"));
+                    let mut val = spec.origin[k];
+                    if unit_drag(ui, &mut val, ui_state.unit, 0.5, -100_000.0, 100_000.0).changed() {
+                        spec.origin[k] = val;
+                    }
+                });
+            }
+            ui.label("Rotate");
+            for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Rot {axis}"));
+                    let mut deg = spec.rot_deg[k];
+                    if ui.add(egui::DragValue::new(&mut deg).speed(1.0).range(-360.0..=360.0).suffix("°")).changed() {
+                        spec.rot_deg[k] = deg;
+                    }
+                });
+            }
+            if create {
+                let (u, v, _n) = spec.basis();
+                let name = match spec.edit_target.and_then(|fi| doc.0.features.get(fi)).map(|f| &f.kind) {
+                    Some(FeatureKind::Plane(p)) => p.name.clone(),
+                    _ => format!("Plane{}", doc.0.planes().count().saturating_sub(2)),
+                };
+                let plane = Plane {
+                    name,
+                    origin: [spec.origin.x, spec.origin.y, spec.origin.z],
+                    u: [u.x, u.y, u.z],
+                    v: [v.x, v.y, v.z],
+                    offset: None, // freely placed — no base/offset construction to re-derive
+                };
+                match spec.edit_target {
+                    Some(fi) if fi < doc.0.features.len() => doc.0.features[fi].kind = FeatureKind::Plane(plane),
+                    _ => {
+                        history.snapshot(&doc.0);
+                        doc.0.add_feature(FeatureKind::Plane(plane));
+                    }
+                }
+                ui_state.regen = true; // a moved plane shifts any sketch/feature built on it
+                keep = false;
+            }
+            ui_state.free_plane = if keep { Some(spec) } else { None };
+        }
+        // 3-point-plane instructions panel (the picking happens in the viewport).
+        if let Some(pts) = ui_state.plane_3pt.clone() {
+            ui.heading("3-Point Plane");
+            ui.label(egui::RichText::new("Click three points on the body or a reference scan.").strong());
+            ui.label(
+                egui::RichText::new(format!("Picked {}/3 — snaps to edge endpoints/midpoints on the body; anywhere on a scan.", pts.len()))
+                    .weak()
+                    .small(),
+            );
+            if ui.button("✖  Cancel").clicked() {
+                ui_state.plane_3pt = None;
+            }
         }
         // Reference-image PropertyManager: opacity, size (with aspect lock), position, rotation,
         // mirror, and the two-point scale calibration.
@@ -6588,6 +6741,15 @@ fn ui_system(
                                     datum: true,
                                 };
                                 ui_state.plane_spec = Some(PlaneSpec { base, base_name: off.base_name.clone(), offset: off.distance, flip: off.flip, edit_target: Some(fi) });
+                                ui.close();
+                            }
+                        } else if let (None, Some(fi), true) = (&offset, feat_idx, order >= 3) {
+                            // A free / 3-point plane (no offset construction, not a datum):
+                            // reopen it in the Free Plane PM with the gizmos.
+                            if ui.button("Edit plane (gizmos)").clicked() {
+                                if let Some(FeatureKind::Plane(p)) = doc.0.features.get(fi).map(|f| &f.kind) {
+                                    ui_state.free_plane = Some(FreePlaneSpec::from_plane(p, Some(fi)));
+                                }
                                 ui.close();
                             }
                         }
@@ -9270,7 +9432,8 @@ fn sketch_interaction(
     blocking: Res<UiBlocking>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam_q: Query<(&Camera, &GlobalTransform, &mut Transform, &mut OrbitCamera)>,
-    doc: Res<DocRes>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
     part: Res<Part>,
     asm: Res<AsmRes>,
     asm_render: Res<AsmRender>,
@@ -9344,33 +9507,50 @@ fn sketch_interaction(
         }
     }
 
+    // 3-point plane (view mode): click reference points; the third click creates the plane.
+    if ui_state.plane_3pt.is_some() && session.plane.is_none() && !blocking.0 {
+        if buttons.just_pressed(MouseButton::Left) {
+            if let Some(p) = window
+                .cursor_position()
+                .and_then(|cursor| pick_body_or_scan_point(&part, &doc.0, camera, cam_gt, cursor))
+            {
+                let mut pts = ui_state.plane_3pt.take().unwrap_or_default();
+                pts.push(p);
+                if pts.len() == 3 {
+                    match plane_from_3pts(pts[0], pts[1], pts[2]) {
+                        Some((origin, u, v)) => {
+                            let name = format!("Plane{}", doc.0.planes().count().saturating_sub(2));
+                            history.snapshot(&doc.0);
+                            doc.0.add_feature(FeatureKind::Plane(Plane {
+                                name: name.clone(),
+                                origin: [origin.x, origin.y, origin.z],
+                                u: [u.x, u.y, u.z],
+                                v: [v.x, v.y, v.z],
+                                offset: None,
+                            }));
+                            ui_state.regen = true;
+                            ui_state.toasts.push((format!("{name} created through the 3 points — sketch on it from the tree"), 4.0));
+                            // plane_3pt stays None (taken) — the session is complete.
+                        }
+                        None => {
+                            ui_state.toasts.push(("Those three points are collinear — pick again.".into(), 4.0));
+                            ui_state.plane_3pt = Some(Vec::new());
+                        }
+                    }
+                } else {
+                    ui_state.plane_3pt = Some(pts);
+                }
+            }
+            return; // consume the click
+        }
+    }
+
     // Measure tool (view mode): click body feature points (vertex / edge midpoint, else the surface
     // hit); two points give a distance (shown in the status bar). A third click starts a new pair.
     if ui_state.measuring && session.plane.is_none() && !blocking.0 {
         if buttons.just_pressed(MouseButton::Left) {
             if let Some(cursor) = window.cursor_position() {
-                // Body first (with its vertex/midpoint snapping); reference-scan surfaces are
-                // the fallback, so scan dimensions can be taken before any body exists.
-                let scan_hit = || {
-                    let end = doc.0.rollback.min(doc.0.features.len());
-                    let mut best: Option<(f32, Vec3)> = None;
-                    for f in &doc.0.features[..end] {
-                        let FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } = &f.kind else { continue };
-                        if f.hidden {
-                            continue;
-                        }
-                        if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0) {
-                            if let Some((hit, _)) = pick_face_point(&m, camera, cam_gt, cursor) {
-                                let d = cam_gt.translation().distance(hit);
-                                if best.is_none_or(|(bd, _)| d < bd) {
-                                    best = Some((d, hit));
-                                }
-                            }
-                        }
-                    }
-                    best.map(|(_, p)| p)
-                };
-                if let Some(p) = nearest_measure_point(&part, camera, cam_gt, cursor).or_else(scan_hit) {
+                if let Some(p) = pick_body_or_scan_point(&part, &doc.0, camera, cam_gt, cursor) {
                     if ui_state.measure_pts.len() >= 2 {
                         ui_state.measure_pts.clear();
                     }
@@ -10149,6 +10329,14 @@ fn sketch_interaction(
     if ui_state.section.is_some()
         && session.plane.is_none()
         && section_arrow_drag(&mut session, &mut ui_state, &part, window, camera, cam_gt, &ray, just_pressed, pressed, just_released)
+    {
+        return;
+    }
+
+    // Free-plane gizmo: normal arrow / centre in-plane drag / edge tilt diamonds.
+    if ui_state.free_plane.is_some()
+        && session.plane.is_none()
+        && free_plane_gizmo_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released)
     {
         return;
     }
@@ -12835,6 +13023,14 @@ fn handle_keys(
     if keys.just_pressed(KeyCode::Escape) && ui_state.measuring && !blocking.1 {
         ui_state.measuring = false;
         ui_state.measure_pts.clear();
+    }
+    // Escape also cancels the 3-point-plane pick and the free-plane placement.
+    if keys.just_pressed(KeyCode::Escape) && !blocking.1 {
+        if ui_state.plane_3pt.is_some() {
+            ui_state.plane_3pt = None;
+        } else if ui_state.free_plane.is_some() {
+            ui_state.free_plane = None;
+        }
     }
     if session.plane.is_none() {
         return;
@@ -18486,6 +18682,138 @@ fn draw_section_gizmo(mut overlay: Gizmos<OverlayGizmos>, ui_state: Res<UiState>
     }
 }
 
+/// The free-plane gizmo's geometry: (origin, u, v, n, arrow tip, half-size).
+fn free_plane_gizmo_geom(spec: &FreePlaneSpec, plane_size: f32) -> (Vec3, Vec3, Vec3, Vec3, Vec3, f32) {
+    let (u, v, n) = spec.basis();
+    let half = (plane_size * 0.5).max(1.0);
+    (spec.origin, u, v, n, spec.origin + n * (half * 0.6), half)
+}
+
+/// Drag the free-plane gizmo (view mode): the normal arrow slides the plane along its
+/// normal, the centre square moves it IN the plane, and the four edge-midpoint diamonds
+/// tilt it about its in-plane axes. Same interaction grammar as the section gizmo.
+#[allow(clippy::too_many_arguments)]
+fn free_plane_gizmo_drag(
+    session: &mut SketchSession,
+    ui_state: &mut UiState,
+    window: &Window,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    ray: &Ray3d,
+    just_pressed: bool,
+    pressed: bool,
+    just_released: bool,
+) -> bool {
+    let Some(spec) = ui_state.free_plane.clone() else { return false };
+    let (origin, u, v, n, tip, half) = free_plane_gizmo_geom(&spec, ui_state.plane_size);
+    if just_pressed && session.fp_rot.is_none() && session.fp_arrow.is_none() && session.fp_move.is_none() {
+        if let Some(cursor) = window.cursor_position() {
+            // Rotation diamonds first (edge midpoints), then the centre square, then the arrow.
+            let mut grabbed = false;
+            for (pos, idx) in section_rot_handles(origin, u, v, half) {
+                let near = camera.world_to_viewport(cam_gt, pos).map(|p| p.distance(cursor) < 18.0).unwrap_or(false);
+                if near {
+                    let axis = if idx == 0 { u } else { v };
+                    if let Some(dir) = section_rot_dir(origin, axis, ray) {
+                        session.fp_rot = Some((idx, axis, dir));
+                        grabbed = true;
+                    }
+                    break;
+                }
+            }
+            if !grabbed {
+                let near_center = camera.world_to_viewport(cam_gt, origin).map(|p| p.distance(cursor) < 20.0).unwrap_or(false);
+                if near_center {
+                    // In-plane move: anchor the grab offset so the plane doesn't jump.
+                    if let Some(hit) = ray_plane_point(origin, n, ray) {
+                        session.fp_move = Some(origin - hit);
+                        grabbed = true;
+                    }
+                }
+            }
+            if !grabbed {
+                let near_shaft = segment_screen_dist(camera, cam_gt, cursor, origin, tip).is_some_and(|d| d < 22.0);
+                let near_tip = camera.world_to_viewport(cam_gt, tip).map(|p| p.distance(cursor) < 26.0).unwrap_or(false);
+                if near_shaft || near_tip {
+                    let t0 = closest_t_on_axis(origin, n, ray.origin, ray.direction.as_vec3());
+                    if t0.is_finite() {
+                        session.fp_arrow = Some(-t0); // origin·n-relative grab anchor
+                    }
+                }
+            }
+        }
+    }
+    // Tilt about an in-plane axis (the axis is frozen at grab time, like the section gizmo).
+    if let Some((idx, axis, last)) = session.fp_rot {
+        if pressed {
+            if let Some(dir) = section_rot_dir(origin, axis, ray) {
+                let delta = last.cross(dir).dot(axis).atan2(last.dot(dir).clamp(-1.0, 1.0));
+                let mut s = spec;
+                let q_old = Quat::from_euler(
+                    EulerRot::ZYX,
+                    s.rot_deg[2].to_radians(),
+                    s.rot_deg[1].to_radians(),
+                    s.rot_deg[0].to_radians(),
+                );
+                let q_new = Quat::from_axis_angle(axis, delta) * q_old;
+                let (ez, ey, ex) = q_new.to_euler(EulerRot::ZYX);
+                s.rot_deg = [ex.to_degrees(), ey.to_degrees(), ez.to_degrees()];
+                ui_state.free_plane = Some(s);
+                session.fp_rot = Some((idx, axis, dir));
+            }
+            if just_released {
+                session.fp_rot = None;
+            }
+            return true;
+        }
+        session.fp_rot = None;
+    }
+    // Slide along the normal.
+    if let Some(grab) = session.fp_arrow {
+        if pressed {
+            let t = closest_t_on_axis(origin, n, ray.origin, ray.direction.as_vec3());
+            if t.is_finite() {
+                let mut s = spec;
+                s.origin = origin + n * (t + grab);
+                ui_state.free_plane = Some(s);
+            }
+            if just_released {
+                session.fp_arrow = None;
+            }
+            return true;
+        }
+        session.fp_arrow = None;
+    }
+    // Move in the plane.
+    if let Some(grab) = session.fp_move {
+        if pressed {
+            if let Some(hit) = ray_plane_point(origin, n, ray) {
+                let mut s = spec;
+                s.origin = hit + grab;
+                ui_state.free_plane = Some(s);
+            }
+            if just_released {
+                session.fp_move = None;
+            }
+            return true;
+        }
+        session.fp_move = None;
+    }
+    session.fp_rot.is_some() || session.fp_arrow.is_some() || session.fp_move.is_some()
+}
+
+/// Where the mouse ray pierces the plane through `origin` with normal `n`. None if parallel
+/// or behind the camera.
+fn ray_plane_point(origin: Vec3, n: Vec3, ray: &Ray3d) -> Option<Vec3> {
+    let rd = ray.direction.as_vec3();
+    let denom = rd.dot(n);
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let t = (origin - ray.origin).dot(n) / denom;
+    (t.is_finite() && t > 0.0).then(|| ray.origin + rd * t)
+}
+
 fn plane_arrow_drag(
     session: &mut SketchSession,
     ui_state: &mut UiState,
@@ -18716,6 +19044,32 @@ fn nearest_measure_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform,
     part.mesh.as_ref().and_then(|m| pick_face_point(m, camera, cam_gt, cursor).map(|(hit, _)| hit))
 }
 
+/// A reference point under the cursor: the body first (with its vertex/edge-midpoint
+/// snapping), else the nearest reference-scan surface hit. Shared by the measure tool and
+/// the 3-point-plane picker, so both can work off a scan before any body exists.
+fn pick_body_or_scan_point(part: &Part, doc: &Document, camera: &Camera, cam_gt: &GlobalTransform, cursor: Vec2) -> Option<Vec3> {
+    if let Some(p) = nearest_measure_point(part, camera, cam_gt, cursor) {
+        return Some(p);
+    }
+    let end = doc.rollback.min(doc.features.len());
+    let mut best: Option<(f32, Vec3)> = None;
+    for f in &doc.features[..end] {
+        let FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } = &f.kind else { continue };
+        if f.hidden {
+            continue;
+        }
+        if let Some(m) = import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0) {
+            if let Some((hit, _)) = pick_face_point(&m, camera, cam_gt, cursor) {
+                let d = cam_gt.translation().distance(hit);
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, hit));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Draw the measure tool's picked points (small 3D crosses) and the line between two of them —
 /// plus the 3-point-align session's picked points (teal, numbered by triangle fan) when active.
 fn draw_measure(mut gizmos: Gizmos, ui_state: Res<UiState>, cam_q: Query<&OrbitCamera>) {
@@ -18744,6 +19098,65 @@ fn draw_measure(mut gizmos: Gizmos, ui_state: Res<UiState>, cam_q: Query<&OrbitC
         }
         if al.pts.len() == 3 {
             gizmos.line(al.pts[2], al.pts[0], teal);
+        }
+    }
+    // 3-point-plane picks: green crosses + connecting preview lines.
+    if let Some(pts) = &ui_state.plane_3pt {
+        let green = Color::srgb(0.35, 0.9, 0.45);
+        for (i, &p) in pts.iter().enumerate() {
+            let ss = s * (1.0 + i as f32 * 0.5);
+            gizmos.line(p - Vec3::X * ss, p + Vec3::X * ss, green);
+            gizmos.line(p - Vec3::Y * ss, p + Vec3::Y * ss, green);
+            gizmos.line(p - Vec3::Z * ss, p + Vec3::Z * ss, green);
+        }
+        for w in pts.windows(2) {
+            gizmos.line(w[0], w[1], green);
+        }
+    }
+}
+
+/// Draw the free-plane gizmo: the plane rectangle with corner cross, the normal arrow, the
+/// centre move handle, and the four edge tilt diamonds (highlighted while dragged).
+fn draw_free_plane_gizmo(mut overlay: Gizmos<OverlayGizmos>, ui_state: Res<UiState>, session: Res<SketchSession>) {
+    let Some(spec) = &ui_state.free_plane else { return };
+    let (origin, ua, va, n, tip, half) = free_plane_gizmo_geom(spec, ui_state.plane_size);
+    let u = ua * half;
+    let v = va * half;
+    let col = Color::srgba(0.35, 0.75, 1.0, 0.9);
+    let faint = Color::srgba(0.35, 0.75, 1.0, 0.25);
+    let corners = [origin - u - v, origin + u - v, origin + u + v, origin - u + v];
+    for k in 0..4 {
+        overlay.line(corners[k], corners[(k + 1) % 4], col);
+    }
+    overlay.line(corners[0], corners[2], faint);
+    overlay.line(corners[1], corners[3], faint);
+    // Normal arrow (highlighted while dragging).
+    let acol = if session.fp_arrow.is_some() { Color::srgb(1.0, 1.0, 0.5) } else { col };
+    overlay.line(origin, tip, acol);
+    let d = (tip - origin).normalize_or_zero();
+    let side = d.any_orthonormal_vector() * (half * 0.06);
+    let back = tip - d * (half * 0.12);
+    overlay.line(tip, back + side, acol);
+    overlay.line(tip, back - side, acol);
+    let side2 = d.cross(side.normalize_or_zero()) * (half * 0.06);
+    overlay.line(tip, back + side2, acol);
+    overlay.line(tip, back - side2, acol);
+    // Centre move handle: a small in-plane square.
+    let mcol = if session.fp_move.is_some() { Color::srgb(1.0, 1.0, 0.5) } else { col };
+    let r = half * 0.06;
+    let sq = [origin - ua * r - va * r, origin + ua * r - va * r, origin + ua * r + va * r, origin - ua * r + va * r];
+    for k in 0..4 {
+        overlay.line(sq[k], sq[(k + 1) % 4], mcol);
+    }
+    // Edge tilt diamonds (like the section gizmo).
+    let hr = half * 0.045;
+    for (pos, idx) in section_rot_handles(origin, ua, va, half) {
+        let active = session.fp_rot.is_some_and(|(i, _, _)| i == idx);
+        let hcol = if active { Color::srgb(1.0, 1.0, 0.5) } else { col };
+        let along = if idx == 0 { va } else { ua };
+        let pts = [pos + n * hr, pos + along * hr, pos - n * hr, pos - along * hr];
+        for k in 0..4 {
+            overlay.line(pts[k], pts[(k + 1) % 4], hcol);
         }
     }
 }
@@ -19155,6 +19568,47 @@ mod tests {
                 plane.origin, rp.origin, refw.x, refw.y, refw.z
             );
         }
+    }
+
+    /// `plane_from_3pts` must produce an orthonormal basis whose plane contains all three
+    /// points (origin at their centroid), and reject collinear picks.
+    #[test]
+    fn plane_through_three_points_contains_them() {
+        let (p1, p2, p3) = (Vec3::new(3.0, -2.0, 5.0), Vec3::new(10.0, 4.0, -1.0), Vec3::new(-6.0, 8.0, 2.5));
+        let (origin, u, v) = plane_from_3pts(p1, p2, p3).expect("non-collinear");
+        let n = u.cross(v);
+        // Orthonormal basis.
+        assert!((u.length() - 1.0).abs() < 1e-5 && (v.length() - 1.0).abs() < 1e-5);
+        assert!(u.dot(v).abs() < 1e-5, "u ⊥ v");
+        // All three points lie in the plane, and the origin is their centroid.
+        for p in [p1, p2, p3] {
+            assert!((p - origin).dot(n).abs() < 1e-4, "{p:?} must lie on the plane");
+        }
+        assert!(origin.distance((p1 + p2 + p3) / 3.0) < 1e-5);
+        // Collinear → None.
+        assert!(plane_from_3pts(Vec3::ZERO, Vec3::X * 5.0, Vec3::X * 9.0).is_none());
+    }
+
+    /// FreePlaneSpec round trip: basis → stored Plane → `from_plane` → same basis, so
+    /// re-editing a free plane through the gizmos starts exactly where it was left.
+    #[test]
+    fn free_plane_spec_roundtrips_through_the_stored_plane() {
+        let spec = FreePlaneSpec { origin: Vec3::new(7.0, -3.0, 12.0), rot_deg: [31.0, -14.0, 57.0], edit_target: None };
+        let (u, v, n) = spec.basis();
+        assert!((u.length() - 1.0).abs() < 1e-5 && u.dot(v).abs() < 1e-5, "basis orthonormal");
+        assert!(u.cross(v).distance(n) < 1e-5, "n = u × v");
+        let stored = Plane {
+            name: "P".into(),
+            origin: [spec.origin.x, spec.origin.y, spec.origin.z],
+            u: [u.x, u.y, u.z],
+            v: [v.x, v.y, v.z],
+            offset: None,
+        };
+        let back = FreePlaneSpec::from_plane(&stored, Some(4));
+        let (u2, v2, n2) = back.basis();
+        assert!(u2.distance(u) < 1e-4 && v2.distance(v) < 1e-4 && n2.distance(n) < 1e-4, "basis survives the euler roundtrip");
+        assert!(back.origin.distance(spec.origin) < 1e-5);
+        assert_eq!(back.edit_target, Some(4));
     }
 
     /// 3-point align, end to end: place a cube at an arbitrary rotation+offset, pick three
