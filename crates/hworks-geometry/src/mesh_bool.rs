@@ -71,7 +71,16 @@ fn weld_tol(m: &TriMesh, rel: f32) -> (Vec<f32>, Vec<u32>) {
         });
         remap[i] = id;
     }
-    let tris: Vec<u32> = m.indices.iter().map(|&i| remap[i as usize]).collect();
+    // Drop triangles the weld made degenerate (two corners merged): Manifold rejects a
+    // MeshGL containing them, so a dense mesh with edges shorter than the weld tolerance
+    // (e.g. marching-cubes output slivers) would spuriously read as "not manifold".
+    let mut tris: Vec<u32> = Vec::with_capacity(m.indices.len());
+    for t in m.indices.chunks_exact(3) {
+        let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+        if a != b && b != c && a != c {
+            tris.extend([a, b, c]);
+        }
+    }
     (props, tris)
 }
 
@@ -359,6 +368,69 @@ pub fn mesh_intersection(a: &TriMesh, b: &TriMesh) -> TriMesh {
 /// centred at `c` with half-extent `r` on each axis. Used for CONSERVATIVE voxel rasterization:
 /// every voxel a triangle actually passes through is marked (no sampling gaps), so the shell is
 /// watertight without a dilation that would bridge real concavities.
+/// Squared distance from point `p` to triangle `abc` (Ericson, *Real-Time Collision
+/// Detection*): closest point via barycentric region tests. Used to sharpen the voxel SDF
+/// with EXACT surface distances near the wall, so the remeshed surface lands on the true
+/// scan surface instead of quantized voxel centers (which read as stair-steps).
+fn point_tri_dist2(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let cl = point_tri_closest(p, a, b, c);
+    let d = [p[0] - cl[0], p[1] - cl[1], p[2] - cl[2]];
+    d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+}
+
+/// Closest point on triangle `abc` to `p` (Ericson, *Real-Time Collision Detection*).
+fn point_tri_closest(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let sub = |x: [f32; 3], y: [f32; 3]| [x[0] - y[0], x[1] - y[1], x[2] - y[2]];
+    let dot = |x: [f32; 3], y: [f32; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    let closest = if d1 <= 0.0 && d2 <= 0.0 {
+        a // vertex A
+    } else {
+        let bp = sub(p, b);
+        let d3 = dot(ab, bp);
+        let d4 = dot(ac, bp);
+        if d3 >= 0.0 && d4 <= d3 {
+            b // vertex B
+        } else {
+            let vc = d1 * d4 - d3 * d2;
+            if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+                let v = d1 / (d1 - d3);
+                [a[0] + ab[0] * v, a[1] + ab[1] * v, a[2] + ab[2] * v] // edge AB
+            } else {
+                let cp = sub(p, c);
+                let d5 = dot(ab, cp);
+                let d6 = dot(ac, cp);
+                if d6 >= 0.0 && d5 <= d6 {
+                    c // vertex C
+                } else {
+                    let vb = d5 * d2 - d1 * d6;
+                    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+                        let w = d2 / (d2 - d6);
+                        [a[0] + ac[0] * w, a[1] + ac[1] * w, a[2] + ac[2] * w] // edge AC
+                    } else {
+                        let va = d3 * d6 - d5 * d4;
+                        if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+                            let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                            [b[0] + (c[0] - b[0]) * w, b[1] + (c[1] - b[1]) * w, b[2] + (c[2] - b[2]) * w] // edge BC
+                        } else {
+                            // interior: project onto the triangle plane
+                            let denom = 1.0 / (va + vb + vc);
+                            let v = vb * denom;
+                            let w = vc * denom;
+                            [a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w]
+                        }
+                    }
+                }
+            }
+        }
+    };
+    closest
+}
+
 fn tri_box_overlap(c: [f32; 3], r: f32, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> bool {
     let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
     let (p0, p1, p2) = (sub(v0, c), sub(v1, c), sub(v2, c));
@@ -456,8 +528,11 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
     // (triangle-box overlap), so the shell is watertight with NO sampling gaps — and thus no
     // need for a dilation, which would bridge the model's real concavities into solid.
     let mut wall = vec![false; n];
+    // Which triangles pass through each wall voxel — feeds the exact-distance band below,
+    // which is what makes the output surface smooth instead of voxel-stepped.
+    let mut wall_tris: HashMap<usize, Vec<u32>> = HashMap::new();
     let half = h * 0.5;
-    for t in m.indices.chunks_exact(3) {
+    for (ti, t) in m.indices.chunks_exact(3).enumerate() {
         let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
         let (mut tlo, mut thi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
         for p in [a, b, c] {
@@ -477,7 +552,9 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
                         origin[2] + (z as f32 + 0.5) * h,
                     ];
                     if tri_box_overlap(center, half, a, b, c) {
-                        wall[at(x as usize, y as usize, z as usize)] = true;
+                        let i = at(x as usize, y as usize, z as usize);
+                        wall[i] = true;
+                        wall_tris.entry(i).or_default().push(ti as u32);
                     }
                 }
             }
@@ -602,19 +679,138 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
     }
     // Signed field in world units. Manifold's `from_sdf` takes the region where the value is
     // POSITIVE as the solid, so inside is positive here, outside negative, ~0 at the surface.
-    let sdf: Vec<f32> = (0..n)
+    let mut sdf: Vec<f32> = (0..n)
         .map(|i| {
             let d = if dist[i] == u32::MAX { res as f32 } else { dist[i] as f32 };
             (if solid[i] { d } else { -d }) * h
         })
         .collect();
 
+    // Sharpen the band: near the wall, replace the voxel-quantized BFS distance with the
+    // EXACT distance to the real triangle surface. Without this, the isosurface snaps to
+    // voxel centers and the whole model reads as stair-steps.
+    //
+    // The near-surface SIGN can't come from the voxel classification (a wall voxel whose
+    // centre sits just outside the true surface is classified "solid" — half-voxel sign
+    // errors that re-terrace the surface). It comes from the closest triangle's geometric
+    // normal instead — with a global MAJORITY VOTE against the flood-fill classification, so
+    // a mesh with inverted (or locally inconsistent) winding can't flip the model inside out:
+    // if most band voxels' normal verdicts disagree with the robust flood fill, flip them all.
+    const BAND: i64 = 2;
+    // Parallel over z-slices (read-only inputs, per-thread output) — this is the hottest
+    // loop of the remesh and scales linearly with cores.
+    let nthreads = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(16);
+    let chunk = nz.div_ceil(nthreads.max(1)).max(1);
+    // (voxel, exact dist, normal verdict: +1 out / -1 in / 0 unknown)
+    let band: Vec<(usize, f32, i8)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for tid in 0..nthreads {
+            let (z0, z1) = (tid * chunk, ((tid + 1) * chunk).min(nz));
+            if z0 >= z1 {
+                continue;
+            }
+            let (wall, wall_tris, dist) = (&wall, &wall_tris, &dist);
+            handles.push(scope.spawn(move || {
+                let at = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
+                let mut out: Vec<(usize, f32, i8)> = Vec::new();
+                for z in z0..z1 {
+                    for y in 0..ny {
+                        for x in 0..nx {
+                            let i = at(x, y, z);
+                            if dist[i] > BAND as u32 {
+                                continue; // outside the band — coarse BFS distance is fine there
+                            }
+                            let center = [
+                                origin[0] + (x as f32 + 0.5) * h,
+                                origin[1] + (y as f32 + 0.5) * h,
+                                origin[2] + (z as f32 + 0.5) * h,
+                            ];
+                            let mut best = f32::INFINITY;
+                            let mut best_tri: Option<usize> = None;
+                            for dz in -BAND..=BAND {
+                                for dy in -BAND..=BAND {
+                                    for dx in -BAND..=BAND {
+                                        let (qx, qy, qz) = (x as i64 + dx, y as i64 + dy, z as i64 + dz);
+                                        if qx < 0 || qy < 0 || qz < 0 || qx >= nx as i64 || qy >= ny as i64 || qz >= nz as i64 {
+                                            continue;
+                                        }
+                                        let qi = at(qx as usize, qy as usize, qz as usize);
+                                        if !wall[qi] {
+                                            continue;
+                                        }
+                                        if let Some(tris) = wall_tris.get(&qi) {
+                                            for &ti in tris {
+                                                let t = &m.indices[ti as usize * 3..ti as usize * 3 + 3];
+                                                let d2 = point_tri_dist2(
+                                                    center,
+                                                    m.positions[t[0] as usize],
+                                                    m.positions[t[1] as usize],
+                                                    m.positions[t[2] as usize],
+                                                );
+                                                if d2 < best {
+                                                    best = d2;
+                                                    best_tri = Some(ti as usize);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let (true, Some(ti)) = (best.is_finite(), best_tri) {
+                                let t = &m.indices[ti * 3..ti * 3 + 3];
+                                let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+                                let cl = point_tri_closest(center, a, b, c);
+                                let to_p = [center[0] - cl[0], center[1] - cl[1], center[2] - cl[2]];
+                                let nrm = [
+                                    (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+                                    (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+                                    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
+                                ];
+                                let s = to_p[0] * nrm[0] + to_p[1] * nrm[1] + to_p[2] * nrm[2];
+                                let nl2 = nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2];
+                                // Ambiguous when the point sits (nearly) on the triangle plane/edge
+                                // or the triangle is degenerate — fall back to the classification.
+                                let verdict = if nl2 < 1e-20 || s.abs() < 1e-12 { 0 } else if s > 0.0 { 1 } else { -1 };
+                                out.push((i, best.sqrt(), verdict));
+                            }
+                        }
+                    }
+                }
+                out
+            }));
+        }
+        handles.into_iter().flat_map(|hnd| hnd.join().unwrap()).collect()
+    });
+    // Majority vote: does "normal says outside" line up with "flood fill says outside"?
+    let (mut agree, mut disagree) = (0usize, 0usize);
+    for &(i, _, v) in &band {
+        if v == 0 {
+            continue;
+        }
+        if (v > 0) == !solid[i] {
+            agree += 1;
+        } else {
+            disagree += 1;
+        }
+    }
+    let flip = disagree > agree; // consistently inverted winding — trust the flood fill's orientation
+    for (i, exact, v) in band {
+        let inside = match v {
+            0 => solid[i],
+            _ => ((v < 0) != flip),
+        };
+        sdf[i] = if inside { exact } else { -exact };
+    }
+
     // 6) Surface the level set with Manifold (guaranteed 2-manifold output). The closure
     // trilinearly samples the SDF grid; outside the grid it returns a large positive value.
     let sample = move |x: f64, y: f64, z: f64| -> f64 {
-        let gx = (x as f32 - origin[0]) / h;
-        let gy = (y as f32 - origin[1]) / h;
-        let gz = (z as f32 - origin[2]) / h;
+        // SDF values live at voxel CENTERS (origin + (i+0.5)·h) — offset by half a voxel so
+        // the trilinear interpolation is anchored correctly (without this the whole surface
+        // shifts by h/2 per axis).
+        let gx = (x as f32 - origin[0]) / h - 0.5;
+        let gy = (y as f32 - origin[1]) / h - 0.5;
+        let gz = (z as f32 - origin[2]) / h - 0.5;
         if gx < 0.0 || gy < 0.0 || gz < 0.0 || gx >= (nx - 1) as f32 || gy >= (ny - 1) as f32 || gz >= (nz - 1) as f32 {
             return -(longest as f64); // safely outside (negative, matching the inside-positive convention)
         }
@@ -638,7 +834,17 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
             (origin[2] + nz as f32 * h) as f64,
         ],
     );
-    let man = Manifold::from_sdf(sample, bounds, h as f64, 0.0, (h * 0.25) as f64);
+    // Tight tolerance: with the exact-distance band the field is sub-voxel accurate near the
+    // surface, so let the surfacer place vertices precisely rather than to a coarse budget.
+    let man = Manifold::from_sdf(sample, bounds, h as f64, 0.0, (h * 0.05) as f64);
+    if man.status().is_err() {
+        return None;
+    }
+    // Simplify within a small fraction of the voxel size: marching emits sliver edges far
+    // shorter than the boolean pipeline's weld tolerance, which would collapse them into
+    // degenerate/boundary edges on re-ingestion ("not manifold" downstream). Collapsing them
+    // here keeps the surface (deviation ≤ h/10) and trims the triangle count substantially.
+    let man = man.simplify((h * 0.1) as f64);
     if man.status().is_err() {
         return None;
     }

@@ -2454,10 +2454,11 @@ mod tests {
             match remesh_solid(&m, res) {
                 Some(s) => {
                     let sv = vol(&s);
+                    let (wv, wt, wb, wn) = crate::mesh_bool::weld_edge_stats(&s);
                     // boxiness = output volume / bbox: should match the actual shape's fill
                     // fraction, NOT ~1.0 (which would mean it filled the whole box).
                     eprintln!(
-                        "REMESH res={res}: {} tris in {:?} | manifold {} | vol {:.0} | boxiness {:.2}",
+                        "REMESH res={res}: {} tris in {:?} | manifold {} | vol {:.0} | boxiness {:.2} | welded {wv}v {wt}t bnd={wb} nonman={wn}",
                         s.indices.len() / 3,
                         t1.elapsed(),
                         is_manifold(&s),
@@ -2669,6 +2670,50 @@ mod tests {
         assert!(elapsed.as_secs() < 2, "must fail fast, not grind BSP (took {elapsed:?})");
         assert_eq!(out.indices.len(), sheet.indices.len(), "base returned unchanged");
         assert_eq!(take_dense_skip_count(), 1, "the skip must be recorded for the app to warn");
+    }
+
+    /// Surface fidelity: remeshing a SPHERE must land vertices on the true surface with
+    /// sub-voxel accuracy (the exact-distance band). The voxel-quantized SDF this replaces
+    /// put the isosurface on voxel centers — stair-steps with error ≈ a full voxel.
+    #[test]
+    fn remesh_solid_surface_lands_on_the_true_surface() {
+        // UV sphere, r = 10, 48×24 — plenty smooth relative to the voxel size below.
+        let (r, nu, nv) = (10.0f32, 48usize, 24usize);
+        let mut sph = TriMesh::default();
+        let pt = |iu: usize, iv: usize| {
+            let (th, ph) = (
+                iu as f32 / nu as f32 * std::f32::consts::TAU,
+                iv as f32 / nv as f32 * std::f32::consts::PI,
+            );
+            [r * ph.sin() * th.cos(), r * ph.sin() * th.sin(), r * ph.cos()]
+        };
+        for iu in 0..nu {
+            for iv in 0..nv {
+                let (a, b, c, d) = (pt(iu, iv), pt(iu + 1, iv), pt(iu + 1, iv + 1), pt(iu, iv + 1));
+                let push = |m: &mut TriMesh, p: [f32; 3], q: [f32; 3], s: [f32; 3]| {
+                    let base = m.positions.len() as u32;
+                    for v in [p, q, s] {
+                        m.positions.push(v);
+                        m.normals.push([0.0, 0.0, 1.0]);
+                    }
+                    m.indices.extend([base, base + 1, base + 2]);
+                };
+                push(&mut sph, a, b, c);
+                push(&mut sph, a, c, d);
+            }
+        }
+        let res = 64usize;
+        let h = 2.0 * r / res as f32; // voxel size ≈ 0.3125
+        let solid = remesh_solid(&sph, res).expect("remesh sphere");
+        assert!(is_manifold(&solid));
+        let mut worst = 0.0f32;
+        for p in &solid.positions {
+            let rad = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            worst = worst.max((rad - r).abs());
+        }
+        // Sub-voxel: the quantized-SDF version erred by ~a full voxel (stair-steps); the
+        // exact-distance band should keep every vertex well inside half a voxel of truth.
+        assert!(worst < h * 0.5, "worst radial error {worst:.3} vs voxel {h:.3} — surface not landing on the true sphere");
     }
 
     /// `remesh_solid` must reproduce the input SHAPE, not fill its bounding box — the regression

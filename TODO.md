@@ -51,6 +51,23 @@ Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is mem
   scan cuts via the fast Manifold path. Lossy (resolution-limited); default 128 vox.
   Measured: the cat becomes manifold at res 96 in ~1.4s, res 160 in ~3.8s.
 
+**Solidify surface quality (2026-07):** the first cut produced a stair-stepped surface —
+the SDF was voxel-quantized (integer BFS distances, isosurface snapping to voxel centers).
+Fixed with a three-part accuracy pass, all verified by the sphere-fidelity test
+(`remesh_solid_surface_lands_on_the_true_surface`, worst vertex error < h/2):
+- **Exact-distance band**: within 2 voxels of the wall, the SDF holds the exact
+  point-to-triangle distance (Ericson closest-point), parallelized over z-slices; the
+  near-surface SIGN comes from the closest triangle's normal with a global majority vote
+  vs the flood fill (inverted winding can't flip the model inside out).
+- **Center-anchored sampling**: SDF values live at voxel centers; the trilinear sampler
+  offsets by h/2 (without it the whole surface shifted half a voxel per axis).
+- **Simplify pass** (`Manifold::simplify(h/10)`): marching emits sliver edges shorter than
+  the boolean pipeline's weld tolerance, which collapsed into degenerate/boundary edges on
+  re-ingestion ("not manifold" downstream, seen at res 128). Collapsing them keeps the
+  surface within h/10 and cuts the output ~5× (cat res 96: 98k → 19.8k tris, ~2.5s,
+  volume within 0.1% of the input's).
+- `weld` also now drops triangles the weld degenerates (a general ingest-robustness fix).
+
 **Solidify — remaining edges.**
 - Holes larger than the 1-voxel morphological close (roughly a >2-voxel-wide opening — e.g. a
   whole missing face, or a scan with no bottom) leak the flood fill, so the interior isn't
