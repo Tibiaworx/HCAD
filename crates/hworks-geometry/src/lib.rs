@@ -2424,18 +2424,48 @@ mod tests {
         let (v2, t2, bnd2, nonman2) = crate::mesh_bool::weld_edge_stats(&r);
         eprintln!("REPAIRED: welded {v2} verts, {t2} tris | boundary edges {bnd2} | non-manifold edges {nonman2}");
         eprintln!("REPAIRED is_manifold: {}", is_manifold(&r));
-        for res in [96usize, 160] {
+        let bbox = |mesh: &TriMesh| {
+            let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            for p in &mesh.positions {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            (lo, hi)
+        };
+        let vol = |mesh: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in mesh.indices.chunks_exact(3) {
+                let p = |i: u32| {
+                    let q = mesh.positions[i as usize];
+                    [q[0] as f64, q[1] as f64, q[2] as f64]
+                };
+                let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                v += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2]) + a[2] * (b[0] * c[1] - c[0] * b[1])) / 6.0;
+            }
+            v.abs()
+        };
+        let (blo, bhi) = bbox(&m);
+        let bbox_vol = (bhi[0] - blo[0]) as f64 * (bhi[1] - blo[1]) as f64 * (bhi[2] - blo[2]) as f64;
+        eprintln!("INPUT bbox {blo:?}..{bhi:?} | bbox_vol {bbox_vol:.0} | input surface vol (bogus if open) {:.0}", vol(&m));
+        for res in [96usize, 128] {
             let t1 = std::time::Instant::now();
             match remesh_solid(&m, res) {
                 Some(s) => {
+                    let sv = vol(&s);
+                    // boxiness = output volume / bbox: should match the actual shape's fill
+                    // fraction, NOT ~1.0 (which would mean it filled the whole box).
                     eprintln!(
-                        "REMESH res={res}: {} tris in {:?} | is_manifold {}",
+                        "REMESH res={res}: {} tris in {:?} | manifold {} | vol {:.0} | boxiness {:.2}",
                         s.indices.len() / 3,
                         t1.elapsed(),
-                        is_manifold(&s)
+                        is_manifold(&s),
+                        sv,
+                        sv / bbox_vol
                     );
                 }
-                None => eprintln!("REMESH res={res}: FAILED"),
+                None => eprintln!("REMESH res={res}: returned None (falls back to raw)"),
             }
         }
     }
@@ -2641,32 +2671,74 @@ mod tests {
         assert_eq!(take_dense_skip_count(), 1, "the skip must be recorded for the app to warn");
     }
 
-    /// `remesh_solid` must turn a non-manifold/open mesh into a watertight solid that CUTS via
-    /// the fast Manifold path: remesh an open box, confirm it's manifold, then difference a
-    /// tool through it and confirm the volume actually dropped (the cut applied, no skip).
+    /// `remesh_solid` must reproduce the input SHAPE, not fill its bounding box — the regression
+    /// guard for the SDF-sign bug that surfaced the complement (a scan came out a solid block).
+    /// An octahedron fills only ~1/6 of its bbox, so a bbox-fill bug (≈100%) is unmistakable.
     #[test]
-    fn remesh_solid_makes_an_open_mesh_cuttable() {
-        // A cube with its top face removed → open (boundary loop) → non-manifold.
+    fn remesh_solid_reproduces_shape_not_bounding_box() {
+        let s = 10.0f32;
+        // Octahedron: 6 axis vertices, 8 faces, wound outward.
+        let v = [[s, 0.0, 0.0], [-s, 0.0, 0.0], [0.0, s, 0.0], [0.0, -s, 0.0], [0.0, 0.0, s], [0.0, 0.0, -s]];
+        let faces = [
+            [0, 2, 4], [2, 1, 4], [1, 3, 4], [3, 0, 4], // top pyramid
+            [2, 0, 5], [1, 2, 5], [3, 1, 5], [0, 3, 5], // bottom pyramid
+        ];
+        let mut oct = TriMesh::default();
+        for f in faces {
+            let base = oct.positions.len() as u32;
+            for &vi in &f {
+                oct.positions.push(v[vi]);
+                oct.normals.push([0.0, 0.0, 1.0]);
+            }
+            oct.indices.extend([base, base + 1, base + 2]);
+        }
+        let vol = |m: &TriMesh| {
+            let mut vv = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let p = |i: u32| {
+                    let q = m.positions[i as usize];
+                    [q[0] as f64, q[1] as f64, q[2] as f64]
+                };
+                let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                vv += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2]) + a[2] * (b[0] * c[1] - c[0] * b[1])) / 6.0;
+            }
+            vv.abs()
+        };
+        let bbox_vol = (2.0 * s as f64).powi(3); // 8000
+        let true_vol = 4.0 / 3.0 * (s as f64).powi(3); // octahedron ≈ 1333 (17% of bbox)
+        let solid = remesh_solid(&oct, 64).expect("remesh octahedron");
+        assert!(is_manifold(&solid), "remeshed octahedron must be manifold");
+        let vs = vol(&solid);
+        // The output must be the OCTAHEDRON, not the bounding box: comfortably under half the
+        // bbox (a bbox-fill bug lands near 100%), and in a plausible band around the true volume
+        // (voxel remesh rounds the sharp vertices outward, so allow generous headroom).
+        assert!(vs < bbox_vol * 0.5, "remesh filled the bbox (vol {vs:.0} / bbox {bbox_vol:.0}) — SDF sign regression?");
+        assert!(vs > true_vol * 0.6 && vs < true_vol * 2.2, "octahedron volume {vs:.0} implausible vs true {true_vol:.0}");
+    }
+
+    /// `remesh_solid` must turn a CLOSED-but-non-manifold mesh (the common scan defect: edges
+    /// shared by >2 faces) into a watertight solid that CUTS via the fast Manifold path. Build
+    /// a cube, then duplicate some faces so several edges are non-manifold; remesh, confirm it's
+    /// manifold and ~cube-sized, then difference a tool and confirm material was removed.
+    #[test]
+    fn remesh_solid_makes_a_nonmanifold_mesh_cuttable() {
         let sq = [[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]];
         let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
         let cube = extrude_tool_mesh(&sq, &[], &basis, 0.0, 20.0).expect("cube");
-        // Drop triangles whose all-three vertices sit on the top plane (z ≈ 20).
-        let mut open = TriMesh::default();
-        for t in cube.indices.chunks_exact(3) {
-            let ps = [cube.positions[t[0] as usize], cube.positions[t[1] as usize], cube.positions[t[2] as usize]];
-            if ps.iter().all(|p| (p[2] - 20.0).abs() < 1e-3) {
-                continue; // this is a top-face triangle — remove it
+        // Closed but non-manifold: append duplicates of the first few triangles, so their edges
+        // are shared by 3+ faces (Manifold declines it → the reason a scan won't cut).
+        let mut bad = cube.clone();
+        for t in cube.indices.chunks_exact(3).take(4) {
+            let base = bad.positions.len() as u32;
+            for &vi in t {
+                bad.positions.push(cube.positions[vi as usize]);
+                bad.normals.push([0.0, 0.0, 1.0]);
             }
-            let base = open.positions.len() as u32;
-            for p in ps {
-                open.positions.push(p);
-                open.normals.push([0.0, 0.0, 1.0]);
-            }
-            open.indices.extend([base, base + 1, base + 2]);
+            bad.indices.extend([base, base + 1, base + 2]);
         }
-        assert!(!is_manifold(&open), "the open-topped box must be non-manifold");
+        assert!(!is_manifold(&bad), "duplicated faces make it non-manifold");
 
-        let solid = remesh_solid(&open, 40).expect("remesh");
+        let solid = remesh_solid(&bad, 48).expect("remesh");
         assert!(is_manifold(&solid), "remeshed body must be a clean manifold");
         let vol = |m: &TriMesh| {
             let mut v = 0.0f64;
@@ -2680,15 +2752,11 @@ mod tests {
             }
             v.abs()
         };
-        // The remeshed box should be a FILLED solid roughly the size of the 20³ = 8000 cube.
-        // A coarse voxel remesh (res 40) doesn't preserve volume precisely — it inflates by
-        // ~1 voxel/side (close + level-set bias) — so the band is wide on purpose; the point
-        // is "closed and roughly right-sized", not metrology. Accuracy improves with res.
+        // Roughly the 20³ = 8000 cube (voxel remesh inflates a little at coarse res).
         let vs = vol(&solid);
-        assert!(vs > 8000.0 * 0.6 && vs < 8000.0 * 1.7, "remeshed volume {vs:.0} near 8000");
+        assert!(vs > 8000.0 * 0.7 && vs < 8000.0 * 1.5, "remeshed volume {vs:.0} near 8000");
 
-        // Now CUT it — a tool box removing a corner — and confirm the volume dropped (cut
-        // applied via Manifold) with no dense-skip.
+        // Now CUT it — a corner tool — and confirm material was removed via the fast path.
         let _ = take_dense_skip_count();
         let tsq = [[0.0, 0.0], [12.0, 0.0], [12.0, 12.0], [0.0, 12.0]];
         let tbasis = PlaneBasis { origin: [0.0, 0.0, -1.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };

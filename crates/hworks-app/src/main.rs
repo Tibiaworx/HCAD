@@ -19312,8 +19312,8 @@ mod tests {
             }
             m.indices.extend([base, base + 1, base + 2]);
         };
-        // Six faces of a cube [-s,s]³, each an g×g grid — but SKIP the +Z (top) face so it's open.
-        let faces: [(usize, f32); 5] = [(2, -s), (0, -s), (0, s), (1, -s), (1, s)]; // axis, level (z-top omitted)
+        // A CLOSED cube [-s,s]³, all six faces subdivided g×g (dense, >20k tris).
+        let faces: [(usize, f32); 6] = [(2, -s), (2, s), (0, -s), (0, s), (1, -s), (1, s)];
         for (axis, level) in faces {
             let (u_ax, v_ax) = ((axis + 1) % 3, (axis + 2) % 3);
             for i in 0..g {
@@ -19330,8 +19330,20 @@ mod tests {
                 }
             }
         }
+        // Make it NON-manifold (the scan defect) while keeping it closed: duplicate a handful
+        // of faces so their edges are shared by 3+ triangles. Manifold declines it → dense-skip.
+        for k in 0..12 {
+            let t = [open.indices[k * 3], open.indices[k * 3 + 1], open.indices[k * 3 + 2]];
+            let base = open.positions.len() as u32;
+            for &vi in &t {
+                let p = open.positions[vi as usize];
+                open.positions.push(p);
+                open.normals.push([0.0, 0.0, 1.0]);
+            }
+            open.indices.extend([base, base + 1, base + 2]);
+        }
         assert!(open.indices.len() / 3 > 20_000, "must exceed the dense-skip guard");
-        assert!(!is_manifold(&open), "open box is non-manifold");
+        assert!(!is_manifold(&open), "duplicated faces make it non-manifold");
         let blob = encode_mesh_blob(&export_stl(&open));
 
         // Build a cut that would remove a corner.

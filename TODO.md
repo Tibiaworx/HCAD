@@ -52,8 +52,14 @@ Both embed the STL deflate+base64 in the `.hcad` (self-contained); decode is mem
   Measured: the cat becomes manifold at res 96 in ~1.4s, res 160 in ~3.8s.
 
 **Solidify — remaining edges.**
-- Holes larger than the 1-voxel morphological close leak the flood fill (interior lost);
-  raise resolution or pre-repair. A generalized-winding-number fill would be hole-robust.
+- Holes larger than the 1-voxel morphological close (roughly a >2-voxel-wide opening — e.g. a
+  whole missing face, or a scan with no bottom) leak the flood fill, so the interior isn't
+  filled (you get a hollow shell). Raise resolution, pre-repair, or (future) a
+  generalized-winding-number fill which is hole-robust. Small scan holes/cracks close fine.
+- `remesh_solid` SDF sign: Manifold's `from_sdf` takes the POSITIVE region as solid (inside
+  positive). Got this backwards once — it surfaced the complement, so a scan came out as a
+  near-bounding-box block. Regression-guarded by `remesh_solid_reproduces_shape_not_bounding_box`
+  (octahedron fills ~1/6 of its bbox, so a bbox-fill bug is unmistakable).
 - Output triangle count is high (res 96 → ~275k for the cat); a decimation pass on the
   remesh output, or a coarser `from_sdf` edge_length, would trim it.
 - Remesh re-runs on any placement change (cached by full key incl. rot/offset); could cache

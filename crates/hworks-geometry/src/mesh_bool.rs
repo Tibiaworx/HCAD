@@ -355,6 +355,58 @@ pub fn mesh_intersection(a: &TriMesh, b: &TriMesh) -> TriMesh {
     manifold_boolean(a, b, Op::Intersection).unwrap_or_default()
 }
 
+/// Triangle vs axis-aligned voxel box overlap (Akenine-Möller separating-axis test). Box is
+/// centred at `c` with half-extent `r` on each axis. Used for CONSERVATIVE voxel rasterization:
+/// every voxel a triangle actually passes through is marked (no sampling gaps), so the shell is
+/// watertight without a dilation that would bridge real concavities.
+fn tri_box_overlap(c: [f32; 3], r: f32, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> bool {
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let (p0, p1, p2) = (sub(v0, c), sub(v1, c), sub(v2, c));
+    // 1) AABB of the triangle vs the box (3 axes).
+    for k in 0..3 {
+        let (mn, mx) = (p0[k].min(p1[k]).min(p2[k]), p0[k].max(p1[k]).max(p2[k]));
+        if mn > r || mx < -r {
+            return false;
+        }
+    }
+    let e = [sub(p1, p0), sub(p2, p1), sub(p0, p2)];
+    // 2) Triangle-normal plane vs box.
+    let nrm = [
+        e[0][1] * e[1][2] - e[0][2] * e[1][1],
+        e[0][2] * e[1][0] - e[0][0] * e[1][2],
+        e[0][0] * e[1][1] - e[0][1] * e[1][0],
+    ];
+    let d = nrm[0] * p0[0] + nrm[1] * p0[1] + nrm[2] * p0[2];
+    let rad = r * (nrm[0].abs() + nrm[1].abs() + nrm[2].abs());
+    if d.abs() > rad {
+        return false;
+    }
+    // 3) Nine edge × axis cross-product separating axes.
+    let verts = [p0, p1, p2];
+    for ei in &e {
+        for axis in 0..3 {
+            // axis unit vector cross edge → the test axis.
+            let a = match axis {
+                0 => [0.0, -ei[2], ei[1]],
+                1 => [ei[2], 0.0, -ei[0]],
+                _ => [-ei[1], ei[0], 0.0],
+            };
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for v in &verts {
+                let p = a[0] * v[0] + a[1] * v[1] + a[2] * v[2];
+                mn = mn.min(p);
+                mx = mx.max(p);
+            }
+            let rr = r * (a[0].abs() + a[1].abs() + a[2].abs());
+            if mn > rr || mx < -rr {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Voxel-remesh a triangle mesh into a **watertight, 2-manifold solid** so a scan (or any
 /// non-manifold soup) can be cut. `res` is the voxel count on the longest bounding-box axis
 /// (≈ 64 fast/coarse … 256 slow/fine). Pipeline: rasterize the surface into an occupancy grid
@@ -400,59 +452,85 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
         ]
     };
 
-    // 1) Rasterize the surface: sample each triangle on a barycentric grid fine enough that
-    // consecutive samples are ≤ 1 voxel apart, marking each sample's voxel as wall.
+    // 1) CONSERVATIVE rasterization: mark every voxel each triangle actually passes through
+    // (triangle-box overlap), so the shell is watertight with NO sampling gaps — and thus no
+    // need for a dilation, which would bridge the model's real concavities into solid.
     let mut wall = vec![false; n];
+    let half = h * 0.5;
     for t in m.indices.chunks_exact(3) {
         let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
-        let elen = |p: [f32; 3], q: [f32; 3]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
-        let steps = ((elen(a, b).max(elen(a, c)).max(elen(b, c)) / h).ceil() as usize + 1).max(1);
-        for i in 0..=steps {
-            for j in 0..=(steps - i) {
-                let (u, v) = (i as f32 / steps as f32, j as f32 / steps as f32);
-                let p = [
-                    a[0] + (b[0] - a[0]) * u + (c[0] - a[0]) * v,
-                    a[1] + (b[1] - a[1]) * u + (c[1] - a[1]) * v,
-                    a[2] + (b[2] - a[2]) * u + (c[2] - a[2]) * v,
-                ];
-                let g = vox(p);
-                if (0..3).all(|k| g[k] >= 0) {
-                    let (x, y, z) = (g[0] as usize, g[1] as usize, g[2] as usize);
-                    if x < nx && y < ny && z < nz {
-                        wall[at(x, y, z)] = true;
+        let (mut tlo, mut thi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for p in [a, b, c] {
+            for k in 0..3 {
+                tlo[k] = tlo[k].min(p[k]);
+                thi[k] = thi[k].max(p[k]);
+            }
+        }
+        let lo_v = vox(tlo);
+        let hi_v = vox(thi);
+        for z in lo_v[2].max(0)..=hi_v[2].min(nz as i64 - 1) {
+            for y in lo_v[1].max(0)..=hi_v[1].min(ny as i64 - 1) {
+                for x in lo_v[0].max(0)..=hi_v[0].min(nx as i64 - 1) {
+                    let center = [
+                        origin[0] + (x as f32 + 0.5) * h,
+                        origin[1] + (y as f32 + 0.5) * h,
+                        origin[2] + (z as f32 + 0.5) * h,
+                    ];
+                    if tri_box_overlap(center, half, a, b, c) {
+                        wall[at(x as usize, y as usize, z as usize)] = true;
                     }
                 }
             }
         }
     }
-
-    // 2) Morphological close: dilate the wall by 1 voxel (seals holes/cracks up to ~2 voxels
-    // wide, the common scan defect), so the flood fill can't leak through a hole.
-    let dilate = |src: &[bool]| {
+    // Seal genuine mesh holes (missing surface) without bridging concavities: a morphological
+    // CLOSE (dilate then erode by the same radius) fills gaps up to ~2·seal voxels and restores
+    // the surface elsewhere. `seal = 1` closes the common 1–2 voxel scan cracks; a conservative
+    // shell rarely needs more. (Concavities wider than 2 voxels are preserved by the erode.)
+    let seal = 1usize;
+    let grow = |src: &[bool], want: bool| {
+        // one-voxel morphological step: `want=true` dilate, `want=false` erode.
         let mut out = src.to_vec();
         for z in 0..nz {
             for y in 0..ny {
                 for x in 0..nx {
-                    if src[at(x, y, z)] {
+                    let i = at(x, y, z);
+                    if src[i] == want {
                         continue;
                     }
-                    let near = (x > 0 && src[at(x - 1, y, z)])
-                        || (x + 1 < nx && src[at(x + 1, y, z)])
-                        || (y > 0 && src[at(x, y - 1, z)])
-                        || (y + 1 < ny && src[at(x, y + 1, z)])
-                        || (z > 0 && src[at(x, y, z - 1)])
-                        || (z + 1 < nz && src[at(x, y, z + 1)]);
-                    if near {
-                        out[at(x, y, z)] = true;
+                    let nb = |x: usize, y: usize, z: usize| src[at(x, y, z)] == want;
+                    let touches = (x > 0 && nb(x - 1, y, z))
+                        || (x + 1 < nx && nb(x + 1, y, z))
+                        || (y > 0 && nb(x, y - 1, z))
+                        || (y + 1 < ny && nb(x, y + 1, z))
+                        || (z > 0 && nb(x, y, z - 1))
+                        || (z + 1 < nz && nb(x, y, z + 1))
+                        // grid border counts as "empty" for erosion so the solid never
+                        // touches the padded bounds.
+                        || (!want && (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || z == 0 || z + 1 == nz));
+                    if touches {
+                        out[i] = want;
                     }
                 }
             }
         }
         out
     };
-    let wall_d = dilate(&wall);
+    let mut wall_c = wall.clone();
+    for _ in 0..seal {
+        wall_c = grow(&wall_c, true);
+    }
+    for _ in 0..seal {
+        wall_c = grow(&wall_c, false);
+    }
+    // Re-add the original wall so erosion never re-opens a thin true surface.
+    for i in 0..n {
+        if wall[i] {
+            wall_c[i] = true;
+        }
+    }
 
-    // 3) Flood-fill "outside" from the (guaranteed-empty) corner through non-wall voxels.
+    // 2) Flood-fill "outside" from the (guaranteed-empty) corner through non-wall voxels.
     let mut outside = vec![false; n];
     let mut stack = vec![at(0, 0, 0)];
     outside[at(0, 0, 0)] = true;
@@ -462,7 +540,7 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
         let x = idx % nx;
         let push = |x: usize, y: usize, z: usize, stack: &mut Vec<usize>, outside: &mut Vec<bool>| {
             let i = at(x, y, z);
-            if !outside[i] && !wall_d[i] {
+            if !outside[i] && !wall_c[i] {
                 outside[i] = true;
                 stack.push(i);
             }
@@ -475,30 +553,8 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
         if z + 1 < nz { push(x, y, z + 1, &mut stack, &mut outside); }
     }
 
-    // 4) Solid = everything the outside flood couldn't reach (wall + enclosed interior), then
-    // erode by 1 to undo the dilation — net effect: holes sealed, original size preserved.
-    let solid_dilated: Vec<bool> = (0..n).map(|i| !outside[i]).collect();
-    let erode = |src: &[bool]| {
-        let mut out = src.to_vec();
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    if !src[at(x, y, z)] {
-                        continue;
-                    }
-                    let exposed = x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || z == 0 || z + 1 == nz
-                        || !src[at(x - 1, y, z)] || !src[at(x + 1, y, z)]
-                        || !src[at(x, y - 1, z)] || !src[at(x, y + 1, z)]
-                        || !src[at(x, y, z - 1)] || !src[at(x, y, z + 1)];
-                    if exposed {
-                        out[at(x, y, z)] = false;
-                    }
-                }
-            }
-        }
-        out
-    };
-    let solid = erode(&solid_dilated);
+    // 3) Solid = everything the outside flood couldn't reach (wall + enclosed interior).
+    let solid: Vec<bool> = (0..n).map(|i| !outside[i]).collect();
     if !solid.iter().any(|&s| s) {
         return None; // nothing enclosed — likely a hole bigger than the close could seal
     }
@@ -544,11 +600,12 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
         if z > 0 { relax(x, y, z - 1, &mut dist, &mut q); }
         if z + 1 < nz { relax(x, y, z + 1, &mut dist, &mut q); }
     }
-    // Signed field in world units: negative inside, positive outside, ~0 at the surface.
+    // Signed field in world units. Manifold's `from_sdf` takes the region where the value is
+    // POSITIVE as the solid, so inside is positive here, outside negative, ~0 at the surface.
     let sdf: Vec<f32> = (0..n)
         .map(|i| {
             let d = if dist[i] == u32::MAX { res as f32 } else { dist[i] as f32 };
-            (if solid[i] { -d } else { d }) * h
+            (if solid[i] { d } else { -d }) * h
         })
         .collect();
 
@@ -559,7 +616,7 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
         let gy = (y as f32 - origin[1]) / h;
         let gz = (z as f32 - origin[2]) / h;
         if gx < 0.0 || gy < 0.0 || gz < 0.0 || gx >= (nx - 1) as f32 || gy >= (ny - 1) as f32 || gz >= (nz - 1) as f32 {
-            return longest as f64; // safely outside
+            return -(longest as f64); // safely outside (negative, matching the inside-positive convention)
         }
         let (x0, y0, z0) = (gx as usize, gy as usize, gz as usize);
         let (fx, fy, fz) = (gx - x0 as f32, gy - y0 as f32, gz - z0 as f32);
