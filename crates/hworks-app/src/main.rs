@@ -26,7 +26,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, M
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -2074,6 +2074,12 @@ struct UiState {
     /// Active 3-point-align session for the mesh being edited (points picked so far,
     /// target datum plane, whether the first point becomes the origin).
     mesh_align: Option<MeshAlign>,
+    /// Fit-datum-from-surface mode (mesh PM): the next click on the edited mesh region-grows
+    /// from the hit triangle and fits a plane/cylinder/sphere → creates the matching datum.
+    scan_fit: bool,
+    /// Region-boundary flash after a surface fit: segments + seconds remaining.
+    fit_flash: Vec<[[f32; 3]; 2]>,
+    fit_flash_t: f32,
     /// Open Free Plane PM: a reference plane placed anywhere via gizmos/number fields.
     free_plane: Option<FreePlaneSpec>,
     /// Active 3-point-plane pick session: the reference points clicked so far (body
@@ -5513,6 +5519,27 @@ fn ui_system(
                         }
                     });
                 }
+                // Fit a datum from a surface region: click once on the mesh — the smooth
+                // region around the click is fitted as a plane / cylinder / sphere and the
+                // matching reference plane is created (cylinders also report Ø).
+                ui.separator();
+                if ui_state.scan_fit {
+                    ui.label(egui::RichText::new("Fit: click a face on the mesh.").strong());
+                    ui.label(
+                        egui::RichText::new("Flat → plane. Cylinder → plane ⊥ its axis (Ø reported). Ball → plane through its centre.")
+                            .weak()
+                            .small(),
+                    );
+                    if ui.button("Cancel fit").clicked() {
+                        ui_state.scan_fit = false;
+                    }
+                } else if ui
+                    .button("🎯  Fit datum from surface…")
+                    .on_hover_text("Click a region on the mesh — a flat face becomes a reference plane; a cylindrical face (bore/boss) gives its axis plane + diameter; a ball gives its centre plane")
+                    .clicked()
+                {
+                    ui_state.scan_fit = true;
+                }
                 // 3-point align: pick three points on the mesh surface → they define a plane
                 // that gets mapped onto Front/Top/Right (first picked point optionally → origin).
                 ui.separator();
@@ -5666,14 +5693,17 @@ fn ui_system(
                     }
                     ui_state.mesh_edit = None;
                     ui_state.mesh_align = None;
+                    ui_state.scan_fit = false;
                     ui_state.regen = true;
                 } else if close {
                     ui_state.mesh_edit = None;
                     ui_state.mesh_align = None;
+                    ui_state.scan_fit = false;
                 }
             } else {
                 ui_state.mesh_edit = None;
                 ui_state.mesh_align = None;
+                ui_state.scan_fit = false;
             }
         }
         if let Some(profiles) = ui_state.loft_spec.clone() {
@@ -9484,6 +9514,81 @@ fn sketch_interaction(
         return;
     }
 
+    // Fade out the region-fit boundary flash.
+    if ui_state.fit_flash_t > 0.0 {
+        ui_state.fit_flash_t -= time.delta_secs();
+        if ui_state.fit_flash_t <= 0.0 {
+            ui_state.fit_flash.clear();
+        }
+    }
+
+    // Fit-datum-from-surface (view mode, mesh PM): one click on the edited mesh fits the
+    // smooth region around the hit and creates the matching reference plane.
+    if ui_state.scan_fit && session.plane.is_none() && !blocking.0 {
+        if buttons.just_pressed(MouseButton::Left) {
+            if let (Some(cursor), Some(idx)) = (window.cursor_position(), ui_state.mesh_edit) {
+                let placed = doc.0.features.get(idx).and_then(|f| match &f.kind {
+                    FeatureKind::ImportMesh { data, scale, rot_deg, offset, solidify, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, true, *solidify),
+                    FeatureKind::RefMesh { data, scale, rot_deg, offset, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, false, 0),
+                    _ => None,
+                });
+                if let Some(m) = placed {
+                    if let Some(seed) = pick_mesh_tri(&m, camera, cam_gt, cursor) {
+                        // Cap the region at a quarter of the mesh size — big enough for any
+                        // real face, small enough not to swallow the whole scan.
+                        let (lo, hi) = mesh_bbox(&m);
+                        let max_dist = (hi - lo).length() * 0.25;
+                        match fit_region(&m, seed, max_dist) {
+                            Some((fit, boundary)) => {
+                                let name = format!("Plane{}", doc.0.planes().count().saturating_sub(2));
+                                let mk_plane = |origin: [f32; 3], n: Vec3, name: &str| {
+                                    let n = n.normalize();
+                                    let u = n.any_orthonormal_vector();
+                                    let v = n.cross(u);
+                                    Plane {
+                                        name: name.to_string(),
+                                        origin,
+                                        u: [u.x, u.y, u.z],
+                                        v: [v.x, v.y, v.z],
+                                        offset: None,
+                                    }
+                                };
+                                let (plane, msg) = match &fit {
+                                    RegionFit::Plane { origin, normal, rms, count } => (
+                                        mk_plane(*origin, Vec3::from_array(*normal), &name),
+                                        format!("Flat region ({count} tris, rms {rms:.3} mm) → {name}"),
+                                    ),
+                                    RegionFit::Cylinder { center, axis, radius, rms, count } => (
+                                        mk_plane(*center, Vec3::from_array(*axis), &name),
+                                        format!(
+                                            "Cylinder Ø{:.2} mm ({count} tris, rms {rms:.3}) → {name} ⊥ axis through its centre — sketch on it for the exact circle",
+                                            radius * 2.0
+                                        ),
+                                    ),
+                                    RegionFit::Sphere { center, radius, rms, count } => (
+                                        mk_plane(*center, Vec3::Z, &name),
+                                        format!("Sphere Ø{:.2} mm ({count} tris, rms {rms:.3}) → {name} through its centre", radius * 2.0),
+                                    ),
+                                };
+                                history.snapshot(&doc.0);
+                                doc.0.add_feature(FeatureKind::Plane(plane));
+                                ui_state.regen = true;
+                                ui_state.toasts.push((msg, 5.0));
+                                ui_state.fit_flash = boundary;
+                                ui_state.fit_flash_t = 2.5;
+                                ui_state.scan_fit = false;
+                            }
+                            None => {
+                                ui_state.toasts.push(("Couldn't fit that region — try clicking a larger, smoother area.".into(), 4.0));
+                            }
+                        }
+                    }
+                }
+            }
+            return; // consume the click
+        }
+    }
+
     // 3-point align (view mode, while the mesh PM's align session is active): click points on
     // the edited mesh feature's own surface — its placed TriMesh, not the body.
     if ui_state.mesh_align.is_some() && session.plane.is_none() && !blocking.0 {
@@ -13024,9 +13129,11 @@ fn handle_keys(
         ui_state.measuring = false;
         ui_state.measure_pts.clear();
     }
-    // Escape also cancels the 3-point-plane pick and the free-plane placement.
+    // Escape also cancels the 3-point-plane pick, free-plane placement, and surface fit.
     if keys.just_pressed(KeyCode::Escape) && !blocking.1 {
-        if ui_state.plane_3pt.is_some() {
+        if ui_state.scan_fit {
+            ui_state.scan_fit = false;
+        } else if ui_state.plane_3pt.is_some() {
             ui_state.plane_3pt = None;
         } else if ui_state.free_plane.is_some() {
             ui_state.free_plane = None;
@@ -19100,6 +19207,14 @@ fn draw_measure(mut gizmos: Gizmos, ui_state: Res<UiState>, cam_q: Query<&OrbitC
             gizmos.line(al.pts[2], al.pts[0], teal);
         }
     }
+    // Region-fit boundary flash: the fitted region's outline, fading out.
+    if ui_state.fit_flash_t > 0.0 {
+        let a = (ui_state.fit_flash_t / 2.5).clamp(0.0, 1.0);
+        let col = Color::srgba(1.0, 0.6, 0.15, a);
+        for e in &ui_state.fit_flash {
+            gizmos.line(Vec3::from_array(e[0]), Vec3::from_array(e[1]), col);
+        }
+    }
     // 3-point-plane picks: green crosses + connecting preview lines.
     if let Some(pts) = &ui_state.plane_3pt {
         let green = Color::srgb(0.35, 0.9, 0.45);
@@ -19181,6 +19296,25 @@ fn pick_face_point(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cu
         }
         (orig + dir * t, n)
     })
+}
+
+/// Like [`pick_face_point`] but returns the INDEX of the nearest hit triangle — the seed
+/// for region growing (fit-primitive-from-surface).
+fn pick_mesh_tri(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cursor: Vec2) -> Option<usize> {
+    let ray = camera.viewport_to_world(cam_gt, cursor).ok()?;
+    let (orig, dir) = (ray.origin, *ray.direction);
+    let mut best: Option<(f32, usize)> = None;
+    for (ti, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let a = Vec3::from_array(mesh.positions[tri[0] as usize]);
+        let b = Vec3::from_array(mesh.positions[tri[1] as usize]);
+        let c = Vec3::from_array(mesh.positions[tri[2] as usize]);
+        if let Some(t) = ray_triangle(orig, dir, a, b, c) {
+            if best.map_or(true, |(bt, _)| t < bt) {
+                best = Some((t, ti));
+            }
+        }
+    }
+    best.map(|(_, ti)| ti)
 }
 
 /// Pick an edge loop for fillet/chamfer from BOTH selectable pools: sharp edges first (they win

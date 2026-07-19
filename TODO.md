@@ -113,6 +113,23 @@ Fixed with a three-part accuracy pass, all verified by the sphere-fidelity test
 - The exact (truck) path still rebuilds synchronously — it's fast for its feature set, but
   could move onto the same job if it ever stalls.
 
+**Fit primitives from scan regions (2026-07):** mesh PM → "🎯 Fit datum from surface…" →
+one click on the mesh region-grows across smooth triangles (dihedral < ~35°, capped at
+25% of the mesh size) and fits plane / cylinder / sphere (`fit_region`: point-PCA plane,
+normal-covariance axis + Kasa circle for cylinders, 4×4 Kasa sphere; Jacobi 3×3 eigen;
+simpler primitive preferred within 25% + epsilon so flat faces don't win as huge spheres,
+and numerically-tied fits — a two-ring cylinder wall is also exactly a sphere — break
+toward the simpler shape). Results: flat → reference plane; cylinder → plane ⊥ axis
+through its centre + Ø in the toast (sketch on it → exact section circle); sphere →
+plane through the centre. Region boundary flashes orange ~2.5s. Esc cancels.
+
+**Fit — remaining edges.**
+- One region per click; no multi-region select or live hover preview of the region.
+- Cylinder creates the ⊥ plane only — a datum AXIS entity (usable by Revolve/mates)
+  doesn't exist in the document model yet.
+- Cone/torus not recognized (fit as the nearest of the three, usually cylinder-ish).
+- Region cap is fixed at 25% of mesh size; a PM slider could expose it.
+
 **Remaining edges.**
 - Scan sections come only from `RefMesh`; sectioning the solid body itself (imported or not)
   through a sketch plane could reuse the same helper (`mesh_plane_section`).

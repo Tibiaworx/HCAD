@@ -1022,6 +1022,364 @@ pub fn repair_mesh(m: &TriMesh) -> (TriMesh, RepairReport) {
     (out, rep)
 }
 
+/// A primitive fitted to a clicked scan region by [`fit_region`] — the reverse-engineering
+/// "click a face, get a datum" step. `rms` is the fit residual (mm), `count` the region size.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegionFit {
+    /// A flat region: plane through `origin` (region centroid) with `normal`.
+    Plane { origin: [f32; 3], normal: [f32; 3], rms: f32, count: usize },
+    /// A cylindrical region: `axis` through `center` (on the axis, at the region's mid-height).
+    Cylinder { center: [f32; 3], axis: [f32; 3], radius: f32, rms: f32, count: usize },
+    /// A spherical region.
+    Sphere { center: [f32; 3], radius: f32, rms: f32, count: usize },
+}
+
+/// Eigen-decomposition of a symmetric 3×3 matrix by cyclic Jacobi rotations.
+/// Returns (eigenvalues, eigenvectors as columns), sorted DESCENDING by eigenvalue.
+fn sym_eigen3(m: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
+    let mut a = m;
+    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..32 {
+        // Largest off-diagonal element.
+        let (mut p, mut q, mut big) = (0usize, 1usize, 0.0f64);
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                if a[i][j].abs() > big {
+                    big = a[i][j].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if big < 1e-14 {
+            break;
+        }
+        let theta = 0.5 * (a[q][q] - a[p][p]) / a[p][q];
+        let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+        let c = 1.0 / (t * t + 1.0).sqrt();
+        let s = t * c;
+        // Apply the rotation G(p,q,θ): a = GᵀaG, v = vG.
+        let (app, aqq, apq) = (a[p][p], a[q][q], a[p][q]);
+        a[p][p] = app - t * apq;
+        a[q][q] = aqq + t * apq;
+        a[p][q] = 0.0;
+        a[q][p] = 0.0;
+        for k in 0..3 {
+            if k != p && k != q {
+                let (akp, akq) = (a[k][p], a[k][q]);
+                a[k][p] = c * akp - s * akq;
+                a[p][k] = a[k][p];
+                a[k][q] = s * akp + c * akq;
+                a[q][k] = a[k][q];
+            }
+        }
+        for k in 0..3 {
+            let (vkp, vkq) = (v[k][p], v[k][q]);
+            v[k][p] = c * vkp - s * vkq;
+            v[k][q] = s * vkp + c * vkq;
+        }
+    }
+    // Sort descending.
+    let mut idx = [0usize, 1, 2];
+    idx.sort_by(|&i, &j| a[j][j].partial_cmp(&a[i][i]).unwrap());
+    let vals = [a[idx[0]][idx[0]], a[idx[1]][idx[1]], a[idx[2]][idx[2]]];
+    let mut vecs = [[0.0; 3]; 3];
+    for (col, &i) in idx.iter().enumerate() {
+        for r in 0..3 {
+            vecs[r][col] = v[r][i];
+        }
+    }
+    (vals, vecs)
+}
+
+/// Grow a smooth region from `seed_tri` (BFS across edges whose dihedral angle stays under
+/// ~35°, capped at `max_dist` from the seed) and fit the best primitive — plane, cylinder,
+/// or sphere — to it. Returns the fit plus the region's boundary edges (for a highlight).
+/// This is "click a face on the scan → get its datum": flat face → plane, bore/boss →
+/// axis + radius, ball → centre.
+pub fn fit_region(m: &TriMesh, seed_tri: usize, max_dist: f32) -> Option<(RegionFit, Vec<[[f32; 3]; 2]>)> {
+    use std::collections::HashMap;
+    let ntri = m.indices.len() / 3;
+    if seed_tri >= ntri {
+        return None;
+    }
+    // Weld verts by position (scan meshes are flat-shaded: every triangle owns copies).
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let wtol = (diag * 1e-5).max(1e-6);
+    let key = |p: [f32; 3]| ((p[0] / wtol).round() as i64, (p[1] / wtol).round() as i64, (p[2] / wtol).round() as i64);
+    let mut vid: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut verts: Vec<[f32; 3]> = Vec::new();
+    let tri_vids: Vec<[u32; 3]> = m
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let mut ids = [0u32; 3];
+            for (k, &i) in t.iter().enumerate() {
+                let p = m.positions[i as usize];
+                ids[k] = *vid.entry(key(p)).or_insert_with(|| {
+                    verts.push(p);
+                    (verts.len() - 1) as u32
+                });
+            }
+            ids
+        })
+        .collect();
+    // Edge → adjacent triangles.
+    let mut edge_tris: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    for (ti, ids) in tri_vids.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (ids[k], ids[(k + 1) % 3]);
+            edge_tris.entry((a.min(b), a.max(b))).or_default().push(ti as u32);
+        }
+    }
+    // Per-triangle normal / centroid / area.
+    let tri_geo: Vec<([f32; 3], [f32; 3], f32)> = tri_vids
+        .iter()
+        .map(|ids| {
+            let (a, b, c) = (verts[ids[0] as usize], verts[ids[1] as usize], verts[ids[2] as usize]);
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            let cen = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+            if l > 1e-12 {
+                ([n[0] / l, n[1] / l, n[2] / l], cen, l * 0.5)
+            } else {
+                ([0.0, 0.0, 1.0], cen, 0.0)
+            }
+        })
+        .collect();
+    // BFS with dihedral smoothness + distance cap.
+    const COS_SMOOTH: f32 = 0.82; // ~35°
+    let seed_c = tri_geo[seed_tri].1;
+    let d2 = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
+    let max_d2 = max_dist * max_dist;
+    let mut in_region = vec![false; ntri];
+    in_region[seed_tri] = true;
+    let mut queue = std::collections::VecDeque::from([seed_tri as u32]);
+    while let Some(ti) = queue.pop_front() {
+        let (n0, _, _) = tri_geo[ti as usize];
+        let ids = tri_vids[ti as usize];
+        for k in 0..3 {
+            let (a, b) = (ids[k], ids[(k + 1) % 3]);
+            if let Some(nbrs) = edge_tris.get(&(a.min(b), a.max(b))) {
+                for &nb in nbrs {
+                    if in_region[nb as usize] {
+                        continue;
+                    }
+                    let (n1, c1, _) = tri_geo[nb as usize];
+                    let dot = n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2];
+                    if dot > COS_SMOOTH && d2(c1, seed_c) < max_d2 {
+                        in_region[nb as usize] = true;
+                        queue.push_back(nb);
+                    }
+                }
+            }
+        }
+    }
+    // Region data: unique verts + area-weighted normal second moment.
+    let mut region_verts: Vec<[f32; 3]> = Vec::new();
+    let mut seen_v: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut nn = [[0.0f64; 3]; 3];
+    let mut area_sum = 0.0f64;
+    let mut count = 0usize;
+    for ti in 0..ntri {
+        if !in_region[ti] {
+            continue;
+        }
+        count += 1;
+        let (n, _, area) = tri_geo[ti];
+        let w = area as f64;
+        area_sum += w;
+        for r in 0..3 {
+            for c in 0..3 {
+                nn[r][c] += w * n[r] as f64 * n[c] as f64;
+            }
+        }
+        for &v in &tri_vids[ti] {
+            if seen_v.insert(v) {
+                region_verts.push(verts[v as usize]);
+            }
+        }
+    }
+    if count < 4 || area_sum < 1e-12 || region_verts.len() < 6 {
+        return None;
+    }
+    for r in 0..3 {
+        for c in 0..3 {
+            nn[r][c] /= area_sum;
+        }
+    }
+    let (_, evecs) = sym_eigen3(nn);
+    let col = |c: usize| [evecs[0][c] as f32, evecs[1][c] as f32, evecs[2][c] as f32];
+    let centroid = {
+        let mut s = [0.0f64; 3];
+        for p in &region_verts {
+            for k in 0..3 {
+                s[k] += p[k] as f64;
+            }
+        }
+        [(s[0] / region_verts.len() as f64) as f32, (s[1] / region_verts.len() as f64) as f32, (s[2] / region_verts.len() as f64) as f32]
+    };
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let rms = |errs: &[f32]| (errs.iter().map(|e| (e * e) as f64).sum::<f64>() / errs.len() as f64).sqrt() as f32;
+
+    // Candidate 1 — PLANE via point PCA: normal = smallest point-scatter direction.
+    let (plane_normal, plane_rms) = {
+        let mut cov = [[0.0f64; 3]; 3];
+        for p in &region_verts {
+            let d = sub(*p, centroid);
+            for r in 0..3 {
+                for c in 0..3 {
+                    cov[r][c] += d[r] as f64 * d[c] as f64;
+                }
+            }
+        }
+        let (_, pv) = sym_eigen3(cov);
+        let n = [pv[0][2] as f32, pv[1][2] as f32, pv[2][2] as f32]; // smallest scatter
+        let errs: Vec<f32> = region_verts.iter().map(|p| dot3(sub(*p, centroid), n)).collect();
+        (n, rms(&errs))
+    };
+    // Candidate 2 — CYLINDER: axis = least-spread direction of the NORMALS (a cylinder's
+    // normals fan out perpendicular to its axis), then a Kasa circle in the ⊥ plane.
+    let cyl = {
+        let axis = col(2);
+        let ax_u = {
+            let pick = if axis[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+            let c = [axis[1] * pick[2] - axis[2] * pick[1], axis[2] * pick[0] - axis[0] * pick[2], axis[0] * pick[1] - axis[1] * pick[0]];
+            let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+            [c[0] / l, c[1] / l, c[2] / l]
+        };
+        let ax_v = [
+            axis[1] * ax_u[2] - axis[2] * ax_u[1],
+            axis[2] * ax_u[0] - axis[0] * ax_u[2],
+            axis[0] * ax_u[1] - axis[1] * ax_u[0],
+        ];
+        let p2: Vec<[f32; 2]> = region_verts.iter().map(|p| {
+            let d = sub(*p, centroid);
+            [dot3(d, ax_u), dot3(d, ax_v)]
+        }).collect();
+        kasa_circle_2d(&p2).map(|(c2, r, _)| {
+            let center = [
+                centroid[0] + ax_u[0] * c2[0] + ax_v[0] * c2[1],
+                centroid[1] + ax_u[1] * c2[0] + ax_v[1] * c2[1],
+                centroid[2] + ax_u[2] * c2[0] + ax_v[2] * c2[1],
+            ];
+            let errs: Vec<f32> = p2.iter().map(|q| (((q[0] - c2[0]).powi(2) + (q[1] - c2[1]).powi(2)).sqrt() - r)).collect();
+            (center, axis, r, rms(&errs))
+        })
+    };
+    // Candidate 3 — SPHERE (Kasa in 3D: x²+y²+z² + Dx + Ey + Fz + G = 0).
+    let sph = {
+        let n = region_verts.len() as f64;
+        let mut a4 = [[0.0f64; 4]; 4];
+        let mut b4 = [0.0f64; 4];
+        for p in &region_verts {
+            let (x, y, z) = (p[0] as f64, p[1] as f64, p[2] as f64);
+            let row = [x, y, z, 1.0];
+            let rhs = -(x * x + y * y + z * z);
+            for r in 0..4 {
+                for c in 0..4 {
+                    a4[r][c] += row[r] * row[c];
+                }
+                b4[r] += row[r] * rhs;
+            }
+        }
+        let _ = n;
+        // Gaussian elimination with partial pivoting.
+        let mut ok = true;
+        for i in 0..4 {
+            let mut piv = i;
+            for r in (i + 1)..4 {
+                if a4[r][i].abs() > a4[piv][i].abs() {
+                    piv = r;
+                }
+            }
+            a4.swap(i, piv);
+            b4.swap(i, piv);
+            if a4[i][i].abs() < 1e-12 {
+                ok = false;
+                break;
+            }
+            for r in (i + 1)..4 {
+                let f = a4[r][i] / a4[i][i];
+                for c in i..4 {
+                    a4[r][c] -= f * a4[i][c];
+                }
+                b4[r] -= f * b4[i];
+            }
+        }
+        if ok {
+            let mut x = [0.0f64; 4];
+            for i in (0..4).rev() {
+                let mut s = b4[i];
+                for c in (i + 1)..4 {
+                    s -= a4[i][c] * x[c];
+                }
+                x[i] = s / a4[i][i];
+            }
+            let c = [(-x[0] / 2.0) as f32, (-x[1] / 2.0) as f32, (-x[2] / 2.0) as f32];
+            let r2 = (c[0] as f64).powi(2) + (c[1] as f64).powi(2) + (c[2] as f64).powi(2) - x[3];
+            if r2 > 0.0 {
+                let r = (r2 as f32).sqrt();
+                let errs: Vec<f32> = region_verts
+                    .iter()
+                    .map(|p| ((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2)).sqrt() - r)
+                    .collect();
+                Some((c, r, rms(&errs)))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    // Pick by residual, preferring the SIMPLER primitive when it's close (within 25%, plus
+    // a small absolute epsilon): a plane is a degenerate cylinder is a degenerate sphere, so
+    // without the preference every flat face would "win" as a huge-radius sphere — and on
+    // sparsely-sampled geometry two fits can BOTH be numerically perfect (e.g. a two-ring
+    // cylinder wall lies exactly on a sphere too), where only the epsilon breaks the tie.
+    let eps = (diag * 1e-6).max(1e-5);
+    let cyl_rms = cyl.as_ref().map(|c| c.3).unwrap_or(f32::INFINITY);
+    let sph_rms = sph.as_ref().map(|s| s.2).unwrap_or(f32::INFINITY);
+    let fit = if plane_rms <= cyl_rms * 1.25 + eps && plane_rms <= sph_rms * 1.25 + eps {
+        RegionFit::Plane { origin: centroid, normal: plane_normal, rms: plane_rms, count }
+    } else if let (true, Some((center, axis, radius, r))) = (cyl_rms <= sph_rms * 1.25 + eps, cyl) {
+        RegionFit::Cylinder { center, axis, radius, rms: r, count }
+    } else if let Some((center, radius, r)) = sph {
+        RegionFit::Sphere { center, radius, rms: r, count }
+    } else {
+        RegionFit::Plane { origin: centroid, normal: plane_normal, rms: plane_rms, count }
+    };
+    // Boundary edges of the region (used by exactly one region triangle) — the highlight.
+    let mut boundary: Vec<[[f32; 3]; 2]> = Vec::new();
+    let mut edge_use: HashMap<(u32, u32), u32> = HashMap::new();
+    for ti in 0..ntri {
+        if !in_region[ti] {
+            continue;
+        }
+        let ids = tri_vids[ti];
+        for k in 0..3 {
+            let (a, b) = (ids[k], ids[(k + 1) % 3]);
+            *edge_use.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    for ((a, b), uses) in edge_use {
+        if uses == 1 {
+            boundary.push([verts[a as usize], verts[b as usize]]);
+        }
+    }
+    Some((fit, boundary))
+}
+
 /// A recognized curve in a mesh cross-section, in the sketch plane's 2D (uv) space.
 /// Produced by [`fit_section_shapes`] from the raw triangle-crossing segments of
 /// [`mesh_plane_section`] — tessellation chords become real circles/arcs/polylines the
@@ -2670,6 +3028,98 @@ mod tests {
         assert!(elapsed.as_secs() < 2, "must fail fast, not grind BSP (took {elapsed:?})");
         assert_eq!(out.indices.len(), sheet.indices.len(), "base returned unchanged");
         assert_eq!(take_dense_skip_count(), 1, "the skip must be recorded for the app to warn");
+    }
+
+    /// `fit_region` must recognize what was clicked: a cylinder's wall → Cylinder with the
+    /// right axis/radius; its flat cap → Plane with the right normal; a ball → Sphere with
+    /// the right centre/radius. This is the click-a-scan-face-get-a-datum feature's core.
+    #[test]
+    fn fit_region_recognizes_cylinder_cap_and_sphere() {
+        // Cylinder r=8, z∈[0,30], 64-gon — via the extrude tool (side + caps).
+        let n = 64;
+        let circle: Vec<[f64; 2]> = (0..n)
+            .map(|k| {
+                let a = k as f64 / n as f64 * std::f64::consts::TAU;
+                [8.0 * a.cos(), 8.0 * a.sin()]
+            })
+            .collect();
+        let basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let cyl = extrude_tool_mesh(&circle, &[], &basis, 0.0, 30.0).expect("cylinder");
+        let tri_at = |m: &TriMesh, pred: &dyn Fn([f32; 3], [f32; 3]) -> bool| -> usize {
+            for (ti, t) in m.indices.chunks_exact(3).enumerate() {
+                let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+                let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                if l < 1e-12 {
+                    continue;
+                }
+                let n = [n[0] / l, n[1] / l, n[2] / l];
+                let cen = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+                if pred(cen, n) {
+                    return ti;
+                }
+            }
+            panic!("no seed triangle matched");
+        };
+        // Wall seed: a mid-height triangle whose normal is radial (≈ no z).
+        let wall_seed = tri_at(&cyl, &|c, n| n[2].abs() < 0.1 && c[2] > 5.0 && c[2] < 25.0);
+        let (fit, boundary) = fit_region(&cyl, wall_seed, 100.0).expect("wall fit");
+        match fit {
+            RegionFit::Cylinder { axis, radius, center, rms, .. } => {
+                assert!(axis[2].abs() > 0.99, "axis along z, got {axis:?}");
+                assert!((radius - 8.0).abs() < 0.05, "radius {radius}");
+                assert!((center[0].powi(2) + center[1].powi(2)).sqrt() < 0.05, "centre on the z axis: {center:?}");
+                assert!(rms < 0.05, "wall rms {rms}");
+            }
+            other => panic!("wall should fit a cylinder, got {other:?}"),
+        }
+        assert!(!boundary.is_empty(), "region boundary must be reported for the highlight");
+        // Cap seed: a top-face triangle (normal +z).
+        let cap_seed = tri_at(&cyl, &|_, n| n[2] > 0.99);
+        let (fit, _) = fit_region(&cyl, cap_seed, 100.0).expect("cap fit");
+        match fit {
+            RegionFit::Plane { normal, origin, rms, .. } => {
+                assert!(normal[2].abs() > 0.99, "cap normal along z, got {normal:?}");
+                assert!((origin[2] - 30.0).abs() < 0.05, "cap at z=30, got {origin:?}");
+                assert!(rms < 0.02, "cap rms {rms}");
+            }
+            other => panic!("cap should fit a plane, got {other:?}"),
+        }
+        // Sphere r=9 centred at (3,-2,5), UV-tessellated.
+        let (r, c0, nu, nv) = (9.0f32, [3.0f32, -2.0, 5.0], 48usize, 24usize);
+        let mut sph = TriMesh::default();
+        let pt = |iu: usize, iv: usize| {
+            let (th, ph) = (iu as f32 / nu as f32 * std::f32::consts::TAU, iv as f32 / nv as f32 * std::f32::consts::PI);
+            [c0[0] + r * ph.sin() * th.cos(), c0[1] + r * ph.sin() * th.sin(), c0[2] + r * ph.cos()]
+        };
+        for iu in 0..nu {
+            for iv in 0..nv {
+                let (a, b, c, d) = (pt(iu, iv), pt(iu + 1, iv), pt(iu + 1, iv + 1), pt(iu, iv + 1));
+                for tri in [[a, b, c], [a, c, d]] {
+                    let base = sph.positions.len() as u32;
+                    for p in tri {
+                        sph.positions.push(p);
+                        sph.normals.push([0.0, 0.0, 1.0]);
+                    }
+                    sph.indices.extend([base, base + 1, base + 2]);
+                }
+            }
+        }
+        // Seed at the equator (iv = nv/2) — the iv=0 row is pole-degenerate (zero-area tris).
+        let (fit, _) = fit_region(&sph, nv, 100.0).expect("sphere fit");
+        match fit {
+            RegionFit::Sphere { center, radius, rms, .. } => {
+                assert!((radius - r).abs() < 0.1, "sphere radius {radius}");
+                assert!(
+                    ((center[0] - c0[0]).powi(2) + (center[1] - c0[1]).powi(2) + (center[2] - c0[2]).powi(2)).sqrt() < 0.1,
+                    "sphere centre {center:?}"
+                );
+                assert!(rms < 0.05, "sphere rms {rms}");
+            }
+            other => panic!("ball should fit a sphere, got {other:?}"),
+        }
     }
 
     /// Surface fidelity: remeshing a SPHERE must land vertices on the true surface with
