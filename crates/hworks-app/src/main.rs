@@ -14059,16 +14059,22 @@ fn do_solid_op(
     history.snapshot(&doc.0);
     let sketch = session.sketch.clone();
     let plane = plane_ref(&ap);
+    // Record an interior sample point per chosen contour: indices re-order when a
+    // crossing-heavy sketch re-solves, so regeneration re-resolves the picks by POINT.
+    let region_pts: Vec<[f64; 2]> = {
+        let all = sketch.regions();
+        regions.iter().filter_map(|&i| all.get(i)).map(region_sample_point).collect()
+    };
     let kind = match op {
-        SolidOp::Boss(d, back, thin, thin_side) => FeatureKind::Extrude { sketch, regions, plane, distance: d, back, thin, thin_side },
-        SolidOp::Cut(d, back, thin, thin_side) => FeatureKind::Cut { sketch, regions, plane, distance: d, back, thin, thin_side },
+        SolidOp::Boss(d, back, thin, thin_side) => FeatureKind::Extrude { sketch, regions, region_pts, plane, distance: d, back, thin, thin_side },
+        SolidOp::Cut(d, back, thin, thin_side) => FeatureKind::Cut { sketch, regions, region_pts, plane, distance: d, back, thin, thin_side },
         SolidOp::Revolve(angle) => {
             let (axis_pt, axis_dir) = axis.unwrap();
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut: false }
+            FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut: false }
         }
         SolidOp::RevolveCut(angle) => {
             let (axis_pt, axis_dir) = axis.unwrap();
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut: true }
+            FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut: true }
         }
     };
     // Editing an existing feature replaces it in place; otherwise append.
@@ -14297,10 +14303,14 @@ fn handle_exit_sketch(
             let contours = session.selected_contours.clone();
             match &mut doc.0.features[i].kind {
                 FeatureKind::Sketch { sketch, .. } => *sketch = new_sketch,
-                FeatureKind::Extrude { sketch, regions: r, .. }
-                | FeatureKind::Cut { sketch, regions: r, .. }
-                | FeatureKind::Revolve { sketch, regions: r, .. } => {
+                FeatureKind::Extrude { sketch, regions: r, region_pts: rp, .. }
+                | FeatureKind::Cut { sketch, regions: r, region_pts: rp, .. }
+                | FeatureKind::Revolve { sketch, regions: r, region_pts: rp, .. } => {
                     *sketch = new_sketch;
+                    // Re-sample the picked contours from the EDITED sketch (indices and
+                    // sample points both refresh together).
+                    let all = sketch.regions();
+                    *rp = contours.iter().filter_map(|&i| all.get(i)).map(region_sample_point).collect();
                     *r = contours;
                     ui_state.regen = true;
                 }
@@ -14396,7 +14406,7 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
             FeatureKind::Plane(_) => {}
             FeatureKind::Sketch { .. } => {} // 2D only — no solid contribution
             FeatureKind::RefImage { .. } => {} // a visual underlay — no solid contribution
-            FeatureKind::Extrude { sketch, regions, plane, distance, back, .. } => {
+            FeatureKind::Extrude { sketch, regions, region_pts, plane, distance, back, .. } => {
                 let all = sketch.regions();
                 // A feature built on a face rides on that face: re-resolve its plane
                 // to the current body so stacked features build on each other and
@@ -14406,7 +14416,7 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 // Merge adjacent contours into single profiles first (a dumbbell of
                 // two circles + connecting band becomes one outline), so each piece
                 // extrudes as one solid without a coincident-face boolean.
-                let mut merged = merge_regions(&chosen_regions(&all, regions));
+                let mut merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
                 gate_arcs(&mut merged, fi);
                 for r in &merged {
                     let next = match &body {
@@ -14432,7 +14442,7 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            FeatureKind::Cut { sketch, regions, plane, distance, back, .. } => {
+            FeatureKind::Cut { sketch, regions, region_pts, plane, distance, back, .. } => {
                 let Some(b0) = &body else { continue };
                 let all = sketch.regions();
                 let resolved = reproject_plane(plane, b0);
@@ -14441,7 +14451,7 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 let n = Vec3::new(resolved.normal[0] as f32, resolved.normal[1] as f32, resolved.normal[2] as f32);
                 // Merge adjacent contours into single profiles first (same reason as
                 // the boss), then cut each from the current body.
-                let mut merged = merge_regions(&chosen_regions(&all, regions));
+                let mut merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
                 gate_arcs(&mut merged, fi);
                 for ri in 0..merged.len() {
                     let Some(b) = &body else { break };
@@ -14463,11 +14473,11 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     }
                 }
             }
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut } => {
+            FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut } => {
                 let all = sketch.regions();
                 let resolved = match &body { Some(b) => reproject_plane(plane, b), None => plane.clone() };
                 let basis = basis_from_ref(&resolved);
-                let mut merged = merge_regions(&chosen_regions(&all, regions));
+                let mut merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
                 gate_arcs(&mut merged, fi);
                 for r in &merged {
                     let solid = revolve_solid_arcs(
@@ -14744,11 +14754,11 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     None => warn!("Import {name}: embedded mesh data could not be decoded."),
                 }
             }
-            FeatureKind::Extrude { sketch, regions, plane, distance, back, thin, thin_side } => {
+            FeatureKind::Extrude { sketch, regions, region_pts, plane, distance, back, thin, thin_side } => {
                 // A boss adds material elsewhere; it doesn't invalidate edges from an earlier
                 // fillet/chamfer, so keep them (don't clear here).
                 let all = sketch.regions();
-                let regs = merge_regions(&chosen_regions(&all, regions));
+                let regs = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
                 // Reproject onto the live body's matching face (like the exact path), so a boss
                 // stacks on the *current* top rather than the stale stored plane — testing under
                 // the footprint centroid so it can't snap onto an unrelated feature's top.
@@ -14834,7 +14844,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     };
                 }
             }
-            FeatureKind::Cut { sketch, regions, plane, distance, back, thin, thin_side } => {
+            FeatureKind::Cut { sketch, regions, region_pts, plane, distance, back, thin, thin_side } => {
                 // A cut elsewhere doesn't invalidate an earlier fillet/chamfer's edges, so keep
                 // them (don't clear) — they accumulate through the timeline like the boss path.
                 let Some(cur0) = &body else { continue };
@@ -14843,7 +14853,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 // starts at the real surface — otherwise a chamfered body (forced onto this
                 // mesh path) cuts from the stale stored plane and comes out shallow. Test under
                 // the footprint centroid so it lands on the face the sketch actually sits on.
-                let mut cut_regs = merge_regions(&chosen_regions(&all, regions));
+                let mut cut_regs = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
                 let ref_world = sketch_footprint_world(plane, cut_regs.iter().flat_map(|r| r.outer.iter()));
                 let samples = sketch_footprint_samples(plane, &cut_regs);
                 let plane = reproject_plane_on_mesh(plane, cur0, &samples);
@@ -14894,10 +14904,10 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     });
                 }
             }
-            FeatureKind::Revolve { sketch, regions, plane, axis_pt, axis_dir, angle, cut } => {
+            FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut } => {
                 bevel_edges.clear();
                 let all = sketch.regions();
-                let regs = merge_regions(&chosen_regions(&all, regions));
+                let regs = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
                 let samples = sketch_footprint_samples(plane, &regs);
                 let resolved = match &body {
                     Some(b) => reproject_plane_on_mesh(plane, b, &samples),
@@ -16396,11 +16406,81 @@ fn kernel_hole_spans(r: &hworks_sketch::Region) -> Vec<Vec<hworks_geometry::ArcS
 /// hole. Explicit selections are honoured verbatim (you *can* pick a nested disk).
 /// Out-of-range indices are skipped (the sketch may have changed since creation).
 fn chosen_regions<'a>(all: &'a [hworks_sketch::Region], selected: &[usize]) -> Vec<&'a hworks_sketch::Region> {
+    chosen_regions_pts(all, selected, &[])
+}
+
+/// Resolve a feature's chosen contours. When interior SAMPLE POINTS were recorded at pick
+/// time they win: each point selects the smallest region containing it — region indices
+/// re-order whenever a crossing-heavy sketch re-solves, so an index that meant "this pocket"
+/// can silently become a different (often much larger) area at regen. Old documents without
+/// samples fall back to the stored indices.
+fn chosen_regions_pts<'a>(
+    all: &'a [hworks_sketch::Region],
+    selected: &[usize],
+    pts: &[[f64; 2]],
+) -> Vec<&'a hworks_sketch::Region> {
+    if !pts.is_empty() {
+        let area = |r: &hworks_sketch::Region| -> f64 {
+            let mut a = 0.0;
+            for w in 0..r.outer.len() {
+                let p = r.outer[w];
+                let q = r.outer[(w + 1) % r.outer.len()];
+                a += p[0] * q[1] - q[0] * p[1];
+            }
+            (a * 0.5).abs()
+        };
+        let inside = |r: &hworks_sketch::Region, p: [f64; 2]| {
+            point_in_poly(p, &r.outer) && !r.holes.iter().any(|h| point_in_poly(p, h))
+        };
+        let mut picked: Vec<usize> = Vec::new();
+        for p in pts {
+            let best = all
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| inside(r, *p))
+                .min_by(|a2, b2| area(a2.1).partial_cmp(&area(b2.1)).unwrap());
+            if let Some((i, _)) = best {
+                if !picked.contains(&i) {
+                    picked.push(i);
+                }
+            }
+        }
+        if !picked.is_empty() {
+            return picked.into_iter().filter_map(|i| all.get(i)).collect();
+        }
+        // No sample matched (the sketch changed drastically) → fall through to indices.
+    }
     if selected.is_empty() {
         all.iter().filter(|r| !r.nested).collect()
     } else {
         selected.iter().filter_map(|&i| all.get(i)).collect()
     }
+}
+
+/// A point genuinely inside a region (inside the outer loop, outside every hole): the
+/// centroid when it qualifies, else points walked from the centroid toward rim vertices.
+fn region_sample_point(r: &hworks_sketch::Region) -> [f64; 2] {
+    let mut c = [0.0f64; 2];
+    for p in &r.outer {
+        c[0] += p[0];
+        c[1] += p[1];
+    }
+    let n = r.outer.len().max(1) as f64;
+    let c = [c[0] / n, c[1] / n];
+    let inside = |p: [f64; 2]| point_in_poly(p, &r.outer) && !r.holes.iter().any(|h| point_in_poly(p, h));
+    if inside(c) {
+        return c;
+    }
+    let step = (r.outer.len() / 8).max(1);
+    for f in [0.5f64, 0.75, 0.9, 0.25] {
+        for v in r.outer.iter().step_by(step) {
+            let q = [c[0] + (v[0] - c[0]) * f, c[1] + (v[1] - c[1]) * f];
+            if inside(q) {
+                return q;
+            }
+        }
+    }
+    c
 }
 
 /// A boss/cut whose face exactly coincides with a body face (e.g. a circle drawn to
@@ -20174,6 +20254,7 @@ mod tests {
         doc.add_feature(FeatureKind::Cut {
             sketch: cut_sketch,
             regions: vec![0],
+            region_pts: vec![],
             plane: standard_plane_ref(0),
             distance: 25.0,
             back: 25.0,
@@ -20253,7 +20334,7 @@ mod tests {
             for k in 0..4 {
                 sk.add_line(p[k], p[(k + 1) % 4], false);
             }
-            FeatureKind::Cut { sketch: sk, regions: vec![0], plane: standard_plane_ref(0), distance: 30.0, back: 30.0, thin: 0.0, thin_side: 0 }
+            FeatureKind::Cut { sketch: sk, regions: vec![0], region_pts: vec![], plane: standard_plane_ref(0), distance: 30.0, back: 30.0, thin: 0.0, thin_side: 0 }
         };
 
         // solidify = 0: the cut can't apply (dense non-manifold) → skip recorded, body ≈ uncut.
@@ -21015,7 +21096,7 @@ mod tests {
             normal: [0.0, 1.0, 0.0],
             datum: true,
         };
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: 50.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], region_pts: vec![], plane: top, distance: 50.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let cap = ActivePlane {
             name: "Face".into(),
             origin: Vec3::new(0.0, 50.0, 0.0),
@@ -21065,7 +21146,7 @@ mod tests {
     #[test]
     fn regenerate_replays_an_extrude_into_a_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let solid = regenerate(&doc).expect("regen should produce a body");
         assert_eq!(tessellate(&solid, 0.05).edges.len(), 12);
     }
@@ -21133,18 +21214,18 @@ mod tests {
         let mut a = Sketch::default();
         let pa = a.add_point(0.0, 0.0);
         a.add_circle(pa, 3.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: a, regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: a, regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut b = Sketch::default();
         let pb = b.add_point(10.0, 0.0);
         b.add_circle(pb, 3.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: b, regions: vec![], plane: xy(), distance: 3.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: b, regions: vec![], region_pts: vec![], plane: xy(), distance: 3.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let before = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
         // Cut a 1mm hole in the top of cylinder A (z=5), 2mm deep.
         let mut cut = Sketch::default();
         let pc = cut.add_point(0.0, 0.0);
         cut.add_circle(pc, 1.0);
         let top = PlaneRef { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Cut { sketch: cut, regions: vec![], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: cut, regions: vec![], region_pts: vec![], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let after_solid = regenerate(&doc).expect("body after cut");
         let after = tessellate(&after_solid, 0.05).edges.len();
         eprintln!("edges before cut {before}, after cut {after}");
@@ -21166,13 +21247,13 @@ mod tests {
         let b2 = boss.add_point(11.0, -2.0);
         boss.add_line(b1, b2, false);
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         // Cut a 1mm-radius hole in the middle, from the top face.
         let mut cutsk = Sketch::default();
         let cc = cutsk.add_point(5.0, 0.0);
         cutsk.add_circle(cc, 1.0);
         let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Cut { sketch: cutsk, regions: vec![], plane: top, distance: 1.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: cutsk, regions: vec![], region_pts: vec![], plane: top, distance: 1.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let solid = regenerate(&doc); // must not panic
         assert!(solid.is_some(), "dumbbell with a cut should still produce a body");
     }
@@ -21180,7 +21261,7 @@ mod tests {
     #[test]
     fn editing_a_distance_rebuilds_taller() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let h2 = height(&regenerate(&doc).unwrap());
         if let FeatureKind::Extrude { distance, .. } = &mut doc.features.last_mut().unwrap().kind {
             *distance = 6.0;
@@ -21194,10 +21275,10 @@ mod tests {
     fn editing_an_upstream_height_shifts_stacked_features() {
         let mut doc = Document::with_default_planes();
         // Base box 4×4×2 on XY.
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         // Boss 2×2 sketched on the top face (z=2), 2 tall → stacked total height 4.
         let top = PlaneRef { origin: [0.0, 0.0, 2.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(2.0, 2.0), regions: vec![0], region_pts: vec![], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let before = height(&regenerate(&doc).unwrap());
         assert!((before - 4.0).abs() < 0.2, "stacked height should be 4, was {before}");
         // Grow the base to 5 tall — the boss must ride up to z=5..7 (total 7), not
@@ -21212,7 +21293,7 @@ mod tests {
     #[test]
     fn rollback_suppresses_downstream_features() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         assert!(regenerate(&doc).is_some());
         // Roll the bar back before the extrude → no body.
         doc.rollback = doc.features.len() - 1;
@@ -21225,6 +21306,7 @@ mod tests {
         doc.add_feature(FeatureKind::Extrude {
             sketch: rect_sketch(2.0, 2.0),
             regions: vec![0],
+            region_pts: vec![],
             plane: xy(),
             distance: 2.0,
             back: 0.0,
@@ -21241,7 +21323,7 @@ mod tests {
     #[test]
     fn regenerate_replays_a_cut_through_the_box() {
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(4.0, 4.0), regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         // Cut a centred 2x2 pocket from the same plane (body is on the +normal side).
         let mut pocket = Sketch::default();
         let a = pocket.add_point(1.0, 1.0);
@@ -21252,7 +21334,7 @@ mod tests {
         pocket.add_line(b, c, false);
         pocket.add_line(c, d, false);
         pocket.add_line(d, a, false);
-        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let solid = regenerate(&doc).expect("regen with a cut should produce a body");
         assert!(tessellate(&solid, 0.05).edges.len() > 12, "cut should add edges");
     }
@@ -21277,7 +21359,7 @@ mod tests {
         let s = two_disjoint_squares();
         assert_eq!(s.regions().len(), 2, "two separate squares are two regions");
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![0], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![0], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let edges = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
         assert_eq!(edges, 12, "one selected contour → one box, got {edges}");
     }
@@ -21287,7 +21369,7 @@ mod tests {
         let s = two_disjoint_squares();
         let mut doc = Document::with_default_planes();
         // Empty selection ⇒ all contours.
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], region_pts: vec![], plane: xy(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let edges = tessellate(&regenerate(&doc).unwrap(), 0.05).edges.len();
         // Two separate boxes = 24 edges (proves the disjoint union worked).
         assert_eq!(edges, 24, "all contours → two boxes (24 edges), got {edges}");
@@ -21475,7 +21557,7 @@ mod tests {
         s.add_line(p3, p0, false);
 
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], region_pts: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
 
         let radius = 7.78000020980835;
         let top_rim = vec![vec![
@@ -21525,7 +21607,7 @@ mod tests {
         s.add_line(p3, p0, false);
 
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: s, regions: vec![], region_pts: vec![], plane: top, distance: dist, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.add_feature(FeatureKind::Fillet { radius, edges });
 
         let (mesh, _tangent_edges) = regenerate_mesh(&doc).expect("mesh regen with a fillet should produce a body");
@@ -21606,13 +21688,13 @@ mod tests {
         let mut boss = Sketch::default();
         let c = boss.add_point(0.0, 0.0);
         boss.add_circle(c, 30.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut hole = Sketch::default();
         let hc = hole.add_point(-10.0, 0.0);
         hole.add_circle(hc, 2.0);
         let top = PlaneRef { origin: [0.0, 0.0, 4.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
         let cut_idx = doc.features.len();
-        doc.add_feature(FeatureKind::Cut { sketch: hole, regions: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: hole, regions: vec![], region_pts: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.rollback = doc.features.len();
         let (before, _) = regenerate_mesh(&doc).expect("body with one hole");
         doc.add_feature(FeatureKind::Pattern {
@@ -21640,13 +21722,13 @@ mod tests {
         let mut boss = Sketch::default();
         let c = boss.add_point(0.0, 0.0);
         boss.add_circle(c, 30.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut hole = Sketch::default();
         let hc = hole.add_point(20.0, 0.0);
         hole.add_circle(hc, 2.0);
         let top = PlaneRef { origin: [0.0, 0.0, 4.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
         let cut_idx = doc.features.len();
-        doc.add_feature(FeatureKind::Cut { sketch: hole, regions: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: hole, regions: vec![], region_pts: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.rollback = doc.features.len();
         let (before, _) = regenerate_mesh(&doc).expect("body with one hole");
         doc.add_feature(FeatureKind::Pattern {
@@ -21672,7 +21754,7 @@ mod tests {
         // 20×20×10 box, t=2 shell with the top face removed → an open tray.
         // Cavity = 16×16×8 = 2048, so material = 4000 − 2048 = 1952.
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.add_feature(FeatureKind::Shell { thickness: 2.0, open: vec![([10.0, 10.0, 10.0], [0.0, 0.0, 1.0])] });
         doc.rollback = doc.features.len();
         let (m, _) = regenerate_mesh(&doc).expect("shelled box");
@@ -21685,7 +21767,7 @@ mod tests {
     fn shell_without_open_faces_leaves_an_enclosed_hollow() {
         // Fully enclosed: cavity = 16×16×6 = 1536 → material = 4000 − 1536 = 2464.
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.add_feature(FeatureKind::Shell { thickness: 2.0, open: vec![] });
         doc.rollback = doc.features.len();
         let (m, _) = regenerate_mesh(&doc).expect("enclosed shell");
@@ -21699,7 +21781,7 @@ mod tests {
         // Two instances of a box part, one moved: RON roundtrip preserves everything, and the
         // component regenerates through the same pipeline the assembly renderer uses.
         let mut part = Document::with_default_planes();
-        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         part.rollback = part.features.len();
         let mut asm = Assembly::default();
         let a = asm.add_component("box".into(), "box.hcad".into(), part.clone(), [0.0, 0.0, 0.0]);
@@ -21721,7 +21803,7 @@ mod tests {
         // Two boxes; mate box B's bottom (z=0 local) onto box A's top (z=5 local). B floats
         // somewhere off in space — the solver must land its bottom plane on A's top plane.
         let mut part = Document::with_default_planes();
-        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut asm = Assembly::default();
         let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
         let b = asm.add_component("b".into(), String::new(), part.clone(), [3.0, 7.0, 40.0]);
@@ -21749,7 +21831,7 @@ mod tests {
         let mut sk = Sketch::default();
         let c = sk.add_point(0.0, 0.0);
         sk.add_circle(c, 3.0);
-        part.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut asm = Assembly::default();
         let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
         let b = asm.add_component("b".into(), String::new(), part.clone(), [11.0, -6.0, 9.0]);
@@ -21774,7 +21856,7 @@ mod tests {
         let mut sk = Sketch::default();
         let c = sk.add_point(0.0, 0.0);
         sk.add_circle(c, 4.0);
-        part.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], plane: xy(), distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
         part.rollback = part.features.len();
         let tess = component_tessellation(&part).expect("cylinder");
         let tri = &tess.mesh;
@@ -21811,7 +21893,7 @@ mod tests {
         // measurably unsatisfied — the red-row diagnostic that tells the user *which* mate
         // is fighting instead of the solver silently giving up.
         let mut part = Document::with_default_planes();
-        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut asm = Assembly::default();
         let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
         let b = asm.add_component("b".into(), String::new(), part.clone(), [3.0, 7.0, 40.0]);
@@ -21834,7 +21916,7 @@ mod tests {
         // Both parts Fixed with an unmet coincident mate: the solver can't move anything, and
         // the mate must read unsatisfied (with the both-fixed hint in the UI).
         let mut part = Document::with_default_planes();
-        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut asm = Assembly::default();
         let a = asm.add_component("a".into(), String::new(), part.clone(), [0.0, 0.0, 0.0]);
         let b = asm.add_component("b".into(), String::new(), part.clone(), [3.0, 7.0, 40.0]);
@@ -21860,7 +21942,7 @@ mod tests {
         // it as a sketchable plane, expressed in the edited part's (= assembly, identity)
         // frame: origin on the top face near its centre, normal +Z.
         let mut box_part = Document::with_default_planes();
-        box_part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        box_part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut asm = Assembly::default();
         let bx = asm.add_component("box".into(), String::new(), box_part.clone(), [20.0, 0.0, 0.0]);
         let newp = asm.add_component("Part1".into(), String::new(), Document::with_default_planes(), [0.0, 0.0, 0.0]);
@@ -21888,7 +21970,7 @@ mod tests {
         // The same setup's cached edges must land at the component's ASSEMBLY position when
         // gathered for an identity-placed edited part (translation +20 applied).
         let mut box_part = Document::with_default_planes();
-        box_part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        box_part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut asm = Assembly::default();
         let bx = asm.add_component("box".into(), String::new(), box_part.clone(), [20.0, 0.0, 0.0]);
         let newp = asm.add_component("Part1".into(), String::new(), Document::with_default_planes(), [0.0, 0.0, 0.0]);
@@ -21941,6 +22023,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_regions -- --ignored --nocapture
+    fn diag_regions() {
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        for (fi, f) in doc.features.iter().enumerate() {
+            let (sketch, regions, label) = match &f.kind {
+                FeatureKind::Cut { sketch, regions, .. } => (sketch, regions.clone(), "Cut"),
+                FeatureKind::Extrude { sketch, regions, .. } => (sketch, regions.clone(), "Extrude"),
+                FeatureKind::Sketch { sketch, .. } => (sketch, vec![], "Sketch"),
+                _ => continue,
+            };
+            let regs = sketch.regions();
+            eprintln!("== feature {fi} {label}: {} regions, selected {:?}", regs.len(), regions);
+            for (ri, r) in regs.iter().enumerate() {
+                let area = {
+                    let mut a = 0.0;
+                    for w in 0..r.outer.len() {
+                        let p = r.outer[w];
+                        let q = r.outer[(w + 1) % r.outer.len()];
+                        a += p[0] * q[1] - q[0] * p[1];
+                    }
+                    a * 0.5
+                };
+                let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+                for p in &r.outer {
+                    lo[0] = lo[0].min(p[0]);
+                    lo[1] = lo[1].min(p[1]);
+                    hi[0] = hi[0].max(p[0]);
+                    hi[1] = hi[1].max(p[1]);
+                }
+                let sel = if regions.contains(&ri) { "  <== SELECTED" } else { "" };
+                eprintln!(
+                    "   region {ri}: area {area:8.1}  bbox ({:.1},{:.1})..({:.1},{:.1})  holes {} pts {}{sel}",
+                    lo[0], lo[1], hi[0], hi[1], r.holes.len(), r.outer.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn region_sample_point_survives_index_reordering() {
+        // A slab, then a cut whose sketch is a rectangle split by a crossing line into an
+        // asymmetric lower (20x3) and upper (20x7) region. The stored INDEX deliberately
+        // points at the WRONG region — the recorded interior sample point must win, cutting
+        // only the intended upper half. This is the excut.hcad failure: crossing-heavy
+        // sketches re-order their regions between pick time and regen.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut cs = rect_sketch(20.0, 10.0);
+        let a = cs.add_point(0.0, 3.0);
+        let b = cs.add_point(20.0, 3.0);
+        cs.add_line(a, b, false);
+        let all = cs.regions();
+        assert!(all.len() >= 2, "crossing line should split the rect, got {}", all.len());
+        let upper_pt = [10.0, 8.0];
+        let upper_idx = all
+            .iter()
+            .position(|r| point_in_poly(upper_pt, &r.outer) && !r.holes.iter().any(|h| point_in_poly(upper_pt, h)))
+            .expect("upper region");
+        let wrong_idx = (0..all.len()).find(|&i| i != upper_idx).unwrap();
+        let top = PlaneRef { origin: [0.0, 0.0, 10.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Cut {
+            sketch: cs,
+            regions: vec![wrong_idx],
+            region_pts: vec![upper_pt],
+            plane: top,
+            distance: 2.0,
+            back: 0.0,
+            thin: 0.0,
+            thin_side: 0,
+        });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("cut body");
+        let vol = tri_vol(&mesh);
+        let expect = 20.0 * 10.0 * 10.0 - 20.0 * 7.0 * 2.0; // only the upper (sampled) half cut
+        eprintln!("region-pts cut volume {vol:.1} (expected {expect:.1})");
+        // Tolerance covers cut-tool overshoot noise; the wrong-region outcome differs by 160.
+        assert!((vol - expect).abs() < 25.0, "sample point must override the wrong index: {vol:.1} vs {expect:.1}");
+    }
+
+    #[test]
     fn counterbore_snapped_to_hole_leaves_no_sliver_walls() {
         // The excut.hcad case: a slab with a through-hole (r=6), then a counterbore cut whose
         // sketch is a big circle plus a circle SNAPPED onto the hole's rim (same centre, same
@@ -21951,14 +22115,14 @@ mod tests {
         let mut base = rect_sketch(30.0, 30.0);
         let hc = base.add_point(15.0, 15.0);
         base.add_circle(hc, 6.0);
-        doc.add_feature(FeatureKind::Extrude { sketch: base, regions: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: base, regions: vec![], region_pts: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut cb = Sketch::default();
         let c1 = cb.add_point(15.0, 15.0);
         cb.add_circle(c1, 11.25);
         let c2 = cb.add_point(15.0, 15.0 + 1e-7); // snapped: off by the same hair as the real file
         cb.add_circle(c2, 6.0);
         let top = PlaneRef { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
-        doc.add_feature(FeatureKind::Cut { sketch: cb, regions: vec![], plane: top, distance: 2.5, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: cb, regions: vec![], region_pts: vec![], plane: top, distance: 2.5, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.rollback = doc.features.len();
         // The exact kernel may reject this cut outright (truck is fragile around a tool
         // crossing a hole) — the app then falls back to the mesh kernel, so the MESH result
@@ -22001,7 +22165,7 @@ mod tests {
         // The counter-case: a pocket with a hole loop standing over SOLID material (a post to
         // keep). The pruning must NOT touch it — the post survives the cut.
         let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(30.0, 30.0), regions: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(30.0, 30.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
         let mut pocket = Sketch::default();
         let c1 = pocket.add_point(15.0, 15.0);
         pocket.add_circle(c1, 11.0);
@@ -22009,7 +22173,7 @@ mod tests {
         pocket.add_circle(c2, 4.0);
         let top = PlaneRef { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
         // Only region 0 (the annulus) — cutting it must leave the r=4 post standing.
-        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], plane: top, distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], region_pts: vec![], plane: top, distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.rollback = doc.features.len();
         let (mesh, _) = regenerate_mesh(&doc).expect("pocket with post");
         let vol = tri_vol(&mesh);

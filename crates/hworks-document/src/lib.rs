@@ -79,14 +79,17 @@ pub enum FeatureKind {
     /// `thin` > 0 makes it a **thin feature**: extrude a wall of that thickness along the profile
     /// (a pipe/box shell) instead of filling the region. `thin_side`: 0 = outward (profile is the
     /// inner wall), 1 = inward (outer wall), 2 = mid-plane (split evenly).
-    Extrude { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64, #[serde(default)] back: f64, #[serde(default)] thin: f64, #[serde(default)] thin_side: u8 },
+    /// `region_pts` are interior SAMPLE POINTS of the chosen regions (one per pick, sketch
+    /// uv): region INDICES shift when a crossing-heavy sketch re-solves (the arrangement
+    /// re-orders), so regeneration re-resolves the selection by point when samples exist.
+    Extrude { sketch: Sketch, regions: Vec<usize>, #[serde(default)] region_pts: Vec<[f64; 2]>, plane: PlaneRef, distance: f64, #[serde(default)] back: f64, #[serde(default)] thin: f64, #[serde(default)] thin_side: u8 },
     /// Cut: subtract the chosen swept `regions` from the body (empty = all). `back` = Direction 2.
     /// `thin`/`thin_side` as for [`Extrude`] — subtract a wall instead of the filled region.
-    Cut { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, distance: f64, #[serde(default)] back: f64, #[serde(default)] thin: f64, #[serde(default)] thin_side: u8 },
+    Cut { sketch: Sketch, regions: Vec<usize>, #[serde(default)] region_pts: Vec<[f64; 2]>, plane: PlaneRef, distance: f64, #[serde(default)] back: f64, #[serde(default)] thin: f64, #[serde(default)] thin_side: u8 },
     /// Revolve: sweep the chosen `regions` of `sketch` around an axis line (a point + direction in
     /// the sketch's uv plane) by `angle` radians (τ = full turn). `cut` subtracts the swept solid
     /// from the body (a lathe groove/bore) instead of adding it (a revolve boss).
-    Revolve { sketch: Sketch, regions: Vec<usize>, plane: PlaneRef, axis_pt: [f64; 2], axis_dir: [f64; 2], angle: f64, #[serde(default)] cut: bool },
+    Revolve { sketch: Sketch, regions: Vec<usize>, #[serde(default)] region_pts: Vec<[f64; 2]>, plane: PlaneRef, axis_pt: [f64; 2], axis_dir: [f64; 2], angle: f64, #[serde(default)] cut: bool },
     /// Fillet: round body edges by `radius` (a mesh round). `edges` are the picked edge
     /// polylines (world space) to round; empty means "round every edge".
     Fillet { radius: f64, #[serde(default)] edges: Vec<Vec<[f64; 3]>> },
