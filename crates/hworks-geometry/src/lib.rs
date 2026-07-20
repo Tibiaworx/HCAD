@@ -472,12 +472,247 @@ pub fn extrude_tool_mesh(
     start_offset: f64,
     length: f64,
 ) -> Option<TriMesh> {
-    let solid = build_solid(outer, holes, basis, start_offset, length)?;
-    guard(|| {
-        let mut poly = solid.triangulation(TOL).to_polygon();
-        poly.triangulate();
-        Some(polymesh_to_trimesh(&poly))
-    })
+    // Expected volume from the profile: the cheap ground truth that catches a bad
+    // triangulation regardless of HOW it went wrong.
+    let expect = (poly_area_2d(outer) - holes.iter().map(|h| poly_area_2d(h)).sum::<f64>()).abs() * length.abs();
+    let truck = build_solid(outer, holes, basis, start_offset, length).and_then(|solid| {
+        guard(|| {
+            let mut poly = solid.triangulation(TOL).to_polygon();
+            poly.triangulate();
+            Some(polymesh_to_trimesh(&poly))
+        })
+    });
+    // truck's triangulation of a complex arrangement region (hundreds of vertices weaving
+    // through skinny channels) can silently produce a prism that COVERS GROUND OUTSIDE the
+    // profile — excut.hcad's bottom cut ate the part's rim that way. Validate the volume
+    // against the profile area; on disagreement (or truck failure) build the prism
+    // DIRECTLY: ear-clipped caps + side walls, watertight by construction.
+    if let Some(m) = truck {
+        if expect < 1e-9 || (signed_mesh_volume(&m).abs() - expect).abs() <= expect * 0.02 {
+            return Some(m);
+        }
+    }
+    direct_prism_mesh(outer, holes, basis, start_offset, length)
+}
+
+/// Shoelace area of a 2D polygon (absolute).
+fn poly_area_2d(l: &[[f64; 2]]) -> f64 {
+    let mut a = 0.0;
+    for k in 0..l.len() {
+        let p = l[k];
+        let q = l[(k + 1) % l.len()];
+        a += p[0] * q[1] - q[0] * p[1];
+    }
+    (a * 0.5).abs()
+}
+
+/// Signed volume of a triangle mesh (divergence theorem).
+pub fn signed_mesh_volume(m: &TriMesh) -> f64 {
+    let mut v = 0.0;
+    for t in m.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            let q = m.positions[i as usize];
+            [q[0] as f64, q[1] as f64, q[2] as f64]
+        };
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        v += a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+    }
+    v / 6.0
+}
+
+/// Ear-clip triangulation of a simple polygon (indices into `pts`). Robust to collinear
+/// runs; bails (partial fan) only if no ear exists at all (degenerate input).
+fn earcut_simple(pts: &[[f64; 2]]) -> Vec<[usize; 3]> {
+    let n = pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    // Ensure CCW.
+    let mut a2 = 0.0;
+    for k in 0..n {
+        let (p, q) = (pts[k], pts[(k + 1) % n]);
+        a2 += p[0] * q[1] - q[0] * p[1];
+    }
+    if a2 < 0.0 {
+        idx.reverse();
+    }
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let in_tri = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        cross(a, b, p) >= -1e-12 && cross(b, c, p) >= -1e-12 && cross(c, a, p) >= -1e-12
+    };
+    let mut tris = Vec::new();
+    let mut guard = 0usize;
+    while idx.len() > 3 && guard < 4 * n * n {
+        guard += 1;
+        let m = idx.len();
+        let mut clipped = false;
+        for k in 0..m {
+            let (i0, i1, i2) = (idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]);
+            let (a, b, c) = (pts[i0], pts[i1], pts[i2]);
+            if cross(a, b, c) <= 1e-12 {
+                continue; // reflex or collinear — not an ear
+            }
+            let blocked = idx.iter().any(|&j| j != i0 && j != i1 && j != i2 && in_tri(pts[j], a, b, c));
+            if !blocked {
+                tris.push([i0, i1, i2]);
+                idx.remove(k);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            // Degenerate leftovers: clip the least-bad corner so we always terminate.
+            let mut best = (0usize, f64::MIN);
+            for k in 0..idx.len() {
+                let m2 = idx.len();
+                let c = cross(pts[idx[(k + m2 - 1) % m2]], pts[idx[k]], pts[idx[(k + 1) % m2]]);
+                if c > best.1 {
+                    best = (k, c);
+                }
+            }
+            let m2 = idx.len();
+            tris.push([idx[(best.0 + m2 - 1) % m2], idx[best.0], idx[(best.0 + 1) % m2]]);
+            idx.remove(best.0);
+        }
+    }
+    if idx.len() == 3 {
+        tris.push([idx[0], idx[1], idx[2]]);
+    }
+    tris
+}
+
+/// Merge holes into the outer loop with bridge edges (rightmost-vertex ray casting), giving
+/// one simple polygon ear-clip can chew.
+fn bridge_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
+    // Outer CCW, holes CW.
+    let ensure = |l: &[[f64; 2]], ccw: bool| -> Vec<[f64; 2]> {
+        let mut a2 = 0.0;
+        for k in 0..l.len() {
+            let (p, q) = (l[k], l[(k + 1) % l.len()]);
+            a2 += p[0] * q[1] - q[0] * p[1];
+        }
+        let mut v = l.to_vec();
+        if (a2 > 0.0) != ccw {
+            v.reverse();
+        }
+        v
+    };
+    let mut poly = ensure(outer, true);
+    // Biggest-x holes first (standard hole-bridging order).
+    let mut hs: Vec<Vec<[f64; 2]>> = holes.iter().filter(|h| h.len() >= 3).map(|h| ensure(h, false)).collect();
+    hs.sort_by(|a, b| {
+        let mx = |l: &Vec<[f64; 2]>| l.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
+        mx(b).partial_cmp(&mx(a)).unwrap()
+    });
+    for h in hs {
+        // The hole's rightmost vertex…
+        let hk = (0..h.len()).max_by(|&i, &j| h[i][0].partial_cmp(&h[j][0]).unwrap()).unwrap();
+        let hp = h[hk];
+        // …bridged to the visible poly vertex: nearest poly vertex to the RIGHT whose
+        // connecting segment crosses no poly edge (fallback: plain nearest).
+        let seg_hits = |a: [f64; 2], b: [f64; 2]| -> bool {
+            let m = poly.len();
+            for k in 0..m {
+                let (c, d) = (poly[k], poly[(k + 1) % m]);
+                if (c == a && d == b) || (c == b && d == a) {
+                    continue;
+                }
+                let den = (b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0]);
+                if den.abs() < 1e-15 {
+                    continue;
+                }
+                let t = ((c[0] - a[0]) * (d[1] - c[1]) - (c[1] - a[1]) * (d[0] - c[0])) / den;
+                let u = ((c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])) / den;
+                if t > 1e-9 && t < 1.0 - 1e-9 && u > 1e-9 && u < 1.0 - 1e-9 {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut order: Vec<usize> = (0..poly.len()).collect();
+        order.sort_by(|&i, &j| {
+            let di = (poly[i][0] - hp[0]).powi(2) + (poly[i][1] - hp[1]).powi(2);
+            let dj = (poly[j][0] - hp[0]).powi(2) + (poly[j][1] - hp[1]).powi(2);
+            di.partial_cmp(&dj).unwrap()
+        });
+        let pk = order
+            .iter()
+            .copied()
+            .find(|&i| poly[i][0] >= hp[0] - 1e-9 && !seg_hits(hp, poly[i]))
+            .or_else(|| order.iter().copied().find(|&i| !seg_hits(hp, poly[i])))
+            .unwrap_or(order[0]);
+        // Splice: …poly[pk], hole[hk..], hole[..hk], hole[hk], poly[pk]…
+        let mut merged: Vec<[f64; 2]> = Vec::with_capacity(poly.len() + h.len() + 2);
+        merged.extend_from_slice(&poly[..=pk]);
+        for off in 0..=h.len() {
+            merged.push(h[(hk + off) % h.len()]);
+        }
+        merged.push(poly[pk]);
+        merged.extend_from_slice(&poly[pk + 1..]);
+        poly = merged;
+    }
+    poly
+}
+
+/// Build the extrude prism DIRECTLY as a watertight triangle mesh: ear-clipped caps (holes
+/// bridged in) + side-wall quads per loop. The robust fallback when the exact kernel's
+/// triangulation misbehaves on a complex profile.
+pub fn direct_prism_mesh(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    basis: &PlaneBasis,
+    start_offset: f64,
+    length: f64,
+) -> Option<TriMesh> {
+    if outer.len() < 3 || length.abs() < 1e-9 {
+        return None;
+    }
+    let o = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+    let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+    let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+    let nrm = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
+    let (w0, w1) = (start_offset, start_offset + length);
+    let to3 = |p: [f64; 2], w: f64| {
+        let q = o + u * p[0] + v * p[1] + nrm * w;
+        [q.x, q.y, q.z]
+    };
+    let mut mesh = TriMesh::default();
+    // Caps: triangulate the bridged polygon once, emit both ends with opposite winding.
+    let cap_poly = bridge_holes(outer, holes);
+    for t in earcut_simple(&cap_poly) {
+        let (a, b, c) = (cap_poly[t[0]], cap_poly[t[1]], cap_poly[t[2]]);
+        push_tri(&mut mesh, to3(a, w1), to3(b, w1), to3(c, w1)); // top (+normal side)
+        push_tri(&mut mesh, to3(a, w0), to3(c, w0), to3(b, w0)); // bottom (reversed)
+    }
+    // Side walls: every loop contributes quads between the two levels.
+    for l in std::iter::once(outer).chain(holes.iter().map(|h| h.as_slice())) {
+        let m = l.len();
+        if m < 3 {
+            continue;
+        }
+        for k in 0..m {
+            let (a, b) = (l[k], l[(k + 1) % m]);
+            if (a[0] - b[0]).abs() < 1e-12 && (a[1] - b[1]).abs() < 1e-12 {
+                continue;
+            }
+            push_tri(&mut mesh, to3(a, w0), to3(b, w0), to3(b, w1));
+            push_tri(&mut mesh, to3(a, w0), to3(b, w1), to3(a, w1));
+        }
+    }
+    if mesh.indices.is_empty() {
+        return None;
+    }
+    // Orient outward (the loop windings vary — the signed volume settles it).
+    if signed_mesh_volume(&mesh) < 0.0 {
+        for t in mesh.indices.chunks_exact_mut(3) {
+            t.swap(1, 2);
+        }
+        for n2 in &mut mesh.normals {
+            *n2 = [-n2[0], -n2[1], -n2[2]];
+        }
+    }
+    Some(mesh)
 }
 
 /// Revolve a closed region (outer loop + optional holes, in plane-local uv) around an axis

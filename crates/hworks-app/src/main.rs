@@ -16502,6 +16502,14 @@ const ROBUST_OVERLAP: f64 = 0.1;
 /// inputs if a clean merge can't be traced.
 fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Region> {
     use std::collections::{HashMap, HashSet};
+    // A single region has nothing to merge with — and its outline must NOT be re-traced:
+    // a crossing-heavy arrangement region can weave through pinch vertices that read as
+    // "reversed edges" after quantised welding, and the union re-trace then reconstructs a
+    // wrong, much larger profile (excut.hcad's bottom cut grew 355 mm2 -> 966 mm2, cutting
+    // the rim and areas below the crossing line that were never selected).
+    if regions.len() <= 1 {
+        return regions.iter().map(|r| (*r).clone()).collect();
+    }
     let key = |p: [f64; 2]| ((p[0] * 1.0e6).round() as i64, (p[1] * 1.0e6).round() as i64);
     let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
     let mut pos: Vec<[f64; 2]> = Vec::new();
@@ -16525,17 +16533,20 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
         }
     }
     // A directed edge whose reverse also appears is internal (between two selected
-    // faces) → drop it. The survivors are the union boundary.
+    // faces, or an out-and-back stub inside one) → drop it. The survivors are the
+    // union boundary. (The single-region guard above keeps this re-trace away from
+    // a lone weaving outline, where it reconstructed the wrong profile.)
     let present: HashSet<(usize, usize)> = edges.iter().copied().collect();
+    let cancels = |a: usize, b: usize| present.contains(&(b, a));
     // Nothing cancels ⇒ no two regions are adjacent ⇒ nothing to merge. Return
     // the inputs as-is (keeping their exact-arc annotations, which re-tracing
     // the loops below would discard).
-    if !edges.iter().any(|&(a, b)| present.contains(&(b, a))) {
+    if !edges.iter().any(|&(a, b)| cancels(a, b)) {
         return regions.iter().map(|r| (*r).clone()).collect();
     }
     let mut next: HashMap<usize, usize> = HashMap::new();
     for &(a, b) in &edges {
-        if !present.contains(&(b, a)) {
+        if !cancels(a, b) {
             next.insert(a, b);
         }
     }
@@ -22204,6 +22215,183 @@ mod tests {
             }
         }
         eprintln!("({} regions)", regs.len());
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_cut_probe -- --ignored --nocapture
+    fn diag_cut_probe() {
+        // Regenerate the file and probe solid/air at y=1 (inside the bottom cut's depth)
+        // at labelled uv spots of the last cut's plane.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        let before = {
+            let mut d2 = doc.clone();
+            d2.rollback = d2.features.len().saturating_sub(1); // without the last cut
+            regenerate_mesh(&d2).expect("body before last cut").0
+        };
+        let (plane, regions, region_pts) = doc
+            .features
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Cut { plane, regions, region_pts, .. } => Some((plane.clone(), regions.clone(), region_pts.clone())),
+                _ => None,
+            })
+            .expect("a cut");
+        eprintln!("stored regions {regions:?} pts {region_pts:?}");
+        // Self-intersections of the picked region's outer loop (mid-segment crossings).
+        {
+            let sk2 = doc
+                .features
+                .iter()
+                .rev()
+                .find_map(|f| match &f.kind {
+                    FeatureKind::Cut { sketch, .. } => Some(sketch.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let all2 = sk2.regions();
+            let picked2 = chosen_regions_pts(&all2, &regions, &region_pts);
+            for r in &picked2 {
+                let o = &r.outer;
+                let m = o.len();
+                let mut hits = 0;
+                for i in 0..m {
+                    for j in (i + 2)..m {
+                        if i == 0 && j == m - 1 {
+                            continue;
+                        }
+                        let (a, b) = (o[i], o[(i + 1) % m]);
+                        let (c, d) = (o[j], o[(j + 1) % m]);
+                        let den = (b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0]);
+                        if den.abs() < 1e-15 {
+                            continue;
+                        }
+                        let t = ((c[0] - a[0]) * (d[1] - c[1]) - (c[1] - a[1]) * (d[0] - c[0])) / den;
+                        let u2 = ((c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])) / den;
+                        if t > 1e-9 && t < 1.0 - 1e-9 && u2 > 1e-9 && u2 < 1.0 - 1e-9 {
+                            hits += 1;
+                            if hits <= 12 {
+                                let x = a[0] + (b[0] - a[0]) * t;
+                                let y = a[1] + (b[1] - a[1]) * t;
+                                eprintln!("  SELF-X at ({x:.4},{y:.4}) segs {i}({:.3},{:.3})-({:.3},{:.3}) x {j}({:.3},{:.3})-({:.3},{:.3})", a[0], a[1], b[0], b[1], c[0], c[1], d[0], d[1]);
+                            }
+                        }
+                    }
+                }
+                eprintln!("picked region: {} self-intersections in {} pts", hits, m);
+            }
+        }
+        // What does the resolver pick, and what does merging produce?
+        let sketch = doc
+            .features
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Cut { sketch, .. } => Some(sketch.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let all = sketch.regions();
+        let area = |outer: &[[f64; 2]]| -> f64 {
+            let mut a = 0.0;
+            for w in 0..outer.len() {
+                let p = outer[w];
+                let q = outer[(w + 1) % outer.len()];
+                a += p[0] * q[1] - q[0] * p[1];
+            }
+            (a * 0.5).abs()
+        };
+        let picked = chosen_regions_pts(&all, &regions, &region_pts);
+        eprintln!("resolver picked {} region(s):", picked.len());
+        for r in &picked {
+            eprintln!("   area {:8.1} pts {} holes {}", area(&r.outer), r.outer.len(), r.holes.len());
+        }
+        let merged = merge_regions(&picked);
+        eprintln!("after merge_regions: {} region(s):", merged.len());
+        for r in &merged {
+            eprintln!("   area {:8.1} pts {} holes {}", area(&r.outer), r.outer.len(), r.holes.len());
+        }
+        let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+        // Probe the cut TOOL mesh itself: does the prism truck builds from this region
+        // cover ground the region polygon doesn't?
+        {
+            let sk3 = doc
+                .features
+                .iter()
+                .rev()
+                .find_map(|f| match &f.kind {
+                    FeatureKind::Cut { sketch, .. } => Some(sketch.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let all3 = sk3.regions();
+            let picked3 = chosen_regions_pts(&all3, &regions, &region_pts);
+            if let Some(r) = picked3.first() {
+                let basis = basis_from_ref(&plane);
+                let expect = {
+                    let area = |l: &Vec<[f64; 2]>| {
+                        let mut a = 0.0;
+                        for k in 0..l.len() { let p = l[k]; let q = l[(k + 1) % l.len()]; a += p[0]*q[1]-q[0]*p[1]; }
+                        (a * 0.5).abs()
+                    };
+                    let a0 = { let mut aa = 0.0; for k in 0..r.outer.len() { let p=r.outer[k]; let q=r.outer[(k+1)%r.outer.len()]; aa += p[0]*q[1]-q[0]*p[1]; } (aa*0.5).abs() };
+                    a0 - r.holes.iter().map(|h| area(h)).sum::<f64>()
+                };
+                if let Some(d) = hworks_geometry::direct_prism_mesh(&r.outer, &r.holes, &basis, -2.1, 2.2) {
+                    eprintln!("  DIRECT vol {:.1} (expect area {:.1} x 2.2 = {:.1})", hworks_geometry::signed_mesh_volume(&d).abs(), expect, expect*2.2);
+                    for (label, uv) in [("band", [0.0f32, 2.67]), ("rimL", [-20.0, 0.0]), ("rimB", [0.0, -14.4]), ("belowline", [0.0, -5.0])] {
+                        let w = o + u * uv[0] + v * uv[1] - n * 1.0;
+                        eprintln!("    DIRECT {label:10} -> {}", if point_inside_mesh(&d, w) { "COVERS" } else { "clear" });
+                    }
+                }
+                if let Some(tool) = cut_tool_mesh(&r.outer, &r.holes, &basis, -2.0, 0.0) {
+                    eprintln!("  chosen tool vol {:.1}", hworks_geometry::signed_mesh_volume(&tool).abs());
+                    for (label, uv) in [
+                        ("band centre", [0.0f32, 2.67]),
+                        ("rim LEFT", [-20.0, 0.0]),
+                        ("rim RIGHT", [20.0, 0.0]),
+                        ("rim BOTTOM", [0.0, -14.4]),
+                        ("below crossing line", [0.0, -5.0]),
+                        ("crescent TR", [19.8, 8.8]),
+                    ] {
+                        let w = o + u * uv[0] + v * uv[1] - n * 1.0;
+                        eprintln!("  TOOL {label:22} -> {}", if point_inside_mesh(&tool, w) { "COVERS" } else { "clear" });
+                    }
+                } else {
+                    eprintln!("  TOOL: cut_tool_mesh returned None");
+                }
+            }
+        }
+        // Probe 1 mm into the cut (against the outward normal).
+        for (label, uv) in [
+            ("band centre (the pick)", [0.0f32, 2.67]),
+            ("band upper", [0.0, 10.0]),
+            ("rim LEFT strip", [-20.0, 0.0]),
+            ("rim RIGHT strip", [20.0, 0.0]),
+            ("rim TOP strip", [0.0, 13.3]),
+            ("rim BOTTOM strip", [0.0, -14.4]),
+            ("crescent outside TL circle", [-19.8, 8.8]),
+            ("crescent outside TR circle", [19.8, 8.8]),
+            ("below crossing line", [0.0, -5.0]),
+            ("inside TL small hole area", [-15.0, 8.8]),
+        ] {
+            let w = o + u * uv[0] + v * uv[1] - n * 1.0;
+            let solid = point_inside_mesh(&mesh, w);
+            let was = point_inside_mesh(&before, w);
+            let verdict = match (was, solid) {
+                (true, false) => "CUT BY THIS FEATURE",
+                (false, false) => "air already (earlier feature)",
+                (true, true) => "SOLID",
+                (false, true) => "solid?? (was air before)",
+            };
+            eprintln!("  {label:32} uv({:6.1},{:6.1}) -> {verdict}", uv[0], uv[1]);
+        }
     }
 
     #[test]

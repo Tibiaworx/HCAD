@@ -584,9 +584,14 @@ impl Sketch {
         let contours: Vec<&Vec<[f64; 2]>> = faces.iter().map(|f| &f.0).collect();
         let spans: Vec<Vec<ArcSpan>> = faces.iter().map(|f| arc_spans(&f.1)).collect();
         let areas: Vec<f64> = contours.iter().map(|c| area(c)).collect();
-        // `j` contains `i` if it's bigger and `i`'s centroid falls inside it.
+        // `j` contains `i` if it's bigger and a point genuinely INTERIOR to `i` falls inside
+        // it. The vertex centroid is NOT that point for a concave/weaving contour (a frame
+        // ring's centroid sits in the middle of the part, far outside the ring itself) — the
+        // old centroid test then filed the ring as a "hole" of an unrelated region, and the
+        // poisoned region overcut everything downstream (excut.hcad's eaten rim).
+        let interior: Vec<[f64; 2]> = contours.iter().map(|c| loop_interior_point(c)).collect();
         let contains = |j: usize, i: usize| {
-            j != i && areas[j] > areas[i] && point_in_poly(centroid(contours[i]), contours[j])
+            j != i && areas[j] > areas[i] && point_in_poly(interior[i], contours[j])
         };
         let depth: Vec<usize> =
             (0..n).map(|i| (0..n).filter(|&j| contains(j, i)).count()).collect();
@@ -1063,6 +1068,45 @@ fn intersect_param(p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], p4: [f64; 2]) -> Op
 /// is registered in the cells its bounding box covers and only tested against
 /// segments sharing a cell — O(n·local density) instead of the all-pairs O(n²)
 /// that made dense sketches (every circle is 128 segments) crawl.
+/// A point genuinely inside a simple loop (even-odd): the midpoint of the WIDEST span of a
+/// mid-height scanline (a few heights tried, jittered off vertices). Unlike the vertex
+/// centroid this stays inside concave/ring-shaped contours.
+fn loop_interior_point(l: &[[f64; 2]]) -> [f64; 2] {
+    if l.len() < 3 {
+        return centroid(l);
+    }
+    let (mut ymin, mut ymax) = (f64::MAX, f64::MIN);
+    for p in l {
+        ymin = ymin.min(p[1]);
+        ymax = ymax.max(p[1]);
+    }
+    let span = (ymax - ymin).max(1e-12);
+    for f in [0.5f64, 0.37, 0.63, 0.21, 0.79] {
+        let y = ymin + span * f + span * 1.3e-7;
+        let mut xs: Vec<f64> = Vec::new();
+        for k in 0..l.len() {
+            let (a, b) = (l[k], l[(k + 1) % l.len()]);
+            if (a[1] > y) != (b[1] > y) {
+                xs.push(a[0] + (y - a[1]) / (b[1] - a[1]) * (b[0] - a[0]));
+            }
+        }
+        xs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        let mut best: Option<(f64, f64)> = None;
+        let mut k = 0;
+        while k + 1 < xs.len() {
+            let w = xs[k + 1] - xs[k];
+            if w > 1e-9 && best.map_or(true, |(bw, _)| w > bw) {
+                best = Some((w, (xs[k] + xs[k + 1]) * 0.5));
+            }
+            k += 2;
+        }
+        if let Some((_, x)) = best {
+            return [x, y];
+        }
+    }
+    centroid(l)
+}
+
 fn split_at_intersections(segs: &[TagSeg]) -> Vec<TagSeg> {
     let n = segs.len();
     if n == 0 {
