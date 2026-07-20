@@ -2787,6 +2787,10 @@ struct SketchSession {
     /// The body edge (straight or arc) currently under the cursor while sketching,
     /// highlighted.
     hover_edge: Option<EdgeSnap>,
+    /// The centre of the round body edge the cursor discovered (uv, radius): shown as a
+    /// crosshair and snappable. STICKY — it stays alive while the cursor is inside the
+    /// circle's disc, so you can travel from the rim to the centre without losing it.
+    arc_center_snap: Option<(Vec2, f32)>,
     /// The edge the cursor is snapped *onto* this frame (so placing a point adds a
     /// point-on-edge relation); and the same remembered for the line's start point.
     cursor_edge: Option<EdgeSnap>,
@@ -10077,8 +10081,38 @@ fn sketch_interaction(
                         };
                         session.hover_edge = Some(es);
                         snaps.push(edge_snap_point(es, uv));
+                        // A round edge exposes its CENTRE — hovering a hole rim or fillet arc
+                        // shows the crosshair and makes the centre snappable (see below).
+                        if let Some((c, r)) = fit {
+                            session.arc_center_snap = Some((c, r));
+                        }
                     }
                 }
+            }
+        }
+        // Hovering an IN-PLANE circular edge (a hole rim on the sketch face) also raises
+        // the centre marker — those centres were already snappable, now they're visible.
+        if session.arc_center_snap.is_none() {
+            if let Some(uv) = active_uv {
+                for (c, r) in &session.reference_circles {
+                    if (uv.distance(*c) - r).abs() <= snap {
+                        session.arc_center_snap = Some((*c, *r));
+                        break;
+                    }
+                }
+            }
+        }
+        // The discovered arc centre stays snappable while the cursor is inside the circle's
+        // disc — so you can hover the rim, then travel inward and land exactly on centre.
+        // Placing a point there LOCKS it (fixed), keeping the next circle/sketch square
+        // with the existing bore.
+        if let Some((c, r)) = session.arc_center_snap {
+            let keep = active_uv.is_some_and(|uv| uv.distance(c) <= r + snap * 2.0);
+            if keep {
+                snaps.push(c);
+                session.reference_points.push(c);
+            } else {
+                session.arc_center_snap = None;
             }
         }
         // Strong geometry (points, line spans, straight edges) wins; circle perimeters are
@@ -17960,6 +17994,28 @@ fn draw_sketch(
                     prev = cur;
                 }
             }
+        }
+    }
+
+    // Arc-centre snap marker: a crosshair + ring at the hovered round edge's centre. It
+    // brightens when the cursor is snapped onto it (about to place a locked centre point).
+    if let Some((c, _r)) = session.arc_center_snap {
+        let on_it = session.cursor_uv.is_some_and(|uv| uv.distance(c) < 1e-3);
+        let col = if on_it { Color::srgb(0.4, 1.0, 0.5) } else { Color::srgb(1.0, 0.6, 0.1) };
+        let w = ap.to_world(c);
+        let m = (session.snap_dist * 0.7).max(0.05);
+        gizmos.line(w - ap.u * m, w + ap.u * m, col);
+        gizmos.line(w - ap.v * m, w + ap.v * m, col);
+        const N: usize = 16;
+        let rr = m * 0.45;
+        for i in 0..N {
+            let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / N as f32 * std::f32::consts::TAU;
+            gizmos.line(
+                w + (ap.u * a0.cos() + ap.v * a0.sin()) * rr,
+                w + (ap.u * a1.cos() + ap.v * a1.sin()) * rr,
+                col,
+            );
         }
     }
 
