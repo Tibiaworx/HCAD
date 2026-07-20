@@ -7464,7 +7464,28 @@ fn ui_system(
                     TreeAction::Delete(i) => {
                         if i < doc.0.features.len() {
                             history.snapshot(&doc.0);
-                            doc.0.features.remove(i);
+                            // Deleting a sketch-based feature keeps its SKETCH as a standalone
+                            // Sketch node — the drawn work survives, ready to re-extrude/cut
+                            // (a wrong depth or direction doesn't cost the whole profile).
+                            // Loft/Sweep only reference standalone sketches that stay in the
+                            // tree anyway, so they (and bevels etc.) delete outright.
+                            let keep = match &doc.0.features[i].kind {
+                                FeatureKind::Extrude { sketch, plane, .. }
+                                | FeatureKind::Cut { sketch, plane, .. }
+                                | FeatureKind::Revolve { sketch, plane, .. } => {
+                                    Some((sketch.clone(), plane.clone()))
+                                }
+                                _ => None,
+                            };
+                            match keep {
+                                Some((sketch, plane)) => {
+                                    doc.0.features[i].kind = FeatureKind::Sketch { sketch, plane };
+                                    ui_state.toasts.push(("Feature deleted — its sketch was kept in the tree".into(), 3.0));
+                                }
+                                None => {
+                                    doc.0.features.remove(i);
+                                }
+                            }
                             if doc.0.rollback > doc.0.features.len() {
                                 doc.0.rollback = doc.0.features.len();
                             }
