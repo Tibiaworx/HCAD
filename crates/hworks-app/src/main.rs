@@ -11603,12 +11603,22 @@ fn circle_radius_of(sketch: &Sketch, center: usize) -> Option<f32> {
 /// at `center`. The mode (apart / enclosing / inside) and the initial value come from the
 /// current geometry, so the dimension opens showing the as-drawn distance.
 fn add_ref_circle_dim(sketch: &mut Sketch, center: usize, rsk: f64, cref: Vec2, rref: f32) -> Option<usize> {
+    // One edge-to-edge dimension per (circle, reference) pair — clicking the pair again
+    // reopens the existing one instead of stacking a conflicting duplicate.
+    if let Some(i) = sketch.constraints.iter().position(|c| {
+        matches!(c, Constraint::RefCircleDistance { center: ec, cx, cy, .. }
+            if *ec == center && Vec2::new(*cx as f32, *cy as f32).distance(cref) < 1e-3)
+    }) {
+        return Some(i);
+    }
     let p = sketch.points.get(center)?;
     let csk = Vec2::new(p.x as f32, p.y as f32);
     let d = csk.distance(cref) as f64;
     let rref = rref as f64;
     // Exactly one configuration has a positive edge gap; overlapping picks the least bad.
-    let cands = [(0u8, d - rref - rsk), (1, rsk - d - rref), (2, rref - d - rsk)];
+    // Mode 1 (enclosing) goes LAST so a dead tie — a circle drawn exactly on the reference
+    // rim, the concentric counterbore start — resolves to the enclosing wall, not "inside".
+    let cands = [(0u8, d - rref - rsk), (2, rref - d - rsk), (1, rsk - d - rref)];
     let (mode, cur) = cands.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?;
     sketch.constraints.push(Constraint::RefCircleDistance {
         center,
@@ -11667,6 +11677,7 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
         Some(Constraint::Angle { value, .. }) => value.to_degrees(),
         Some(Constraint::PointLineDistance { value, .. }) => *value,
         Some(Constraint::SlotWidth { value, .. }) => *value,
+        Some(Constraint::RefCircleDistance { value, .. }) => *value,
         _ => return,
     };
     session.dim_edit = Some(ci);
@@ -18105,9 +18116,9 @@ fn draw_sketch(
         }
     }
     // A body circle picked as the reference side of an edge-to-edge dimension glows until
-    // the second click (on a sketch circle) completes it.
+    // the second click (on a sketch circle) completes it — the standard orange selection accent.
     if let Some((c, r)) = session.dim_ref_circle {
-        let col = Color::srgb(0.3, 0.85, 1.0);
+        let col = Color::srgb(1.0, 0.6, 0.1);
         const NR: usize = 48;
         for i in 0..NR {
             let a0 = i as f32 / NR as f32 * std::f32::consts::TAU;
