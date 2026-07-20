@@ -2787,6 +2787,9 @@ struct SketchSession {
     /// The body edge (straight or arc) currently under the cursor while sketching,
     /// highlighted.
     hover_edge: Option<EdgeSnap>,
+    /// Dimension tool: a picked round BODY edge (centre uv, radius) waiting for a second
+    /// click on a sketch circle — together they make an edge-to-edge driving dimension.
+    dim_ref_circle: Option<(Vec2, f32)>,
     /// The centre of the round body edge the cursor discovered (uv, radius): shown as a
     /// crosshair and snappable. STICKY — it stays alive while the cursor is inside the
     /// circle's disc, so you can travel from the rim to the centre without losing it.
@@ -6100,6 +6103,7 @@ fn ui_system(
                             | Constraint::Angle { .. }
                             | Constraint::PointLineDistance { .. }
                             | Constraint::SlotWidth { .. }
+                            | Constraint::RefCircleDistance { .. }
                     )
                     .then_some(i)
                 })
@@ -6132,7 +6136,8 @@ fn ui_system(
                             match session.sketch.constraints.get_mut(*i) {
                                 Some(Constraint::Distance { value, .. })
                                 | Some(Constraint::PointLineDistance { value, .. })
-                                | Some(Constraint::SlotWidth { value, .. }) => {
+                                | Some(Constraint::SlotWidth { value, .. })
+                                | Some(Constraint::RefCircleDistance { value, .. }) => {
                                     if ui.add(egui::DragValue::new(value).speed(0.05).range(0.01..=10_000.0).suffix(" mm")).changed() {
                                         changed = true;
                                     }
@@ -7779,6 +7784,13 @@ fn ui_system(
                         act(label_at(ctx, egui::Id::new(("slotlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
                     }
                 }
+                Constraint::RefCircleDistance { center, cx, cy, radius, value, mode, .. } => {
+                    if let (Some(pc), Some(rsk)) = (session.sketch.points.get(*center), circle_radius_of(&session.sketch, *center)) {
+                        let csk = Vec2::new(pc.x as f32, pc.y as f32);
+                        let (_, _, lab) = ref_circle_dim_geometry(Vec2::new(*cx as f32, *cy as f32), *radius as f32, csk, rsk, *mode);
+                        act(label_at(ctx, egui::Id::new(("rcdlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
+                    }
+                }
                 _ => {}
             }
         }
@@ -7939,7 +7951,7 @@ fn ui_system(
             Some(Constraint::Radius { diameter, .. }) => Some(DimKind::Radius(*diameter)),
             Some(Constraint::Angle { .. }) => Some(DimKind::Angle),
             // Slot width edits like a plain mm distance (no axis/diameter toggle).
-            Some(Constraint::PointLineDistance { .. }) | Some(Constraint::SlotWidth { .. }) => Some(DimKind::PointLine),
+            Some(Constraint::PointLineDistance { .. }) | Some(Constraint::SlotWidth { .. }) | Some(Constraint::RefCircleDistance { .. }) => Some(DimKind::PointLine),
             _ => None,
         };
         // Label/box anchor in plane uv, computed from the constraint's points.
@@ -7969,6 +7981,14 @@ fn ui_system(
                 (Some(a2), Some(b2)) => Some(slot_width_geometry(a2, b2, (*value * 0.5) as f32).2),
                 _ => None,
             },
+            Some(Constraint::RefCircleDistance { center, cx, cy, radius, mode, .. }) => {
+                match (pt(*center), circle_radius_of(&session.sketch, *center)) {
+                    (Some(csk), Some(rsk)) => {
+                        Some(ref_circle_dim_geometry(Vec2::new(*cx as f32, *cy as f32), *radius as f32, csk, rsk, *mode).2)
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         };
         let screen_pos = match (kind, session.plane.as_ref(), cam_read.single().ok(), label_uv) {
@@ -8033,6 +8053,7 @@ fn ui_system(
                                     }
                                     Some(Constraint::PointLineDistance { value, .. }) => *value = v,
                                     Some(Constraint::SlotWidth { value, .. }) => *value = v,
+                                    Some(Constraint::RefCircleDistance { value, .. }) => *value = v,
                                     _ => {}
                                 }
                                 match angle_ref {
@@ -9114,6 +9135,7 @@ fn constraint_points(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
         Constraint::PointOnArc { p, .. } => vec![*p],
         Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
+        Constraint::RefCircleDistance { center, .. } => vec![*center],
     }
 }
 
@@ -9147,6 +9169,7 @@ fn constraint_label(c: &Constraint) -> String {
         Constraint::PointOnLine { .. } => "On edge".into(),
         Constraint::PointOnArc { .. } => "On arc".into(),
         Constraint::SlotWidth { value, .. } => format!("Slot width  {value:.2}"),
+        Constraint::RefCircleDistance { value, .. } => format!("Edge gap  {value:.2}"),
     }
 }
 
@@ -9188,6 +9211,7 @@ fn sketch_fingerprint(s: &Sketch) -> u64 {
             Constraint::Distance { value, .. }
             | Constraint::PointLineDistance { value, .. }
             | Constraint::Radius { value, .. }
+            | Constraint::RefCircleDistance { value, .. }
             | Constraint::Angle { value, .. } => *value,
             _ => 0.0,
         };
@@ -10381,6 +10405,7 @@ fn sketch_interaction(
                     session.dim_buf = match session.sketch.constraints.get(ci2) {
                         Some(Constraint::Angle { value, .. }) => value.to_degrees(),
                         Some(Constraint::PointLineDistance { value, .. }) => *value,
+                        Some(Constraint::RefCircleDistance { value, .. }) => *value,
                         _ => 0.0,
                     };
                     session.dim_edit_focus = true;
@@ -10611,6 +10636,7 @@ fn sketch_interaction(
         session.dim_first = None;
         session.dim_line = None;
         session.dim_slot = None;
+        session.dim_ref_circle = None;
     }
     if session.tool != Tool::Spline && !session.spline_pts.is_empty() {
         session.spline_pts.clear(); // leaving the spline tool drops the in-progress curve
@@ -10998,7 +11024,12 @@ fn sketch_interaction(
                             line_ctx = Some(e);
                             add_distance_dim(&mut session.sketch, a, b)
                         } else if let Some((center, radius)) = entity_circle(&session.sketch, e) {
-                            add_radius_dim(&mut session.sketch, center, radius)
+                            // A round body edge was picked first → edge-to-edge dimension
+                            // that DRIVES this circle's size; otherwise the usual Ø dim.
+                            match session.dim_ref_circle.take() {
+                                Some((rc, rr)) => add_ref_circle_dim(&mut session.sketch, center, radius, rc, rr),
+                                None => add_radius_dim(&mut session.sketch, center, radius),
+                            }
                         } else if entity_slot(&session.sketch, e).is_some() {
                             // A slot is one entity — clicking it dimensions its width; but
                             // remember it so a follow-up click on a line/edge instead makes
@@ -11009,6 +11040,22 @@ fn sketch_interaction(
                             None
                         }
                     } else {
+                        // Nothing in the sketch under the cursor: a round BODY edge here
+                        // becomes the reference side of an edge-to-edge dimension (the next
+                        // click on a sketch circle completes it). Empty space clears it.
+                        let mut picked = None;
+                        for (c, r) in &session.reference_circles {
+                            if (uv.distance(*c) - r).abs() <= snap * 1.5 {
+                                picked = Some((*c, *r));
+                                break;
+                            }
+                        }
+                        if picked.is_none() {
+                            if let Some(EdgeSnap::Arc { center, radius, .. }) = session.hover_edge {
+                                picked = Some((center, radius));
+                            }
+                        }
+                        session.dim_ref_circle = picked;
                         None
                     };
                     if let Some(ci) = created {
@@ -11530,6 +11577,51 @@ fn apply_mirror(session: &mut SketchSession) -> Result<usize, String> {
 
 /// The index of a dimension whose label sits within `tol` (plane uv) of `uv` — used
 /// to click an existing dimension and reopen its Modify box.
+/// Display geometry of a [`Constraint::RefCircleDistance`]: the rim-to-rim segment along
+/// the centre line (per the captured mode) and the label point at its middle.
+fn ref_circle_dim_geometry(cref: Vec2, rref: f32, csk: Vec2, rsk: f32, mode: u8) -> (Vec2, Vec2, Vec2) {
+    let mut dir = csk - cref;
+    let d = dir.length();
+    dir = if d > 1e-6 { dir / d } else { Vec2::X };
+    let (p1, p2) = match mode {
+        1 => (cref - dir * rref, csk - dir * rsk),
+        2 => (cref + dir * rref, csk + dir * rsk),
+        _ => (cref + dir * rref, csk - dir * rsk),
+    };
+    (p1, p2, (p1 + p2) * 0.5)
+}
+
+/// The sketch circle's current radius by its centre point (first matching circle entity).
+fn circle_radius_of(sketch: &Sketch, center: usize) -> Option<f32> {
+    sketch.entities.iter().find_map(|e| match e {
+        SketchEntity::Circle { center: c, radius, .. } if *c == center => Some(*radius as f32),
+        _ => None,
+    })
+}
+
+/// Create an edge-to-edge dimension from a picked body circle to the sketch circle centred
+/// at `center`. The mode (apart / enclosing / inside) and the initial value come from the
+/// current geometry, so the dimension opens showing the as-drawn distance.
+fn add_ref_circle_dim(sketch: &mut Sketch, center: usize, rsk: f64, cref: Vec2, rref: f32) -> Option<usize> {
+    let p = sketch.points.get(center)?;
+    let csk = Vec2::new(p.x as f32, p.y as f32);
+    let d = csk.distance(cref) as f64;
+    let rref = rref as f64;
+    // Exactly one configuration has a positive edge gap; overlapping picks the least bad.
+    let cands = [(0u8, d - rref - rsk), (1, rsk - d - rref), (2, rref - d - rsk)];
+    let (mode, cur) = cands.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?;
+    sketch.constraints.push(Constraint::RefCircleDistance {
+        center,
+        cx: cref.x as f64,
+        cy: cref.y as f64,
+        radius: rref,
+        value: cur.max(0.05),
+        mode,
+        offset: 0.0,
+    });
+    Some(sketch.constraints.len() - 1)
+}
+
 fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
     let pt = |i: usize| sketch.points.get(i).copied().map(|p| Vec2::new(p.x as f32, p.y as f32));
     sketch.constraints.iter().enumerate().find_map(|(i, c)| {
@@ -17994,6 +18086,37 @@ fn draw_sketch(
                     prev = cur;
                 }
             }
+        }
+    }
+
+    // Edge-to-edge dimensions (RefCircleDistance): the rim-to-rim segment with end ticks.
+    let rcd_col = Color::srgb(0.85, 0.85, 0.9);
+    for c in &session.sketch.constraints {
+        if let Constraint::RefCircleDistance { center, cx, cy, radius, mode, .. } = c {
+            if let (Some(pc), Some(rsk)) = (session.sketch.points.get(*center), circle_radius_of(&session.sketch, *center)) {
+                let csk = Vec2::new(pc.x as f32, pc.y as f32);
+                let (p1, p2, _) = ref_circle_dim_geometry(Vec2::new(*cx as f32, *cy as f32), *radius as f32, csk, rsk, *mode);
+                let (w1, w2) = (ap.to_world(p1), ap.to_world(p2));
+                gizmos.line(w1, w2, rcd_col);
+                let t = ap.n.cross((w2 - w1).normalize_or_zero()).normalize_or_zero() * (session.snap_dist * 0.35).max(0.03);
+                gizmos.line(w1 - t, w1 + t, rcd_col);
+                gizmos.line(w2 - t, w2 + t, rcd_col);
+            }
+        }
+    }
+    // A body circle picked as the reference side of an edge-to-edge dimension glows until
+    // the second click (on a sketch circle) completes it.
+    if let Some((c, r)) = session.dim_ref_circle {
+        let col = Color::srgb(0.3, 0.85, 1.0);
+        const NR: usize = 48;
+        for i in 0..NR {
+            let a0 = i as f32 / NR as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / NR as f32 * std::f32::consts::TAU;
+            gizmos.line(
+                ap.to_world(c + Vec2::new(a0.cos(), a0.sin()) * r),
+                ap.to_world(c + Vec2::new(a1.cos(), a1.sin()) * r),
+                col,
+            );
         }
     }
 

@@ -206,6 +206,23 @@ pub enum Constraint {
     /// after the solve (the slot's radius isn't a point variable). `offset` is the display
     /// offset of the dimension line.
     SlotWidth { a: usize, b: usize, value: f64, offset: f64 },
+    /// Driving rim-to-rim distance between a FIXED reference circle (a round body edge,
+    /// centre `cx`,`cy` + `radius` baked at creation) and the sketch circle centred at
+    /// `center` — dimensioning a drawn circle straight off an existing bore, so the value
+    /// drives the sketch circle's size. `mode` captures the configuration at creation:
+    /// 0 = circles apart (edge gap), 1 = the sketch circle ENCLOSES the reference (a wall
+    /// outside the bore — the concentric counterbore case), 2 = the sketch circle sits
+    /// INSIDE the reference.
+    RefCircleDistance {
+        center: usize,
+        cx: f64,
+        cy: f64,
+        radius: f64,
+        value: f64,
+        mode: u8,
+        #[serde(default)]
+        offset: f64,
+    },
 }
 
 /// Which span a [`Constraint::Distance`] measures: the true point-to-point distance
@@ -1263,6 +1280,7 @@ fn constraint_point_indices(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
         Constraint::PointOnArc { p, .. } => vec![*p],
         Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
+        Constraint::RefCircleDistance { center, .. } => vec![*center],
     }
 }
 
@@ -1325,7 +1343,7 @@ fn remap_constraint(c: &mut Constraint, m: &[usize]) {
             *b = m[*b];
             *center = m[*center];
         }
-        Constraint::Radius { center, .. } => *center = m[*center],
+        Constraint::Radius { center, .. } | Constraint::RefCircleDistance { center, .. } => *center = m[*center],
         Constraint::Angle { a, b, c, d, .. } => {
             *a = m[*a];
             *b = m[*b];
@@ -1762,6 +1780,8 @@ impl Sketch {
             // Enforced after the solve: EqualRadius keeps its "a drives b"
             // semantics; slot width isn't a solver variable.
             Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => 0,
+            // Always one row (a no-op row when its circle is gone, keeping counts stable).
+            Constraint::RefCircleDistance { .. } => 1,
         }
     }
 
@@ -2015,6 +2035,31 @@ impl Sketch {
                     // Driving radius dimension on the circle's radius variable.
                     if let Some(rv) = layout.radius_var(*center) {
                         put_row(&mut r, jac, &mut k, x[rv] - value.max(1e-4), &[(rv, 1.0)]);
+                    }
+                }
+                Constraint::RefCircleDistance { center, cx, cy, radius, value, mode, .. } => {
+                    // Rim-to-rim distance from a fixed reference circle. Depending on the
+                    // captured configuration the residual reads: apart → D − R − r − v;
+                    // enclosing → r − D − R − v; inside → R − D − r − v (D = centre gap,
+                    // R = reference radius, r = the sketch circle's radius variable).
+                    let c = *center;
+                    let dx = px(c) - cx;
+                    let dy = py(c) - cy;
+                    let dist = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    match layout.radius_var(c) {
+                        Some(rv) => {
+                            let (res, rsign, csign) = match mode {
+                                1 => (x[rv] - dist - radius - value, 1.0, -1.0),
+                                2 => (radius - dist - x[rv] - value, -1.0, -1.0),
+                                _ => (dist - radius - x[rv] - value, -1.0, 1.0),
+                            };
+                            put_row(&mut r, jac, &mut k, res, &[
+                                (2 * c, csign * dx / dist),
+                                (2 * c + 1, csign * dy / dist),
+                                (rv, rsign),
+                            ]);
+                        }
+                        None => put_row(&mut r, jac, &mut k, 0.0, &[]),
                     }
                 }
                 // Enforced after the solve: EqualRadius keeps its "a drives b"
@@ -2984,6 +3029,62 @@ mod tests {
         assert!((s.points[p3].y - s.points[p2].y).abs() < 1e-6, "top edge not horizontal");
         assert!((s.points[p0].y - s.points[p1].y).abs() < 1e-6, "bottom edge not horizontal");
         assert!((s.points[p0].x - s.points[p3].x).abs() < 1e-6, "left edge not vertical");
+    }
+
+    #[test]
+    fn ref_circle_distance_drives_a_concentric_counterbore() {
+        // A fixed reference bore r=6 at the origin; a sketch circle locked concentric on it
+        // starts at r=10. An enclosing (mode 1) edge gap of 2 must resize it to r=8.
+        let mut s = Sketch::default();
+        let c = s.add_fixed_point(0.0, 0.0);
+        s.add_circle(c, 10.0);
+        s.constraints.push(Constraint::RefCircleDistance {
+            center: c,
+            cx: 0.0,
+            cy: 0.0,
+            radius: 6.0,
+            value: 2.0,
+            mode: 1,
+            offset: 0.0,
+        });
+        s.solve();
+        let r = s
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .unwrap();
+        assert!((r - 8.0).abs() < 1e-4, "counterbore radius should solve to 8, got {r}");
+    }
+
+    #[test]
+    fn ref_circle_distance_gap_between_separate_circles() {
+        // Reference r=2 at the origin; sketch circle fixed at (10,0) starting r=1.
+        // An apart-mode gap of 3 must resize it to r = 10 - 2 - 3 = 5.
+        let mut s = Sketch::default();
+        let c = s.add_fixed_point(10.0, 0.0);
+        s.add_circle(c, 1.0);
+        s.constraints.push(Constraint::RefCircleDistance {
+            center: c,
+            cx: 0.0,
+            cy: 0.0,
+            radius: 2.0,
+            value: 3.0,
+            mode: 0,
+            offset: 0.0,
+        });
+        s.solve();
+        let r = s
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .unwrap();
+        assert!((r - 5.0).abs() < 1e-4, "gap-mode radius should solve to 5, got {r}");
     }
 }
 
