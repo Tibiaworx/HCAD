@@ -18889,9 +18889,19 @@ fn hatch_region(
             }
         }
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Crossing parity can miscount on dense arrangement outlines (a scanline landing
+        // within f32 epsilon of near-tangent vertices double-counts) — a wrong pairing then
+        // paints fill OUTSIDE the region, over empty sketch space. Verify each span's
+        // midpoint really lies inside (outer minus holes) before drawing it.
+        let inside = |x: f32| {
+            let q = [x as f64, y as f64];
+            point_in_poly(q, outer) && !holes.iter().any(|h| point_in_poly(q, h))
+        };
         let mut k = 0;
         while k + 1 < xs.len() {
-            gizmos.line(ap.to_world(Vec2::new(xs[k], y)), ap.to_world(Vec2::new(xs[k + 1], y)), color);
+            if xs[k + 1] - xs[k] > 1e-5 && inside((xs[k] + xs[k + 1]) * 0.5) {
+                gizmos.line(ap.to_world(Vec2::new(xs[k], y)), ap.to_world(Vec2::new(xs[k + 1], y)), color);
+            }
             k += 2;
         }
         y += spacing;
@@ -22061,6 +22071,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_region_ghost_edges -- --ignored --nocapture
+    fn diag_region_ghost_edges() {
+        // For the LAST cut's sketch: flag region boundary segments that don't lie on any
+        // real (non-construction) sketch entity — ghost walls from the arrangement.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        let sketch = doc
+            .features
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Cut { sketch, .. } => Some(sketch.clone()),
+                _ => None,
+            })
+            .expect("a cut");
+        // Collect entity curves: line segments and circles.
+        let pt = |i: usize| {
+            let p = &sketch.points[i];
+            Vec2::new(p.x as f32, p.y as f32)
+        };
+        let mut segs: Vec<(Vec2, Vec2)> = Vec::new();
+        let mut circles: Vec<(Vec2, f32)> = Vec::new();
+        for e in &sketch.entities {
+            match e {
+                SketchEntity::Line { a, b, construction: false, .. } => segs.push((pt(*a), pt(*b))),
+                SketchEntity::Circle { center, radius, construction: false } => circles.push((pt(*center), *radius as f32)),
+                _ => {}
+            }
+        }
+        let dist_to_geom = |q: Vec2| -> f32 {
+            let mut d = f32::MAX;
+            for (a, b) in &segs {
+                d = d.min(closest_on_segment(q, *a, *b).distance(q));
+            }
+            for (c, r) in &circles {
+                d = d.min((q.distance(*c) - r).abs());
+            }
+            d
+        };
+        let regs = sketch.regions();
+        for (ri, r) in regs.iter().enumerate() {
+            let mut ghosts = 0;
+            let mut worst = 0.0f32;
+            let mut example = None;
+            for w in 0..r.outer.len() {
+                let a = r.outer[w];
+                let b = r.outer[(w + 1) % r.outer.len()];
+                let m = Vec2::new(((a[0] + b[0]) * 0.5) as f32, ((a[1] + b[1]) * 0.5) as f32);
+                let d = dist_to_geom(m);
+                if d > 0.05 {
+                    ghosts += 1;
+                    if d > worst {
+                        worst = d;
+                        example = Some((a, b));
+                    }
+                }
+            }
+            if ghosts > 0 {
+                eprintln!(
+                    "region {ri}: {ghosts}/{} ghost boundary segs, worst {worst:.3} e.g. {:?}",
+                    r.outer.len(),
+                    example
+                );
+            }
+        }
+        eprintln!("({} regions checked)", regs.len());
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_region_selftouch -- --ignored --nocapture
+    fn diag_region_selftouch() {
+        // Self-touching outer loops (a vertex visited twice) break the even-odd fill —
+        // report repeated vertices and odd scanline-crossing counts per region.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        let sketch = doc
+            .features
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Cut { sketch, .. } => Some(sketch.clone()),
+                _ => None,
+            })
+            .expect("a cut");
+        let regs = sketch.regions();
+        for (ri, r) in regs.iter().enumerate() {
+            // repeated (non-adjacent) vertices in the outer loop
+            let mut dup = 0;
+            for i in 0..r.outer.len() {
+                for j in (i + 2)..r.outer.len() {
+                    if i == 0 && j == r.outer.len() - 1 {
+                        continue; // closing adjacency
+                    }
+                    let (a, b) = (r.outer[i], r.outer[j]);
+                    if (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9 {
+                        dup += 1;
+                    }
+                }
+            }
+            // odd-crossing scanlines
+            let (mut ymin, mut ymax) = (f64::MAX, f64::MIN);
+            for p in &r.outer {
+                ymin = ymin.min(p[1]);
+                ymax = ymax.max(p[1]);
+            }
+            let mut odd = 0;
+            let steps = 200;
+            for k in 0..steps {
+                let y = ymin + (ymax - ymin) * (k as f64 + 0.5) / steps as f64;
+                let mut n = 0;
+                for lp in std::iter::once(&r.outer).chain(r.holes.iter()) {
+                    let m = lp.len();
+                    for i in 0..m {
+                        let (y1, y2) = (lp[i][1], lp[(i + 1) % m][1]);
+                        if (y1 > y) != (y2 > y) {
+                            n += 1;
+                        }
+                    }
+                }
+                if n % 2 == 1 {
+                    odd += 1;
+                }
+            }
+            if dup > 0 || odd > 0 {
+                eprintln!("region {ri}: {} pts, {dup} repeated verts, {odd}/{steps} odd scanlines", r.outer.len());
+            }
+        }
+        eprintln!("({} regions)", regs.len());
     }
 
     #[test]
