@@ -14285,12 +14285,18 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 // the boss), then cut each from the current body.
                 let mut merged = merge_regions(&chosen_regions(&all, regions));
                 gate_arcs(&mut merged, fi);
-                for r in &merged {
+                for ri in 0..merged.len() {
                     let Some(b) = &body else { break };
                     // Pick the cut direction from the *current* body, so it stays
                     // correct even after upstream edits move things around.
-                    let centroid = mesh_centroid(&tessellate(b, 0.06).mesh);
+                    let tessm = tessellate(b, 0.06).mesh;
+                    let centroid = mesh_centroid(&tessm);
                     let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
+                    // Coincident-wall guard: geometry snapped onto an existing hole cuts only
+                    // air — prune it so the exact kernel never sees the coincident faces.
+                    let mut one = vec![merged[ri].clone()];
+                    prune_void_cut_geometry(&mut one, &tessm, &resolved, signed.signum() as f32);
+                    let Some(r) = one.first() else { continue }; // the whole region was void — nothing to cut
                     if let Some(s) = cut_op(b, r, &basis, signed, *back) {
                         body = Some(s);
                     } else {
@@ -14679,7 +14685,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 // starts at the real surface — otherwise a chamfered body (forced onto this
                 // mesh path) cuts from the stale stored plane and comes out shallow. Test under
                 // the footprint centroid so it lands on the face the sketch actually sits on.
-                let cut_regs = merge_regions(&chosen_regions(&all, regions));
+                let mut cut_regs = merge_regions(&chosen_regions(&all, regions));
                 let ref_world = sketch_footprint_world(plane, cut_regs.iter().flat_map(|r| r.outer.iter()));
                 let samples = sketch_footprint_samples(plane, &cut_regs);
                 let plane = reproject_plane_on_mesh(plane, cur0, &samples);
@@ -14703,6 +14709,9 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 } else {
                     1.0
                 };
+                // A circle snapped onto an existing hole's rim would give the tool walls
+                // exactly coincident with the hole — prune footprint-over-void geometry.
+                prune_void_cut_geometry(&mut cut_regs, cur0, &plane, into as f32);
                 for r in &cut_regs {
                     let Some(cur) = body.take() else { break };
                     let signed = into * *distance;
@@ -15886,6 +15895,97 @@ fn ray_tri_hit(o: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
 }
 
 /// True if `p` is inside the closed mesh — odd number of ray crossings along an arbitrary ray.
+/// Prune a cut's regions of geometry that sits entirely over AIR (an existing hole/void):
+///
+/// * a whole REGION over air (e.g. the inner disc formed when a circle is snapped onto a
+///   hole's rim and "all contours" is used) cuts nothing — but its wall is EXACTLY
+///   coincident with the existing hole wall, and two tessellated cylinders at different
+///   facet phases cross and shed sliver "thin feature" stripes in the boolean;
+/// * a HOLE LOOP over air (the annulus case) likewise gives the tool an inner wall
+///   coincident with the hole — cutting straight across the void removes identical
+///   material and stays clean.
+///
+/// Geometry standing over SOLID (a post being preserved inside a pocket) is kept: the
+/// probe tests several interior points at a few depths below the surface along the cut
+/// direction, and any solid hit keeps the loop/region.
+fn prune_void_cut_geometry(regs: &mut Vec<hworks_sketch::Region>, mesh: &TriMesh, plane: &PlaneRef, into: f32) {
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let nrm = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+    let dir = nrm * into; // the direction the cut bites into the body
+    let solid_under = |pt: [f64; 2]| -> bool {
+        for d in [0.25f32, 0.6, 1.2] {
+            let w = o + u * pt[0] as f32 + v * pt[1] as f32 + dir * d;
+            if point_inside_mesh(mesh, w) {
+                return true;
+            }
+        }
+        false
+    };
+    let centroid2 = |l: &[[f64; 2]]| -> [f64; 2] {
+        let mut c = [0.0f64; 2];
+        for p in l {
+            c[0] += p[0];
+            c[1] += p[1];
+        }
+        [c[0] / l.len().max(1) as f64, c[1] / l.len().max(1) as f64]
+    };
+    // Interior samples of a loop-with-holes: the centroid plus points pushed toward the rim
+    // at several fractions, keeping only those actually inside (outer minus holes).
+    let region_samples = |outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]| -> Vec<[f64; 2]> {
+        let c = centroid2(outer);
+        let mut out = Vec::new();
+        let inside = |p: [f64; 2]| point_in_poly(p, outer) && !holes.iter().any(|h| point_in_poly(p, h));
+        if inside(c) {
+            out.push(c);
+        }
+        let step = (outer.len() / 6).max(1);
+        for p in outer.iter().step_by(step) {
+            for f in [0.5f64, 0.75, 0.92] {
+                let q = [c[0] + (p[0] - c[0]) * f, c[1] + (p[1] - c[1]) * f];
+                if inside(q) {
+                    out.push(q);
+                }
+            }
+        }
+        out
+    };
+    // 1) Drop regions whose entire footprint is void.
+    regs.retain(|r| {
+        let samples = region_samples(&r.outer, &r.holes);
+        samples.is_empty() || samples.iter().any(|p| solid_under(*p))
+    });
+    // 2) Drop hole loops whose footprint is void (keeping arc info parallel).
+    for r in regs.iter_mut() {
+        let keep: Vec<bool> = r
+            .holes
+            .iter()
+            .map(|h| {
+                if h.len() < 3 {
+                    return true;
+                }
+                let samples = region_samples(h, &[]);
+                samples.is_empty() || samples.iter().any(|p| solid_under(*p))
+            })
+            .collect();
+        if keep.iter().all(|k| *k) {
+            continue;
+        }
+        let had_arcs = r.hole_arcs.len() == r.holes.len();
+        let holes = std::mem::take(&mut r.holes);
+        let arcs = std::mem::take(&mut r.hole_arcs);
+        for (i, h) in holes.into_iter().enumerate() {
+            if keep[i] {
+                r.holes.push(h);
+                if had_arcs {
+                    r.hole_arcs.push(arcs.get(i).cloned().unwrap_or_default());
+                }
+            }
+        }
+    }
+}
+
 fn point_inside_mesh(mesh: &TriMesh, p: Vec3) -> bool {
     let dir = Vec3::new(0.573_257, 0.577_350, 0.581_443).normalize();
     let mut crossings = 0u32;
@@ -21627,6 +21727,84 @@ mod tests {
             Vec3::new(2.0, 0.0, 0.0),
         ];
         assert!(fit_circle_3d(&square).is_none(), "a square loop must not read as a circle");
+    }
+
+    #[test]
+    fn counterbore_snapped_to_hole_leaves_no_sliver_walls() {
+        // The excut.hcad case: a slab with a through-hole (r=6), then a counterbore cut whose
+        // sketch is a big circle plus a circle SNAPPED onto the hole's rim (same centre, same
+        // radius) with "all contours". Naively that cuts an annulus with an inner wall exactly
+        // coincident with the hole wall PLUS a disc entirely over the void — both shed sliver
+        // "thin feature" stripes. The void-pruning must reduce it to one clean disc cut.
+        let mut doc = Document::with_default_planes();
+        let mut base = rect_sketch(30.0, 30.0);
+        let hc = base.add_point(15.0, 15.0);
+        base.add_circle(hc, 6.0);
+        doc.add_feature(FeatureKind::Extrude { sketch: base, regions: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut cb = Sketch::default();
+        let c1 = cb.add_point(15.0, 15.0);
+        cb.add_circle(c1, 11.25);
+        let c2 = cb.add_point(15.0, 15.0 + 1e-7); // snapped: off by the same hair as the real file
+        cb.add_circle(c2, 6.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Cut { sketch: cb, regions: vec![], plane: top, distance: 2.5, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        // The exact kernel may reject this cut outright (truck is fragile around a tool
+        // crossing a hole) — the app then falls back to the mesh kernel, so the MESH result
+        // is what must be clean. When the exact path does produce a body, hold it to the
+        // same standard.
+        let mut builds: Vec<(&str, TriMesh)> = vec![("mesh path", regenerate_mesh(&doc).expect("mesh body").0)];
+        if let (Some(solid), fails) = regenerate_reported(&doc) {
+            // A failing exact rebuild returns its PARTIAL body — the app discards it and
+            // falls back to the mesh kernel, so only a CLEAN exact result gets judged here.
+            if fails.is_empty() {
+                builds.push(("exact path", tessellate(&solid, 0.03).mesh));
+            }
+        }
+        for (label, mesh) in builds {
+            let vol = tri_vol(&mesh);
+            let expect = 30.0 * 30.0 * 15.0
+                - std::f64::consts::PI * 36.0 * 12.5      // the hole below the counterbore floor
+                - std::f64::consts::PI * 11.25 * 11.25 * 2.5; // the full counterbore disc
+            eprintln!("{label}: volume {vol:.1} (expected {expect:.1})");
+            assert!((vol - expect).abs() < expect * 0.01, "{label}: volume off: {vol:.1} vs {expect:.1}");
+            // Nothing may survive in the ring where the coincident walls used to fight:
+            // radius ~6 around the hole axis, inside the counterbore depth band.
+            let mut slivers = 0;
+            for t in mesh.indices.chunks_exact(3) {
+                let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+                let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+                let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+                let m = (a + b + c) / 3.0;
+                let r = ((m.x - 15.0).powi(2) + (m.y - 15.0).powi(2)).sqrt();
+                if (5.6..6.4).contains(&r) && m.z > 12.6 && m.z < 14.9 {
+                    slivers += 1;
+                }
+            }
+            assert_eq!(slivers, 0, "{label}: {slivers} sliver facets in the counterbore band at the old hole wall");
+        }
+    }
+
+    #[test]
+    fn cut_hole_loop_over_solid_still_protects_the_post() {
+        // The counter-case: a pocket with a hole loop standing over SOLID material (a post to
+        // keep). The pruning must NOT touch it — the post survives the cut.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(30.0, 30.0), regions: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut pocket = Sketch::default();
+        let c1 = pocket.add_point(15.0, 15.0);
+        pocket.add_circle(c1, 11.0);
+        let c2 = pocket.add_point(15.0, 15.0);
+        pocket.add_circle(c2, 4.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        // Only region 0 (the annulus) — cutting it must leave the r=4 post standing.
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![0], plane: top, distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("pocket with post");
+        let vol = tri_vol(&mesh);
+        let expect = 30.0 * 30.0 * 15.0 - std::f64::consts::PI * (11.0 * 11.0 - 4.0 * 4.0) * 5.0;
+        eprintln!("post-in-pocket volume {vol:.1} (expected {expect:.1})");
+        assert!((vol - expect).abs() < expect * 0.01, "the post must survive: {vol:.1} vs {expect:.1}");
     }
 
     #[test]
