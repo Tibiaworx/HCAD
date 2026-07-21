@@ -860,8 +860,9 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
             continue; // not a clean 3-face corner — membrane fallback
         }
         let fs = others[0];
-        if topo.faces[fs].loops.len() != 1 {
-            continue; // faces with holes would need bridged triangulation — fallback
+        // Faces with holes are fine: the notched loop gets hole-bridged triangulation below.
+        if !topo.faces[fs].loops.iter().any(|lp| lp.contains(&vi)) {
+            continue; // the vertex isn't on any boundary loop of fs — not a splice shape
         }
         if inc.iter().any(|&ei| ei != sel[0] && !topo.edges[ei].faces.contains(&fs)) {
             continue; // a sharp edge here not bordering fs — not the simple terminal shape
@@ -930,8 +931,7 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
     //    re-triangulated (ear clip; the notch makes the polygon concave).
     for fi in 0..topo.faces.len() {
         let f = &topo.faces[fi];
-        let has_splice = f.loops.len() == 1
-            && f.loops[0].iter().any(|w| splices.get(w).is_some_and(|(sf, _)| *sf == fi));
+        let has_splice = f.loops.iter().any(|lp| lp.iter().any(|w| splices.get(w).is_some_and(|(sf, _)| *sf == fi)));
         if !has_splice {
             for &ti in &f.tris {
                 let t = topo.tris[ti];
@@ -942,31 +942,101 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
             }
             continue;
         }
-        let lp = &f.loops[0];
-        let m = lp.len();
-        let mut poly: Vec<V3> = Vec::new();
-        for i in 0..m {
-            let wv = lp[i];
-            match splices.get(&wv) {
-                Some((sf, ring)) if *sf == fi => {
-                    // Orient the ring so it continues from the loop's incoming edge.
-                    let prev = verts[lp[(i + m - 1) % m]];
-                    let d_first = pt_seg_dist2(ring[0], prev, verts[wv]);
-                    let d_last = pt_seg_dist2(ring[ring.len() - 1], prev, verts[wv]);
-                    if d_first <= d_last {
-                        poly.extend(ring.iter().copied());
-                    } else {
-                        poly.extend(ring.iter().rev().copied());
+        // Every loop of the face, with arc notches spliced in where a terminal fillet ends
+        // on it and every other vertex moved to its inset corner.
+        let splice_loop = |lp: &Vec<usize>| -> Vec<V3> {
+            let m = lp.len();
+            let mut poly: Vec<V3> = Vec::new();
+            for i in 0..m {
+                let wv = lp[i];
+                match splices.get(&wv) {
+                    Some((sf, ring)) if *sf == fi => {
+                        // Orient the ring so it continues from the loop's incoming edge.
+                        let prev = verts[lp[(i + m - 1) % m]];
+                        let d_first = pt_seg_dist2(ring[0], prev, verts[wv]);
+                        let d_last = pt_seg_dist2(ring[ring.len() - 1], prev, verts[wv]);
+                        if d_first <= d_last {
+                            poly.extend(ring.iter().copied());
+                        } else {
+                            poly.extend(ring.iter().rev().copied());
+                        }
+                    }
+                    _ => poly.push(cpt(wv, fi)),
+                }
+            }
+            poly
+        };
+        if f.loops.len() == 1 {
+            let poly = splice_loop(&f.loops[0]);
+            for t in ear_clip(&poly, f.normal) {
+                let a = b.v(poly[t[0]]);
+                let c = b.v(poly[t[1]]);
+                let d = b.v(poly[t[2]]);
+                b.tri(a, c, d);
+            }
+            continue;
+        }
+        // Holes present (excut's chamfered/counterbored top face): project every loop into
+        // the face plane, bridge the holes into the outer, ear-clip, lift back. Without this
+        // the face used to fall back to full-square triangles + a coplanar membrane over the
+        // arc — the visible "thin square corner" flap.
+        let n = f.normal;
+        let seed = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+        let u = norm(sub(seed, scale(n, dot(seed, n))));
+        let w = cross(n, u);
+        let loops3: Vec<Vec<V3>> = f.loops.iter().map(splice_loop).collect();
+        let to2 = |p: V3| [dot(p, u), dot(p, w)];
+        let loops2: Vec<Vec<[f64; 2]>> = loops3.iter().map(|l| l.iter().map(|&p| to2(p)).collect()).collect();
+        let area2 = |l: &Vec<[f64; 2]>| -> f64 {
+            let mut a = 0.0;
+            for k in 0..l.len() {
+                let (p, q) = (l[k], l[(k + 1) % l.len()]);
+                a += p[0] * q[1] - q[0] * p[1];
+            }
+            (a * 0.5).abs()
+        };
+        let outer_i = (0..loops2.len()).max_by(|&i, &j| area2(&loops2[i]).partial_cmp(&area2(&loops2[j])).unwrap()).unwrap();
+        let holes2: Vec<Vec<[f64; 2]>> = (0..loops2.len()).filter(|&i| i != outer_i).map(|i| loops2[i].clone()).collect();
+        let merged = crate::bridge_holes(&loops2[outer_i], &holes2);
+        // Lift 2D back to the face plane through a reference vertex.
+        let r0 = loops3[outer_i][0];
+        let r02 = to2(r0);
+        let lift0 = |q: [f64; 2]| add(r0, add(scale(u, q[0] - r02[0]), scale(w, q[1] - r02[1])));
+        // The planar lift drops any tiny off-plane component a loop vertex carried — the same
+        // vertex emitted by the neighbouring wall then no longer welds, cracking the mesh
+        // (and failing the watertight check). Snap each lifted point back onto the exact
+        // original loop vertex it came from.
+        let lift = |q: [f64; 2]| -> V3 {
+            let p = lift0(q);
+            for l in &loops3 {
+                for &v0 in l {
+                    if dot(sub(p, v0), sub(p, v0)) < 1e-10 {
+                        return v0;
                     }
                 }
-                _ => poly.push(cpt(wv, fi)),
             }
-        }
-        for t in ear_clip(&poly, f.normal) {
-            let a = b.v(poly[t[0]]);
-            let c = b.v(poly[t[1]]);
-            let d = b.v(poly[t[2]]);
-            b.tri(a, c, d);
+            p
+        };
+        // earcut emits CCW in (u, w); the surrounding surface follows the topo loop's own
+        // winding — mismatched face triangles fail the watertight self-check. Match it.
+        let outer_signed = {
+            let l = &loops2[outer_i];
+            let mut a2 = 0.0;
+            for k in 0..l.len() {
+                let (p, q) = (l[k], l[(k + 1) % l.len()]);
+                a2 += p[0] * q[1] - q[0] * p[1];
+            }
+            a2
+        };
+        for t in crate::earcut_simple(&merged) {
+            let a = b.v(lift(merged[t[0]]));
+            let c = b.v(lift(merged[t[1]]));
+            let d = b.v(lift(merged[t[2]]));
+            if outer_signed >= 0.0 {
+                b.tri(a, c, d);
+            } else {
+                b.tri(a, d, c);
+            }
         }
     }
 
@@ -1216,6 +1286,30 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
     if is_closed(&out) {
         Some(out)
     } else {
+        if std::env::var("HCAD_BEVEL_DEBUG").is_ok() {
+            // Report the open edges so a watertight failure is diagnosable.
+            let key = |i: u32| {
+                let p = out.positions[i as usize];
+                ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64)
+            };
+            let mut edges: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), i32> = std::collections::HashMap::new();
+            for t in out.indices.chunks_exact(3) {
+                for &(a, b2) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let (ka, kb) = (key(a), key(b2));
+                    let e = if ka < kb { (ka, kb) } else { (kb, ka) };
+                    *edges.entry(e).or_insert(0) += 1;
+                }
+            }
+            let mut shown = 0;
+            for (e, c) in &edges {
+                if *c != 2 && shown < 12 {
+                    eprintln!("  OPEN edge x{} at ({:.2},{:.2},{:.2})-({:.2},{:.2},{:.2})", c,
+                        e.0.0 as f64 / 1e4, e.0.1 as f64 / 1e4, e.0.2 as f64 / 1e4,
+                        e.1.0 as f64 / 1e4, e.1.1 as f64 / 1e4, e.1.2 as f64 / 1e4);
+                    shown += 1;
+                }
+            }
+        }
         None
     }
 }

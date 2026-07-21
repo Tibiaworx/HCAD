@@ -22395,6 +22395,164 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_corner -- --ignored --nocapture
+    fn diag_fillet_corner() {
+        // Vertical corner-edge fillet r=2.5: probe diagonally inset from each sharp corner
+        // at several heights. Rounded => air at 0.35 inset; a square remnant => solid.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        // The four sharp corners (x, z) of the base slab, with inward diagonal directions.
+        let corners = [
+            ("BL", -15.2919f32, 17.7381f32, 1.0f32, -1.0f32),
+            ("BR", 25.9681, 17.7381, -1.0, -1.0),
+            ("TL", -15.2919, -10.9619, 1.0, 1.0),
+            ("TR", 25.9681, -10.9619, -1.0, 1.0),
+        ];
+        for (name, cx, cz, dx, dz) in corners {
+            let mut line = format!("corner {name}: ");
+            for y in [1.0f32, 7.5, 13.0, 14.0, 14.5, 14.9] {
+                let inset = 0.35;
+                let p = Vec3::new(cx + dx * inset, y, cz + dz * inset);
+                line.push_str(&format!("y{y}={} ", if point_inside_mesh(&mesh, p) { "SQUARE" } else { "round" }));
+            }
+            eprintln!("{line}");
+        }
+        // Zero-thickness FLAPS: top-face-coplanar triangles whose centroid lies beyond the
+        // fillet arc in a corner square (visible square remnant with no volume).
+        let mut flaps = 0;
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            let m = (a + b + c) / 3.0;
+            if (m.y - 15.0).abs() > 0.05 {
+                continue;
+            }
+            for (name, cx, cz, dx, dz) in corners {
+                // In the corner square (within r of the sharp corner along both axes)…
+                let (lx, lz) = ((m.x - cx) * dx, (m.z - cz) * dz);
+                if lx < 0.0 || lx > 2.5 || lz < 0.0 || lz > 2.5 {
+                    continue;
+                }
+                // …but OUTSIDE the fillet arc (arc centre inset r,r from the corner).
+                let (ax, az) = (cx + dx * 2.5, cz + dz * 2.5);
+                let dr = ((m.x - ax).powi(2) + (m.z - az).powi(2)).sqrt();
+                if dr > 2.5 + 0.05 {
+                    flaps += 1;
+                    if flaps <= 4 {
+                        eprintln!("  FLAP at {name}: verts A({:.3},{:.3},{:.3}) B({:.3},{:.3},{:.3}) C({:.3},{:.3},{:.3})", a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+                    }
+                }
+            }
+        }
+        eprintln!("total corner flap facets: {flaps}");
+        // Which engine makes them? Rebuild the pre-fillet body, run each engine, recount.
+        let (radius, edges) = doc
+            .features
+            .iter()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Fillet { radius, edges } => Some((*radius, edges.clone())),
+                _ => None,
+            })
+            .expect("fillet");
+        let mut d2 = doc.clone();
+        d2.rollback = d2
+            .features
+            .iter()
+            .position(|f| matches!(f.kind, FeatureKind::Fillet { .. }))
+            .unwrap();
+        let (pre, _) = regenerate_mesh(&d2).expect("pre-fillet body");
+        let count_flaps = |m: &TriMesh| -> usize {
+            let mut n2 = 0;
+            for t in m.indices.chunks_exact(3) {
+                let a = Vec3::from_array(m.positions[t[0] as usize]);
+                let b = Vec3::from_array(m.positions[t[1] as usize]);
+                let c = Vec3::from_array(m.positions[t[2] as usize]);
+                let mm = (a + b + c) / 3.0;
+                if (mm.y - 15.0).abs() > 0.05 {
+                    continue;
+                }
+                for (_, cx, cz, dx, dz) in corners {
+                    let (lx, lz) = ((mm.x - cx) * dx, (mm.z - cz) * dz);
+                    if lx < 0.0 || lx > 2.5 || lz < 0.0 || lz > 2.5 {
+                        continue;
+                    }
+                    let (ax, az) = (cx + dx * 2.5, cz + dz * 2.5);
+                    if ((mm.x - ax).powi(2) + (mm.z - az).powi(2)).sqrt() > 2.55 {
+                        n2 += 1;
+                    }
+                }
+            }
+            n2
+        };
+        // Vertices of the pre-fillet body lying near the BL corner line (x,z fixed, y 0..15):
+        // where exactly did the chamfer retess split the corner edge, and how far off-line?
+        {
+            let (cx, cz) = (-15.291874885559082f32, 17.738117218017578f32);
+            let mut seen: Vec<(f32, f32)> = Vec::new();
+            for pt2 in &pre.positions {
+                let dr = ((pt2[0] - cx).powi(2) + (pt2[2] - cz).powi(2)).sqrt();
+                if dr < 0.3 {
+                    if !seen.iter().any(|(y, _)| (y - pt2[1]).abs() < 1e-4) {
+                        seen.push((pt2[1], dr));
+                    }
+                }
+            }
+            seen.sort_by(|a2, b2| a2.0.partial_cmp(&b2.0).unwrap());
+            for (y, dr) in &seen {
+                eprintln!("  corner-line vertex y={y:.4} off-line={dr:.5}");
+            }
+        }
+        let seg = ((radius * 6.0).round() as usize).clamp(3, 12);
+        let (surg, _) = bevel_mesh_and_edges(&pre, radius, seg, &edges);
+        match surg {
+            Some(m) => eprintln!("surgery: SUCCEEDED, flaps {}", count_flaps(&m)),
+            None => eprintln!("surgery: DECLINED"),
+        }
+        match round_mesh(&pre, radius, &edges) {
+            Some(m) => eprintln!("CSG round: flaps {}", count_flaps(&m)),
+            None => eprintln!("CSG round: failed"),
+        }
+    }
+
+    #[test]
+    fn vertical_edge_fillet_leaves_no_face_flaps() {
+        // A box with one vertical corner edge filleted r=2.5: the TOP face must not keep
+        // coplanar facets poking past the fillet arc at the corner (the excut square-corner
+        // remnant — zero volume, but it renders as a thin square flap on the face).
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        // The vertical edge at corner (0,0) runs z 0..10 in world (xy() maps sketch y → world y).
+        doc.add_feature(FeatureKind::Fillet {
+            radius: 2.5,
+            edges: vec![vec![[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]]],
+        });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("filleted box");
+        let mut flaps = 0;
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            let m = (a + b + c) / 3.0;
+            if (m.z - 10.0).abs() > 0.05 {
+                continue; // not on the top face
+            }
+            // Inside the corner square but beyond the fillet arc (arc centre at (2.5, 2.5)).
+            if m.x >= 0.0 && m.x <= 2.5 && m.y >= 0.0 && m.y <= 2.5 {
+                let dr = ((m.x - 2.5).powi(2) + (m.y - 2.5).powi(2)).sqrt();
+                if dr > 2.5 + 0.05 {
+                    flaps += 1;
+                    eprintln!("flap facet centroid ({:.3},{:.3},{:.3}) r-from-arc {dr:.3}", m.x, m.y, m.z);
+                }
+            }
+        }
+        assert_eq!(flaps, 0, "{flaps} coplanar flap facets past the fillet arc on the top face");
+    }
+
+    #[test]
     fn region_sample_point_survives_index_reordering() {
         // A slab, then a cut whose sketch is a rectangle split by a crossing line into an
         // asymmetric lower (20x3) and upper (20x7) region. The stored INDEX deliberately

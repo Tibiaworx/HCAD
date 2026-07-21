@@ -522,7 +522,7 @@ pub fn signed_mesh_volume(m: &TriMesh) -> f64 {
 
 /// Ear-clip triangulation of a simple polygon (indices into `pts`). Robust to collinear
 /// runs; bails (partial fan) only if no ear exists at all (degenerate input).
-fn earcut_simple(pts: &[[f64; 2]]) -> Vec<[usize; 3]> {
+pub(crate) fn earcut_simple(pts: &[[f64; 2]]) -> Vec<[usize; 3]> {
     let n = pts.len();
     if n < 3 {
         return Vec::new();
@@ -538,7 +538,14 @@ fn earcut_simple(pts: &[[f64; 2]]) -> Vec<[usize; 3]> {
         idx.reverse();
     }
     let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    // A point COINCIDENT with an ear corner never blocks it — hole bridging duplicates
+    // vertices exactly, and counting a duplicate as "inside" would block every ear through
+    // it (the clipper then degrades to overlapping fallback junk).
+    let same = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).abs() < 1e-12 && (p[1] - q[1]).abs() < 1e-12;
     let in_tri = |p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        if same(p, a) || same(p, b) || same(p, c) {
+            return false;
+        }
         cross(a, b, p) >= -1e-12 && cross(b, c, p) >= -1e-12 && cross(c, a, p) >= -1e-12
     };
     let mut tris = Vec::new();
@@ -584,7 +591,7 @@ fn earcut_simple(pts: &[[f64; 2]]) -> Vec<[usize; 3]> {
 
 /// Merge holes into the outer loop with bridge edges (rightmost-vertex ray casting), giving
 /// one simple polygon ear-clip can chew.
-fn bridge_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
+pub(crate) fn bridge_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[f64; 2]> {
     // Outer CCW, holes CW.
     let ensure = |l: &[[f64; 2]], ccw: bool| -> Vec<[f64; 2]> {
         let mut a2 = 0.0;
