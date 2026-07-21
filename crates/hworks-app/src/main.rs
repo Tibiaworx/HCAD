@@ -14632,19 +14632,47 @@ fn clip_edges_to_mesh(edges: &[([[f32; 3]; 2], [f32; 3])], mesh: &TriMesh, rel: 
         }
         false
     };
-    // Classify each bevel chord by which of {endpoint A, endpoint B, midpoint} are supported:
-    //   • legit chord:      midpoint supported                       → keep
-    //   • straddling (break): exactly ONE end supported              → keep (reaches the cut edge)
-    //   • void/grazing span: nothing (or only a foreign face) nearby → drop
-    edges
-        .iter()
-        .filter(|(e, n)| {
-            let mid = [(e[0][0] + e[1][0]) * 0.5, (e[0][1] + e[1][1]) * 0.5, (e[0][2] + e[1][2]) * 0.5];
-            let (a_on, b_on) = (supported(e[0], *n), supported(e[1], *n));
-            supported(mid, *n) || (a_on != b_on)
-        })
-        .map(|(e, _)| *e)
-        .collect()
+    // Keep only each chord's SUPPORTED RUNS. The old classifier kept a whole chord when
+    // exactly one endpoint was supported ("straddling reaches the cut edge") — right for the
+    // short chords of a curved seam, but a straight chamfer/fillet seam is ONE long chord:
+    // after a cut guts the wall, a single surviving endpoint kept the entire line hanging
+    // across the void (excut's floating verticals). Sampling along the chord and emitting
+    // the supported sub-segments handles both shapes: short chords behave as before, long
+    // chords get trimmed at the support boundary.
+    let mut out: Vec<[[f32; 3]; 2]> = Vec::new();
+    for (e, n) in edges {
+        let a = Vec3::from_array(e[0]);
+        let b = Vec3::from_array(e[1]);
+        let len = a.distance(b);
+        let steps = ((len / (diag * 0.01).max(tol)).ceil() as usize).clamp(2, 64);
+        let sup: Vec<bool> = (0..=steps)
+            .map(|k| supported(a.lerp(b, k as f32 / steps as f32).to_array(), *n))
+            .collect();
+        let mut i = 0usize;
+        while i <= steps {
+            if sup[i] {
+                let start = i;
+                while i + 1 <= steps && sup[i + 1] {
+                    i += 1;
+                }
+                if start == 0 && i == steps {
+                    // Fully supported → keep the ORIGINAL chord exactly (curved seams are
+                    // many short chords; resampling or a length floor must not eat them).
+                    out.push(*e);
+                } else {
+                    // Half a sample of overshoot each way so runs still reach the cut edge.
+                    let t0 = (start as f32 - 0.5).max(0.0) / steps as f32;
+                    let t1 = (i as f32 + 0.5).min(steps as f32) / steps as f32;
+                    let (p0, p1) = (a.lerp(b, t0), a.lerp(b, t1));
+                    if p0.distance(p1) > 1e-3 {
+                        out.push([p0.to_array(), p1.to_array()]);
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Deflate-compress + base64 an STL blob for self-contained embedding in a `.hcad` file
@@ -22550,6 +22578,92 @@ mod tests {
             }
         }
         assert_eq!(flaps, 0, "{flaps} coplanar flap facets past the fillet arc on the top face");
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_seam_floaters -- --ignored --nocapture
+    fn diag_seam_floaters() {
+        // Regenerate + clip the file's bevel seams like do_regenerate does, then count
+        // surviving segments whose midpoint sits far from ANY surface (floating lines).
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        let (mesh, bevel_edges) = regenerate_mesh(&doc).expect("body");
+        let tess = mesh_tessellation(mesh);
+        let seams = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+        let mut floaters = 0;
+        for e in &seams {
+            let mid = [
+                (e[0][0] + e[1][0]) * 0.5,
+                (e[0][1] + e[1][1]) * 0.5,
+                (e[0][2] + e[1][2]) * 0.5,
+            ];
+            // Distance from the mid to the nearest triangle, any orientation.
+            let mut best = f32::MAX;
+            for t in tess.mesh.indices.chunks_exact(3) {
+                let d = point_tri_dist(
+                    mid,
+                    tess.mesh.positions[t[0] as usize],
+                    tess.mesh.positions[t[1] as usize],
+                    tess.mesh.positions[t[2] as usize],
+                );
+                best = best.min(d);
+                if best < 0.2 {
+                    break;
+                }
+            }
+            if best >= 0.2 {
+                floaters += 1;
+                if floaters <= 8 {
+                    eprintln!("  FLOATER: ({:.2},{:.2},{:.2})-({:.2},{:.2},{:.2}) mid-dist {best:.2}", e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2]);
+                }
+            }
+        }
+        eprintln!("bevel edges {} -> clipped {} -> floaters {floaters}", bevel_edges.len(), seams.len());
+        // Long near-vertical SHARP edges (the pool the leftover lines could live in):
+        // print each with whether the mesh has surface on both sides of its midpoint.
+        let mut count = 0;
+        for e in &tess.edges {
+            let a = Vec3::from_array(e[0]);
+            let b = Vec3::from_array(e[1]);
+            let d = b - a;
+            if d.length() < 4.0 || d.normalize().y.abs() < 0.9 {
+                continue;
+            }
+            count += 1;
+            if count <= 24 {
+                eprintln!("  V-EDGE ({:.2},{:.2},{:.2})-({:.2},{:.2},{:.2}) len {:.1}", a.x, a.y, a.z, b.x, b.y, b.z, d.length());
+            }
+        }
+        eprintln!("long vertical sharp edges: {count}");
+        // Sliver detection: triangle pairs facing OPPOSITE ways within 0.02 of each other
+        // (a zero-thickness wall left by a coincident-plane boolean).
+        let m2 = &tess.mesh;
+        let mut sliver = 0;
+        let tri_data: Vec<(Vec3, Vec3)> = m2
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let a = Vec3::from_array(m2.positions[t[0] as usize]);
+                let b = Vec3::from_array(m2.positions[t[1] as usize]);
+                let c = Vec3::from_array(m2.positions[t[2] as usize]);
+                ((a + b + c) / 3.0, (b - a).cross(c - a).normalize_or_zero())
+            })
+            .collect();
+        for i in 0..tri_data.len() {
+            for j in (i + 1)..tri_data.len() {
+                let (ci, ni) = tri_data[i];
+                let (cj, nj) = tri_data[j];
+                if ni.dot(nj) < -0.995 && ci.distance(cj) < 0.05 {
+                    sliver += 1;
+                    if sliver <= 6 {
+                        eprintln!("  SLIVER pair near ({:.2},{:.2},{:.2})", ci.x, ci.y, ci.z);
+                    }
+                    break;
+                }
+            }
+        }
+        eprintln!("sliver triangle pairs: {sliver}");
     }
 
     #[test]
