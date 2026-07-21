@@ -56,7 +56,7 @@ Section "HCAD (required)" SecMain
   WriteRegStr HKLM "Software\HCAD" "InstallDir" "$INSTDIR"
   !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\HCAD"
   WriteRegStr HKLM "${UNINST}" "DisplayName" "HCAD"
-  WriteRegStr HKLM "${UNINST}" "DisplayVersion" "0.19.0"
+  WriteRegStr HKLM "${UNINST}" "DisplayVersion" "0.20.0"
   WriteRegStr HKLM "${UNINST}" "Publisher" "HCAD"
   WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\hcad.ico"
   WriteRegStr HKLM "${UNINST}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
