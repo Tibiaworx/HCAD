@@ -17908,7 +17908,7 @@ fn draw_sketch(
     }
 
     let solid = Color::srgb(0.95, 0.95, 0.25);
-    let construction = Color::srgb(0.9, 0.45, 0.95);
+    let construction = Color::srgb(1.0, 0.35, 1.0);
     let circle_col = Color::srgb(0.25, 0.9, 0.95);
     let point_col = Color::srgb(1.0, 0.55, 0.15);
     let preview_col = Color::srgb(1.0, 0.95, 0.45); // opaque so the rubber-band reads over a picture
@@ -17980,8 +17980,10 @@ fn draw_sketch(
                     // Body-edge reference geometry: solid amber so it reads as "locked".
                     gizmos.line(wa, wb, Color::srgb(1.0, 0.65, 0.1));
                 } else if *is_con {
-                    // Dashed so construction geometry is distinguishable at a glance.
-                    dashed_line(&mut gizmos, wa, wb, construction, 0.16, 0.12);
+                    // Dashed so construction geometry is distinguishable at a glance —
+                    // drawn in the depth-biased profile group so it sits IN FRONT of the
+                    // region fill and the body (edge-on side profiles otherwise wash it out).
+                    dashed_line(&mut profile, wa, wb, construction, 0.16, 0.12);
                 } else {
                     profile.line(wa, wb, solid);
                 }
@@ -17998,7 +18000,7 @@ fn draw_sketch(
                         let a = std::f32::consts::TAU * k as f32 / SEG as f32;
                         let p = cu + Vec2::new(r * a.cos(), r * a.sin());
                         if k % 2 == 0 {
-                            gizmos.line(ap.to_world(prev), ap.to_world(p), construction);
+                            profile.line(ap.to_world(prev), ap.to_world(p), construction);
                         }
                         prev = p;
                     }
@@ -18022,7 +18024,7 @@ fn draw_sketch(
                             ap.to_world(Vec2::new(w[1][0] as f32, w[1][1] as f32)),
                         );
                         if *is_con {
-                            gizmos.line(wa, wb, construction);
+                            profile.line(wa, wb, construction);
                         } else {
                             profile.line(wa, wb, circle_col);
                         }
@@ -18040,7 +18042,7 @@ fn draw_sketch(
                     let poly = tessellate_spline(&pts, *closed, *control);
                     let mut seg = |a: Vec2, b: Vec2| {
                         if *is_con {
-                            gizmos.line(ap.to_world(a), ap.to_world(b), construction);
+                            profile.line(ap.to_world(a), ap.to_world(b), construction);
                         } else {
                             profile.line(ap.to_world(a), ap.to_world(b), solid);
                         }
@@ -18066,7 +18068,7 @@ fn draw_sketch(
                         let p = Vec2::new(poly[k][0] as f32, poly[k][1] as f32);
                         let q = Vec2::new(poly[(k + 1) % n][0] as f32, poly[(k + 1) % n][1] as f32);
                         if *is_con {
-                            gizmos.line(ap.to_world(p), ap.to_world(q), construction);
+                            profile.line(ap.to_world(p), ap.to_world(q), construction);
                         } else {
                             profile.line(ap.to_world(p), ap.to_world(q), solid);
                         }
@@ -18954,7 +18956,9 @@ fn draw_marker(gizmos: &mut Gizmos, ap: &ActivePlane, uv: Vec2, color: Color, sc
 }
 
 /// Draw a dashed segment a→b (used so construction geometry reads as construction).
-fn dashed_line(gizmos: &mut Gizmos, a: Vec3, b: Vec3, color: Color, dash: f32, gap: f32) {
+/// Generic over the gizmo config group so construction dashes can go in the depth-biased
+/// `ProfileGizmos` group (in front of the region fill / body) like the solid profile lines.
+fn dashed_line<G: GizmoConfigGroup>(gizmos: &mut Gizmos<G>, a: Vec3, b: Vec3, color: Color, dash: f32, gap: f32) {
     let total = a.distance(b);
     if total < 1e-5 {
         return;
