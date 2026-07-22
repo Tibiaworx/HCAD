@@ -1958,6 +1958,13 @@ struct UiState {
     toasts: Vec<(String, f32)>,
     /// Whether the About window is open.
     show_about: bool,
+    /// In-app path entry (bypasses the OS file dialog, which rejects UNC / network paths):
+    /// `(is_save, text buffer)`. Confirming sets `pending_open_path`/`pending_save_path`.
+    path_prompt: Option<(bool, String)>,
+    /// A path typed into the in-app prompt to open / save, consumed by `handle_file_io`
+    /// in place of the native dialog.
+    pending_open_path: Option<std::path::PathBuf>,
+    pending_save_path: Option<std::path::PathBuf>,
     /// Displacement (logical px, +right/+down) of the VISIBLE viewport centre from the window
     /// centre — panels/toolbars overlay the 3D view. Measured from egui's rects each frame;
     /// used by "Normal To" framing so geometry centres in what the user actually sees.
@@ -3399,9 +3406,19 @@ fn ui_system(
                     ui.close();
                 }
                 if ui.button("Open…").clicked() { ui_state.open_request = true; ui.close(); }
+                if ui.button("Open by Path…").on_hover_text("Type or paste a full path — for network shares the OS dialog can't reach").clicked() {
+                    let seed = ui_state.current_file.as_ref().and_then(|p| p.parent()).map(|d| format!("{}{}", d.display(), std::path::MAIN_SEPARATOR)).unwrap_or_default();
+                    ui_state.path_prompt = Some((false, seed));
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Save").clicked() { ui_state.save_request = true; ui.close(); }
                 if ui.button("Save As…").clicked() { ui_state.save_as_request = true; ui.close(); }
+                if ui.button("Save to Path…").on_hover_text("Type or paste a full path — for network shares the OS dialog can't reach").clicked() {
+                    let seed = ui_state.current_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    ui_state.path_prompt = Some((true, seed));
+                    ui.close();
+                }
                 ui.separator();
                 ui.menu_button("Export", |ui| {
                     if ui.button("STL… (mesh)").on_hover_text("Triangle mesh for 3D printing — works for any body").clicked() {
@@ -8258,6 +8275,53 @@ fn ui_system(
     }
 
     // About window.
+    // In-app path entry for network shares (the OS dialog rejects UNC paths).
+    if let Some((is_save, mut buf)) = ui_state.path_prompt.take() {
+        let mut keep = true;
+        let mut go = false;
+        let title = if is_save { "Save to Path" } else { "Open by Path" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.label(if is_save {
+                    "Full path to save to (a network share, or any folder):"
+                } else {
+                    "Full path to open (a network share, or any folder):"
+                });
+                let resp = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(f32::INFINITY).hint_text(r"\\192.168.1.249\column2\General stuff\part.hcad"));
+                resp.request_focus();
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.label(egui::RichText::new("Tip: paste the folder from Explorer's address bar, then add the file name. Missing folders are created on save.").weak().small());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let label = if is_save { "Save" } else { "Open" };
+                    if ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+        let trimmed = buf.trim().to_string();
+        if go && !trimmed.is_empty() {
+            if is_save {
+                ui_state.pending_save_path = Some(std::path::PathBuf::from(&trimmed));
+                ui_state.save_as_request = true;
+            } else {
+                ui_state.pending_open_path = Some(std::path::PathBuf::from(&trimmed));
+                ui_state.open_request = true;
+            }
+        } else if keep && !go {
+            ui_state.path_prompt = Some((is_save, buf)); // still open — keep the edited text
+        }
+    }
+
     if ui_state.show_about {
         // Lazily upload the (cropped) logo into an egui texture the first time About is shown.
         let tex = logo_tex.get_or_insert_with(|| {
@@ -13639,10 +13703,15 @@ fn handle_file_io(
         ui_state.save_request = false;
         ui_state.save_as_request = false;
         let target = if need_dialog {
-            rfd::FileDialog::new()
-                .add_filter("HCAD assembly", &["hasm"])
-                .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("assembly.hasm"))
-                .save_file()
+            ui_state
+                .pending_save_path
+                .take()
+                .or_else(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("HCAD assembly", &["hasm"])
+                        .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("assembly.hasm"))
+                        .save_file()
+                })
                 .map(|mut p| {
                     if p.extension().is_none() {
                         p.set_extension("hasm");
@@ -13684,14 +13753,17 @@ fn handle_file_io(
             None => ui_state.save_as_request = true,
         }
     }
-    // Save As: always prompt; bind the chosen path so later Saves are dialog-free.
+    // Save As: always prompt (unless a path was typed into the in-app prompt); bind the
+    // chosen path so later Saves are dialog-free.
     if ui_state.save_as_request {
         ui_state.save_as_request = false;
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("HCAD part", &["hcad"])
-            .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("part.hcad"))
-            .save_file()
-        {
+        let chosen = ui_state.pending_save_path.take().or_else(|| {
+            rfd::FileDialog::new()
+                .add_filter("HCAD part", &["hcad"])
+                .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("part.hcad"))
+                .save_file()
+        });
+        if let Some(path) = chosen {
             let path = with_hcad(path);
             match write_doc(&doc.0, &path) {
                 Ok(()) => {
@@ -13770,12 +13842,15 @@ fn handle_file_io(
 
     if ui_state.open_request {
         ui_state.open_request = false;
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("HCAD documents", &["hcad", "hasm", "ron"])
-            .add_filter("HCAD part", &["hcad", "ron"])
-            .add_filter("HCAD assembly", &["hasm"])
-            .pick_file()
-        {
+        // A path typed into the in-app prompt wins (the OS dialog can't reach UNC shares).
+        let chosen = ui_state.pending_open_path.take().or_else(|| {
+            rfd::FileDialog::new()
+                .add_filter("HCAD documents", &["hcad", "hasm", "ron"])
+                .add_filter("HCAD part", &["hcad", "ron"])
+                .add_filter("HCAD assembly", &["hasm"])
+                .pick_file()
+        });
+        if let Some(path) = chosen {
             if path.extension().and_then(|e| e.to_str()) == Some("hasm") {
                 match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Assembly>(&t).map_err(|e| e.to_string())) {
                     Ok(mut loaded) => {
