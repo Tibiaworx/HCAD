@@ -8036,7 +8036,11 @@ fn ui_system(
             };
             // Re-set dim_buf from the displayed value when an axis/diameter toggle has
             // just changed the meaning of the number; signalled via dim_edit_focus path.
-            egui::Area::new(egui::Id::new("dim_modify"))
+            // Key the popup (and thus the DragValue's internal text-edit state) to THIS
+            // constraint. With a constant id egui reused the previous dimension's typed
+            // buffer, so clicking a new sketch item showed the LAST item's value instead
+            // of the current one until you re-clicked the field.
+            egui::Area::new(egui::Id::new(("dim_modify", ci)))
                 .fixed_pos(pos)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
@@ -13590,26 +13594,28 @@ fn handle_file_io(
         }
         p
     };
-    let write_doc = |doc: &Document, path: &std::path::Path| -> bool {
-        match ron::ser::to_string_pretty(doc, ron::ser::PrettyConfig::default()) {
-            Ok(text) => match std::fs::write(path, text) {
-                Ok(()) => {
-                    info!("Saved {}", path.display());
-                    true
-                }
-                Err(e) => {
-                    warn!("Save failed: {e}");
-                    false
-                }
-            },
-            Err(e) => {
-                warn!("Serialize failed: {e}");
-                false
+    // Write serialized text to `path`, creating any missing parent folders first (so typing
+    // a new folder into the Save dialog just works) and returning the REAL OS error on
+    // failure so the banner can show it — network paths otherwise died with a useless
+    // "see the log". NOTE: this is plain std::fs, identical on Windows and Linux; a mounted
+    // network share (SMB/NFS on Linux, UNC/mapped drive on Windows) is a normal path here,
+    // so no platform-specific networked-file code is needed. If a future target needs a
+    // non-filesystem transport (e.g. a URL), that's where a platform stub would go.
+    let write_text = |text: String, path: &std::path::Path| -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() && !dir.exists() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't create folder {}: {e}", dir.display()))?;
             }
         }
+        std::fs::write(path, text).map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
+        info!("Saved {}", path.display());
+        Ok(())
     };
-
-    let write_asm = |asm: &Assembly, path: &std::path::Path| -> bool {
+    let write_doc = |doc: &Document, path: &std::path::Path| -> Result<(), String> {
+        let text = ron::ser::to_string_pretty(doc, ron::ser::PrettyConfig::default()).map_err(|e| format!("Serialize failed: {e}"))?;
+        write_text(text, path)
+    };
+    let write_asm = |asm: &Assembly, path: &std::path::Path| -> Result<(), String> {
         // Relativise absolute component sources against the save folder so a copied
         // project directory keeps its references.
         let mut out = asm.clone();
@@ -13623,22 +13629,8 @@ fn handle_file_io(
                 }
             }
         }
-        match ron::ser::to_string_pretty(&out, ron::ser::PrettyConfig::default()) {
-            Ok(text) => match std::fs::write(path, text) {
-                Ok(()) => {
-                    info!("Saved {}", path.display());
-                    true
-                }
-                Err(e) => {
-                    warn!("Save failed: {e}");
-                    false
-                }
-            },
-            Err(e) => {
-                warn!("Serialize failed: {e}");
-                false
-            }
-        }
+        let text = ron::ser::to_string_pretty(&out, ron::ser::PrettyConfig::default()).map_err(|e| format!("Serialize failed: {e}"))?;
+        write_text(text, path)
     };
 
     // ---- Assembly save (bound file / dialog), before the part paths below ----
@@ -13661,12 +13653,16 @@ fn handle_file_io(
             ui_state.current_file.clone()
         };
         if let Some(path) = target {
-            if write_asm(&asm.0, &path) {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("assembly").to_string();
-                ui_state.current_file = Some(path);
-                ui_state.toasts.push((format!("Saved {name}"), 2.5));
-            } else {
-                ui_state.last_error = Some("Save failed — see the log.".into());
+            match write_asm(&asm.0, &path) {
+                Ok(()) => {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("assembly").to_string();
+                    ui_state.current_file = Some(path);
+                    ui_state.toasts.push((format!("Saved {name}"), 2.5));
+                }
+                Err(e) => {
+                    warn!("{e}");
+                    ui_state.last_error = Some(e);
+                }
             }
         }
     }
@@ -13675,14 +13671,16 @@ fn handle_file_io(
     if ui_state.save_request {
         ui_state.save_request = false;
         match ui_state.current_file.clone() {
-            Some(path) => {
-                if write_doc(&doc.0, &path) {
+            Some(path) => match write_doc(&doc.0, &path) {
+                Ok(()) => {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
                     ui_state.toasts.push((format!("Saved {name}"), 2.5));
-                } else {
-                    ui_state.last_error = Some("Save failed — see the log.".into());
                 }
-            }
+                Err(e) => {
+                    warn!("{e}");
+                    ui_state.last_error = Some(e);
+                }
+            },
             None => ui_state.save_as_request = true,
         }
     }
@@ -13695,12 +13693,16 @@ fn handle_file_io(
             .save_file()
         {
             let path = with_hcad(path);
-            if write_doc(&doc.0, &path) {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
-                ui_state.current_file = Some(path);
-                ui_state.toasts.push((format!("Saved {name}"), 2.5));
-            } else {
-                ui_state.last_error = Some("Save failed — see the log.".into());
+            match write_doc(&doc.0, &path) {
+                Ok(()) => {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
+                    ui_state.current_file = Some(path);
+                    ui_state.toasts.push((format!("Saved {name}"), 2.5));
+                }
+                Err(e) => {
+                    warn!("{e}");
+                    ui_state.last_error = Some(e);
+                }
             }
         }
     }
