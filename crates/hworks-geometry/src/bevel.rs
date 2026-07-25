@@ -1349,9 +1349,12 @@ pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f
 
 /// Every welded edge shared by exactly two triangles (closed, 2-manifold).
 fn is_closed(m: &TriMesh) -> bool {
+    // Weld on the SAME 1e-5 grid `Build::finish` used. A coarser grid here (was 1e-4) merges
+    // vertices finish kept distinct, so a sub-1e-4 crack would be papered over and an
+    // actually-open surgery mesh wrongly pass as watertight.
     let key = |i: u32| {
         let p = m.positions[i as usize];
-        ((p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64)
+        ((p[0] * 1e5).round() as i64, (p[1] * 1e5).round() as i64, (p[2] * 1e5).round() as i64)
     };
     let mut id: HashMap<(i64, i64, i64), usize> = HashMap::new();
     let mut next = 0usize;

@@ -243,6 +243,17 @@ impl Node {
     /// Build (or extend) the tree from a set of polygons, using the first as the
     /// splitting plane. Iterative front/back accumulation, recursive descent.
     fn build(&mut self, polygons: Vec<Polygon>) {
+        self.build_depth(polygons, 0);
+    }
+
+    /// `build` picks `polygons[0]`'s plane as the split (no balancing), so a near-coplanar
+    /// fan produces an almost-linear tree whose depth ≈ polygon count — 20k-deep recursion
+    /// (each frame allocating Vecs) can blow the stack. Cap the depth: past the limit, keep
+    /// the remaining polygons as this node's own coplanar set rather than recursing. The BSP
+    /// is the lossy CSG fallback already, so a slightly coarser leaf is acceptable next to a
+    /// crash.
+    fn build_depth(&mut self, polygons: Vec<Polygon>, depth: u32) {
+        const MAX_DEPTH: u32 = 3000;
         if polygons.is_empty() {
             return;
         }
@@ -257,11 +268,17 @@ impl Node {
         }
         self.polygons.extend(cf);
         self.polygons.extend(cb);
+        if depth >= MAX_DEPTH {
+            // Bail out flat: stop splitting, keep the rest here.
+            self.polygons.extend(front);
+            self.polygons.extend(back);
+            return;
+        }
         if !front.is_empty() {
-            self.front.get_or_insert_with(|| Box::new(Node::new())).build(front);
+            self.front.get_or_insert_with(|| Box::new(Node::new())).build_depth(front, depth + 1);
         }
         if !back.is_empty() {
-            self.back.get_or_insert_with(|| Box::new(Node::new())).build(back);
+            self.back.get_or_insert_with(|| Box::new(Node::new())).build_depth(back, depth + 1);
         }
     }
 }

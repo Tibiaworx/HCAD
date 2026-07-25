@@ -610,11 +610,11 @@ pub(crate) fn bridge_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[
     let mut hs: Vec<Vec<[f64; 2]>> = holes.iter().filter(|h| h.len() >= 3).map(|h| ensure(h, false)).collect();
     hs.sort_by(|a, b| {
         let mx = |l: &Vec<[f64; 2]>| l.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
-        mx(b).partial_cmp(&mx(a)).unwrap()
+        mx(b).total_cmp(&mx(a))
     });
     for h in hs {
         // The hole's rightmost vertex…
-        let hk = (0..h.len()).max_by(|&i, &j| h[i][0].partial_cmp(&h[j][0]).unwrap()).unwrap();
+        let hk = (0..h.len()).max_by(|&i, &j| h[i][0].total_cmp(&h[j][0])).unwrap();
         let hp = h[hk];
         // …bridged to the visible poly vertex: nearest poly vertex to the RIGHT whose
         // connecting segment crosses no poly edge (fallback: plain nearest).
@@ -641,7 +641,7 @@ pub(crate) fn bridge_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[
         order.sort_by(|&i, &j| {
             let di = (poly[i][0] - hp[0]).powi(2) + (poly[i][1] - hp[1]).powi(2);
             let dj = (poly[j][0] - hp[0]).powi(2) + (poly[j][1] - hp[1]).powi(2);
-            di.partial_cmp(&dj).unwrap()
+            di.total_cmp(&dj)
         });
         let pk = order
             .iter()
@@ -684,16 +684,44 @@ pub fn direct_prism_mesh(
         let q = o + u * p[0] + v * p[1] + nrm * w;
         [q.x, q.y, q.z]
     };
+    // Normalize winding ONCE (outer CCW, holes CW) and use the SAME loops for both the caps
+    // and the side walls. `bridge_holes` normalizes internally, so the caps were already
+    // right, but the walls used to iterate the RAW loops — a hole arriving CCW (same as the
+    // outer) then produced inward-flipped wall quads that a single global volume flip can't
+    // reconcile, so Manifold read the tool as non-manifold and dropped to the lossy BSP.
+    let signed = |l: &[[f64; 2]]| -> f64 {
+        let mut a = 0.0;
+        for k in 0..l.len() {
+            let (p, q) = (l[k], l[(k + 1) % l.len()]);
+            a += p[0] * q[1] - q[0] * p[1];
+        }
+        a
+    };
+    let mut outer_n = outer.to_vec();
+    if signed(&outer_n) < 0.0 {
+        outer_n.reverse();
+    }
+    let holes_n: Vec<Vec<[f64; 2]>> = holes
+        .iter()
+        .filter(|h| h.len() >= 3)
+        .map(|h| {
+            let mut hv = h.clone();
+            if signed(&hv) > 0.0 {
+                hv.reverse(); // holes wind CW
+            }
+            hv
+        })
+        .collect();
     let mut mesh = TriMesh::default();
     // Caps: triangulate the bridged polygon once, emit both ends with opposite winding.
-    let cap_poly = bridge_holes(outer, holes);
+    let cap_poly = bridge_holes(&outer_n, &holes_n);
     for t in earcut_simple(&cap_poly) {
         let (a, b, c) = (cap_poly[t[0]], cap_poly[t[1]], cap_poly[t[2]]);
         push_tri(&mut mesh, to3(a, w1), to3(b, w1), to3(c, w1)); // top (+normal side)
         push_tri(&mut mesh, to3(a, w0), to3(c, w0), to3(b, w0)); // bottom (reversed)
     }
-    // Side walls: every loop contributes quads between the two levels.
-    for l in std::iter::once(outer).chain(holes.iter().map(|h| h.as_slice())) {
+    // Side walls: every (winding-normalized) loop contributes quads between the two levels.
+    for l in std::iter::once(&outer_n).chain(holes_n.iter()) {
         let m = l.len();
         if m < 3 {
             continue;

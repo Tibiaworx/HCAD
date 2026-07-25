@@ -11297,7 +11297,12 @@ fn add_distance_dim(sketch: &mut Sketch, a: usize, b: usize) -> Option<usize> {
     }) {
         return Some(i);
     }
-    let (pa, pb) = (sketch.points[a], sketch.points[b]);
+    // Bounds-check: `a`/`b` can be a stale point index (e.g. `dim_first` remembered across
+    // clicks, then a sketch undo shrank the point list) — indexing directly would panic
+    // outside the regen catch_unwind and crash the app.
+    let (Some(pa), Some(pb)) = (sketch.points.get(a).copied(), sketch.points.get(b).copied()) else {
+        return None;
+    };
     let d = ((pa.x - pb.x).powi(2) + (pa.y - pb.y).powi(2)).sqrt();
     sketch.constraints.push(Constraint::Distance { a, b, value: d, offset: (d * 0.2).max(0.5), axis: DimAxis::Aligned });
     Some(sketch.constraints.len() - 1)
@@ -14050,6 +14055,20 @@ fn handle_file_io(
 /// per-operation sketch history first (so it reverts the last line / dimension / drag, not
 /// the whole sketch feature); only once that's exhausted does it fall back to the
 /// document-level (feature timeline) history.
+/// Clear the one-shot sketch pick state that holds POINT/ENTITY INDICES into the current
+/// sketch (dimension-in-progress, mid-line, revolve axis). A sketch undo/redo swaps in a
+/// different sketch whose index space differs, so a leftover index would target the wrong
+/// element or panic on a direct index (`add_distance_dim`).
+fn clear_pending_picks(session: &mut SketchSession) {
+    session.dim_first = None;
+    session.dim_line = None;
+    session.dim_slot = None;
+    session.dim_ref_circle = None;
+    session.pending = None;
+    session.pending_b = None;
+    session.pending_c = None;
+}
+
 fn apply_history(
     mut history: ResMut<History>,
     mut doc: ResMut<DocRes>,
@@ -14068,6 +14087,7 @@ fn apply_history(
             session.undo_fp = sketch_fingerprint(&session.sketch);
             session.selected_entities.clear();
             session.selected_dim = None;
+            clear_pending_picks(&mut session); // stale indices into the pre-undo sketch → OOB
         } else if let Some(prev) = history.undo.pop() {
             history.redo.push(doc.0.clone());
             doc.0 = prev;
@@ -14087,6 +14107,7 @@ fn apply_history(
             session.undo_fp = sketch_fingerprint(&session.sketch);
             session.selected_entities.clear();
             session.selected_dim = None;
+            clear_pending_picks(&mut session); // stale indices into the pre-redo sketch → OOB
         } else if let Some(next) = history.redo.pop() {
             history.undo.push(doc.0.clone());
             doc.0 = next;
@@ -14532,11 +14553,27 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                 gate_arcs(&mut merged, fi);
                 for ri in 0..merged.len() {
                     let Some(b) = &body else { break };
-                    // Pick the cut direction from the *current* body, so it stays
-                    // correct even after upstream edits move things around.
+                    // Pick the cut direction from the *current* body, LOCALLY — probe just
+                    // under the cut footprint on each side and see which is solid. The old
+                    // global-centroid test flipped the cut to face open air when a tall
+                    // feature elsewhere (a boss) pulled the whole-body centroid past the cut
+                    // plane; the mesh path was fixed but this exact path was not.
                     let tessm = tessellate(b, 0.06).mesh;
-                    let centroid = mesh_centroid(&tessm);
-                    let signed = if (centroid - origin).dot(n) < 0.0 { -*distance } else { *distance };
+                    let ref_world = sketch_footprint_world(&resolved, merged[ri].outer.iter());
+                    let surf = ref_world - n * (ref_world - origin).dot(n);
+                    let eps = 0.02_f32.max(distance.abs() as f32 * 0.01);
+                    let neg_in = point_inside_mesh(&tessm, surf - n * eps);
+                    let pos_in = point_inside_mesh(&tessm, surf + n * eps);
+                    let into: f64 = if neg_in && !pos_in {
+                        -1.0
+                    } else if pos_in && !neg_in {
+                        1.0
+                    } else if (mesh_centroid(&tessm) - origin).dot(n) < 0.0 {
+                        -1.0 // ambiguous → fall back to the centroid heuristic
+                    } else {
+                        1.0
+                    };
+                    let signed = into * *distance;
                     // Coincident-wall guard: geometry snapped onto an existing hole cuts only
                     // air — prune it so the exact kernel never sees the coincident faces.
                     let mut one = vec![merged[ri].clone()];
@@ -16187,8 +16224,11 @@ fn prune_void_cut_geometry(regs: &mut Vec<hworks_sketch::Region>, mesh: &TriMesh
     let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
     let nrm = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
     let dir = nrm * into; // the direction the cut bites into the body
+    // SHALLOW probes first: a thin sheet (material thinner than the old 0.25 floor under the
+    // footprint) was pierced clean through by every probe, so the region read as "over air"
+    // and the cut silently vanished. Sampling from 0.02 upward catches sub-mm material.
     let solid_under = |pt: [f64; 2]| -> bool {
-        for d in [0.25f32, 0.6, 1.2] {
+        for d in [0.02f32, 0.05, 0.1, 0.25, 0.6, 1.2] {
             let w = o + u * pt[0] as f32 + v * pt[1] as f32 + dir * d;
             if point_inside_mesh(mesh, w) {
                 return true;
@@ -16262,7 +16302,9 @@ fn prune_void_cut_geometry(regs: &mut Vec<hworks_sketch::Region>, mesh: &TriMesh
 fn point_inside_mesh(mesh: &TriMesh, p: Vec3) -> bool {
     let dir = Vec3::new(0.573_257, 0.577_350, 0.581_443).normalize();
     let mut crossings = 0u32;
-    for t in mesh.indices.chunks(3) {
+    // chunks_exact so a malformed (imported) index buffer whose length isn't a multiple of
+    // 3 drops the ragged tail instead of panicking on t[1]/t[2].
+    for t in mesh.indices.chunks_exact(3) {
         let a = Vec3::from_array(mesh.positions[t[0] as usize]);
         let b = Vec3::from_array(mesh.positions[t[1] as usize]);
         let c = Vec3::from_array(mesh.positions[t[2] as usize]);
@@ -16543,7 +16585,7 @@ fn chosen_regions_pts<'a>(
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| inside(r, *p))
-                .min_by(|a2, b2| area(a2.1).partial_cmp(&area(b2.1)).unwrap());
+                .min_by(|a2, b2| area(a2.1).total_cmp(&area(b2.1)));
             if let Some((i, _)) = best {
                 if !picked.contains(&i) {
                     picked.push(i);
@@ -22786,6 +22828,48 @@ mod tests {
         eprintln!("region-pts cut volume {vol:.1} (expected {expect:.1})");
         // Tolerance covers cut-tool overshoot noise; the wrong-region outcome differs by 160.
         assert!((vol - expect).abs() < 25.0, "sample point must override the wrong index: {vol:.1} vs {expect:.1}");
+    }
+
+    #[test]
+    fn exact_path_cut_direction_survives_a_tall_boss() {
+        // Bug: the EXACT kernel's Cut branch decided direction from the whole-body centroid.
+        // A tall boss pulls the centroid above the cut plane, flipping a top-face pocket to
+        // face open air (removes nothing). The fix probes locally. Plate 20x20x5 + a tall
+        // 4x4 boss 30 high on top; pocket the plate's top face (z=5) down 2mm.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        // Tall boss centred, extruded up from the plate top.
+        let mut boss = Sketch::default();
+        let a = boss.add_point(8.0, 8.0); let b = boss.add_point(12.0, 8.0);
+        let c = boss.add_point(12.0, 12.0); let d = boss.add_point(8.0, 12.0);
+        boss.add_line(a, b, false); boss.add_line(b, c, false); boss.add_line(c, d, false); boss.add_line(d, a, false);
+        let top = PlaneRef { origin: [0.0, 0.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: top.clone(), distance: 30.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        // Pocket in a corner of the plate top, away from the boss.
+        let mut pocket = rect_sketch(4.0, 4.0); // 0..4 x 0..4
+        let cut_plane = PlaneRef { origin: [2.0, 2.0, 5.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        // move the pocket sketch to (2,2)..(6,6) via its own coords: rect_sketch is 0..4, plane origin at 2,2.
+        let _ = &mut pocket;
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![], region_pts: vec![], plane: cut_plane, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (solid, fails) = regenerate_reported(&doc);
+        assert!(fails.is_empty(), "exact regen reported: {fails:?}");
+        let mesh = tessellate(&solid.expect("body"), 0.05).mesh;
+        // A point 1mm below the plate top, under the pocket footprint (world ~4,4), must be AIR
+        // (the pocket cut down into it). If the cut flipped upward, it stays solid.
+        assert!(!point_inside_mesh(&mesh, Vec3::new(4.0, 4.0, 4.0)), "pocket didn't cut down into the plate top (direction flipped by the boss)");
+        // And a point deep in the plate away from the pocket stays solid.
+        assert!(point_inside_mesh(&mesh, Vec3::new(16.0, 16.0, 2.5)), "the plate body vanished");
+    }
+
+    #[test]
+    fn add_distance_dim_rejects_a_stale_index_without_panicking() {
+        // The undo-mid-dimension crash: dim_first held an index into a larger pre-undo sketch.
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        // b = 5 is out of range (only one point) — must return None, not panic.
+        assert_eq!(add_distance_dim(&mut s, a, 5), None);
+        assert_eq!(add_distance_dim(&mut s, 9, 0), None);
     }
 
     #[test]
