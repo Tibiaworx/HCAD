@@ -49,6 +49,7 @@ use hworks_sketch::{
     Constraint, DimAxis, Sketch, SketchEntity,
 };
 
+mod icons;
 mod text;
 
 /// The HCAD wordmark logo, embedded so it ships in the binary (About dialog).
@@ -3260,9 +3261,64 @@ fn dropdown_arrow(ui: &mut egui::Ui, hover: &str) -> egui::Response {
 
 /// A menu button with a **drawn** down-arrow (our font has no ▼ glyph, so a text arrow renders as a
 /// box). Trailing space reserves room; the triangle is painted over the button's right edge.
+/// Shared body of the icon widgets: an icon-then-label row that behaves like
+/// `selectable_label` (same hover/selected visuals and click semantics).
+fn icon_widget(ui: &mut egui::Ui, selected: bool, icon: icons::Icon, text: &str, stretch: bool) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER);
+    let pad = ui.spacing().button_padding;
+    let sz = ui.text_style_height(&egui::TextStyle::Button) * 1.15; // icon box
+    let gap = 6.0;
+    let mut desired = egui::vec2(pad.x * 2.0 + sz + gap + galley.size().x, galley.size().y.max(sz) + pad.y * 2.0);
+    if stretch {
+        desired.x = desired.x.max(ui.available_width());
+    }
+    let (rect, resp) = ui.allocate_at_least(desired, egui::Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, text));
+    if ui.is_rect_visible(rect) {
+        let vis = ui.style().interact_selectable(&resp, selected);
+        if selected || resp.hovered() || resp.has_focus() {
+            ui.painter().rect(rect, vis.corner_radius, vis.weak_bg_fill, vis.bg_stroke, egui::StrokeKind::Inside);
+        }
+        let ir = egui::Rect::from_min_size(egui::pos2(rect.left() + pad.x, rect.center().y - sz * 0.5), egui::Vec2::splat(sz));
+        icons::paint(ui.painter(), ir, icon, vis.text_color());
+        let tp = egui::pos2(ir.right() + gap, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(tp, galley, vis.text_color());
+    }
+    resp
+}
+
+/// A toolbar toggle that leads with its tool icon — the drop-in for `selectable_label`.
+fn icon_label(ui: &mut egui::Ui, selected: bool, icon: icons::Icon, text: &str) -> egui::Response {
+    icon_widget(ui, selected, icon, text, false)
+}
+
+/// A flyout-menu row: full width, same icon language as the toolbar, honouring `enabled`.
+fn icon_item(ui: &mut egui::Ui, enabled: bool, icon: icons::Icon, text: &str) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| icon_widget(ui, false, icon, text, true)).inner
+}
+
 fn flyout_menu<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<Option<R>> {
-    let inner = ui.menu_button(format!("{label}    "), add);
+    flyout_menu_icon(ui, label, None, add)
+}
+
+/// `flyout_menu` with a leading icon. The label reserves the space and the icon is painted
+/// into it afterwards — `menu_button` only takes text, so this mirrors how the ▾ is drawn.
+fn flyout_menu_icon<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: Option<icons::Icon>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    let text = if icon.is_some() { format!("      {label}    ") } else { format!("{label}    ") };
+    let inner = ui.menu_button(text, add);
     let rect = inner.response.rect;
+    if let Some(ic) = icon {
+        let sz = ui.text_style_height(&egui::TextStyle::Button) * 1.15;
+        let col = if inner.response.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+        let ir = egui::Rect::from_min_size(egui::pos2(rect.left() + 5.0, rect.center().y - sz * 0.5), egui::Vec2::splat(sz));
+        icons::paint(ui.painter(), ir, ic, col);
+    }
     let c = egui::pos2(rect.right() - 10.0, rect.center().y);
     let col = if inner.response.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
     ui.painter().add(egui::Shape::convex_polygon(
@@ -3650,8 +3706,7 @@ fn ui_system(
             match ui_state.active_tab {
                 Tab::Sketch => {
                     ui.add_enabled_ui(in_sketch, |ui| {
-                        if ui
-                            .selectable_label(session.tool == Tool::Select, "Select")
+                        if icon_label(ui, session.tool == Tool::Select, icons::Icon::Select, "Select")
                             .on_hover_text("Select & drag points — geometry re-solves (S)")
                             .clicked()
                         {
@@ -3661,8 +3716,7 @@ fn ui_system(
                         // Line tool + a ▾ dropdown of its variants (plain / construction /
                         // midpoint). Picking a variant also activates the Line tool.
                         let line_on = session.tool == Tool::Line;
-                        if ui
-                            .selectable_label(line_on, "Line")
+                        if icon_label(ui, line_on, icons::Icon::Line, "Line")
                             .on_hover_text("Draw line segments; endpoints snap to close loops (L)")
                             .clicked()
                         {
@@ -3713,8 +3767,7 @@ fn ui_system(
                         });
                         // Circle tool + a ▾ dropdown: centre circle, or perimeter circle.
                         let circle_on = session.tool == Tool::Circle;
-                        if ui
-                            .selectable_label(circle_on, "Circle")
+                        if icon_label(ui, circle_on, icons::Icon::Circle, "Circle")
                             .on_hover_text("Click centre, then radius (C)")
                             .clicked()
                         {
@@ -3743,8 +3796,7 @@ fn ui_system(
                             }
                         });
                         // Arc tool: 3-point arc (start, end, point-on-arc).
-                        if ui
-                            .selectable_label(session.tool == Tool::Arc, "Arc")
+                        if icon_label(ui, session.tool == Tool::Arc, icons::Icon::Arc, "Arc")
                             .on_hover_text("3-point arc: click start, end, then a point the arc passes through")
                             .clicked()
                         {
@@ -3754,8 +3806,7 @@ fn ui_system(
                         }
                         // Rectangle tool + a ▾ dropdown: corner / centre / parallelogram.
                         let rect_on = session.tool == Tool::Rectangle;
-                        if ui
-                            .selectable_label(rect_on, "Rectangle")
+                        if icon_label(ui, rect_on, icons::Icon::Rectangle, "Rectangle")
                             .on_hover_text("Click two opposite corners (R)")
                             .clicked()
                         {
@@ -3779,8 +3830,7 @@ fn ui_system(
                         });
                         // Spline tool + a ▾ dropdown: through-points or control-points.
                         let spline_on = session.tool == Tool::Spline;
-                        if ui
-                            .selectable_label(spline_on, "Spline")
+                        if icon_label(ui, spline_on, icons::Icon::Spline, "Spline")
                             .on_hover_text("Click points for a smooth curve; Enter to finish, click the first point to close")
                             .clicked()
                         {
@@ -3810,8 +3860,7 @@ fn ui_system(
                         });
                         // Slot tool + a ▾ dropdown: straight / centrepoint / arc.
                         let slot_on = session.tool == Tool::Slot;
-                        if ui
-                            .selectable_label(slot_on, "Slot")
+                        if icon_label(ui, slot_on, icons::Icon::Slot, "Slot")
                             .on_hover_text("Click two centres for the slot line, then move out to set its width")
                             .clicked()
                         {
@@ -3837,8 +3886,7 @@ fn ui_system(
                         });
                         // Polygon tool: click centre, then a vertex. Side count lives in the
                         // left-hand parameter panel.
-                        if ui
-                            .selectable_label(session.tool == Tool::Polygon, "Polygon")
+                        if icon_label(ui, session.tool == Tool::Polygon, icons::Icon::Polygon, "Polygon")
                             .on_hover_text("Click the centre, then a vertex — sides set in the panel on the left")
                             .clicked()
                         {
@@ -3849,8 +3897,7 @@ fn ui_system(
                             session.pending = None;
                         }
                         // Text tool: parameters (font, style, arc, …) live in the left panel.
-                        if ui
-                            .selectable_label(session.tool == Tool::Text, "Text")
+                        if icon_label(ui, session.tool == Tool::Text, icons::Icon::Text, "Text")
                             .on_hover_text("Place outlined text — font and options in the panel on the left")
                             .clicked()
                         {
@@ -3858,8 +3905,7 @@ fn ui_system(
                             session.tool = Tool::Text;
                             session.pending = None;
                         }
-                        if ui
-                            .selectable_label(session.tool == Tool::Dimension, "Dimension")
+                        if icon_label(ui, session.tool == Tool::Dimension, icons::Icon::Dimension, "Dimension")
                             .on_hover_text("Click two points to set an exact distance (M)")
                             .clicked()
                         {
@@ -3868,8 +3914,7 @@ fn ui_system(
                         }
                         // Pattern tool + a ▾ dropdown: linear / circular / fill. Select the
                         // entities to repeat first; parameters live in the left panel.
-                        if ui
-                            .selectable_label(session.tool == Tool::Pattern, "Pattern")
+                        if icon_label(ui, session.tool == Tool::Pattern, icons::Icon::Pattern, "Pattern")
                             .on_hover_text("Repeat the selected sketch geometry — options in the panel on the left")
                             .clicked()
                         {
@@ -3893,8 +3938,7 @@ fn ui_system(
                         });
                         // Mirror: reflect the selection across a selected line (a construction
                         // centre line is the natural axis).
-                        if ui
-                            .selectable_label(session.tool == Tool::Mirror, "Mirror")
+                        if icon_label(ui, session.tool == Tool::Mirror, icons::Icon::Mirror, "Mirror")
                             .on_hover_text("Reflect selected geometry across a selected line — options in the panel on the left")
                             .clicked()
                         {
@@ -3902,8 +3946,7 @@ fn ui_system(
                             session.pending = None;
                         }
                         // Trim tool + a ▾ dropdown: closest / power / corner.
-                        if ui
-                            .selectable_label(session.tool == Tool::Trim, "Trim")
+                        if icon_label(ui, session.tool == Tool::Trim, icons::Icon::Trim, "Trim")
                             .on_hover_text("Trim entities — pick a mode from the ▾ (closest / power / corner)")
                             .clicked()
                         {
@@ -4020,45 +4063,45 @@ fn ui_system(
                         ui_state.pending = Some(PendingOp { kind, depth, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
                     };
                     // Add material.
-                    flyout_menu(ui, "Boss", |ui| {
-                        if ui.add_enabled(can_extrude, egui::Button::new("Extrude Boss")).on_hover_text("Add material from the sketch (E)").clicked() {
+                    flyout_menu_icon(ui, "Boss", Some(icons::Icon::Boss), |ui| {
+                        if icon_item(ui, can_extrude, icons::Icon::Boss, "Extrude Boss").on_hover_text("Add material from the sketch (E)").clicked() {
                             start_op(&mut ui_state, OpKind::Boss, EXTRUDE_DISTANCE as f32);
                             ui.close();
                         }
-                        if ui.add_enabled(can_extrude, egui::Button::new("Revolve")).on_hover_text("Revolve the profile around a picked axis line (adds material)").clicked() {
+                        if icon_item(ui, can_extrude, icons::Icon::Revolve, "Revolve").on_hover_text("Revolve the profile around a picked axis line (adds material)").clicked() {
                             start_op(&mut ui_state, OpKind::Revolve, 360.0);
                             ui.close();
                         }
-                        if ui.add_enabled(can_loft, egui::Button::new("Loft")).on_hover_text("Skin a solid between 2+ sketch profiles — click the sketches in the tree in order").clicked() {
+                        if icon_item(ui, can_loft, icons::Icon::Loft, "Loft").on_hover_text("Skin a solid between 2+ sketch profiles — click the sketches in the tree in order").clicked() {
                             ui_state.loft_spec = Some(Vec::new());
                             ui_state.loft_cut = false;
                             ui.close();
                         }
-                        if ui.add_enabled(can_loft, egui::Button::new("Sweep")).on_hover_text("Sweep a profile sketch along a path sketch (a tube, rail or handle)").clicked() {
+                        if icon_item(ui, can_loft, icons::Icon::Sweep, "Sweep").on_hover_text("Sweep a profile sketch along a path sketch (a tube, rail or handle)").clicked() {
                             ui_state.sweep_spec = Some(SweepSpec { profile: None, path: None, region: 0, cut: false });
                             ui.close();
                         }
                     });
                     // Remove material.
-                    flyout_menu(ui, "Cut", |ui| {
-                        if ui.add_enabled(can_extrude, egui::Button::new("Extrude Cut")).on_hover_text("Remove material from the sketch (D)").clicked() {
+                    flyout_menu_icon(ui, "Cut", Some(icons::Icon::Cut), |ui| {
+                        if icon_item(ui, can_extrude, icons::Icon::Cut, "Extrude Cut").on_hover_text("Remove material from the sketch (D)").clicked() {
                             start_op(&mut ui_state, OpKind::Cut, EXTRUDE_DISTANCE as f32);
                             ui.close();
                         }
-                        if ui.add_enabled(can_extrude, egui::Button::new("Revolve Cut")).on_hover_text("Revolve the profile around a picked axis line and subtract it (a lathe groove/bore)").clicked() {
+                        if icon_item(ui, can_extrude, icons::Icon::RevolveCut, "Revolve Cut").on_hover_text("Revolve the profile around a picked axis line and subtract it (a lathe groove/bore)").clicked() {
                             start_op(&mut ui_state, OpKind::RevolveCut, 360.0);
                             ui.close();
                         }
-                        if ui.add_enabled(can_loft && has_mesh, egui::Button::new("Loft Cut")).on_hover_text("Subtract a solid lofted between 2+ profiles from the body (a tapered pocket/bore)").clicked() {
+                        if icon_item(ui, can_loft && has_mesh, icons::Icon::LoftCut, "Loft Cut").on_hover_text("Subtract a solid lofted between 2+ profiles from the body (a tapered pocket/bore)").clicked() {
                             ui_state.loft_spec = Some(Vec::new());
                             ui_state.loft_cut = true;
                             ui.close();
                         }
-                        if ui.add_enabled(can_loft && has_mesh, egui::Button::new("Sweep Cut")).on_hover_text("Subtract a profile swept along a path (a groove or channel)").clicked() {
+                        if icon_item(ui, can_loft && has_mesh, icons::Icon::SweepCut, "Sweep Cut").on_hover_text("Subtract a profile swept along a path (a groove or channel)").clicked() {
                             ui_state.sweep_spec = Some(SweepSpec { profile: None, path: None, region: 0, cut: true });
                             ui.close();
                         }
-                        if ui.add_enabled(has_mesh, egui::Button::new("Hole Genie")).on_hover_text("Threaded holes: click a face (or a sketch point) to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
+                        if icon_item(ui, has_mesh, icons::Icon::Hole, "Hole Genie").on_hover_text("Threaded holes: click a face (or a sketch point) to place, pick a size & pitch — taps a hole or threads a boss").clicked() {
                             ui_state.pending_thread = Some(ThreadSpec::default());
                             ui_state.pending_fillet = None;
                             ui_state.pending_chamfer = None;
@@ -4067,7 +4110,7 @@ fn ui_system(
                         }
                     });
                     // Bevel / pattern the body.
-                    flyout_menu(ui, "Fillet", |ui| {
+                    flyout_menu_icon(ui, "Fillet", Some(icons::Icon::Fillet), |ui| {
                         // Seed the edge set from a pre-selected edge (click an edge, then the tool).
                         let seed = |ui_state: &mut UiState| {
                             ui_state.fillet_edges.clear();
@@ -4076,21 +4119,21 @@ fn ui_system(
                             }
                         };
                         let bevel_ok = has_mesh && !in_sketch;
-                        if ui.add_enabled(bevel_ok, egui::Button::new("Fillet")).on_hover_text("Round picked edges by a radius — click edges on the body").clicked() {
+                        if icon_item(ui, bevel_ok, icons::Icon::Fillet, "Fillet").on_hover_text("Round picked edges by a radius — click edges on the body").clicked() {
                             ui_state.pending_fillet = Some(0.2);
                             ui_state.fillet_shown = None;
                             ui_state.pending_chamfer = None;
                             seed(&mut ui_state);
                             ui.close();
                         }
-                        if ui.add_enabled(bevel_ok, egui::Button::new("Chamfer")).on_hover_text("Flat-bevel picked edges by a distance — click edges on the body").clicked() {
+                        if icon_item(ui, bevel_ok, icons::Icon::Chamfer, "Chamfer").on_hover_text("Flat-bevel picked edges by a distance — click edges on the body").clicked() {
                             ui_state.pending_chamfer = Some(0.2);
                             ui_state.chamfer_shown = None;
                             ui_state.pending_fillet = None;
                             seed(&mut ui_state);
                             ui.close();
                         }
-                        if ui.add_enabled(bevel_ok, egui::Button::new("Mirror")).on_hover_text("Reflect the whole body across a plane and union it (a symmetric part)").clicked() {
+                        if icon_item(ui, bevel_ok, icons::Icon::MirrorFeature, "Mirror").on_hover_text("Reflect the whole body across a plane and union it (a symmetric part)").clicked() {
                             ui_state.pending_mirror = Some(0);
                             ui_state.mirror_shown = None;
                             ui_state.pending_fillet = None;
@@ -4100,29 +4143,29 @@ fn ui_system(
                         let seedable = doc.0.features.iter().rposition(|f| {
                             matches!(f.kind, FeatureKind::Extrude { .. } | FeatureKind::Cut { .. } | FeatureKind::Revolve { .. } | FeatureKind::Loft { .. } | FeatureKind::Sweep { .. })
                         });
-                        if ui.add_enabled(bevel_ok && seedable.is_some(), egui::Button::new("Linear Pattern")).on_hover_text("Repeat a feature (a hole, boss, pocket…) in a straight row").clicked() {
+                        if icon_item(ui, bevel_ok && seedable.is_some(), icons::Icon::LinearPattern, "Linear Pattern").on_hover_text("Repeat a feature (a hole, boss, pocket…) in a straight row").clicked() {
                             ui_state.pattern_spec = Some(PatternSpec { seed: seedable.unwrap_or(0), ..Default::default() });
                             ui.close();
                         }
-                        if ui.add_enabled(bevel_ok && seedable.is_some(), egui::Button::new("Circular Pattern")).on_hover_text("Repeat a feature around an axis (a bolt circle)").clicked() {
+                        if icon_item(ui, bevel_ok && seedable.is_some(), icons::Icon::CircularPattern, "Circular Pattern").on_hover_text("Repeat a feature around an axis (a bolt circle)").clicked() {
                             ui_state.pattern_spec = Some(PatternSpec { seed: seedable.unwrap_or(0), circular: true, ..Default::default() });
                             ui.close();
                         }
-                        if ui.add_enabled(bevel_ok, egui::Button::new("Shell")).on_hover_text("Hollow the body leaving walls of a set thickness — click faces to open them (a box, a case)").clicked() {
+                        if icon_item(ui, bevel_ok, icons::Icon::Shell, "Shell").on_hover_text("Hollow the body leaving walls of a set thickness — click faces to open them (a box, a case)").clicked() {
                             ui_state.shell_spec = Some(ShellSpec { thickness: 1.5, open: Vec::new() });
                             ui.close();
                         }
                     });
                     ui.separator();
                     // Reference geometry — always available (you can build a plane with no body yet).
-                    flyout_menu(ui, "Plane", |ui| {
-                        if ui.button("Offset Plane").on_hover_text("A plane parallel to a datum plane or picked face, offset along its normal (e.g. stacked loft profiles)").clicked() {
+                    flyout_menu_icon(ui, "Plane", Some(icons::Icon::Plane), |ui| {
+                        if icon_item(ui, true, icons::Icon::Plane, "Offset Plane").on_hover_text("A plane parallel to a datum plane or picked face, offset along its normal (e.g. stacked loft profiles)").clicked() {
                             if let Some((_, p)) = doc.0.planes().next() {
                                 ui_state.plane_spec = Some(PlaneSpec { base: ActivePlane::from_doc(p), base_name: p.name.clone(), offset: 10.0, flip: false, edit_target: None });
                             }
                             ui.close();
                         }
-                        if ui.button("Free Plane").on_hover_text("A plane placed anywhere — drag it with the viewport gizmos (arrow = along normal, centre = in plane, edge diamonds = tilt)").clicked() {
+                        if icon_item(ui, true, icons::Icon::Plane, "Free Plane").on_hover_text("A plane placed anywhere — drag it with the viewport gizmos (arrow = along normal, centre = in plane, edge diamonds = tilt)").clicked() {
                             // Start at the body's centre (or the origin with no body yet).
                             let origin = part.mesh.as_ref().map(|m| {
                                 let (lo, hi) = mesh_bbox(m);
@@ -4131,7 +4174,7 @@ fn ui_system(
                             ui_state.free_plane = Some(FreePlaneSpec { origin, rot_deg: [0.0; 3], edit_target: None });
                             ui.close();
                         }
-                        if ui.button("3-Point Plane").on_hover_text("Click three points on the body or a reference scan — the plane through them is created (great for sectioning a scan at an angle)").clicked() {
+                        if icon_item(ui, true, icons::Icon::Plane, "3-Point Plane").on_hover_text("Click three points on the body or a reference scan — the plane through them is created (great for sectioning a scan at an angle)").clicked() {
                             ui_state.plane_3pt = Some(Vec::new());
                             ui.close();
                         }
