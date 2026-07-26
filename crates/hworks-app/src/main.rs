@@ -9673,6 +9673,37 @@ fn sketch_interaction(
         return;
     }
 
+    // Shell face picking has to run before the egui pointer-block for the same reason as
+    // fillet/chamfer above: the Shell panel's thickness DragValue keeps egui greedy for the
+    // pointer, so a click on the body never reached the picker. `open` then stayed empty and
+    // OK produced a fully ENCLOSED hollow — which is indistinguishable from the untouched
+    // solid when viewed from outside, so Shell looked like it did nothing at all.
+    // Gating on an actual face hit keeps clicks on the panel itself safe.
+    if ui_state.shell_spec.is_some() && session.plane.is_none() && buttons.just_pressed(MouseButton::Left) {
+        if let (Some(cursor), Some(mesh)) = (window.cursor_position(), part.mesh.as_ref()) {
+            if let Some((p, n)) = pick_face_point(mesh, camera, cam_gt, cursor) {
+                let (lo, hi) = mesh_bbox(mesh);
+                let tol = (hi - lo).length() * 1e-3 + 0.02;
+                if let Some(spec) = ui_state.shell_spec.as_mut() {
+                    let hit = spec.open.iter().position(|(op, on)| {
+                        let onv = Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32);
+                        let opv = Vec3::new(op[0] as f32, op[1] as f32, op[2] as f32);
+                        onv.dot(n) > 0.985 && (p - opv).dot(onv).abs() < tol
+                    });
+                    match hit {
+                        Some(k) => {
+                            spec.open.remove(k);
+                        }
+                        None => {
+                            spec.open.push(([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64]));
+                        }
+                    }
+                }
+                return; // consume the pick
+            }
+        }
+    }
+
     // Fade out the region-fit boundary flash.
     if ui_state.fit_flash_t > 0.0 {
         ui_state.fit_flash_t -= time.delta_secs();
@@ -10594,30 +10625,9 @@ fn sketch_interaction(
 
     // Shell PM open: viewport clicks pick faces to remove (click again to unpick).
     if ui_state.shell_spec.is_some() && session.plane.is_none() {
-        if just_pressed {
-            if let (Some(cursor), Some(mesh)) = (window.cursor_position(), part.mesh.as_ref()) {
-                if let Some((p, n)) = pick_face_point(mesh, camera, cam_gt, cursor) {
-                    let (lo, hi) = mesh_bbox(mesh);
-                    let tol = (hi - lo).length() * 1e-3 + 0.02;
-                    if let Some(spec) = ui_state.shell_spec.as_mut() {
-                        let hit = spec.open.iter().position(|(op, on)| {
-                            let onv = Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32);
-                            let opv = Vec3::new(op[0] as f32, op[1] as f32, op[2] as f32);
-                            onv.dot(n) > 0.985 && (p - opv).dot(onv).abs() < tol
-                        });
-                        match hit {
-                            Some(k) => {
-                                spec.open.remove(k);
-                            }
-                            None => {
-                                spec.open.push(([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return; // swallow viewport clicks while the Shell PM is open (orbit still works)
+        // Picks are handled before the egui pointer-block (see `shell_face_pick` above);
+        // swallow the remaining viewport clicks so they don't change the selection.
+        return;
     }
 
     // Section-view gizmo: grab the offset arrow or a rotation handle in plain view mode.
@@ -15223,7 +15233,12 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     let overshoot = thickness + diag * 0.02 + 0.5;
                     body = Some(match shell_tool(&b, *thickness, open, overshoot) {
                         Some(tool) => mesh_difference(&b, &tool),
-                        None => b,
+                        None => {
+                            // Returning the body unchanged here reads to the user as "Shell
+                            // did nothing" with no clue why — say so in the log at least.
+                            warn!("Shell: could not build the inward-offset tool (thickness {thickness} may exceed the wall the body can support) — body left unchanged.");
+                            b
+                        }
                     });
                 }
             }
@@ -15938,6 +15953,14 @@ fn apply_shell_feature(
 ) {
     let Some(spec) = ui_state.shell_request.take() else { return };
     history.snapshot(&doc.0);
+    if spec.open.is_empty() {
+        // A sealed hollow looks EXACTLY like the original solid from outside, so without
+        // this the feature reads as a no-op. Say what happened and how to open it.
+        ui_state.toasts.push((
+            "Shell: sealed hollow (no faces opened) — pick faces in the Shell panel to open it, or use Section view to see inside".to_string(),
+            5.0,
+        ));
+    }
     let kind = FeatureKind::Shell { thickness: spec.thickness as f64, open: spec.open };
     if let Some(i) = ui_state.editing_feature.take() {
         if let Some(f) = doc.0.features.get_mut(i) {
@@ -17293,8 +17316,14 @@ fn draw_body_edges(
             let n = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32).normalize_or_zero();
             let u = n.any_orthonormal_vector();
             let v = n.cross(u);
+            // A boxed X: the bare cross was easy to miss, and missing it means not noticing
+            // the pick never registered.
             gizmos.line(nudge(p - u * r - v * r), nudge(p + u * r + v * r), mcol);
             gizmos.line(nudge(p - u * r + v * r), nudge(p + u * r - v * r), mcol);
+            let c = [p - u * r - v * r, p + u * r - v * r, p + u * r + v * r, p - u * r + v * r];
+            for k in 0..4 {
+                gizmos.line(nudge(c[k]), nudge(c[(k + 1) % 4]), mcol);
+            }
         }
     }
     // Section-view cross-hatch: 45° lines on the cut face mark sliced solid material.
@@ -21961,6 +21990,37 @@ mod tests {
         let hole_vol = std::f64::consts::PI * 4.0 * 4.0;
         eprintln!("bolt circle removed {removed:.1} (5 holes = {:.1})", hole_vol * 5.0);
         assert!((removed - hole_vol * 5.0).abs() < hole_vol * 0.75, "expected ~5 extra holes removed, got {removed:.1}");
+    }
+
+    /// Sweep realistic box sizes / thicknesses / pick points to find where Shell gives up.
+    #[test]
+    #[ignore]
+    fn diag_shell_matrix() {
+        for &(w, h, d) in &[(20.0f64, 20.0, 10.0), (10.0, 10.0, 10.0), (50.0, 50.0, 20.0), (100.0, 60.0, 25.0), (5.0, 5.0, 5.0)] {
+            for &t in &[1.5f64, 2.0, 0.5] {
+                for &(pick, tag) in &[(true, "open-top"), (false, "enclosed")] {
+                    // Pick point: the CENTRE of the top face, and also near a corner (what a
+                    // real click often lands on).
+                    for &(fx, fy, ptag) in &[(0.5f64, 0.5, "centre"), (0.12, 0.12, "corner")] {
+                        let mut doc = Document::with_default_planes();
+                        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(w, h), regions: vec![], region_pts: vec![], plane: xy(), distance: d, back: 0.0, thin: 0.0, thin_side: 0 });
+                        let open = if pick { vec![([w * fx, h * fy, d], [0.0, 0.0, 1.0])] } else { vec![] };
+                        doc.add_feature(FeatureKind::Shell { thickness: t, open });
+                        doc.rollback = doc.features.len();
+                        let solid = w * h * d;
+                        match regenerate_mesh(&doc) {
+                            Some((m, _)) => {
+                                let vol = tri_vol(&m);
+                                let flag = if (vol - solid).abs() < solid * 0.01 { "  <-- UNCHANGED (shell did nothing)" } else { "" };
+                                eprintln!("{w}x{h}x{d} t={t} {tag}/{ptag}: vol {vol:.1} (solid {solid:.1}){flag}");
+                            }
+                            None => eprintln!("{w}x{h}x{d} t={t} {tag}/{ptag}: REGEN RETURNED NONE"),
+                        }
+                        if !pick { break; } // pick point irrelevant when enclosed
+                    }
+                }
+            }
+        }
     }
 
     #[test]
