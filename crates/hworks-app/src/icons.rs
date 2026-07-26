@@ -27,6 +27,20 @@ pub enum Icon {
     Pattern,
     Mirror,
     Trim,
+    // --- sketch tool variants (dropdowns) ---
+    ConstructionLine,
+    MidpointLine,
+    CenterLine,
+    PerimeterCircle,
+    CenterRectangle,
+    Parallelogram,
+    SplineThrough,
+    SplineControl,
+    CenterpointSlot,
+    ArcSlot,
+    FillPattern,
+    PowerTrim,
+    TrimCorner,
     // --- features: add material ---
     Boss,
     Revolve,
@@ -111,6 +125,26 @@ fn bezier(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) -> Vec<[f32; 2
         .collect()
 }
 
+/// Every icon with its name — the one list the bounds test and the preview dump share, so a
+/// new icon can't silently escape either.
+#[cfg(test)]
+pub const ALL: &[(&str, Icon)] = &[
+    ("Select", Icon::Select), ("Line", Icon::Line), ("Circle", Icon::Circle), ("Arc", Icon::Arc),
+    ("Rectangle", Icon::Rectangle), ("Slot", Icon::Slot), ("Polygon", Icon::Polygon), ("Spline", Icon::Spline),
+    ("Text", Icon::Text), ("Dimension", Icon::Dimension), ("Pattern", Icon::Pattern), ("Mirror", Icon::Mirror),
+    ("Trim", Icon::Trim),
+    ("ConstructionLine", Icon::ConstructionLine), ("MidpointLine", Icon::MidpointLine), ("CenterLine", Icon::CenterLine),
+    ("PerimeterCircle", Icon::PerimeterCircle), ("CenterRectangle", Icon::CenterRectangle),
+    ("Parallelogram", Icon::Parallelogram), ("SplineThrough", Icon::SplineThrough), ("SplineControl", Icon::SplineControl),
+    ("CenterpointSlot", Icon::CenterpointSlot), ("ArcSlot", Icon::ArcSlot), ("FillPattern", Icon::FillPattern),
+    ("PowerTrim", Icon::PowerTrim), ("TrimCorner", Icon::TrimCorner),
+    ("Boss", Icon::Boss), ("Revolve", Icon::Revolve), ("Loft", Icon::Loft), ("Sweep", Icon::Sweep),
+    ("Cut", Icon::Cut), ("RevolveCut", Icon::RevolveCut), ("LoftCut", Icon::LoftCut), ("SweepCut", Icon::SweepCut),
+    ("Hole", Icon::Hole), ("Fillet", Icon::Fillet), ("Chamfer", Icon::Chamfer), ("Shell", Icon::Shell),
+    ("LinearPattern", Icon::LinearPattern), ("CircularPattern", Icon::CircularPattern),
+    ("MirrorFeature", Icon::MirrorFeature), ("Plane", Icon::Plane), ("Sketch", Icon::Sketch),
+];
+
 /// The artwork for one icon, in the 0..1 unit box.
 pub fn prims(icon: Icon) -> Vec<Prim> {
     use Icon::*;
@@ -176,6 +210,100 @@ pub fn prims(icon: Icon) -> Vec<Prim> {
             Prim::Path(vec![[0.10, 0.82], [0.50, 0.50]], false),
             Prim::Dash(vec![[0.50, 0.50], [0.90, 0.18]]),
             Prim::Dot([0.50, 0.50]),
+        ],
+
+        // ---------------- sketch tool variants ----------------
+        // Construction geometry is dashed, matching how it draws in the sketch.
+        ConstructionLine => vec![Prim::Dash(vec![[0.18, 0.82], [0.82, 0.18]]), Prim::Dot([0.18, 0.82]), Prim::Dot([0.82, 0.18])],
+        // Grows symmetrically from the middle: centre mark, arrows heading both ways.
+        MidpointLine => vec![
+            Prim::Path(vec![[0.22, 0.78], [0.78, 0.22]], false),
+            Prim::Dot([0.5, 0.5]),
+            head([0.88, 0.12], [1.0, -1.0]),
+            head([0.12, 0.88], [-1.0, 1.0]),
+        ],
+        // The two combined: a dashed line that grows from its centre.
+        CenterLine => vec![
+            Prim::Dash(vec![[0.22, 0.78], [0.78, 0.22]]),
+            Prim::Dot([0.5, 0.5]),
+            head([0.88, 0.12], [1.0, -1.0]),
+            head([0.12, 0.88], [-1.0, 1.0]),
+        ],
+        // Defined by points ON the rim rather than from the centre.
+        PerimeterCircle => {
+            let mut v = vec![Prim::Circle([0.5, 0.5], 0.34)];
+            for deg in [-90.0f32, 30.0, 150.0] {
+                let a = deg.to_radians();
+                v.push(Prim::Dot([0.5 + 0.34 * a.cos(), 0.5 + 0.34 * a.sin()]));
+            }
+            v
+        }
+        // Centre out, with the X construction diagonals the tool actually adds.
+        CenterRectangle => vec![
+            boxp(0.16, 0.24, 0.84, 0.76),
+            Prim::Dash(vec![[0.16, 0.24], [0.84, 0.76]]),
+            Prim::Dash(vec![[0.84, 0.24], [0.16, 0.76]]),
+            Prim::Dot([0.5, 0.5]),
+        ],
+        Parallelogram => vec![
+            Prim::Path(vec![[0.30, 0.24], [0.94, 0.24], [0.70, 0.76], [0.06, 0.76]], true),
+            Prim::Dot([0.30, 0.24]),
+            Prim::Dot([0.94, 0.24]),
+        ],
+        // Interpolating: the points sit ON the curve.
+        SplineThrough => vec![
+            Prim::Path(bezier([0.12, 0.74], [0.34, 0.10], [0.66, 0.90], [0.88, 0.26]), false),
+            Prim::Dot([0.12, 0.74]),
+            Prim::Dot([0.5, 0.5]),
+            Prim::Dot([0.88, 0.26]),
+        ],
+        // Approximating: a dashed control polygon with the handles off the curve.
+        SplineControl => vec![
+            Prim::Path(bezier([0.12, 0.74], [0.34, 0.10], [0.66, 0.90], [0.88, 0.26]), false),
+            Prim::Dash(vec![[0.12, 0.74], [0.34, 0.10], [0.66, 0.90], [0.88, 0.26]]),
+            Prim::Dot([0.34, 0.10]),
+            Prim::Dot([0.66, 0.90]),
+        ],
+        // A slot placed from its centre: centre mark on the axis between the end radii.
+        CenterpointSlot => vec![
+            Prim::Arc([0.33, 0.5], 0.2, 90.0, 270.0),
+            Prim::Arc([0.67, 0.5], 0.2, 270.0, 450.0),
+            Prim::Path(vec![[0.33, 0.30], [0.67, 0.30]], false),
+            Prim::Path(vec![[0.33, 0.70], [0.67, 0.70]], false),
+            Prim::Dash(vec![[0.33, 0.5], [0.67, 0.5]]),
+            Prim::Dot([0.5, 0.5]),
+        ],
+        // The same stadium bent along an arc.
+        ArcSlot => vec![
+            Prim::Arc([0.5, 0.88], 0.46, 205.0, 335.0),
+            Prim::Arc([0.5, 0.88], 0.24, 205.0, 335.0),
+            Prim::Path(vec![[0.083, 0.685], [0.283, 0.779]], false),
+            Prim::Path(vec![[0.917, 0.685], [0.717, 0.779]], false),
+        ],
+        // Copies tiled to fill a closed region.
+        FillPattern => {
+            let mut v = vec![Prim::Path(vec![[0.10, 0.20], [0.90, 0.12], [0.88, 0.84], [0.14, 0.90]], true)];
+            for y in [0.38f32, 0.66] {
+                for x in [0.28f32, 0.50, 0.72] {
+                    v.push(Prim::Dot([x, y]));
+                }
+            }
+            v
+        }
+        // A stroke dragged across everything it crosses.
+        PowerTrim => vec![
+            Prim::Path(vec![[0.26, 0.12], [0.26, 0.88]], false),
+            Prim::Path(vec![[0.52, 0.12], [0.52, 0.88]], false),
+            Prim::Path(vec![[0.78, 0.12], [0.78, 0.88]], false),
+            Prim::Dash(bezier([0.08, 0.74], [0.36, 0.86], [0.62, 0.20], [0.94, 0.32])),
+        ],
+        // Two lines extended (dashed) until they meet at a corner.
+        TrimCorner => vec![
+            Prim::Path(vec![[0.20, 0.12], [0.20, 0.56]], false),
+            Prim::Dash(vec![[0.20, 0.56], [0.20, 0.80]]),
+            Prim::Path(vec![[0.88, 0.80], [0.44, 0.80]], false),
+            Prim::Dash(vec![[0.44, 0.80], [0.20, 0.80]]),
+            Prim::Dot([0.20, 0.80]),
         ],
 
         // ---------------- features: add material ----------------
@@ -354,20 +482,13 @@ mod tests {
     /// coordinate would clip against the neighbouring button).
     #[test]
     fn icons_are_non_empty_and_in_bounds() {
-        let all = [
-            Icon::Select, Icon::Line, Icon::Circle, Icon::Arc, Icon::Rectangle, Icon::Slot, Icon::Polygon,
-            Icon::Spline, Icon::Text, Icon::Dimension, Icon::Pattern, Icon::Mirror, Icon::Trim, Icon::Boss,
-            Icon::Revolve, Icon::Loft, Icon::Sweep, Icon::Cut, Icon::RevolveCut, Icon::LoftCut, Icon::SweepCut,
-            Icon::Hole, Icon::Fillet, Icon::Chamfer, Icon::Shell, Icon::LinearPattern, Icon::CircularPattern,
-            Icon::MirrorFeature, Icon::Plane, Icon::Sketch,
-        ];
-        for icon in all {
+        for &(name, icon) in ALL {
             let ps = prims(icon);
-            assert!(!ps.is_empty(), "{icon:?} draws nothing");
+            assert!(!ps.is_empty(), "{name} draws nothing");
             let mut check = |q: [f32; 2]| {
                 assert!(
                     (-0.02..=1.02).contains(&q[0]) && (-0.02..=1.02).contains(&q[1]),
-                    "{icon:?} has a point outside the unit box: {q:?}"
+                    "{name} has a point outside the unit box: {q:?}"
                 );
             };
             for prim in ps {
@@ -396,28 +517,25 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_icon_sheet() {
-        let all = [
-            ("Select", Icon::Select), ("Line", Icon::Line), ("Circle", Icon::Circle), ("Arc", Icon::Arc),
-            ("Rectangle", Icon::Rectangle), ("Slot", Icon::Slot), ("Polygon", Icon::Polygon), ("Spline", Icon::Spline),
-            ("Text", Icon::Text), ("Dimension", Icon::Dimension), ("Pattern", Icon::Pattern), ("Mirror", Icon::Mirror),
-            ("Trim", Icon::Trim), ("Boss", Icon::Boss), ("Revolve", Icon::Revolve), ("Loft", Icon::Loft),
-            ("Sweep", Icon::Sweep), ("Cut", Icon::Cut), ("RevolveCut", Icon::RevolveCut), ("LoftCut", Icon::LoftCut),
-            ("SweepCut", Icon::SweepCut), ("Hole", Icon::Hole), ("Fillet", Icon::Fillet), ("Chamfer", Icon::Chamfer),
-            ("Shell", Icon::Shell), ("LinearPattern", Icon::LinearPattern), ("CircularPattern", Icon::CircularPattern),
-            ("MirrorFeature", Icon::MirrorFeature), ("Plane", Icon::Plane), ("Sketch", Icon::Sketch),
-        ];
         let mut out = String::new();
-        for (name, icon) in all {
-            out.push_str(&format!("ICON {name}\n"));
+        for &(name, icon) in ALL {
+            out.push_str(&format!("ICON {name}
+"));
             for prim in prims(icon) {
                 let pts = |v: &Vec<[f32; 2]>| v.iter().map(|q| format!("{},{}", q[0], q[1])).collect::<Vec<_>>().join(" ");
                 match prim {
-                    Prim::Path(v, c) => out.push_str(&format!("path {} {}\n", if c { 1 } else { 0 }, pts(&v))),
-                    Prim::Dash(v) => out.push_str(&format!("dash {}\n", pts(&v))),
-                    Prim::Fill(v) => out.push_str(&format!("fill {}\n", pts(&v))),
-                    Prim::Circle(c, r) => out.push_str(&format!("circle {} {} {r}\n", c[0], c[1])),
-                    Prim::Dot(c) => out.push_str(&format!("dot {} {}\n", c[0], c[1])),
-                    Prim::Arc(c, r, a0, a1) => out.push_str(&format!("arc {} {} {r} {a0} {a1}\n", c[0], c[1])),
+                    Prim::Path(v, c) => out.push_str(&format!("path {} {}
+", if c { 1 } else { 0 }, pts(&v))),
+                    Prim::Dash(v) => out.push_str(&format!("dash {}
+", pts(&v))),
+                    Prim::Fill(v) => out.push_str(&format!("fill {}
+", pts(&v))),
+                    Prim::Circle(c, r) => out.push_str(&format!("circle {} {} {r}
+", c[0], c[1])),
+                    Prim::Dot(c) => out.push_str(&format!("dot {} {}
+", c[0], c[1])),
+                    Prim::Arc(c, r, a0, a1) => out.push_str(&format!("arc {} {} {r} {a0} {a1}
+", c[0], c[1])),
                 }
             }
         }

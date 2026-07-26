@@ -3293,6 +3293,12 @@ fn icon_label(ui: &mut egui::Ui, selected: bool, icon: icons::Icon, text: &str) 
     icon_widget(ui, selected, icon, text, false)
 }
 
+/// A dropdown row that shows which variant is active: full width, with the tick state of a
+/// `selectable_label`.
+fn icon_choice(ui: &mut egui::Ui, selected: bool, icon: icons::Icon, text: &str) -> egui::Response {
+    icon_widget(ui, selected, icon, text, true)
+}
+
 /// A flyout-menu row: full width, same icon language as the toolbar, honouring `enabled`.
 fn icon_item(ui: &mut egui::Ui, enabled: bool, icon: icons::Icon, text: &str) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| icon_widget(ui, false, icon, text, true)).inner
@@ -3728,14 +3734,13 @@ fn ui_system(
                         let is_con = session.construction && !session.line_midpoint;
                         let is_plain = !session.construction && !session.line_midpoint;
                         egui::Popup::menu(&dropdown_arrow(ui, "Line variants")).show(|ui| {
-                            if ui.selectable_label(line_on && is_plain, "Line").clicked() {
+                            if icon_choice(ui, line_on && is_plain, icons::Icon::Line, "Line").clicked() {
                                 session.tool = Tool::Line;
                                 session.construction = false;
                                 session.line_midpoint = false;
                                 session.pending = None;
                             }
-                            if ui
-                                .selectable_label(line_on && is_con, "Construction Line")
+                            if icon_choice(ui, line_on && is_con, icons::Icon::ConstructionLine, "Construction Line")
                                 .on_hover_text("A guide line — not part of the extrude profile")
                                 .clicked()
                             {
@@ -3744,8 +3749,7 @@ fn ui_system(
                                 session.line_midpoint = false;
                                 session.pending = None;
                             }
-                            if ui
-                                .selectable_label(line_on && is_mid, "Midpoint Line")
+                            if icon_choice(ui, line_on && is_mid, icons::Icon::MidpointLine, "Midpoint Line")
                                 .on_hover_text("Line grows symmetrically from the first click (its midpoint)")
                                 .clicked()
                             {
@@ -3754,8 +3758,7 @@ fn ui_system(
                                 session.line_midpoint = true;
                                 session.pending = None;
                             }
-                            if ui
-                                .selectable_label(line_on && is_ccl, "Construction Center Line")
+                            if icon_choice(ui, line_on && is_ccl, icons::Icon::CenterLine, "Construction Center Line")
                                 .on_hover_text("A construction centre line — click the centre, then an end. Edit each half-length in the panel.")
                                 .clicked()
                             {
@@ -3776,8 +3779,7 @@ fn ui_system(
                         }
                         let perim = session.circle_perimeter;
                         egui::Popup::menu(&dropdown_arrow(ui, "Circle variants")).show(|ui| {
-                            if ui
-                                .selectable_label(circle_on && !perim, "Circle")
+                            if icon_choice(ui, circle_on && !perim, icons::Icon::Circle, "Circle")
                                 .on_hover_text("Centre, then radius")
                                 .clicked()
                             {
@@ -3785,8 +3787,7 @@ fn ui_system(
                                 session.circle_perimeter = false;
                                 session.pending = None;
                             }
-                            if ui
-                                .selectable_label(circle_on && perim, "Perimeter Circle")
+                            if icon_choice(ui, circle_on && perim, icons::Icon::PerimeterCircle, "Perimeter Circle")
                                 .on_hover_text("Click a point on the rim, then drag to the opposite rim (a diameter)")
                                 .clicked()
                             {
@@ -3816,17 +3817,17 @@ fn ui_system(
                         }
                         let rm = session.rect_mode;
                         egui::Popup::menu(&dropdown_arrow(ui, "Rectangle variants")).show(|ui| {
-                            let mut pick = |ui: &mut egui::Ui, m: RectMode, name: &str, tip: &str| {
-                                if ui.selectable_label(rect_on && rm == m, name).on_hover_text(tip).clicked() {
+                            let mut pick = |ui: &mut egui::Ui, m: RectMode, ic: icons::Icon, name: &str, tip: &str| {
+                                if icon_choice(ui, rect_on && rm == m, ic, name).on_hover_text(tip).clicked() {
                                     session.tool = Tool::Rectangle;
                                     session.rect_mode = m;
                                     session.pending = None;
                                     session.pending_b = None;
                                 }
                             };
-                            pick(ui, RectMode::Corner, "Corner Rectangle", "Two opposite corners");
-                            pick(ui, RectMode::Center, "Center Rectangle", "Centre, then a corner (adds X construction diagonals)");
-                            pick(ui, RectMode::Parallelogram, "Parallelogram", "Two points anchor one side, then pull out the rest");
+                            pick(ui, RectMode::Corner, icons::Icon::Rectangle, "Corner Rectangle", "Two opposite corners");
+                            pick(ui, RectMode::Center, icons::Icon::CenterRectangle, "Center Rectangle", "Centre, then a corner (adds X construction diagonals)");
+                            pick(ui, RectMode::Parallelogram, icons::Icon::Parallelogram, "Parallelogram", "Two points anchor one side, then pull out the rest");
                         });
                         // Spline tool + a ▾ dropdown: through-points or control-points.
                         let spline_on = session.tool == Tool::Spline;
@@ -3839,8 +3840,7 @@ fn ui_system(
                         }
                         let ctrl = session.spline_control;
                         egui::Popup::menu(&dropdown_arrow(ui, "Spline variants")).show(|ui| {
-                            if ui
-                                .selectable_label(spline_on && !ctrl, "Spline (through points)")
+                            if icon_choice(ui, spline_on && !ctrl, icons::Icon::SplineThrough, "Spline (through points)")
                                 .on_hover_text("Curve passes through each clicked point")
                                 .clicked()
                             {
@@ -3848,8 +3848,7 @@ fn ui_system(
                                 session.spline_control = false;
                                 session.spline_pts.clear();
                             }
-                            if ui
-                                .selectable_label(spline_on && ctrl, "Spline (control points)")
+                            if icon_choice(ui, spline_on && ctrl, icons::Icon::SplineControl, "Spline (control points)")
                                 .on_hover_text("Clicked points form a control hull the curve only approaches")
                                 .clicked()
                             {
@@ -3871,8 +3870,8 @@ fn ui_system(
                         }
                         let sm = session.slot_mode;
                         egui::Popup::menu(&dropdown_arrow(ui, "Slot variants")).show(|ui| {
-                            let mut pick = |ui: &mut egui::Ui, m: SlotMode, name: &str, tip: &str| {
-                                if ui.selectable_label(slot_on && sm == m, name).on_hover_text(tip).clicked() {
+                            let mut pick = |ui: &mut egui::Ui, m: SlotMode, ic: icons::Icon, name: &str, tip: &str| {
+                                if icon_choice(ui, slot_on && sm == m, ic, name).on_hover_text(tip).clicked() {
                                     session.tool = Tool::Slot;
                                     session.slot_mode = m;
                                     session.pending = None;
@@ -3880,9 +3879,9 @@ fn ui_system(
                                     session.pending_c = None;
                                 }
                             };
-                            pick(ui, SlotMode::Straight, "Straight Slot", "Two end centres, then the width");
-                            pick(ui, SlotMode::Centerpoint, "Centerpoint Slot", "Centre, then one end, then the width");
-                            pick(ui, SlotMode::Arc, "3-Point Arc Slot", "Two ends, bend into an arc, then the width");
+                            pick(ui, SlotMode::Straight, icons::Icon::Slot, "Straight Slot", "Two end centres, then the width");
+                            pick(ui, SlotMode::Centerpoint, icons::Icon::CenterpointSlot, "Centerpoint Slot", "Centre, then one end, then the width");
+                            pick(ui, SlotMode::Arc, icons::Icon::ArcSlot, "3-Point Arc Slot", "Two ends, bend into an arc, then the width");
                         });
                         // Polygon tool: click centre, then a vertex. Side count lives in the
                         // left-hand parameter panel.
@@ -3924,17 +3923,17 @@ fn ui_system(
                         }
                         egui::Popup::menu(&dropdown_arrow(ui, "Pattern variants")).show(|ui| {
                             let pat_on = session.tool == Tool::Pattern;
-                            let mut pick = |ui: &mut egui::Ui, m: PatternMode, name: &str, tip: &str| {
-                                if ui.selectable_label(pat_on && session.pattern_mode == m, name).on_hover_text(tip).clicked() {
+                            let mut pick = |ui: &mut egui::Ui, m: PatternMode, ic: icons::Icon, name: &str, tip: &str| {
+                                if icon_choice(ui, pat_on && session.pattern_mode == m, ic, name).on_hover_text(tip).clicked() {
                                     init_pattern_defaults(&mut session);
                                     session.pattern_mode = m;
                                     session.tool = Tool::Pattern;
                                     session.pending = None;
                                 }
                             };
-                            pick(ui, PatternMode::Linear, "Linear Pattern", "Rows × columns at a set spacing");
-                            pick(ui, PatternMode::Circular, "Circular Pattern", "Copies revolved around a centre");
-                            pick(ui, PatternMode::Fill, "Fill Pattern", "Tile copies to fill a selected closed region");
+                            pick(ui, PatternMode::Linear, icons::Icon::LinearPattern, "Linear Pattern", "Rows × columns at a set spacing");
+                            pick(ui, PatternMode::Circular, icons::Icon::CircularPattern, "Circular Pattern", "Copies revolved around a centre");
+                            pick(ui, PatternMode::Fill, icons::Icon::FillPattern, "Fill Pattern", "Tile copies to fill a selected closed region");
                         });
                         // Mirror: reflect the selection across a selected line (a construction
                         // centre line is the natural axis).
@@ -3956,15 +3955,15 @@ fn ui_system(
                         }
                         egui::Popup::menu(&dropdown_arrow(ui, "Trim modes")).show(|ui| {
                             let m = session.trim_mode;
-                            if ui.selectable_label(m == TrimMode::Closest, "Trim to closest").on_hover_text("Click a piece → delete it back to the nearest intersections").clicked() {
+                            if icon_choice(ui, m == TrimMode::Closest, icons::Icon::Trim, "Trim to closest").on_hover_text("Click a piece → delete it back to the nearest intersections").clicked() {
                                 session.tool = Tool::Trim;
                                 session.trim_mode = TrimMode::Closest;
                             }
-                            if ui.selectable_label(m == TrimMode::Power, "Power Trim").on_hover_text("Drag a stroke across entities → trim everything it crosses").clicked() {
+                            if icon_choice(ui, m == TrimMode::Power, icons::Icon::PowerTrim, "Power Trim").on_hover_text("Drag a stroke across entities → trim everything it crosses").clicked() {
                                 session.tool = Tool::Trim;
                                 session.trim_mode = TrimMode::Power;
                             }
-                            if ui.selectable_label(m == TrimMode::Corner, "Corner").on_hover_text("Click two lines → trim/extend both to meet at a corner").clicked() {
+                            if icon_choice(ui, m == TrimMode::Corner, icons::Icon::TrimCorner, "Corner").on_hover_text("Click two lines → trim/extend both to meet at a corner").clicked() {
                                 session.tool = Tool::Trim;
                                 session.trim_mode = TrimMode::Corner;
                             }
