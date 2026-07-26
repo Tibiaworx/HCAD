@@ -22,7 +22,8 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef};
+use hworks_geometry::drawing::{edges_bounds, project_edges, to_svg, ProjEdge, SheetItem, ViewBasis};
+use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
@@ -179,8 +180,7 @@ fn main() {
                 ),
                 (
                     (handle_new_part, asm_regenerate, mate_hover_highlight, asm_interaction, asm_solve_mates, check_interference, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
-                    highlight_face,
-                    shell_overlays,
+                    (highlight_face, shell_overlays, (drawing_regenerate, drawing_ui).chain()),
                     hover_body_edge,
                     sync_ref_planes,
                     scale_ref_planes,
@@ -218,6 +218,25 @@ enum DocMode {
     #[default]
     Part,
     Assembly,
+    /// A 2D drawing sheet (.hdrw) documenting one part.
+    Drawing,
+}
+
+/// The open drawing document (empty & unused outside Drawing mode).
+#[derive(Resource, Default)]
+struct DrawRes(Drawing);
+
+/// Projected edges for the drawing's source part, one entry per view direction. Rebuilt when
+/// the part or the view set changes — projection is far too costly to redo every frame.
+#[derive(Resource, Default)]
+struct DrawCache {
+    /// The part path the cache was built from.
+    source: String,
+    /// Model-space geometry, kept so a newly added view can project without a reload.
+    mesh: Option<TriMesh>,
+    edges: Vec<[[f32; 3]; 2]>,
+    /// Projected runs per view direction.
+    proj: std::collections::HashMap<String, Vec<hworks_geometry::drawing::ProjEdge>>,
 }
 
 /// The open assembly document (empty & unused in Part mode).
@@ -2121,6 +2140,18 @@ struct UiState {
     /// One-shot: remove the red interference overlays without recomputing.
     interf_clear: bool,
     new_asm_request: bool,
+    /// One-shot: start a new drawing documenting the current part.
+    new_draw_request: bool,
+    /// One-shot: export the drawing sheet to SVG.
+    export_svg_request: bool,
+    /// One-shot: (re)project the drawing's views.
+    draw_dirty: bool,
+    /// Sheet view transform: pan in screen px, and px-per-millimetre zoom.
+    draw_pan: egui::Vec2,
+    draw_zoom: f32,
+    /// The view being dragged on the sheet, and the id of the selected view.
+    draw_drag: Option<(u64, egui::Vec2)>,
+    draw_sel: Option<u64>,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
     pattern_spec: Option<PatternSpec>,
@@ -3188,42 +3219,27 @@ fn open_cli_file(
     mut asm: ResMut<AsmRes>,
     mut asm_render: ResMut<AsmRender>,
     mut mode: ResMut<DocMode>,
+    mut draw: ResMut<DrawRes>,
+    mut cache: ResMut<DrawCache>,
 ) {
     let Some(arg) = std::env::args().nth(1) else { return };
     let path = std::path::PathBuf::from(&arg);
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
     // Double-clicked assembly: load it, refresh caches from any present sources.
-    if ext == "hasm" {
-        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Assembly>(&t).map_err(|e| e.to_string())) {
-            Ok(mut loaded) => {
-                let dir = path.parent().map(|d| d.to_path_buf());
-                for c in &mut loaded.components {
-                    if c.source.is_empty() {
-                        continue;
-                    }
-                    let sp = std::path::PathBuf::from(&c.source);
-                    let full = if sp.is_absolute() { sp } else { dir.clone().map(|d| d.join(&sp)).unwrap_or(sp) };
-                    if let Ok(t) = std::fs::read_to_string(&full) {
-                        if let Ok(d) = ron::from_str::<Document>(&t) {
-                            c.cached = d;
-                        }
-                    }
-                }
-                *mode = DocMode::Assembly;
-                asm.0 = loaded;
-                asm_render.dirty = true;
-                doc.0 = Document::with_default_planes();
-                for f in &mut doc.0.features {
-                    f.hidden = true;
-                }
+    // Double-clicked drawing: load the sheet and switch to Drawing mode.
+    if ext == "hdrw" {
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Drawing>(&t).map_err(|e| e.to_string())) {
+            Ok(d) => {
+                draw.0 = d;
                 ui_state.current_file = Some(path.clone());
-                ui_state.regen = true;
-                info!("Opened assembly {} (command line)", path.display());
+                *mode = DocMode::Drawing;
+                ui_state.draw_zoom = 0.0;
+                ui_state.draw_dirty = true;
+                cache.mesh = None;
+                cache.source.clear();
+                info!("Opened drawing {}", path.display());
             }
-            Err(e) => {
-                warn!("Could not open {}: {e}", path.display());
-                ui_state.last_error = Some(format!("Couldn't open {} — it isn't a valid HCAD assembly.", path.display()));
-            }
+            Err(e) => ui_state.last_error = Some(format!("Couldn't open {}: {e}", path.display())),
         }
         return;
     }
@@ -3416,7 +3432,7 @@ fn ui_system(
     mut ui_state: ResMut<UiState>,
     mut blocking: ResMut<UiBlocking>,
     mut doc: ResMut<DocRes>,
-    mut asm_ctx: (ResMut<AsmRes>, ResMut<AsmRender>, Res<DocMode>),
+    mut asm_ctx: (ResMut<AsmRes>, ResMut<AsmRender>, Res<DocMode>, ResMut<DrawRes>),
     mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
     cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
@@ -3430,6 +3446,7 @@ fn ui_system(
     let ctx = contexts.ctx_mut()?;
     let (asm, asm_render, asm_mode) = (&mut asm_ctx.0, &mut asm_ctx.1, &asm_ctx.2);
     let in_asm = **asm_mode == DocMode::Assembly;
+    let in_draw = **asm_mode == DocMode::Drawing;
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
 
     // While a 3D gizmo arrow is being dragged, drop egui keyboard focus: a focused DragValue
@@ -3536,6 +3553,10 @@ fn ui_system(
                 if ui.button("New Part").clicked() { ui_state.new_part = true; ui.close(); }
                 if ui.button("New Assembly").on_hover_text("Place saved parts together (insert .hcad files, move them into position)").clicked() {
                     ui_state.new_asm_request = true;
+                    ui.close();
+                }
+                if ui.button("New Drawing").on_hover_text("A 2D drawing sheet documenting the part that's currently open (save the part first)").clicked() {
+                    ui_state.new_draw_request = true;
                     ui.close();
                 }
                 if ui.button("Open…").clicked() { ui_state.open_request = true; ui.close(); }
@@ -4258,6 +4279,11 @@ fn ui_system(
     // ---- Left panel: PropertyManager (if configuring) else FeatureManager ----
     egui::SidePanel::left("left_panel").default_width(240.0).show(ctx, |ui| {
       egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Drawing mode owns the whole panel — none of the modelling tools apply to a sheet.
+        if in_draw {
+            drawing_panel(ui, &mut asm_ctx.3.0, &mut ui_state);
+            return;
+        }
         // Polygon-tool parameters (SolidWorks-style PropertyManager): the side count.
         if session.tool == Tool::Polygon && session.plane.is_some() {
             ui.heading("Polygon");
@@ -13871,6 +13897,8 @@ fn handle_file_io(
     mut asm: ResMut<AsmRes>,
     mut asm_render: ResMut<AsmRender>,
     mut mode: ResMut<DocMode>,
+    mut draw: ResMut<DrawRes>,
+    mut cache: ResMut<DrawCache>,
 ) {
     // ---- Edit-in-place: load a component's part into Part mode ----
     if let Some(id) = ui_state.edit_component_request.take() {
@@ -13949,6 +13977,63 @@ fn handle_file_io(
         }
     }
 
+    // ---- Drawing document requests ----
+    if ui_state.new_draw_request {
+        ui_state.new_draw_request = false;
+        // A drawing documents a SAVED part: the reference is a path, so an unsaved part has
+        // nothing to point at.
+        match ui_state.current_file.clone().filter(|f| f.extension().is_some_and(|e| e == "hcad")) {
+            Some(part_path) => {
+                let mut d = Drawing::default();
+                d.sheet = Sheet::a4();
+                d.source = part_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                d.title.title = part_path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                for dir in [ViewDir::Front, ViewDir::Top, ViewDir::Right] {
+                    d.add_view(dir, 1.0);
+                }
+                drawing_auto_layout(&mut d);
+                draw.0 = d;
+                // The drawing lives beside the part until saved.
+                ui_state.current_file = Some(part_path.with_extension("hdrw"));
+                *mode = DocMode::Drawing;
+                ui_state.draw_zoom = 0.0;
+                ui_state.draw_sel = None;
+                ui_state.draw_dirty = true;
+                cache.mesh = None;
+                cache.source.clear();
+                ui_state.toasts.push(("New drawing — Front, Top and Right views placed".into(), 3.0));
+            }
+            None => {
+                ui_state.last_error = Some("Save the part first — a drawing references its .hcad file by name.".into());
+            }
+        }
+    }
+    if ui_state.export_svg_request {
+        ui_state.export_svg_request = false;
+        if *mode == DocMode::Drawing {
+            let seed = ui_state
+                .current_file
+                .as_ref()
+                .map(|f| f.with_extension("svg"))
+                .unwrap_or_else(|| std::path::PathBuf::from("drawing.svg"));
+            let chosen = rfd::FileDialog::new()
+                .add_filter("SVG drawing", &["svg"])
+                .set_file_name(seed.file_name().and_then(|n| n.to_str()).unwrap_or("drawing.svg"))
+                .save_file();
+            if let Some(mut path) = chosen {
+                if path.extension().is_none() {
+                    path.set_extension("svg");
+                }
+                let items = drawing_sheet_items(&draw.0, &cache);
+                let svg = to_svg(draw.0.sheet.w, draw.0.sheet.h, &items, &drawing_title_rows(&draw.0));
+                match std::fs::write(&path, svg) {
+                    Ok(()) => ui_state.toasts.push((format!("Exported {}", path.display()), 3.5)),
+                    Err(e) => ui_state.last_error = Some(format!("Couldn't write {}: {e}", path.display())),
+                }
+            }
+        }
+    }
+
     // ---- Assembly document requests ----
     if ui_state.new_asm_request {
         ui_state.new_asm_request = false;
@@ -13988,6 +14073,59 @@ fn handle_file_io(
             ui_state.toasts.push((format!("{name}: sketch on a ghost face or a datum plane — Save & Return when done"), 4.5));
             asm_render.dirty = true;
         }
+    }
+    // Drawing save: RON like the other documents, bound to `.hdrw`.
+    if (ui_state.save_request || ui_state.save_as_request) && *mode == DocMode::Drawing {
+        let need_dialog = ui_state.save_as_request || ui_state.current_file.as_ref().is_none_or(|f| f.extension().is_none_or(|e| e != "hdrw"));
+        ui_state.save_request = false;
+        ui_state.save_as_request = false;
+        let target = if need_dialog {
+            ui_state
+                .pending_save_path
+                .take()
+                .or_else(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("HCAD drawing", &["hdrw"])
+                        .set_file_name(ui_state.current_file.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("drawing.hdrw"))
+                        .save_file()
+                })
+                .map(|mut p| {
+                    if p.extension().is_none() {
+                        p.set_extension("hdrw");
+                    }
+                    p
+                })
+        } else {
+            ui_state.current_file.clone()
+        };
+        if let Some(path) = target {
+            // Re-relativise the part reference against the drawing's (possibly new) folder.
+            let mut out = draw.0.clone();
+            if let (Some(dir), Some(abs)) = (path.parent(), drawing_source_path(&ui_state, &draw.0)) {
+                if let Ok(rel) = abs.strip_prefix(dir) {
+                    out.source = rel.to_string_lossy().into_owned();
+                }
+            }
+            match ron::ser::to_string_pretty(&out, ron::ser::PrettyConfig::default()).map_err(|e| e.to_string()) {
+                Ok(text) => {
+                    if let Some(d) = path.parent() {
+                        if !d.as_os_str().is_empty() && !d.exists() {
+                            let _ = std::fs::create_dir_all(d);
+                        }
+                    }
+                    match std::fs::write(&path, text) {
+                        Ok(()) => {
+                            draw.0.source = out.source;
+                            ui_state.current_file = Some(path.clone());
+                            ui_state.toasts.push((format!("Saved {}", path.display()), 3.0));
+                        }
+                        Err(e) => ui_state.last_error = Some(format!("Couldn't write {}: {e}", path.display())),
+                    }
+                }
+                Err(e) => ui_state.last_error = Some(format!("Couldn't serialise the drawing: {e}")),
+            }
+        }
+        return;
     }
     if ui_state.insert_component_request {
         ui_state.insert_component_request = false;
@@ -14216,12 +14354,30 @@ fn handle_file_io(
         // A path typed into the in-app prompt wins (the OS dialog can't reach UNC shares).
         let chosen = ui_state.pending_open_path.take().or_else(|| {
             rfd::FileDialog::new()
-                .add_filter("HCAD documents", &["hcad", "hasm", "ron"])
+                .add_filter("HCAD documents", &["hcad", "hasm", "hdrw", "ron"])
                 .add_filter("HCAD part", &["hcad", "ron"])
                 .add_filter("HCAD assembly", &["hasm"])
                 .pick_file()
         });
         if let Some(path) = chosen {
+            // A drawing sheet: load it and switch modes.
+            if path.extension().and_then(|e| e.to_str()) == Some("hdrw") {
+                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Drawing>(&t).map_err(|e| e.to_string())) {
+                    Ok(d) => {
+                        draw.0 = d;
+                        ui_state.current_file = Some(path.clone());
+                        *mode = DocMode::Drawing;
+                        ui_state.draw_zoom = 0.0;
+                        ui_state.draw_sel = None;
+                        ui_state.draw_dirty = true;
+                        cache.mesh = None;
+                        cache.source.clear();
+                        ui_state.toasts.push((format!("Opened {}", path.display()), 3.0));
+                    }
+                    Err(e) => ui_state.last_error = Some(format!("Couldn't open {}: {e}", path.display())),
+                }
+                return;
+            }
             if path.extension().and_then(|e| e.to_str()) == Some("hasm") {
                 match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Assembly>(&t).map_err(|e| e.to_string())) {
                     Ok(mut loaded) => {
@@ -16301,6 +16457,410 @@ fn axis_face_name(n: Vec3) -> &'static str {
         }
     }
     "Face"
+}
+
+/// Load a part file and produce the geometry a drawing view needs: the tessellated body plus
+/// its feature edges.
+/// The drawing sheet: a 2D canvas over the viewport with the sheet, its views, and the title
+/// block. Scroll zooms, right/middle-drag pans, left-drag moves a view.
+fn drawing_ui(
+    mut contexts: EguiContexts,
+    mode: Res<DocMode>,
+    mut draw: ResMut<DrawRes>,
+    cache: Res<DrawCache>,
+    mut ui_state: ResMut<UiState>,
+) {
+    if *mode != DocMode::Drawing {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(38, 40, 45)))
+        .show(ctx, |ui| {
+            let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+            let rect = resp.rect;
+            let (sw, sh) = (draw.0.sheet.w as f32, draw.0.sheet.h as f32);
+
+            // First paint (or after a sheet change) fits the sheet to the panel.
+            if ui_state.draw_zoom <= 0.0 {
+                let fit = ((rect.width() - 40.0) / sw).min((rect.height() - 40.0) / sh).max(0.05);
+                ui_state.draw_zoom = fit;
+                ui_state.draw_pan = egui::vec2(
+                    rect.center().x - sw * fit * 0.5 - rect.min.x,
+                    rect.center().y - sh * fit * 0.5 - rect.min.y,
+                );
+            }
+            // Scroll to zoom about the cursor, so the sheet doesn't run away under the pointer.
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if resp.hovered() && scroll.abs() > 0.01 {
+                let old = ui_state.draw_zoom;
+                let next = (old * (1.0 + scroll * 0.0015)).clamp(0.05, 40.0);
+                if let Some(pos) = resp.hover_pos() {
+                    let local = pos - rect.min - ui_state.draw_pan;
+                    ui_state.draw_pan += local * (1.0 - next / old);
+                }
+                ui_state.draw_zoom = next;
+            }
+            if resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary) {
+                ui_state.draw_pan += resp.drag_delta();
+            }
+
+            let z = ui_state.draw_zoom;
+            let pan = ui_state.draw_pan;
+            // Sheet millimetres (origin bottom-left, y up) to screen pixels (y down).
+            let to_screen = |q: [f64; 2]| -> egui::Pos2 {
+                egui::pos2(rect.min.x + pan.x + q[0] as f32 * z, rect.min.y + pan.y + (sh - q[1] as f32) * z)
+            };
+            let to_sheet = |p: egui::Pos2| -> [f64; 2] {
+                [((p.x - rect.min.x - pan.x) / z) as f64, (sh - (p.y - rect.min.y - pan.y) / z) as f64]
+            };
+
+            // Paper + border.
+            let paper = egui::Rect::from_min_max(to_screen([0.0, sh as f64]), to_screen([sw as f64, 0.0]));
+            painter.rect_filled(paper, 0.0, egui::Color32::from_rgb(250, 250, 248));
+            painter.rect_stroke(paper, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(120)), egui::StrokeKind::Inside);
+            let inner = egui::Rect::from_min_max(to_screen([10.0, sh as f64 - 10.0]), to_screen([sw as f64 - 10.0, 10.0]));
+            painter.rect_stroke(inner, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(60)), egui::StrokeKind::Inside);
+
+            // Views.
+            let ink = egui::Color32::from_gray(25);
+            let mut hit: Option<u64> = None;
+            for v in &draw.0.views {
+                let Some(edges) = cache.proj.get(v.dir.label()) else { continue };
+                let sel = ui_state.draw_sel == Some(v.id);
+                let place = |q: [f64; 2]| [v.center[0] + q[0] * v.scale, v.center[1] + q[1] * v.scale];
+                for e in edges {
+                    if e.hidden && !v.show_hidden {
+                        continue;
+                    }
+                    let (a, b) = (to_screen(place(e.a)), to_screen(place(e.b)));
+                    if e.hidden {
+                        // Dashed, per drafting convention.
+                        let d = b - a;
+                        let len = d.length().max(1e-3);
+                        let step = (1.5 * z).max(2.0);
+                        let mut t = 0.0;
+                        while t < len {
+                            let t2 = (t + step * 0.6).min(len);
+                            painter.line_segment([a + d * (t / len), a + d * (t2 / len)], egui::Stroke::new(1.0, egui::Color32::from_gray(90)));
+                            t = t2 + step * 0.4;
+                        }
+                    } else {
+                        painter.line_segment([a, b], egui::Stroke::new(1.2, ink));
+                    }
+                }
+                // Selection box + caption.
+                let (lo, hi) = edges_bounds(edges);
+                let bb = egui::Rect::from_min_max(to_screen(place([lo[0], hi[1]])), to_screen(place([hi[0], lo[1]]))).expand(4.0);
+                if let Some(pos) = resp.hover_pos() {
+                    if bb.contains(pos) {
+                        hit = Some(v.id);
+                    }
+                }
+                if sel {
+                    painter.rect_stroke(bb, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 140, 220)), egui::StrokeKind::Outside);
+                }
+                if v.label {
+                    let cx = (bb.min.x + bb.max.x) * 0.5;
+                    painter.text(
+                        egui::pos2(cx, bb.max.y + 2.0),
+                        egui::Align2::CENTER_TOP,
+                        v.dir.label(),
+                        egui::FontId::proportional((3.5 * z).clamp(8.0, 22.0)),
+                        ink,
+                    );
+                }
+            }
+
+            // Title block.
+            let rows = drawing_title_rows(&draw.0);
+            if !rows.is_empty() {
+                let (bw, rh) = (85.0f64, 7.0f64);
+                let bh = rows.len() as f64 * rh;
+                let (bx, by) = (draw.0.sheet.w - 10.0 - bw, 10.0);
+                let tb = egui::Rect::from_min_max(to_screen([bx, by + bh]), to_screen([bx + bw, by]));
+                painter.rect_stroke(tb, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(60)), egui::StrokeKind::Inside);
+                let fs = (3.2 * z).clamp(7.0, 18.0);
+                for (i, (k, val)) in rows.iter().enumerate() {
+                    let y = by + bh - (i as f64 + 0.5) * rh;
+                    if i > 0 {
+                        let ly = by + bh - i as f64 * rh;
+                        painter.line_segment(
+                            [to_screen([bx, ly]), to_screen([bx + bw, ly])],
+                            egui::Stroke::new(0.7, egui::Color32::from_gray(120)),
+                        );
+                    }
+                    painter.text(to_screen([bx + 2.0, y]), egui::Align2::LEFT_CENTER, k, egui::FontId::proportional(fs * 0.85), egui::Color32::from_gray(90));
+                    painter.text(to_screen([bx + 26.0, y]), egui::Align2::LEFT_CENTER, val, egui::FontId::proportional(fs), ink);
+                }
+            }
+
+            // Drag a view around the sheet.
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                if let (Some(id), Some(pos)) = (hit, resp.hover_pos()) {
+                    ui_state.draw_sel = Some(id);
+                    if let Some(v) = draw.0.view(id) {
+                        let sheet = to_sheet(pos);
+                        ui_state.draw_drag = Some((id, egui::vec2((v.center[0] - sheet[0]) as f32, (v.center[1] - sheet[1]) as f32)));
+                    }
+                } else {
+                    ui_state.draw_sel = None;
+                }
+            }
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                if let (Some((id, grab)), Some(pos)) = (ui_state.draw_drag, resp.hover_pos()) {
+                    let sheet = to_sheet(pos);
+                    let (lim_w, lim_h) = (draw.0.sheet.w, draw.0.sheet.h);
+                    if let Some(v) = draw.0.view_mut(id) {
+                        // Clamp inside the border so a view can't be dragged off the paper.
+                        v.center = [(sheet[0] + grab.x as f64).clamp(0.0, lim_w), (sheet[1] + grab.y as f64).clamp(0.0, lim_h)];
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                ui_state.draw_drag = None;
+            }
+            if draw.0.views.is_empty() {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Add a view from the panel on the left",
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::from_gray(150),
+                );
+            }
+        });
+}
+
+/// The Drawing-mode side panel: sheet size, the views on it, and the title block.
+fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) {
+    ui.heading("Drawing");
+    ui.horizontal(|ui| {
+        ui.label("Sheet");
+        egui::ComboBox::from_id_salt("sheet_size")
+            .selected_text(draw.sheet.name.clone())
+            .show_ui(ui, |ui| {
+                for pre in Sheet::presets() {
+                    if ui.selectable_label(draw.sheet.name == pre.name, pre.name.clone()).clicked() {
+                        draw.sheet = pre;
+                        ui_state.draw_zoom = 0.0; // refit
+                    }
+                }
+            });
+        if ui.small_button("Rotate").on_hover_text("Swap landscape / portrait").clicked() {
+            std::mem::swap(&mut draw.sheet.w, &mut draw.sheet.h);
+            ui_state.draw_zoom = 0.0;
+        }
+    });
+    ui.label(egui::RichText::new(format!("Part: {}", if draw.source.is_empty() { "(none)" } else { draw.source.as_str() })).weak().small());
+    ui.separator();
+
+    ui.label("Add view:");
+    egui::Grid::new("draw_add_view").num_columns(4).spacing([4.0, 4.0]).show(ui, |ui| {
+        for (i, d) in ViewDir::all().into_iter().enumerate() {
+            if ui.button(d.label()).on_hover_text("Place this view on the sheet").clicked() {
+                let scale = draw.views.first().map(|v| v.scale).unwrap_or(1.0);
+                let id = draw.add_view(d, scale);
+                // Stagger new views so they don't stack exactly on top of each other.
+                let n = draw.views.len() as f64;
+                let top = draw.sheet.h - 60.0;
+                if let Some(v) = draw.view_mut(id) {
+                    v.center = [40.0 + (n - 1.0) * 20.0, top - (n - 1.0) * 10.0];
+                }
+                ui_state.draw_sel = Some(id);
+                ui_state.draw_dirty = true;
+            }
+            if i % 4 == 3 {
+                ui.end_row();
+            }
+        }
+    });
+    if ui.button("Auto-arrange").on_hover_text("Lay the views out in third-angle projection around the front view").clicked() {
+        drawing_auto_layout(draw);
+    }
+    ui.separator();
+
+    let mut remove: Option<u64> = None;
+    let ids: Vec<u64> = draw.views.iter().map(|v| v.id).collect();
+    for id in ids {
+        let sel = ui_state.draw_sel == Some(id);
+        let Some(v) = draw.view_mut(id) else { continue };
+        let head = format!("{} — {}:1", v.dir.label(), (v.scale * 1000.0).round() / 1000.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if ui.selectable_label(sel, head).clicked() {
+                ui_state.draw_sel = Some(id);
+            }
+            ui.horizontal(|ui| {
+                ui.label("Scale");
+                ui.add(egui::DragValue::new(&mut v.scale).speed(0.05).range(0.05..=20.0));
+                for (lbl, sc) in [("1:1", 1.0f64), ("1:2", 0.5), ("2:1", 2.0)] {
+                    if ui.small_button(lbl).clicked() {
+                        v.scale = sc;
+                    }
+                }
+            });
+            ui.checkbox(&mut v.show_hidden, "Hidden lines").on_hover_text("Draw edges behind material as dashed");
+            ui.checkbox(&mut v.label, "Caption");
+            if ui.small_button("Remove").clicked() {
+                remove = Some(id);
+            }
+        });
+    }
+    if let Some(id) = remove {
+        draw.remove_view(id);
+        if ui_state.draw_sel == Some(id) {
+            ui_state.draw_sel = None;
+        }
+    }
+
+    ui.separator();
+    ui.collapsing("Title block", |ui| {
+        for (lbl, val) in [
+            ("Part", &mut draw.title.title),
+            ("Material", &mut draw.title.material),
+            ("Drawn by", &mut draw.title.drawn_by),
+            ("Date", &mut draw.title.date),
+            ("Notes", &mut draw.title.notes),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(lbl);
+                ui.add(egui::TextEdit::singleline(val).desired_width(140.0));
+            });
+        }
+    });
+    ui.separator();
+    if ui
+        .add(egui::Button::new(egui::RichText::new("Export SVG…").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 110, 160)))
+        .on_hover_text("Vector sheet at true scale — opens in any browser, and prints 1:1")
+        .clicked()
+    {
+        ui_state.export_svg_request = true;
+    }
+}
+
+/// Third-angle layout: front at the centre, top above it, right to its right, iso top-right.
+fn drawing_auto_layout(draw: &mut Drawing) {
+    let (cx, cy) = (draw.sheet.w * 0.42, draw.sheet.h * 0.45);
+    let step = draw.sheet.w * 0.24;
+    for v in &mut draw.views {
+        v.center = match v.dir {
+            ViewDir::Front => [cx, cy],
+            ViewDir::Top => [cx, cy + step * 0.8],
+            ViewDir::Bottom => [cx, cy - step * 0.8],
+            ViewDir::Right => [cx + step, cy],
+            ViewDir::Left => [cx - step, cy],
+            ViewDir::Back => [cx + step * 2.0, cy],
+            ViewDir::Iso => [cx + step, cy + step * 0.8],
+        };
+    }
+}
+
+fn drawing_part_geometry(path: &std::path::Path) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: Document = ron::from_str(&text).ok()?;
+    let (mesh, _) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc))).ok().flatten()?;
+    let _ = take_fallback_count(); // a drawing rebuild must not raise the torn-surface banner
+    let t = mesh_tessellation(mesh);
+    Some((t.mesh, t.edges))
+}
+
+/// Resolve the drawing's part path against the drawing file's own folder (same relative
+/// scheme assemblies use, so a drawing and its part travel together).
+fn drawing_source_path(ui_state: &UiState, draw: &Drawing) -> Option<std::path::PathBuf> {
+    if draw.source.is_empty() {
+        return None;
+    }
+    let raw = std::path::Path::new(&draw.source);
+    if raw.is_absolute() {
+        return Some(raw.to_path_buf());
+    }
+    let base = ui_state.current_file.as_ref().and_then(|f| f.parent()).map(|d| d.to_path_buf()).unwrap_or_default();
+    Some(base.join(raw))
+}
+
+/// Rebuild the drawing's projected edges when flagged. Each distinct view direction is
+/// projected once and shared by every view using it.
+fn drawing_regenerate(mode: Res<DocMode>, draw: Res<DrawRes>, mut cache: ResMut<DrawCache>, mut ui_state: ResMut<UiState>) {
+    if *mode != DocMode::Drawing || !ui_state.draw_dirty {
+        return;
+    }
+    ui_state.draw_dirty = false;
+    let Some(path) = drawing_source_path(&ui_state, &draw.0) else {
+        cache.proj.clear();
+        cache.mesh = None;
+        return;
+    };
+    // Reload the part only when it changed; re-projecting is cheap next to regenerating.
+    if cache.mesh.is_none() || cache.source != draw.0.source {
+        match drawing_part_geometry(&path) {
+            Some((m, e)) => {
+                cache.mesh = Some(m);
+                cache.edges = e;
+                cache.source = draw.0.source.clone();
+                cache.proj.clear();
+            }
+            None => {
+                cache.mesh = None;
+                cache.proj.clear();
+                ui_state.last_error = Some(format!("Drawing: couldn't build the part {}", path.display()));
+                return;
+            }
+        }
+    }
+    let (Some(mesh), edges) = (cache.mesh.clone(), cache.edges.clone()) else { return };
+    let want: Vec<ViewDir> = draw.0.views.iter().map(|v| v.dir).collect();
+    cache.proj.clear();
+    for dir in want {
+        let key = dir.label().to_string();
+        if cache.proj.contains_key(&key) {
+            continue;
+        }
+        let (d, up) = dir.frame();
+        let basis = ViewBasis::looking_along(d, up);
+        cache.proj.insert(key, project_edges(&mesh, &edges, &basis, 24));
+    }
+}
+
+/// Assemble the sheet items an export needs: each view's projected edges with its placement.
+fn drawing_sheet_items<'a>(draw: &'a Drawing, cache: &'a DrawCache) -> Vec<SheetItem<'a>> {
+    let empty: &[ProjEdge] = &[];
+    draw.views
+        .iter()
+        .map(|v| SheetItem {
+            edges: cache.proj.get(v.dir.label()).map(|e| e.as_slice()).unwrap_or(empty),
+            center: v.center,
+            scale: v.scale,
+            show_hidden: v.show_hidden,
+            label: v.label.then(|| v.dir.label().to_string()),
+        })
+        .collect()
+}
+
+/// The title-block rows, in print order.
+fn drawing_title_rows(draw: &Drawing) -> Vec<(String, String)> {
+    let t = &draw.title;
+    let mut rows = vec![("PART".to_string(), t.title.clone())];
+    if !t.material.is_empty() {
+        rows.push(("MATERIAL".into(), t.material.clone()));
+    }
+    if !t.drawn_by.is_empty() {
+        rows.push(("DRAWN BY".into(), t.drawn_by.clone()));
+    }
+    if !t.date.is_empty() {
+        rows.push(("DATE".into(), t.date.clone()));
+    }
+    let scales: Vec<String> = {
+        // Trim the trailing zeros so a 1:1 view reads "1:1", not "1.000:1".
+        let mut v: Vec<String> = draw.views.iter().map(|w| format!("{}:1", (w.scale * 1000.0).round() / 1000.0)).collect();
+        v.dedup();
+        v
+    };
+    rows.push(("SCALE".into(), if scales.len() == 1 { scales[0].clone() } else { "AS SHOWN".into() }));
+    if !t.notes.is_empty() {
+        rows.push(("NOTES".into(), t.notes.clone()));
+    }
+    rows
 }
 
 fn apply_shell_feature(
@@ -22434,6 +22994,77 @@ mod tests {
         let vol = tri_vol(&m);
         // Open tray = 1952; sealed hollow would be 2464. The gap is what proves it opened.
         assert!((vol - 1952.0).abs() < 1952.0 * 0.1, "quick-pick shell didn't open the face: {vol:.1}");
+    }
+
+    /// End to end: save a part, point a drawing at it, project the standard views, and
+    /// export the sheet — the whole chain the Drawing mode drives.
+    #[test]
+    fn drawing_projects_a_saved_part_and_exports_a_sheet() {
+        // A 30x20x10 plate with a 6mm-deep pocket, so there is interior detail to hide.
+        let mut part = Document::with_default_planes();
+        part.add_feature(FeatureKind::Extrude { sketch: rect_sketch(30.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        part.rollback = part.features.len();
+
+        let dir = std::env::temp_dir().join("hcad_drawing_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part_path = dir.join("plate.hcad");
+        std::fs::write(&part_path, ron::ser::to_string_pretty(&part, ron::ser::PrettyConfig::default()).unwrap()).unwrap();
+
+        // The projection source: exactly what drawing_regenerate loads.
+        let (mesh, edges) = drawing_part_geometry(&part_path).expect("part geometry");
+        assert!(!edges.is_empty(), "no feature edges to draw");
+
+        let mut d = Drawing::default();
+        d.source = "plate.hcad".into();
+        d.title.title = "PLATE".into();
+        for v in [ViewDir::Front, ViewDir::Top, ViewDir::Right] {
+            d.add_view(v, 1.0);
+        }
+        drawing_auto_layout(&mut d);
+        assert_eq!(d.views.len(), 3);
+        // Auto-layout must not stack views on top of each other.
+        for i in 0..d.views.len() {
+            for j in (i + 1)..d.views.len() {
+                let (a, b) = (d.views[i].center, d.views[j].center);
+                assert!((a[0] - b[0]).abs() > 1.0 || (a[1] - b[1]).abs() > 1.0, "views {i} and {j} overlap exactly");
+            }
+        }
+
+        // Project each view and check it reports the dimensions that view should show.
+        let mut proj: std::collections::HashMap<String, Vec<ProjEdge>> = Default::default();
+        for v in &d.views {
+            let (dd, up) = v.dir.frame();
+            let basis = ViewBasis::looking_along(dd, up);
+            let e = project_edges(&mesh, &edges, &basis, 24);
+            assert!(!e.is_empty(), "{} projected nothing", v.dir.label());
+            let (lo, hi) = edges_bounds(&e);
+            let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+            match v.dir {
+                // Front looks down -Z: the 30x20 face.
+                ViewDir::Front => assert!((w - 30.0).abs() < 0.2 && (h - 20.0).abs() < 0.2, "front {w:.1}x{h:.1}"),
+                // Top looks down -Y: 30 across, the 10mm thickness deep.
+                ViewDir::Top => assert!((w - 30.0).abs() < 0.2 && (h - 10.0).abs() < 0.2, "top {w:.1}x{h:.1}"),
+                // Right looks down -X: thickness across, 20 tall.
+                ViewDir::Right => assert!((w - 10.0).abs() < 0.2 && (h - 20.0).abs() < 0.2, "right {w:.1}x{h:.1}"),
+                _ => {}
+            }
+            proj.insert(v.dir.label().to_string(), e);
+        }
+
+        let cache = DrawCache { source: d.source.clone(), mesh: Some(mesh), edges, proj };
+        let items = drawing_sheet_items(&d, &cache);
+        assert_eq!(items.len(), 3);
+        let svg = to_svg(d.sheet.w, d.sheet.h, &items, &drawing_title_rows(&d));
+        assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains("297mm") && svg.contains("210mm"), "A4 sheet not sized in mm");
+        assert!(svg.contains("PLATE"), "title block missing the part name");
+        assert!(svg.contains("Front") && svg.contains("Top") && svg.contains("Right"), "view captions missing");
+        // Views must land inside the sheet, not off the paper.
+        for it in &items {
+            assert!(it.center[0] > 0.0 && it.center[0] < d.sheet.w, "view off sheet: {:?}", it.center);
+            assert!(it.center[1] > 0.0 && it.center[1] < d.sheet.h, "view off sheet: {:?}", it.center);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

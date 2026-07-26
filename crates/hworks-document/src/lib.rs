@@ -479,3 +479,160 @@ pub struct Mate {
     pub a: MateRef,
     pub b: MateRef,
 }
+
+// ---------------------------------------------------------------------------
+// Drawing sheets (.hdrw)
+// ---------------------------------------------------------------------------
+
+/// A sheet size in millimetres. Landscape by convention; swap `w`/`h` for portrait.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Sheet {
+    pub name: String,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Default for Sheet {
+    fn default() -> Self {
+        Sheet::a4()
+    }
+}
+
+impl Sheet {
+    pub fn a4() -> Self {
+        Sheet { name: "A4".into(), w: 297.0, h: 210.0 }
+    }
+    pub fn a3() -> Self {
+        Sheet { name: "A3".into(), w: 420.0, h: 297.0 }
+    }
+    pub fn a2() -> Self {
+        Sheet { name: "A2".into(), w: 594.0, h: 420.0 }
+    }
+    pub fn letter() -> Self {
+        Sheet { name: "Letter".into(), w: 279.4, h: 215.9 }
+    }
+    /// The sizes offered in the UI.
+    pub fn presets() -> Vec<Sheet> {
+        vec![Sheet::a4(), Sheet::a3(), Sheet::a2(), Sheet::letter()]
+    }
+}
+
+/// Which way a view looks at the part. Named to match the default planes and the view cube
+/// (Front = +Z, Top = +Y, Right = +X), so "Front" means the same thing everywhere.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewDir {
+    Front,
+    Back,
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Iso,
+}
+
+impl ViewDir {
+    /// The viewing direction (from the eye into the sheet) and the sheet's up hint.
+    pub fn frame(self) -> ([f64; 3], [f64; 3]) {
+        match self {
+            // Standing on +Z looking toward -Z, with +Y up the sheet.
+            ViewDir::Front => ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+            ViewDir::Back => ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+            // Looking down: the sheet's up becomes the part's -Z (standard third-angle).
+            ViewDir::Top => ([0.0, -1.0, 0.0], [0.0, 0.0, -1.0]),
+            ViewDir::Bottom => ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            ViewDir::Right => ([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            ViewDir::Left => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            ViewDir::Iso => ([-1.0, -1.0, -1.0], [0.0, 1.0, 0.0]),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewDir::Front => "Front",
+            ViewDir::Back => "Back",
+            ViewDir::Top => "Top",
+            ViewDir::Bottom => "Bottom",
+            ViewDir::Left => "Left",
+            ViewDir::Right => "Right",
+            ViewDir::Iso => "Isometric",
+        }
+    }
+
+    pub fn all() -> [ViewDir; 7] {
+        [ViewDir::Front, ViewDir::Top, ViewDir::Right, ViewDir::Iso, ViewDir::Back, ViewDir::Bottom, ViewDir::Left]
+    }
+}
+
+/// One projected view placed on the sheet.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DrawView {
+    pub id: u64,
+    pub dir: ViewDir,
+    /// Where the view's centre sits on the sheet, in millimetres from the bottom-left.
+    pub center: [f64; 2],
+    /// Drawing scale: 1.0 is full size, 0.5 is half.
+    pub scale: f64,
+    /// Draw the edges that are behind material as dashed hidden lines.
+    #[serde(default)]
+    pub show_hidden: bool,
+    /// Print the view's name ("Front") under it.
+    #[serde(default = "yes")]
+    pub label: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// The sheet's title block.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct TitleBlock {
+    pub title: String,
+    pub drawn_by: String,
+    pub date: String,
+    pub material: String,
+    pub notes: String,
+}
+
+/// A drawing: standard views of ONE part, placed on a sheet. The part is referenced by a
+/// path relative to the drawing file (same scheme as assembly components), so moving the pair
+/// together keeps the link.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Drawing {
+    pub sheet: Sheet,
+    /// Relative path to the `.hcad` part this drawing documents.
+    pub source: String,
+    pub views: Vec<DrawView>,
+    pub title: TitleBlock,
+    next_id: u64,
+}
+
+impl Drawing {
+    /// Place a view and return its stable id. New views land at the sheet centre; the caller
+    /// positions them (or the auto-layout does).
+    pub fn add_view(&mut self, dir: ViewDir, scale: f64) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.views.push(DrawView {
+            id,
+            dir,
+            center: [self.sheet.w * 0.5, self.sheet.h * 0.5],
+            scale,
+            show_hidden: false,
+            label: true,
+        });
+        id
+    }
+
+    pub fn view(&self, id: u64) -> Option<&DrawView> {
+        self.views.iter().find(|v| v.id == id)
+    }
+
+    pub fn view_mut(&mut self, id: u64) -> Option<&mut DrawView> {
+        self.views.iter_mut().find(|v| v.id == id)
+    }
+
+    pub fn remove_view(&mut self, id: u64) {
+        self.views.retain(|v| v.id != id);
+    }
+}

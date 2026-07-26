@@ -252,6 +252,126 @@ pub fn edges_bounds(edges: &[ProjEdge]) -> ([f64; 2], [f64; 2]) {
     (lo, hi)
 }
 
+/// One view as it should land on an exported sheet.
+pub struct SheetItem<'a> {
+    pub edges: &'a [ProjEdge],
+    /// Sheet position of the view's centre, in millimetres from the bottom-left.
+    pub center: [f64; 2],
+    pub scale: f64,
+    pub show_hidden: bool,
+    /// Caption printed under the view, if any.
+    pub label: Option<String>,
+}
+
+/// Render a sheet to SVG, in real millimetres so it prints at true scale.
+///
+/// SVG's y axis runs down the page while sheet coordinates run up from the bottom-left, so
+/// every point is flipped on the way out. Hidden lines use the drafting dash pattern.
+pub fn to_svg(sheet_w: f64, sheet_h: f64, items: &[SheetItem], title: &[(String, String)]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{sheet_w}mm\" height=\"{sheet_h}mm\" viewBox=\"0 0 {sheet_w} {sheet_h}\">\n"
+    ));
+    out.push_str("<rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\" fill=\"white\"/>\n");
+    // Sheet border, inset the conventional 10mm.
+    out.push_str(&format!(
+        "<rect x=\"10\" y=\"10\" width=\"{:.3}\" height=\"{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.5\"/>\n",
+        (sheet_w - 20.0).max(0.0),
+        (sheet_h - 20.0).max(0.0)
+    ));
+
+    for it in items {
+        let map = |q: [f64; 2]| {
+            let x = it.center[0] + q[0] * it.scale;
+            let y = it.center[1] + q[1] * it.scale;
+            (x, sheet_h - y) // flip into SVG's y-down space
+        };
+        let mut solid = String::new();
+        let mut hidden = String::new();
+        for e in it.edges {
+            if e.hidden && !it.show_hidden {
+                continue;
+            }
+            let (x0, y0) = map(e.a);
+            let (x1, y1) = map(e.b);
+            let seg = format!("M{x0:.3},{y0:.3} L{x1:.3},{y1:.3} ");
+            if e.hidden {
+                hidden.push_str(&seg);
+            } else {
+                solid.push_str(&seg);
+            }
+        }
+        if !solid.is_empty() {
+            out.push_str(&format!("<path d=\"{solid}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.35\"/>\n"));
+        }
+        if !hidden.is_empty() {
+            out.push_str(&format!(
+                "<path d=\"{hidden}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.25\" stroke-dasharray=\"1.5,1\"/>\n"
+            ));
+        }
+        if let Some(lbl) = &it.label {
+            // Caption under the view's own extents, so it never lands on the geometry.
+            let (lo, hi) = edges_bounds(it.edges);
+            let cx = it.center[0] + (lo[0] + hi[0]) * 0.5 * it.scale;
+            let below = it.center[1] + lo[1] * it.scale - 5.0;
+            out.push_str(&format!(
+                "<text x=\"{cx:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"4\" text-anchor=\"middle\" fill=\"black\">{}</text>\n",
+                sheet_h - below,
+                xml_escape(lbl)
+            ));
+        }
+    }
+
+    // Title block, bottom-right inside the border.
+    if !title.is_empty() {
+        let rows = title.len() as f64;
+        let (bw, rh) = (85.0f64, 7.0f64);
+        let bh = rows * rh;
+        let (bx, by) = (sheet_w - 10.0 - bw, sheet_h - 10.0 - bh);
+        out.push_str(&format!(
+            "<rect x=\"{bx:.3}\" y=\"{by:.3}\" width=\"{bw:.3}\" height=\"{bh:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.5\"/>\n"
+        ));
+        for (i, (k, v)) in title.iter().enumerate() {
+            let y = by + (i as f64 + 0.72) * rh;
+            if i > 0 {
+                let ly = by + i as f64 * rh;
+                out.push_str(&format!(
+                    "<line x1=\"{bx:.3}\" y1=\"{ly:.3}\" x2=\"{:.3}\" y2=\"{ly:.3}\" stroke=\"black\" stroke-width=\"0.25\"/>\n",
+                    bx + bw
+                ));
+            }
+            out.push_str(&format!(
+                "<text x=\"{:.3}\" y=\"{y:.3}\" font-family=\"sans-serif\" font-size=\"3\" fill=\"black\">{}</text>\n",
+                bx + 2.0,
+                xml_escape(k)
+            ));
+            out.push_str(&format!(
+                "<text x=\"{:.3}\" y=\"{y:.3}\" font-family=\"sans-serif\" font-size=\"3.4\" fill=\"black\">{}</text>\n",
+                bx + 26.0,
+                xml_escape(v)
+            ));
+        }
+    }
+    out.push_str("</svg>\n");
+    out
+}
+
+/// Escape the five XML metacharacters so a part name with an ampersand can't corrupt the file.
+fn xml_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&apos;"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +447,37 @@ mod tests {
         let (lo, hi) = edges_bounds(&proj);
         assert!((hi[0] - lo[0] - 40.0).abs() < 0.1, "width {:.2}, wanted the 40mm length", hi[0] - lo[0]);
         assert!((hi[1] - lo[1] - 10.0).abs() < 0.1, "height {:.2}", hi[1] - lo[1]);
+    }
+
+    #[test]
+    fn svg_is_well_formed_and_scales() {
+        let edges = [
+            ProjEdge { a: [0.0, 0.0], b: [10.0, 0.0], hidden: false },
+            ProjEdge { a: [0.0, 0.0], b: [0.0, 10.0], hidden: true },
+        ];
+        let items = [SheetItem { edges: &edges, center: [100.0, 100.0], scale: 2.0, show_hidden: true, label: Some("Front".into()) }];
+        let svg = to_svg(297.0, 210.0, &items, &[("PART".into(), "bracket & pin".into())]);
+        assert!(svg.starts_with("<svg"), "no svg root");
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert_eq!(svg.matches("<svg").count(), 1);
+        // The visible edge runs 10mm at 2x from x=100, so it must end at x=120.
+        assert!(svg.contains("M100.000,110.000 L120.000,110.000"), "solid edge misplaced:\n{svg}");
+        // Hidden edges are dashed, and only drawn when asked for.
+        assert!(svg.contains("stroke-dasharray"));
+        let no_hidden = to_svg(297.0, 210.0, &[SheetItem { edges: &edges, center: [100.0, 100.0], scale: 2.0, show_hidden: false, label: None }], &[]);
+        assert!(!no_hidden.contains("stroke-dasharray"), "hidden lines drawn when switched off");
+        // A part name with an ampersand must not produce invalid XML.
+        assert!(svg.contains("bracket &amp; pin"));
+        assert!(!svg.contains("bracket & pin"));
+    }
+
+    /// Sheet coordinates run up from the bottom-left; SVG runs down. A view near the sheet
+    /// bottom must land near the BOTTOM of the file, not the top.
+    #[test]
+    fn svg_flips_the_y_axis() {
+        let e = [ProjEdge { a: [0.0, 0.0], b: [1.0, 0.0], hidden: false }];
+        let low = to_svg(100.0, 100.0, &[SheetItem { edges: &e, center: [50.0, 10.0], scale: 1.0, show_hidden: false, label: None }], &[]);
+        assert!(low.contains("M50.000,90.000"), "y not flipped:\n{low}");
     }
 
     /// An empty edge set must not panic or invent geometry.
