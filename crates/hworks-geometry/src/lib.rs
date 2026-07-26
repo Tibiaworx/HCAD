@@ -11,6 +11,7 @@
 use truck_meshalgo::prelude::*;
 use truck_modeling::{builder, Point3, Vector3};
 
+pub mod drawing;
 mod bevel;
 mod csg;
 mod fillet;
