@@ -4927,10 +4927,55 @@ fn ui_system(
                 ui.label("Wall thickness");
                 ui.add(egui::DragValue::new(&mut spec.thickness).speed(0.1).suffix(" mm").range(0.05..=1_000.0));
             });
-            ui.label(format!("Faces to remove: {}", spec.open.len()));
-            ui.label(egui::RichText::new("Click faces on the body to open the shell through them (click again to unpick). None picked = a fully enclosed hollow.").weak().small());
-            if !spec.open.is_empty() && ui.small_button("Clear picked faces").clicked() {
-                clear = true;
+            ui.separator();
+            // Quick pick: the six axis faces. Opening an enclosure's top (or both ends of a
+            // tube) is the common case, and hunting for the face in the viewport - then
+            // checking the pick registered - is the slow way to do it.
+            ui.label("Open a face:");
+            let picked_dir = |d: Vec3| {
+                spec.open
+                    .iter()
+                    .any(|(_, n)| Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32).normalize_or_zero().dot(d) > 0.985)
+            };
+            let mut toggle_face: Option<Vec3> = None;
+            egui::Grid::new("shell_quick_faces").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
+                for row in [
+                    [("Front", Vec3::Z), ("Top", Vec3::Y), ("Right", Vec3::X)],
+                    [("Back", Vec3::NEG_Z), ("Bottom", Vec3::NEG_Y), ("Left", Vec3::NEG_X)],
+                ] {
+                    for (lbl, d) in row {
+                        if ui
+                            .selectable_label(picked_dir(d), lbl)
+                            .on_hover_text("Open the shell through this face (click again to close it)")
+                            .clicked()
+                        {
+                            toggle_face = Some(d);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.label(egui::RichText::new("...or click any face on the body, including ones not square to an axis.").weak().small());
+            ui.separator();
+            // The picked faces, each removable: an enclosure usually opens exactly one, and
+            // getting an unwanted one off shouldn't mean clearing the lot.
+            let mut remove_face: Option<usize> = None;
+            if spec.open.is_empty() {
+                ui.label(egui::RichText::new("No faces open - this builds a sealed hollow.").weak().small());
+            } else {
+                ui.label(format!("Faces to remove: {}", spec.open.len()));
+                for (i, (_, n)) in spec.open.iter().enumerate() {
+                    let nv = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("\u{2716}").on_hover_text("Close this face again").clicked() {
+                            remove_face = Some(i);
+                        }
+                        ui.label(axis_face_name(nv));
+                    });
+                }
+                if ui.small_button("Clear picked faces").clicked() {
+                    clear = true;
+                }
             }
             ui.separator();
             if commit {
@@ -4942,12 +4987,42 @@ fn ui_system(
                     doc.0.rollback = doc.0.features.len();
                     ui_state.regen = true;
                 }
-            } else if let Some(cur) = ui_state.shell_spec.as_mut() {
-                // Viewport clicks edit `open` directly on ui_state, so only write back the
-                // fields this panel owns (a pick landing mid-frame must not be lost).
-                cur.thickness = spec.thickness;
-                if clear {
-                    cur.open.clear();
+            } else {
+                let mut no_face = false;
+                if let Some(cur) = ui_state.shell_spec.as_mut() {
+                    // Viewport clicks edit `open` directly on ui_state, so only write back the
+                    // fields this panel owns (a pick landing mid-frame must not be lost).
+                    cur.thickness = spec.thickness;
+                    if clear {
+                        cur.open.clear();
+                    }
+                    if let Some(i) = remove_face {
+                        if i < cur.open.len() {
+                            cur.open.remove(i);
+                        }
+                    }
+                    if let Some(d) = toggle_face {
+                        let hits: Vec<usize> = cur
+                            .open
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (_, n))| Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32).normalize_or_zero().dot(d) > 0.985)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if hits.is_empty() {
+                            match part.mesh.as_ref().and_then(|m| outermost_face_toward(m, d)) {
+                                Some((p, n)) => cur.open.push(([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64])),
+                                None => no_face = true, // nothing flat facing that way
+                            }
+                        } else {
+                            for i in hits.into_iter().rev() {
+                                cur.open.remove(i);
+                            }
+                        }
+                    }
+                }
+                if no_face {
+                    ui_state.toasts.push(("No flat face on that side - click the face on the body instead".to_string(), 3.5));
                 }
             }
         }
@@ -15946,6 +16021,49 @@ fn apply_pattern_feature(
 }
 
 /// Append (or, when editing, replace) a confirmed Shell feature.
+/// The outermost flat face pointing along `dir`: the (point, normal) pair Shell needs to
+/// open a face. Picks the triangle whose normal aligns with `dir` and sits furthest out along
+/// it, so "Top" opens the actual top face rather than any parallel ledge below it. The point
+/// returned is a triangle centroid, so it genuinely lies on the face.
+fn outermost_face_toward(mesh: &TriMesh, dir: Vec3) -> Option<(Vec3, Vec3)> {
+    let dir = dir.normalize_or_zero();
+    let mut best: Option<(f32, Vec3, Vec3)> = None; // (offset along dir, centroid, normal)
+    for t in mesh.indices.chunks_exact(3) {
+        let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+        let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+        let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        if n.dot(dir) <= 0.985 {
+            continue;
+        }
+        let ctr = (a + b + c) / 3.0;
+        let off = ctr.dot(dir);
+        if best.as_ref().is_none_or(|(bo, _, _)| off > *bo) {
+            best = Some((off, ctr, n));
+        }
+    }
+    best.map(|(_, c, n)| (c, n))
+}
+
+/// Name a face by its normal, using the same words as the view cube and the default planes
+/// (Front = +Z, Top = +Y, Right = +X).
+fn axis_face_name(n: Vec3) -> &'static str {
+    let n = n.normalize_or_zero();
+    for (d, name) in [
+        (Vec3::Z, "Front"),
+        (Vec3::NEG_Z, "Back"),
+        (Vec3::Y, "Top"),
+        (Vec3::NEG_Y, "Bottom"),
+        (Vec3::X, "Right"),
+        (Vec3::NEG_X, "Left"),
+    ] {
+        if n.dot(d) > 0.985 {
+            return name;
+        }
+    }
+    "Face"
+}
+
 fn apply_shell_feature(
     mut ui_state: ResMut<UiState>,
     mut doc: ResMut<DocRes>,
@@ -22021,6 +22139,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn quick_face_pick_takes_the_outermost_face_not_a_lower_ledge() {
+        // Stepped body: 20x20 slab 10 deep, plus a 10x10 boss 5 more. Two faces point +Z --
+        // the boss top at 15 and the shoulder ring at 10. The Shell panel's "Front" button
+        // must open the boss top, not the ledge underneath it.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut boss = Sketch::default();
+        let a = boss.add_point(5.0, 5.0);
+        let b = boss.add_point(15.0, 5.0);
+        let c = boss.add_point(15.0, 15.0);
+        let d = boss.add_point(5.0, 15.0);
+        boss.add_line(a, b, false);
+        boss.add_line(b, c, false);
+        boss.add_line(c, d, false);
+        boss.add_line(d, a, false);
+        let top = PlaneRef { origin: [0.0, 0.0, 10.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: top, distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("stepped body");
+
+        let (p, n) = outermost_face_toward(&m, Vec3::Z).expect("a +Z face exists");
+        assert!((p.z - 15.0).abs() < 1e-3, "picked a lower ledge at z={:.2}, wanted the top at 15", p.z);
+        assert!(n.dot(Vec3::Z) > 0.985, "normal not facing +Z: {n:?}");
+        // The point must lie on the boss footprint, so Shell matches the right triangles.
+        assert!((5.0..=15.0).contains(&p.x) && (5.0..=15.0).contains(&p.y), "point off the boss face: {p:?}");
+
+        // And the opposite side still finds the slab's back face.
+        let (pb, _) = outermost_face_toward(&m, Vec3::NEG_Z).expect("a -Z face exists");
+        assert!(pb.z.abs() < 1e-3, "back face not at z=0: {:.2}", pb.z);
+
+        // A direction with no flat face square to it yields nothing (the panel toasts).
+        assert!(outermost_face_toward(&m, Vec3::new(1.0, 1.0, 1.0).normalize()).is_none());
+    }
+
+    #[test]
+    fn shell_opens_the_face_the_quick_button_picks() {
+        // End to end: use the panel's own helper to choose the face, feed it to Shell, and
+        // confirm the result is the open tray (not the sealed hollow).
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (box_mesh, _) = regenerate_mesh(&doc).expect("box");
+        let (p, n) = outermost_face_toward(&box_mesh, Vec3::Z).expect("+Z face");
+
+        doc.add_feature(FeatureKind::Shell {
+            thickness: 2.0,
+            open: vec![([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64])],
+        });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("shelled");
+        let vol = tri_vol(&m);
+        // Open tray = 1952; sealed hollow would be 2464. The gap is what proves it opened.
+        assert!((vol - 1952.0).abs() < 1952.0 * 0.1, "quick-pick shell didn't open the face: {vol:.1}");
     }
 
     #[test]
