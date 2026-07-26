@@ -197,7 +197,7 @@ fn clean_loop(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
     // Pass 1: remove consecutive duplicates (and the wrap-around duplicate).
     let mut out: Vec<[f64; 2]> = Vec::with_capacity(pts.len());
     for &p in pts {
-        if out.last().map_or(true, |&q| !close(p, q)) {
+        if out.last().is_none_or(|&q| !close(p, q)) {
             out.push(p);
         }
     }
@@ -1543,7 +1543,7 @@ pub fn fit_region(m: &TriMesh, seed_tri: usize, max_dist: f32) -> Option<(Region
                 centroid[1] + ax_u[1] * c2[0] + ax_v[1] * c2[1],
                 centroid[2] + ax_u[2] * c2[0] + ax_v[2] * c2[1],
             ];
-            let errs: Vec<f32> = p2.iter().map(|q| (((q[0] - c2[0]).powi(2) + (q[1] - c2[1]).powi(2)).sqrt() - r)).collect();
+            let errs: Vec<f32> = p2.iter().map(|q| ((q[0] - c2[0]).powi(2) + (q[1] - c2[1]).powi(2)).sqrt() - r).collect();
             (center, axis, r, rms(&errs))
         })
     };

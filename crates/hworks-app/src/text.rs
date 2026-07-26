@@ -135,7 +135,7 @@ fn best_face(family: &str, bold: bool, italic: bool) -> Option<&'static FaceEntr
         }
         // Lower score = better match.
         let score = (e.bold != bold) as i32 + (e.italic != italic) as i32;
-        if best.map_or(true, |(_, bs)| score < bs) {
+        if best.is_none_or(|(_, bs)| score < bs) {
             best = Some((e, score));
         }
     }

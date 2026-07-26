@@ -11,6 +11,9 @@
 use bevy_egui::egui;
 
 /// Every icon the toolbars can draw.
+// `Sketch` isn't on a toolbar button yet — it's for the drawing-sheet views, which reference
+// sketches. Kept rather than deleted so the artwork set stays complete.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icon {
     // --- sketch tools ---

@@ -612,8 +612,8 @@ impl Sketch {
 
         // Primary (even-depth) regions first, preserving index stability; then the
         // odd-depth holes as nested, selectable disks.
-        let mut regions: Vec<Region> = (0..n).filter(|&i| depth[i] % 2 == 0).map(|i| make(i, false)).collect();
-        regions.extend((0..n).filter(|&i| depth[i] % 2 != 0).map(|i| make(i, true)));
+        let mut regions: Vec<Region> = (0..n).filter(|&i| depth[i].is_multiple_of(2)).map(|i| make(i, false)).collect();
+        regions.extend((0..n).filter(|&i| !depth[i].is_multiple_of(2)).map(|i| make(i, true)));
         regions
     }
 
@@ -1095,7 +1095,7 @@ fn loop_interior_point(l: &[[f64; 2]]) -> [f64; 2] {
         let mut k = 0;
         while k + 1 < xs.len() {
             let w = xs[k + 1] - xs[k];
-            if w > 1e-9 && best.map_or(true, |(bw, _)| w > bw) {
+            if w > 1e-9 && best.is_none_or(|(bw, _)| w > bw) {
                 best = Some((w, (xs[k] + xs[k + 1]) * 0.5));
             }
             k += 2;

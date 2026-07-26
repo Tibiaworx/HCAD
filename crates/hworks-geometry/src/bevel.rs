@@ -218,7 +218,7 @@ pub fn build_topo(mesh: &TriMesh) -> Topo {
                 }
                 loop_v.push(nv);
                 cur = nv;
-                if dir.get(&cur).map_or(true, |v| v.is_empty()) {
+                if dir.get(&cur).is_none_or(|v| v.is_empty()) {
                     break; // open chain (shouldn't happen on a watertight face)
                 }
             }

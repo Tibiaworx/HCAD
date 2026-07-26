@@ -24,7 +24,7 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef};
 use hworks_geometry::{
-    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid, extrude_solid_arcs,
+    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
     export_step, export_stl, extrude_tool_mesh, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
@@ -349,7 +349,7 @@ fn pick_ghost_face(asm: &Assembly, render: &AsmRender, eid: u64, ray: &Ray3d) ->
         let ld = rel_inv.transform_vector3(ray.direction.as_vec3()).normalize_or_zero();
         let Ok(ldir) = Dir3::new(ld) else { continue };
         if let Some((t, ap)) = pick_face(&geom.tri, &Ray3d::new(lo, ldir)) {
-            if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+            if best.as_ref().is_none_or(|(bt, _)| t < *bt) {
                 // Map the picked plane back into the edited part's frame.
                 let plane = ActivePlane {
                     name: "Face".into(),
@@ -796,7 +796,7 @@ fn pick_mate_edge(
         let Some(si) = pick_edge(&wedges, camera, cam_gt, cursor, thresh) else { continue };
         let (a, b) = (Vec3::from_array(wedges[si][0]), Vec3::from_array(wedges[si][1]));
         let d = segment_screen_dist(camera, cam_gt, cursor, a, b).unwrap_or(f32::MAX);
-        if best.as_ref().map_or(true, |(bd, _, _, _)| d < *bd) {
+        if best.as_ref().is_none_or(|(bd, _, _, _)| d < *bd) {
             let (chain, closed) = edge_chain(&wedges, si);
             best = Some((d, comp.id, chain, closed));
         }
@@ -863,7 +863,7 @@ fn mate_pick_at(
             let b = Vec3::from_array(geom.tri.positions[tri[1] as usize]);
             let c = Vec3::from_array(geom.tri.positions[tri[2] as usize]);
             if let Some(t) = ray_triangle(lo, ld, a, b, c) {
-                if best.map_or(true, |(bt, _, _, _)| t < bt) {
+                if best.is_none_or(|(bt, _, _, _)| t < bt) {
                     best = Some((t, comp.id, ti, lo + ld * t));
                 }
             }
@@ -1547,7 +1547,7 @@ fn asm_interaction(
                         let w = raw + f;
                         for tgt in &drag.targets {
                             let adj = tgt - w;
-                            if adj.abs() < tol && best_adj.map_or(true, |b: f64| adj.abs() < b.abs()) {
+                            if adj.abs() < tol && best_adj.is_none_or(|b: f64| adj.abs() < b.abs()) {
                                 best_adj = Some(adj);
                             }
                         }
@@ -1589,7 +1589,7 @@ fn asm_interaction(
             let b = Vec3::from_array(geom.tri.positions[tri[1] as usize]);
             let c = Vec3::from_array(geom.tri.positions[tri[2] as usize]);
             if let Some(t) = ray_triangle(lo, ld, a, b, c) {
-                if best.map_or(true, |(bt, _)| t < bt) {
+                if best.is_none_or(|(bt, _)| t < bt) {
                     best = Some((t, comp.id));
                 }
             }
@@ -4313,7 +4313,7 @@ fn ui_system(
                     let mut lb = (pb - pm).length();
                     // Move an endpoint to a new half-length, sliding along its current
                     // direction from the (fixed) centre. Falls back to +X if degenerate.
-                    let mut set_len = |sk: &mut Sketch, end: usize, len: f32| {
+                    let set_len = |sk: &mut Sketch, end: usize, len: f32| {
                         let m = Vec2::new(sk.points[mid].x as f32, sk.points[mid].y as f32);
                         let e = Vec2::new(sk.points[end].x as f32, sk.points[end].y as f32);
                         let dir = (e - m).normalize_or_zero();
@@ -4477,7 +4477,7 @@ fn ui_system(
                         ui.add(egui::DragValue::new(&mut session.pat_fill_margin).range(0.0..=1000.0).speed(0.05).suffix(" mm"));
                         ui.end_row();
                     });
-                    let region = session.selected_contours.first().is_some();
+                    let region = !session.selected_contours.is_empty();
                     ui.label(if region {
                         egui::RichText::new("Boundary region: selected ✓").color(egui::Color32::from_rgb(90, 200, 120))
                     } else {
@@ -5317,8 +5317,7 @@ fn ui_system(
                     }
                 }
             });
-            if ui.checkbox(&mut spec.rh, "Right-handed").changed() {
-            }
+            ui.checkbox(&mut spec.rh, "Right-handed").changed();
             ui.label(egui::RichText::new(format!("Major Ø {:.2} mm", spec.major_d())).weak().small());
             if spec.internal {
                 // The pilot hole to drill before tapping (metric rule d − p; a close
@@ -6826,7 +6825,7 @@ fn ui_system(
                     // — like the sketch's over-defined diagnostics, so a part that won't seat
                     // isn't a guessing game.
                     let res = mate_residual(&asm.0, m);
-                    let ok = res.map_or(true, mate_satisfied);
+                    let ok = res.is_none_or(mate_satisfied);
                     let mut rt = egui::RichText::new(label).small();
                     if !ok {
                         rt = rt.color(egui::Color32::from_rgb(235, 90, 90));
@@ -6982,7 +6981,7 @@ fn ui_system(
                     .enumerate()
                     .map(|(order, (id, p))| {
                         let fi = doc.0.features.iter().position(|f| f.id == *id);
-                        let hidden = fi.map_or(false, |i| doc.0.features[i].hidden);
+                        let hidden = fi.is_some_and(|i| doc.0.features[i].hidden);
                         (order, p.name.clone(), fi, p.offset.clone(), hidden)
                     })
                     .collect();
@@ -7220,7 +7219,7 @@ fn ui_system(
                                 ex += 1;
                                 (format!("Revolve{ex}  ({:.0}°)", angle.to_degrees()), format!("Sketch of Revolve{ex}"))
                             };
-                            let resp = egui::CollapsingHeader::new(styled(format!("{label}")))
+                            let resp = egui::CollapsingHeader::new(styled(label.to_string()))
                                 .id_salt(i)
                                 .default_open(false)
                                 .show(ui, |ui| {
@@ -7520,12 +7519,12 @@ fn ui_system(
 
                 // ---- Draggable rollback bar, in the tree (SolidWorks-style) ----
                 if !feat_rows.is_empty() {
-                    let bar_y = match feat_rows.iter().filter(|(d, _)| *d < rollback).last() {
+                    let bar_y = match feat_rows.iter().filter(|(d, _)| *d < rollback).next_back() {
                         Some((_, last)) => last.bottom() + 2.0,
                         None => feat_rows[0].1.top() - 2.0,
                     };
                     let x = ui.max_rect().x_range();
-                    let bar_rect = egui::Rect::from_x_y_ranges(x.clone(), (bar_y - 3.0)..=(bar_y + 3.0));
+                    let bar_rect = egui::Rect::from_x_y_ranges(x, (bar_y - 3.0)..=(bar_y + 3.0));
                     let resp = ui.interact(bar_rect, ui.id().with("rollback_bar"), egui::Sense::drag());
                     let col = egui::Color32::from_rgb(70, 140, 220);
                     ui.painter().hline(x, bar_y, egui::Stroke::new(2.0, col));
@@ -7902,7 +7901,7 @@ fn ui_system(
                         // current pose and glide to it (so the transition animates).
                         let cur = (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius);
                         look_along(&mut orbit, ap.origin, ap.n);
-                        recenter_for_panel(&mut orbit, ctx.screen_rect().height(), ui_state.view_center_offset);
+                        recenter_for_panel(&mut orbit, ctx.content_rect().height(), ui_state.view_center_offset);
                         let tgt = (orbit.focus, orbit.radius, orbit.yaw, orbit.pitch);
                         (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius) = cur;
                         orbit.animate_to(tgt.0, tgt.1, tgt.2, tgt.3);
@@ -7992,7 +7991,7 @@ fn ui_system(
         // Deferred click actions (the constraint loop holds an immutable borrow of session).
         let mut dim_action: Option<(usize, bool)> = None; // (constraint index, double-clicked?)
         let mut dia_action: Option<usize> = None; // circle centre to attach a Ø dim to
-        let mut act = |resp: Option<egui::Response>, ci: usize, slot: &mut Option<(usize, bool)>| {
+        let act = |resp: Option<egui::Response>, ci: usize, slot: &mut Option<(usize, bool)>| {
             if let Some(r) = resp {
                 if r.double_clicked() {
                     *slot = Some((ci, true));
@@ -8134,7 +8133,7 @@ fn ui_system(
                 let labpos = valid.then(|| (pv(mid) + pv(end)) * 0.5);
                 let screen = labpos.and_then(|uv| camera.world_to_viewport(cam_gt, ap.to_world(uv)).ok());
                 if let Some(s) = screen {
-                    let r = ctx.screen_rect();
+                    let r = ctx.content_rect();
                     let pos = egui::pos2(
                         s.x.clamp(r.left() + 8.0, (r.right() - 120.0).max(r.left() + 8.0)),
                         s.y.clamp(r.top() + 96.0, (r.bottom() - 40.0).max(r.top() + 96.0)),
@@ -8273,7 +8272,7 @@ fn ui_system(
                 .map(|s| {
                     // Keep the Modify box on-screen (below the toolbar, inside the right
                     // edge) even when the dimension itself sits near/off a screen corner.
-                    let r = ctx.screen_rect();
+                    let r = ctx.content_rect();
                     let x = s.x.clamp(r.left() + 8.0, (r.right() - 175.0).max(r.left() + 8.0));
                     let y = s.y.clamp(r.top() + 96.0, (r.bottom() - 40.0).max(r.top() + 96.0));
                     (kind, egui::pos2(x, y))
@@ -8327,7 +8326,7 @@ fn ui_system(
                                         *value = if *diameter { v * 0.5 } else { v };
                                     }
                                     Some(Constraint::Angle { value, a, b, .. }) => {
-                                        *value = (v as f64).to_radians();
+                                        *value = v.to_radians();
                                         angle_ref = Some([*a, *b]);
                                     }
                                     Some(Constraint::PointLineDistance { value, .. }) => *value = v,
@@ -8421,7 +8420,7 @@ fn ui_system(
 
     if let Some(msg) = ui_state.last_error.clone() {
         let mut dismiss = false;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("error_banner"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(screen.center().x - 300.0, screen.top() + 48.0))
@@ -8484,7 +8483,7 @@ fn ui_system(
                     let (axis, label, col) = axes[i];
                     let tip = c + proj(axis) * r;
                     let positive = !label.starts_with('-');
-                    let hovered = ptr.map_or(false, |p| p.distance(tip) < 12.0);
+                    let hovered = ptr.is_some_and(|p| p.distance(tip) < 12.0);
                     // Axis stick (only for the positive tips, so the gizmo reads as a 3-arm triad).
                     if positive {
                         painter.line_segment([c, tip], egui::Stroke::new(2.0, col));
@@ -8639,7 +8638,7 @@ fn ui_system(
     // declared by now, so available_rect is the true remaining viewport).
     {
         let vr = ctx.available_rect();
-        let sr = ctx.screen_rect();
+        let sr = ctx.content_rect();
         let d = vr.center() - sr.center();
         ui_state.view_center_offset = (d.x, d.y);
     }
@@ -8695,7 +8694,7 @@ fn nearest_point(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (i, p) in sketch.points.iter().enumerate() {
         let d = Vec2::new(p.x as f32, p.y as f32).distance(uv);
-        if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+        if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((i, d));
         }
     }
@@ -8772,10 +8771,10 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
     let mut vx: Option<(Vec2, Option<usize>)> = None; // anchor with matching X → vertical guide
     let mut hy: Option<(Vec2, Option<usize>)> = None; // anchor with matching Y → horizontal guide
     for &(a, idx) in &anchors {
-        if (a.x - cur.x).abs() <= tol && (a.y - cur.y).abs() > tol && vx.map_or(true, |(b, _): (Vec2, _)| (a.x - cur.x).abs() < (b.x - cur.x).abs()) {
+        if (a.x - cur.x).abs() <= tol && (a.y - cur.y).abs() > tol && vx.is_none_or(|(b, _): (Vec2, _)| (a.x - cur.x).abs() < (b.x - cur.x).abs()) {
             vx = Some((a, idx));
         }
-        if (a.y - cur.y).abs() <= tol && (a.x - cur.x).abs() > tol && hy.map_or(true, |(b, _): (Vec2, _)| (a.y - cur.y).abs() < (b.y - cur.y).abs()) {
+        if (a.y - cur.y).abs() <= tol && (a.x - cur.x).abs() > tol && hy.is_none_or(|(b, _): (Vec2, _)| (a.y - cur.y).abs() < (b.y - cur.y).abs()) {
             hy = Some((a, idx));
         }
     }
@@ -8814,7 +8813,7 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
             }
             let proj = pa + dir * t;
             let d = cur.distance(proj);
-            if d <= tol && best.map_or(true, |(bd, _, _)| d < bd) {
+            if d <= tol && best.is_none_or(|(bd, _, _)| d < bd) {
                 let near = if t < 0.0 { pa } else { pb };
                 best = Some((d, proj, near));
             }
@@ -8870,7 +8869,7 @@ fn snap_drag_target(session: &SketchSession, i: usize, uv: Vec2) -> Vec2 {
     let mut best: Option<(Vec2, f32)> = None;
     let mut consider = |p: Vec2| {
         let d = p.distance(uv);
-        if d <= snap && best.map_or(true, |(_, bd)| d < bd) {
+        if d <= snap && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((p, d));
         }
     };
@@ -8923,7 +8922,7 @@ fn get_or_add_point_ref(session: &mut SketchSession, uv: Vec2, snap: f32) -> usi
             continue;
         }
         let d = Vec2::new(p.x as f32, p.y as f32).distance(uv);
-        if d <= snap && best.map_or(true, |(_, bd)| d < bd) {
+        if d <= snap && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((i, d));
         }
     }
@@ -9029,7 +9028,7 @@ fn clean_redundant_relations(sketch: &mut Sketch) -> usize {
 fn maybe_add_point_on_circle(sketch: &mut Sketch, p: usize, tol: f32) {
     // A fixed (body-projected) point can't move — relating it does nothing at best, and at worst
     // creates an unsatisfiable constraint (two pinned points that don't quite coincide).
-    if sketch.points.get(p).map_or(true, |q| q.fixed) {
+    if sketch.points.get(p).is_none_or(|q| q.fixed) {
         return;
     }
     // One curve constraint per point: if `p` is already pinned to a line/arc/circle, don't stack
@@ -9079,7 +9078,7 @@ enum LineHit {
 fn maybe_add_point_on_sketch_line(sketch: &mut Sketch, p: usize, tol: f32) {
     // Never relate a fixed point (see maybe_add_point_on_circle) — a Coincident between two
     // pinned-but-not-identical points is permanently infeasible and poisons every later solve.
-    if sketch.points.get(p).map_or(true, |q| q.fixed) {
+    if sketch.points.get(p).is_none_or(|q| q.fixed) {
         return;
     }
     let pp = Vec2::new(sketch.points[p].x as f32, sketch.points[p].y as f32);
@@ -9192,7 +9191,7 @@ fn edge_snap_point(es: EdgeSnap, uv: Vec2) -> Vec2 {
 /// is enough).
 fn maybe_add_point_on_edge(session: &mut SketchSession, p: usize, edge: Option<EdgeSnap>) {
     let Some(edge) = edge else { return };
-    if session.sketch.points.get(p).map_or(true, |pt| pt.fixed) {
+    if session.sketch.points.get(p).is_none_or(|pt| pt.fixed) {
         return;
     }
     // One curve constraint per point (see maybe_add_point_on_circle): a sketch-circle pin and its
@@ -9329,7 +9328,7 @@ fn nearest_entity(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
             }
             SketchEntity::Point { .. } => continue,
         };
-        if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+        if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((i, d));
         }
     }
@@ -9975,7 +9974,7 @@ fn sketch_interaction(
         // every frame there; the report refreshes on release.
         if session.drag.is_none() {
             let fp = sketch_fingerprint(&session.sketch);
-            if session.dof_cache.as_ref().map_or(true, |(f, _)| *f != fp) {
+            if session.dof_cache.as_ref().is_none_or(|(f, _)| *f != fp) {
                 session.dof_cache = Some((fp, session.sketch.dof_report()));
             }
         }
@@ -10035,8 +10034,8 @@ fn sketch_interaction(
 
     // Fit-datum-from-surface (view mode, mesh PM): one click on the edited mesh fits the
     // smooth region around the hit and creates the matching reference plane.
-    if ui_state.scan_fit && session.plane.is_none() && !blocking.0 {
-        if buttons.just_pressed(MouseButton::Left) {
+    if ui_state.scan_fit && session.plane.is_none() && !blocking.0
+        && buttons.just_pressed(MouseButton::Left) {
             if let (Some(cursor), Some(idx)) = (window.cursor_position(), ui_state.mesh_edit) {
                 let placed = doc.0.features.get(idx).and_then(|f| match &f.kind {
                     FeatureKind::ImportMesh { data, scale, rot_deg, offset, solidify, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, true, *solidify),
@@ -10098,12 +10097,11 @@ fn sketch_interaction(
             }
             return; // consume the click
         }
-    }
 
     // 3-point align (view mode, while the mesh PM's align session is active): click points on
     // the edited mesh feature's own surface — its placed TriMesh, not the body.
-    if ui_state.mesh_align.is_some() && session.plane.is_none() && !blocking.0 {
-        if buttons.just_pressed(MouseButton::Left) {
+    if ui_state.mesh_align.is_some() && session.plane.is_none() && !blocking.0
+        && buttons.just_pressed(MouseButton::Left) {
             if let (Some(cursor), Some(idx)) = (window.cursor_position(), ui_state.mesh_edit) {
                 let placed = doc.0.features.get(idx).and_then(|f| match &f.kind {
                     FeatureKind::ImportMesh { data, scale, rot_deg, offset, solidify, .. } => import_mesh_cached(data, *scale, *rot_deg, *offset, true, *solidify),
@@ -10121,11 +10119,10 @@ fn sketch_interaction(
             }
             return; // consume the click — don't also select faces/edges underneath
         }
-    }
 
     // 3-point plane (view mode): click reference points; the third click creates the plane.
-    if ui_state.plane_3pt.is_some() && session.plane.is_none() && !blocking.0 {
-        if buttons.just_pressed(MouseButton::Left) {
+    if ui_state.plane_3pt.is_some() && session.plane.is_none() && !blocking.0
+        && buttons.just_pressed(MouseButton::Left) {
             if let Some(p) = window
                 .cursor_position()
                 .and_then(|cursor| pick_body_or_scan_point(&part, &doc.0, camera, cam_gt, cursor))
@@ -10159,12 +10156,11 @@ fn sketch_interaction(
             }
             return; // consume the click
         }
-    }
 
     // Measure tool (view mode): click body feature points (vertex / edge midpoint, else the surface
     // hit); two points give a distance (shown in the status bar). A third click starts a new pair.
-    if ui_state.measuring && session.plane.is_none() && !blocking.0 {
-        if buttons.just_pressed(MouseButton::Left) {
+    if ui_state.measuring && session.plane.is_none() && !blocking.0
+        && buttons.just_pressed(MouseButton::Left) {
             if let Some(cursor) = window.cursor_position() {
                 if let Some(p) = pick_body_or_scan_point(&part, &doc.0, camera, cam_gt, cursor) {
                     if ui_state.measure_pts.len() >= 2 {
@@ -10175,7 +10171,6 @@ fn sketch_interaction(
             }
             return;
         }
-    }
 
     // Reference-image calibration: while the "Calibrate scale" tool is armed, the user DRAGS a line
     // across a known feature of the picture (press = start, drag = rubber-band, release = end). A
@@ -10232,7 +10227,7 @@ fn sketch_interaction(
                     let w = ap.to_world(Vec2::new(p.x as f32, p.y as f32));
                     if let Ok(s) = camera.world_to_viewport(cam_gt, w) {
                         let d = s.distance(cursor);
-                        if d < 16.0 && best.map_or(true, |(bd, _)| d < bd) {
+                        if d < 16.0 && best.is_none_or(|(bd, _)| d < bd) {
                             best = Some((d, w));
                         }
                     }
@@ -10576,7 +10571,7 @@ fn sketch_interaction(
                         for w in uvs[*s..=*e].windows(2) {
                             d = d.min(closest_on_segment(uv, w[0], w[1]).distance(uv));
                         }
-                        if best.map_or(true, |(_, bd)| d < bd) {
+                        if best.is_none_or(|(_, bd)| d < bd) {
                             best = Some((ri, d));
                         }
                     }
@@ -10657,7 +10652,7 @@ fn sketch_interaction(
             // yanks the line off a slanted edge (the triangle-edge bug).
             let near = |p: Vec2, t: f32| p.distance(cur) <= t;
             let strong = snap * 0.6;
-            let snapped_to_target = session.cursor_raw_uv.map_or(false, |raw| raw.distance(cur) > 1e-4)
+            let snapped_to_target = session.cursor_raw_uv.is_some_and(|raw| raw.distance(cur) > 1e-4)
                 || session.cursor_edge.is_some()
                 || session.hover_edge.is_some_and(|es| edge_snap_point(es, cur).distance(cur) <= strong);
             let on_strong = snapped_to_target
@@ -10694,7 +10689,7 @@ fn sketch_interaction(
                     let snapped = base + ((ang - base) / step).round() * step;
                     let mut err = (ang - snapped).abs();
                     err = err.min(std::f32::consts::TAU - err);
-                    if best.map_or(true, |(be, _)| err < be) {
+                    if best.is_none_or(|(be, _)| err < be) {
                         best = Some((err, Vec2::new(snapped.cos(), snapped.sin())));
                     }
                 }
@@ -10727,7 +10722,7 @@ fn sketch_interaction(
             // alignment is how a line aimed at a corner ended up rotated 90° off. Sitting ON a
             // hovered edge counts too — tracing along an edge doesn't move the cursor, so the
             // movement test alone misses it.
-            let snapped_to_target = session.cursor_raw_uv.map_or(false, |raw| raw.distance(cur) > 1e-4)
+            let snapped_to_target = session.cursor_raw_uv.is_some_and(|raw| raw.distance(cur) > 1e-4)
                 || session.cursor_edge.is_some()
                 || session.hover_edge.is_some_and(|es| edge_snap_point(es, cur).distance(cur) <= snap * 0.6);
             let coincident = nearest_point(&session.sketch, cur, snap * 0.5).is_some()
@@ -10819,7 +10814,7 @@ fn sketch_interaction(
                             let vb = Vec2::new(pb.x as f32, pb.y as f32);
                             let d = closest_on_segment(uv, va, vb).distance(uv);
                             if d <= snap * 2.0 {
-                                let better = best.map_or(true, |(_, bref, bd)| {
+                                let better = best.is_none_or(|(_, bref, bd)| {
                                     (*reference, d) < (bref, bd) || (*reference == bref && d < bd)
                                 });
                                 if better {
@@ -10929,7 +10924,7 @@ fn sketch_interaction(
                         let ap = active_plane_from_ref(plane, "");
                         if let Some((t, uv)) = ray_plane(&ap, &ray) {
                             for (ri, r) in sketch.regions().iter().enumerate() {
-                                if point_in_poly([uv.x as f64, uv.y as f64], &r.outer) && best.map_or(true, |(bt, _, _)| t < bt) {
+                                if point_in_poly([uv.x as f64, uv.y as f64], &r.outer) && best.is_none_or(|(bt, _, _)| t < bt) {
                                     best = Some((t, pi, ri));
                                 }
                             }
@@ -10980,14 +10975,14 @@ fn sketch_interaction(
                 let ap = ActivePlane::from_doc(p);
                 if let Some((t, uv)) = ray_plane(&ap, &ray) {
                     let half = ui_state.plane_size.max(1.0) * 0.5;
-                    if uv.x.abs() <= half && uv.y.abs() <= half && best.as_ref().map_or(true, |(bt, _, _)| t < *bt) {
+                    if uv.x.abs() <= half && uv.y.abs() <= half && best.as_ref().is_none_or(|(bt, _, _)| t < *bt) {
                         best = Some((t, ap, p.name.clone()));
                     }
                 }
             }
             if let Some(mesh) = &part.mesh {
                 if let Some((t, ap)) = pick_face(mesh, &ray) {
-                    if best.as_ref().map_or(true, |(bt, _, _)| t < *bt) {
+                    if best.as_ref().is_none_or(|(bt, _, _)| t < *bt) {
                         best = Some((t, ap, "Face".to_string()));
                     }
                 }
@@ -11036,18 +11031,17 @@ fn sketch_interaction(
                     let ap = ActivePlane::from_doc(p);
                     if let Some((t, uv)) = ray_plane(&ap, &ray) {
                         let half = ui_state.plane_size.max(1.0) * 0.5;
-                        if uv.x.abs() <= half && uv.y.abs() <= half {
-                            if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                        if uv.x.abs() <= half && uv.y.abs() <= half
+                            && best.as_ref().is_none_or(|(bt, _)| t < *bt) {
                                 best = Some((t, ap));
                             }
-                        }
                     }
                 }
             }
             // Planar faces of the body (M5) — usually in front, so they win.
             if let Some(mesh) = &part.mesh {
                 if let Some((t, ap)) = pick_face(mesh, &ray) {
-                    if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                    if best.as_ref().is_none_or(|(bt, _)| t < *bt) {
                         best = Some((t, ap));
                     }
                 }
@@ -11057,7 +11051,7 @@ fn sketch_interaction(
             // SolidWorks-style in-context reference. Nearest hit wins against the body.
             if let Some(eid) = ui_state.editing_component {
                 if let Some((t, ap)) = pick_ghost_face(&asm.0, &asm_render, eid, &ray) {
-                    if best.as_ref().map_or(true, |(bt, _)| t < *bt) {
+                    if best.as_ref().is_none_or(|(bt, _)| t < *bt) {
                         best = Some((t, ap));
                     }
                 }
@@ -11756,7 +11750,7 @@ fn entity_preview_polylines(sketch: &Sketch, idx: usize) -> Vec<Vec<Vec2>> {
         },
         Some(SketchEntity::Slot { a, b, radius, mid, .. }) => match (pt(*a), pt(*b)) {
             (Some(pa), Some(pb)) => {
-                let poly = match mid.and_then(|m| pt(m)) {
+                let poly = match mid.and_then(&pt) {
                     Some(pm) => tessellate_arc_slot([pa.x as f64, pa.y as f64], [pm.x as f64, pm.y as f64], [pb.x as f64, pb.y as f64], *radius),
                     None => tessellate_slot([pa.x as f64, pa.y as f64], [pb.x as f64, pb.y as f64], *radius),
                 };
@@ -12381,7 +12375,7 @@ fn seg_seg_t(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<f32> {
     }
     let t = ((c.x - a.x) * s.y - (c.y - a.y) * s.x) / denom;
     let u = ((c.x - a.x) * r.y - (c.y - a.y) * r.x) / denom;
-    (t > 1e-3 && t < 1.0 - 1e-3 && u >= -1e-3 && u <= 1.0 + 1e-3).then_some(t)
+    (t > 1e-3 && t < 1.0 - 1e-3 && (-1e-3..=1.0 + 1e-3).contains(&u)).then_some(t)
 }
 
 /// Parameters along segment a→b where it crosses circle (`center`, `r`), within the segment.
@@ -12470,7 +12464,7 @@ fn nearest_line(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
             let l2 = ab.dot(ab);
             let t = if l2 > 1e-9 { ((uv - pa).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
             let d = uv.distance(pa + ab * t);
-            if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -12609,7 +12603,7 @@ fn nearest_circle(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     for (i, e) in sketch.entities.iter().enumerate() {
         if let SketchEntity::Circle { center, radius, .. } = e {
             let d = ((uv - pt2(sketch, *center)).length() - *radius as f32).abs();
-            if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -12803,7 +12797,7 @@ fn nearest_arc(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<usize> {
     for (i, e) in sketch.entities.iter().enumerate() {
         if matches!(e, SketchEntity::Arc { .. }) {
             let d = dist_to_entity(sketch, i, uv);
-            if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -12826,7 +12820,7 @@ fn nearest_spline(sketch: &Sketch, uv: Vec2, thresh: f32) -> Option<(usize, f32)
             let t = if l2 > 1e-9 { ((uv - w[0]).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
             d = d.min(uv.distance(w[0] + ab * t));
         }
-        if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+        if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
             best = Some((i, d));
         }
     }
@@ -13775,11 +13769,10 @@ fn handle_keys(
         session.construction = !session.construction;
     }
     // Enter finishes an in-progress (open) spline.
-    if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
-        if session.tool == Tool::Spline && session.spline_pts.len() >= 2 {
+    if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter))
+        && session.tool == Tool::Spline && session.spline_pts.len() >= 2 {
             commit_spline(&mut session, false);
         }
-    }
     if keys.just_pressed(KeyCode::KeyE) {
         session.op_request = Some(SolidOp::Boss(EXTRUDE_DISTANCE, 0.0, 0.0, 0));
     }
@@ -13927,7 +13920,7 @@ fn handle_file_io(
                         Err(e) => warn!("Serialize failed: {e}"),
                     }
                 }
-                let key = asm.0.component(id).map(|c| asm_geom_key(c));
+                let key = asm.0.component(id).map(asm_geom_key);
                 let src = asm.0.component(id).map(|c| c.source.clone()).unwrap_or_default();
                 for c in &mut asm.0.components {
                     if c.id == id || (!src.is_empty() && c.source == src) {
@@ -14190,7 +14183,7 @@ fn handle_file_io(
     if ui_state.export_step_request {
         ui_state.export_step_request = false;
         let faceted = part.solid.is_none();
-        let solid = part.solid.clone().or_else(|| part.mesh.as_ref().and_then(|m| mesh_to_solid(m)));
+        let solid = part.solid.clone().or_else(|| part.mesh.as_ref().and_then(mesh_to_solid));
         match solid.as_ref().and_then(export_step) {
             Some(step) => {
                 let stem = ui_state.current_file.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("part");
@@ -15139,7 +15132,7 @@ fn clip_edges_to_mesh(edges: &[([[f32; 3]; 2], [f32; 3])], mesh: &TriMesh, rel: 
         while i <= steps {
             if sup[i] {
                 let start = i;
-                while i + 1 <= steps && sup[i + 1] {
+                while i < steps && sup[i + 1] {
                     i += 1;
                 }
                 if start == 0 && i == steps {
@@ -16944,7 +16937,7 @@ fn reproject_plane_on_mesh(plane: &PlaneRef, mesh: &TriMesh, samples: &[Vec3]) -
             continue; // no footprint sample is over this face
         }
         let off = a.dot(n);
-        if best.map_or(true, |bo| (off - o_n).abs() < (bo - o_n).abs()) {
+        if best.is_none_or(|bo| (off - o_n).abs() < (bo - o_n).abs()) {
             best = Some(off);
         }
     }
@@ -17189,7 +17182,7 @@ fn nest_loops(loops: Vec<Vec<[f64; 2]>>) -> Vec<hworks_sketch::Region> {
     let depth: Vec<usize> = (0..n).map(|i| (0..n).filter(|&j| contains(j, i)).count()).collect();
     let mut out = Vec::new();
     for i in 0..n {
-        if depth[i] % 2 != 0 {
+        if !depth[i].is_multiple_of(2) {
             continue;
         }
         let holes = (0..n)
@@ -17672,7 +17665,7 @@ fn draw_body_edges(
     if let Some(spec) = &ui_state.shell_spec {
         let mcol = Color::srgb(1.0, 0.55, 0.1);
         let r = {
-            let (lo, hi) = part.mesh.as_ref().map(|m| mesh_bbox(m)).unwrap_or((Vec3::ZERO, Vec3::ONE));
+            let (lo, hi) = part.mesh.as_ref().map(mesh_bbox).unwrap_or((Vec3::ZERO, Vec3::ONE));
             ((hi - lo).length() * 0.02).max(0.2)
         };
         // The opened faces are shaded orange by `shell_overlays`; just ring each one so the
@@ -18631,7 +18624,7 @@ fn draw_sketch(
             }
             SketchEntity::Text { origin, contours, height, rotation, mirror, arc, .. } => {
                 let o = uv_of(*origin);
-                for loop_ in text_contours([o.x as f64, o.y as f64], contours, *height as f64, *rotation, *mirror, *arc) {
+                for loop_ in text_contours([o.x as f64, o.y as f64], contours, (*height), *rotation, *mirror, *arc) {
                     let n = loop_.len();
                     for k in 0..n {
                         let p = Vec2::new(loop_[k][0] as f32, loop_[k][1] as f32);
@@ -20116,7 +20109,7 @@ fn snap_place_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform, curs
     for c in cands {
         if let Ok(s) = camera.world_to_viewport(cam_gt, c) {
             let d = s.distance(cursor);
-            if d <= 14.0 && best.map_or(true, |(_, bd)| d < bd) {
+            if d <= 14.0 && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((c, d));
             }
         }
@@ -20135,7 +20128,7 @@ fn nearest_measure_point(part: &Part, camera: &Camera, cam_gt: &GlobalTransform,
         for p in [a, b, (a + b) * 0.5] {
             if let Ok(s) = camera.world_to_viewport(cam_gt, p) {
                 let d = s.distance(cursor);
-                if d < 14.0 && best.map_or(true, |(bd, _)| d < bd) {
+                if d < 14.0 && best.is_none_or(|(bd, _)| d < bd) {
                     best = Some((d, p));
                 }
             }
@@ -20281,7 +20274,7 @@ fn pick_face_point(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, cu
         let b = Vec3::from_array(mesh.positions[tri[1] as usize]);
         let c = Vec3::from_array(mesh.positions[tri[2] as usize]);
         if let Some(t) = ray_triangle(orig, dir, a, b, c) {
-            if best.map_or(true, |(bt, _)| t < bt) {
+            if best.is_none_or(|(bt, _)| t < bt) {
                 best = Some((t, (b - a).cross(c - a).normalize_or_zero()));
             }
         }
@@ -20305,7 +20298,7 @@ fn pick_mesh_tri(mesh: &TriMesh, camera: &Camera, cam_gt: &GlobalTransform, curs
         let b = Vec3::from_array(mesh.positions[tri[1] as usize]);
         let c = Vec3::from_array(mesh.positions[tri[2] as usize]);
         if let Some(t) = ray_triangle(orig, dir, a, b, c) {
-            if best.map_or(true, |(bt, _)| t < bt) {
+            if best.is_none_or(|(bt, _)| t < bt) {
                 best = Some((t, ti));
             }
         }
@@ -20354,7 +20347,7 @@ fn pick_edge(
     for (i, e) in edges.iter().enumerate() {
         let (a, b) = (Vec3::from_array(e[0]), Vec3::from_array(e[1]));
         if let Some(d) = segment_screen_dist(camera, cam_gt, cursor, a, b) {
-            if d <= thresh && best.map_or(true, |(_, bd)| d < bd) {
+            if d <= thresh && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -20403,7 +20396,7 @@ fn edge_chain(edges: &[[[f32; 3]; 2]], seed: usize) -> (Vec<Vec3>, bool) {
                     continue;
                 };
                 let d = incoming.dot(dir(cur, other));
-                if best.map_or(true, |(_, _, bd)| d > bd) {
+                if best.is_none_or(|(_, _, bd)| d > bd) {
                     best = Some((sg, other, d));
                 }
             }
@@ -20655,6 +20648,8 @@ fn draw_edge_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests build plain prisms directly; the app goes through the arc-aware variants.
+    use hworks_geometry::extrude_solid;
     use hworks_document::{Document, FeatureKind, PlaneRef};
     use hworks_sketch::Sketch;
 

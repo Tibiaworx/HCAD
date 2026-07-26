@@ -387,7 +387,8 @@ fn point_tri_closest(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32
     let ap = sub(p, a);
     let d1 = dot(ab, ap);
     let d2 = dot(ac, ap);
-    let closest = if d1 <= 0.0 && d2 <= 0.0 {
+    
+    if d1 <= 0.0 && d2 <= 0.0 {
         a // vertex A
     } else {
         let bp = sub(p, b);
@@ -427,8 +428,7 @@ fn point_tri_closest(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32
                 }
             }
         }
-    };
-    closest
+    }
 }
 
 fn tri_box_overlap(c: [f32; 3], r: f32, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) -> bool {
@@ -787,7 +787,7 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
         if v == 0 {
             continue;
         }
-        if (v > 0) == !solid[i] {
+        if (v > 0) != solid[i] {
             agree += 1;
         } else {
             disagree += 1;
@@ -797,7 +797,7 @@ pub fn remesh_solid(m: &TriMesh, res: usize) -> Option<TriMesh> {
     for (i, exact, v) in band {
         let inside = match v {
             0 => solid[i],
-            _ => ((v < 0) != flip),
+            _ => (v < 0) != flip,
         };
         sdf[i] = if inside { exact } else { -exact };
     }
