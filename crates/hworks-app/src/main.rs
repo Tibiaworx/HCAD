@@ -180,6 +180,7 @@ fn main() {
                 (
                     (handle_new_part, asm_regenerate, mate_hover_highlight, asm_interaction, asm_solve_mates, check_interference, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
                     highlight_face,
+                    shell_overlays,
                     hover_body_edge,
                     sync_ref_planes,
                     scale_ref_planes,
@@ -2126,6 +2127,9 @@ struct UiState {
     pattern_request: Option<PatternSpec>,
     /// Shell feature: the spec while its PM is open (faces are picked by clicking the body).
     shell_spec: Option<ShellSpec>,
+    /// The face clicked in the viewport while the Shell PM is open — highlighted yellow, and
+    /// what the panel's "Open this face" checkbox applies to.
+    shell_sel: Option<([f64; 3], [f64; 3])>,
     shell_request: Option<ShellSpec>,
     /// Sweep feature: the spec while its PM is open (profile + path chosen from the tree's sketches).
     sweep_spec: Option<SweepSpec>,
@@ -2952,6 +2956,31 @@ struct RefPlane;
 #[derive(Component)]
 struct RefPlaneIdx(usize);
 
+/// Whole-face overlays shown while the Shell PropertyManager is open: the faces that will be
+/// opened (orange) and the face currently selected in the viewport (yellow).
+#[derive(Component)]
+struct ShellOpenHl;
+#[derive(Component)]
+struct ShellSelHl;
+/// The live see-through preview of the shelled result.
+#[derive(Component)]
+struct ShellPreviewMesh;
+
+/// Meshes behind the Shell overlays, rebuilt in place as the spec changes.
+#[derive(Resource)]
+struct ShellOverlay {
+    open_mesh: Handle<Mesh>,
+    sel_mesh: Handle<Mesh>,
+    preview_mesh: Handle<Mesh>,
+    /// The spec the preview was last built from — rebuild only when it actually changes.
+    last: Option<u64>,
+    /// Seconds until the next rebuild is allowed; dragging the thickness would otherwise
+    /// re-run the boolean every frame.
+    cooldown: f32,
+    /// Whether `preview_mesh` currently holds a usable result.
+    ready: bool,
+}
+
 /// The translucent overlay that highlights the hovered / active face.
 #[derive(Component)]
 struct FaceHighlight;
@@ -3023,6 +3052,48 @@ fn setup(
         Name::new("FaceHighlight"),
     ));
     commands.insert_resource(HighlightMesh(hl_mesh));
+
+    // Shell overlays: opened faces (orange), the selected face (yellow), and the see-through
+    // preview of the hollowed body. All hidden until the Shell PropertyManager opens.
+    let blank = || {
+        let mut m = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        m.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
+        m.insert_attribute(Mesh::ATTRIBUTE_NORMAL, Vec::<[f32; 3]>::new());
+        m
+    };
+    let open_mesh = meshes.add(blank());
+    let sel_mesh = meshes.add(blank());
+    let preview_mesh = meshes.add(blank());
+    let open_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.45, 0.05, 0.55),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    let sel_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.85, 0.15, 0.40),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    // Lit + translucent so the cavity walls read as surfaces, not a flat wash.
+    let preview_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.62, 0.70, 0.80, 0.42),
+        alpha_mode: AlphaMode::Blend,
+        metallic: 0.1,
+        perceptual_roughness: 0.55,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    commands.spawn((Mesh3d(open_mesh.clone()), MeshMaterial3d(open_mat), Visibility::Hidden, ShellOpenHl, Name::new("ShellOpenHl")));
+    commands.spawn((Mesh3d(sel_mesh.clone()), MeshMaterial3d(sel_mat), Visibility::Hidden, ShellSelHl, Name::new("ShellSelHl")));
+    commands.spawn((Mesh3d(preview_mesh.clone()), MeshMaterial3d(preview_mat), Visibility::Hidden, ShellPreviewMesh, Name::new("ShellPreview")));
+    commands.insert_resource(ShellOverlay { open_mesh, sel_mesh, preview_mesh, last: None, cooldown: 0.0, ready: false });
 
     println!("HCAD ready — mouse-driven UI. Click a reference plane to start sketching.");
 }
@@ -4957,6 +5028,31 @@ fn ui_system(
             });
             ui.label(egui::RichText::new("...or click any face on the body, including ones not square to an axis.").weak().small());
             ui.separator();
+            // The clicked face, with a plain checkbox to open or close it. Simpler than
+            // remembering that a viewport click toggles, and it shows what's selected.
+            let mut set_open: Option<bool> = None;
+            match &ui_state.shell_sel {
+                Some((_, n)) => {
+                    let nv = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32);
+                    let is_open = spec
+                        .open
+                        .iter()
+                        .any(|(_, on)| Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32).normalize_or_zero().dot(nv.normalize_or_zero()) > 0.985);
+                    ui.label(format!("Selected face: {}", axis_face_name(nv)));
+                    let mut checked = is_open;
+                    if ui
+                        .checkbox(&mut checked, "Open this face")
+                        .on_hover_text("Remove this face so the shell opens through it")
+                        .changed()
+                    {
+                        set_open = Some(checked);
+                    }
+                }
+                None => {
+                    ui.label(egui::RichText::new("Click a face on the body to select it (it turns yellow).").weak().small());
+                }
+            }
+            ui.separator();
             // The picked faces, each removable: an enclosure usually opens exactly one, and
             // getting an unwanted one off shouldn't mean clearing the lot.
             let mut remove_face: Option<usize> = None;
@@ -4981,14 +5077,17 @@ fn ui_system(
             if commit {
                 ui_state.shell_request = Some(spec);
                 ui_state.shell_spec = None;
+                ui_state.shell_sel = None;
             } else if cancel {
                 ui_state.shell_spec = None;
+                ui_state.shell_sel = None;
                 if ui_state.editing_feature.take().is_some() {
                     doc.0.rollback = doc.0.features.len();
                     ui_state.regen = true;
                 }
             } else {
                 let mut no_face = false;
+                let sel_face = ui_state.shell_sel;
                 if let Some(cur) = ui_state.shell_spec.as_mut() {
                     // Viewport clicks edit `open` directly on ui_state, so only write back the
                     // fields this panel owns (a pick landing mid-frame must not be lost).
@@ -4999,6 +5098,27 @@ fn ui_system(
                     if let Some(i) = remove_face {
                         if i < cur.open.len() {
                             cur.open.remove(i);
+                        }
+                    }
+                    if let Some(want) = set_open {
+                        if let Some((sp, sn)) = sel_face {
+                            let nv = Vec3::new(sn[0] as f32, sn[1] as f32, sn[2] as f32).normalize_or_zero();
+                            let hits: Vec<usize> = cur
+                                .open
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, (_, on))| Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32).normalize_or_zero().dot(nv) > 0.985)
+                                .map(|(i, _)| i)
+                                .collect();
+                            if want {
+                                if hits.is_empty() {
+                                    cur.open.push((sp, sn));
+                                }
+                            } else {
+                                for i in hits.into_iter().rev() {
+                                    cur.open.remove(i);
+                                }
+                            }
                         }
                     }
                     if let Some(d) = toggle_face {
@@ -9607,6 +9727,145 @@ fn build_face_mesh(tris: &[[Vec3; 3]], n: Vec3) -> Mesh {
     mesh
 }
 
+/// Like [`build_face_mesh`] but for triangles from SEVERAL faces at once: each triangle gets
+/// its own normal, and is nudged along it so the overlay sits just proud of the body.
+fn build_faces_mesh(tris: &[[Vec3; 3]]) -> Mesh {
+    let mut positions = Vec::with_capacity(tris.len() * 3);
+    let mut normals = Vec::with_capacity(tris.len() * 3);
+    for t in tris {
+        let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
+        let off = n * 0.025;
+        for vtx in t {
+            let q = *vtx + off;
+            positions.push([q.x, q.y, q.z]);
+            normals.push([n.x, n.y, n.z]);
+        }
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh
+}
+
+/// A cheap change key for a shell spec, so the preview only rebuilds when something moved.
+fn shell_spec_key(spec: &ShellSpec) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut eat = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    eat(spec.thickness.to_bits() as u64);
+    for (p, n) in &spec.open {
+        for v in p.iter().chain(n.iter()) {
+            eat(v.to_bits());
+        }
+    }
+    h
+}
+
+/// Above this the live boolean is too slow to run interactively; the preview is skipped and
+/// the solid body stays on screen (the committed feature still builds normally).
+const SHELL_PREVIEW_TRI_BUDGET: usize = 40_000;
+
+/// Drives everything the Shell PropertyManager shows in the viewport: the orange faces that
+/// will be opened, the yellow selected face, and a translucent preview of the hollowed body
+/// so the cavity is visible before committing (a sealed shell is otherwise invisible).
+fn shell_overlays(
+    time: Res<Time>,
+    part: Res<Part>,
+    ui_state: Res<UiState>,
+    mut ov: ResMut<ShellOverlay>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut q: Query<(&mut Visibility, Option<&ShellOpenHl>, Option<&ShellSelHl>, Option<&ShellPreviewMesh>, Option<&SolidPart>)>,
+) {
+    let spec = ui_state.shell_spec.clone();
+    let body = part.mesh.clone();
+    let (mut show_open, mut show_sel, mut show_prev) = (false, false, false);
+
+    if let (Some(spec), Some(body)) = (spec.as_ref(), body.as_ref()) {
+        // Orange: every face that will be opened.
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        for (p, n) in &spec.open {
+            let pv = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+            let nv = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32);
+            tris.extend(gather_face(body, pv, nv));
+        }
+        if !tris.is_empty() {
+            if let Some(slot) = meshes.get_mut(&ov.open_mesh) {
+                *slot = build_faces_mesh(&tris);
+            }
+            show_open = true;
+        }
+        // Yellow: the face clicked in the viewport, which the panel's checkbox acts on.
+        if let Some((p, n)) = &ui_state.shell_sel {
+            let pv = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+            let nv = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32);
+            let already = spec
+                .open
+                .iter()
+                .any(|(_, on)| Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32).normalize_or_zero().dot(nv.normalize_or_zero()) > 0.985);
+            if !already {
+                let st = gather_face(body, pv, nv);
+                if !st.is_empty() {
+                    if let Some(slot) = meshes.get_mut(&ov.sel_mesh) {
+                        *slot = build_faces_mesh(&st);
+                    }
+                    show_sel = true;
+                }
+            }
+        }
+        // The see-through preview, rebuilt only when the spec changes (and rate-limited, so
+        // dragging the thickness doesn't re-run the boolean every frame).
+        ov.cooldown = (ov.cooldown - time.delta_secs()).max(0.0);
+        let key = shell_spec_key(spec);
+        if ov.last != Some(key) && ov.cooldown <= 0.0 {
+            ov.cooldown = 0.15;
+            ov.last = Some(key);
+            ov.ready = false;
+            if body.indices.len() / 3 <= SHELL_PREVIEW_TRI_BUDGET {
+                let (lo, hi) = mesh_bbox_f64(body);
+                let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+                let overshoot = spec.thickness as f64 + diag * 0.02 + 0.5;
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    shell_tool(body, spec.thickness as f64, &spec.open, overshoot).map(|tool| mesh_difference(body, &tool))
+                }))
+                .ok()
+                .flatten();
+                let _ = take_fallback_count(); // a preview boolean must not raise the torn-surface banner
+                if let Some(m) = built.filter(|m| !m.positions.is_empty()) {
+                    if let Some(slot) = meshes.get_mut(&ov.preview_mesh) {
+                        *slot = trimesh_to_bevy(m);
+                    }
+                    ov.ready = true;
+                }
+            }
+        }
+        show_prev = ov.ready;
+    } else if ov.last.is_some() {
+        ov.last = None;
+        ov.ready = false;
+    }
+
+    for (mut vis, open, sel, prev, solid) in &mut q {
+        let want = if open.is_some() {
+            show_open
+        } else if sel.is_some() {
+            show_sel
+        } else if prev.is_some() {
+            show_prev
+        } else if solid.is_some() {
+            // The opaque body would hide the cavity — stand it down while the preview is up.
+            !show_prev
+        } else {
+            continue;
+        };
+        let next = if want { Visibility::Visible } else { Visibility::Hidden };
+        if *vis != next {
+            *vis = next;
+        }
+    }
+}
+
 /// Highlight the face under the cursor (view mode) or the active sketch face.
 fn highlight_face(
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -9757,23 +10016,10 @@ fn sketch_interaction(
     if ui_state.shell_spec.is_some() && session.plane.is_none() && buttons.just_pressed(MouseButton::Left) {
         if let (Some(cursor), Some(mesh)) = (window.cursor_position(), part.mesh.as_ref()) {
             if let Some((p, n)) = pick_face_point(mesh, camera, cam_gt, cursor) {
-                let (lo, hi) = mesh_bbox(mesh);
-                let tol = (hi - lo).length() * 1e-3 + 0.02;
-                if let Some(spec) = ui_state.shell_spec.as_mut() {
-                    let hit = spec.open.iter().position(|(op, on)| {
-                        let onv = Vec3::new(on[0] as f32, on[1] as f32, on[2] as f32);
-                        let opv = Vec3::new(op[0] as f32, op[1] as f32, op[2] as f32);
-                        onv.dot(n) > 0.985 && (p - opv).dot(onv).abs() < tol
-                    });
-                    match hit {
-                        Some(k) => {
-                            spec.open.remove(k);
-                        }
-                        None => {
-                            spec.open.push(([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64]));
-                        }
-                    }
-                }
+                // Clicking SELECTS the face (highlighted yellow); the panel's checkbox
+                // decides whether it's opened. Clicking an already-open face selects it too,
+                // so the checkbox is there to untick.
+                ui_state.shell_sel = Some(([p.x as f64, p.y as f64, p.z as f64], [n.x as f64, n.y as f64, n.z as f64]));
                 return; // consume the pick
             }
         }
@@ -17429,15 +17675,13 @@ fn draw_body_edges(
             let (lo, hi) = part.mesh.as_ref().map(|m| mesh_bbox(m)).unwrap_or((Vec3::ZERO, Vec3::ONE));
             ((hi - lo).length() * 0.02).max(0.2)
         };
+        // The opened faces are shaded orange by `shell_overlays`; just ring each one so the
+        // marker still reads when the face is viewed edge-on.
         for (p, n) in &spec.open {
             let p = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
             let n = Vec3::new(n[0] as f32, n[1] as f32, n[2] as f32).normalize_or_zero();
             let u = n.any_orthonormal_vector();
             let v = n.cross(u);
-            // A boxed X: the bare cross was easy to miss, and missing it means not noticing
-            // the pick never registered.
-            gizmos.line(nudge(p - u * r - v * r), nudge(p + u * r + v * r), mcol);
-            gizmos.line(nudge(p - u * r + v * r), nudge(p + u * r - v * r), mcol);
             let c = [p - u * r - v * r, p + u * r - v * r, p + u * r + v * r, p - u * r + v * r];
             for k in 0..4 {
                 gizmos.line(nudge(c[k]), nudge(c[(k + 1) % 4]), mcol);
