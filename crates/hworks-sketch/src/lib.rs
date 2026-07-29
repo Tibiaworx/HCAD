@@ -183,7 +183,10 @@ pub enum Constraint {
     /// Driving radius dimension: the circle centred at `center` has radius `value`.
     /// Enforced after the solve (radius isn't a point variable). `diameter` is a
     /// display choice — when true the dimension reads as Ø (2·value).
-    Radius { center: usize, value: f64, #[serde(default)] diameter: bool },
+    /// `label` is the display-only placement of the text: `[angle_radians, distance]` from
+    /// the centre. `[0, 0]` means "auto" — 45 degrees, out on the rim — which is what every
+    /// radius dimension made before dragging existed deserialises to.
+    Radius { center: usize, value: f64, #[serde(default)] diameter: bool, #[serde(default)] label: [f64; 2] },
     /// Driving angle between directed lines (a→b) and (c→d). `value` is in radians;
     /// `offset` is the (display-only) radius of the angle arc from the vertex.
     Angle { a: usize, b: usize, c: usize, d: usize, value: f64, offset: f64 },
@@ -2699,7 +2702,7 @@ mod tests {
         s.add_circle(center, 2.0);
         let p = s.add_point(2.0, 0.0);
         s.constraints.push(Constraint::PointOnCircle { p, center });
-        s.constraints.push(Constraint::Radius { center, value: 6.0, diameter: false });
+        s.constraints.push(Constraint::Radius { center, value: 6.0, diameter: false, label: [0.0, 0.0] });
         s.solve();
         let r = s
             .entities
@@ -2851,7 +2854,7 @@ mod tests {
         let rep = s.dof_report();
         assert_eq!(rep.dof, 1, "free radius is the one remaining DOF");
         // Dimension the radius → fully defined.
-        s.constraints.push(Constraint::Radius { center: c, value: 2.0, diameter: false });
+        s.constraints.push(Constraint::Radius { center: c, value: 2.0, diameter: false, label: [0.0, 0.0] });
         s.solve();
         assert_eq!(s.dof_report().dof, 0, "radius dim completes the definition");
     }

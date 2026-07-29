@@ -8043,12 +8043,12 @@ fn ui_system(
                         act(label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
                     }
                 }
-                Constraint::Radius { center, value, diameter } => {
+                Constraint::Radius { center, value, diameter, label } => {
                     dimensioned_centers.push(*center);
                     if let Some(c) = session.sketch.points.get(*center) {
                         let cu = Vec2::new(c.x as f32, c.y as f32);
                         let r = *value as f32;
-                        let edge = cu + Vec2::new(r * 0.707, r * 0.707);
+                        let edge = radius_label_pos(cu, r, *label);
                         let text = if *diameter { format!("Ø{}", fmt_len_bare(*value as f32 * 2.0, unit)) } else { format!("R{}", fmt_len_bare(*value as f32, unit)) };
                         act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on), k, &mut dim_action);
                     }
@@ -8264,10 +8264,7 @@ fn ui_system(
                 (Some(a2), Some(b2)) => Some(distance_dim_geometry(a2, b2, *offset as f32, *axis).2),
                 _ => None,
             },
-            Some(Constraint::Radius { center, value, .. }) => pt(*center).map(|cu| {
-                let r = *value as f32;
-                cu + Vec2::new(r * 0.707, r * 0.707)
-            }),
+            Some(Constraint::Radius { center, value, label, .. }) => pt(*center).map(|cu| radius_label_pos(cu, *value as f32, *label)),
             Some(Constraint::Angle { a, b, c, d, offset, .. }) => {
                 match (pt(*a), pt(*b), pt(*c), pt(*d)) {
                     (Some(a2), Some(b2), Some(c2), Some(d2)) => {
@@ -9431,14 +9428,44 @@ fn entity_slot(sketch: &Sketch, i: usize) -> Option<(usize, usize, f64)> {
 
 /// The two side points (across the width) and the label anchor of a slot-width dimension:
 /// the perpendicular through the centre line's midpoint, ±`half` to each side.
+/// Where a radius/diameter dimension's text sits: `label` is `[angle, distance]` from the
+/// centre, and `[0, 0]` means the classic auto placement (45 degrees, on the rim). One
+/// function so the drawing, the hit test and the drag can't drift apart.
+fn radius_label_pos(center: Vec2, radius: f32, label: [f64; 2]) -> Vec2 {
+    if label[1] <= 1e-9 {
+        return center + Vec2::new(radius * 0.707, radius * 0.707);
+    }
+    let (a, d) = (label[0] as f32, label[1] as f32);
+    center + Vec2::new(a.cos(), a.sin()) * d
+}
+
+/// The dimension line for a point-to-line distance, pushed `offset` along the perpendicular
+/// so the text can be dragged clear of the geometry.
+fn point_line_geometry_off(p: Vec2, a: Vec2, b: Vec2, offset: f32) -> (Vec2, Vec2) {
+    let (foot, mid) = point_line_geometry(p, a, b);
+    let mut n = (p - foot).normalize_or_zero();
+    if n == Vec2::ZERO {
+        let ab = (b - a).normalize_or_zero();
+        n = Vec2::new(-ab.y, ab.x);
+    }
+    (foot, mid + n * offset)
+}
+
 fn slot_width_geometry(a2: Vec2, b2: Vec2, half: f32) -> (Vec2, Vec2, Vec2) {
+    slot_width_geometry_off(a2, b2, half, 0.0)
+}
+
+/// As `slot_width_geometry`, with the label slid `offset` along the slot's own axis so it can
+/// be dragged off the middle.
+fn slot_width_geometry_off(a2: Vec2, b2: Vec2, half: f32, offset: f32) -> (Vec2, Vec2, Vec2) {
     let center = (a2 + b2) * 0.5;
     let mut dir = (b2 - a2).normalize_or_zero();
     if dir == Vec2::ZERO {
         dir = Vec2::X;
     }
     let perp = Vec2::new(-dir.y, dir.x);
-    (center + perp * half, center - perp * half, center)
+    let slide = dir * offset;
+    (center + perp * half + slide, center - perp * half + slide, center + slide)
 }
 
 /// Add a slot-width dimension (or return the existing one) driving the slot's half-width.
@@ -11714,7 +11741,7 @@ fn add_radius_dim(sketch: &mut Sketch, center: usize, radius: f64) -> Option<usi
     {
         return Some(i);
     }
-    sketch.constraints.push(Constraint::Radius { center, value: radius, diameter: true });
+    sketch.constraints.push(Constraint::Radius { center, value: radius, diameter: true, label: [0.0, 0.0] });
     Some(sketch.constraints.len() - 1)
 }
 
@@ -12070,6 +12097,11 @@ fn apply_mirror(session: &mut SketchSession) -> Result<usize, String> {
 /// Display geometry of a [`Constraint::RefCircleDistance`]: the rim-to-rim segment along
 /// the centre line (per the captured mode) and the label point at its middle.
 fn ref_circle_dim_geometry(cref: Vec2, rref: f32, csk: Vec2, rsk: f32, mode: u8) -> (Vec2, Vec2, Vec2) {
+    ref_circle_dim_geometry_off(cref, rref, csk, rsk, mode, 0.0)
+}
+
+/// As above, with the label slid `offset_along` the centre line so it can be dragged clear.
+fn ref_circle_dim_geometry_off(cref: Vec2, rref: f32, csk: Vec2, rsk: f32, mode: u8, offset_along: f32) -> (Vec2, Vec2, Vec2) {
     let mut dir = csk - cref;
     let d = dir.length();
     dir = if d > 1e-6 { dir / d } else { Vec2::X };
@@ -12078,7 +12110,7 @@ fn ref_circle_dim_geometry(cref: Vec2, rref: f32, csk: Vec2, rsk: f32, mode: u8)
         2 => (cref + dir * rref, csk + dir * rsk),
         _ => (cref + dir * rref, csk - dir * rsk),
     };
-    (p1, p2, (p1 + p2) * 0.5)
+    (p1, p2, (p1 + p2) * 0.5 + dir * offset_along)
 }
 
 /// The sketch circle's current radius by its centre point (first matching circle entity).
@@ -12130,20 +12162,25 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
                 (Some(a2), Some(b2)) => Some(distance_dim_geometry(a2, b2, *offset as f32, *axis).2),
                 _ => None,
             },
-            Constraint::Radius { center, value, .. } => {
-                pt(*center).map(|cu| cu + Vec2::new(*value as f32 * 0.707, *value as f32 * 0.707))
-            }
+            Constraint::Radius { center, value, label, .. } => pt(*center).map(|cu| radius_label_pos(cu, *value as f32, *label)),
             Constraint::Angle { a, b, c, d, offset, .. } => match (pt(*a), pt(*b), pt(*c), pt(*d)) {
                 (Some(a2), Some(b2), Some(c2), Some(d2)) => Some(angle_dim_geometry(a2, b2, c2, d2, *offset as f32).1),
                 _ => None,
             },
-            Constraint::PointLineDistance { p, a, b, .. } => match (pt(*p), pt(*a), pt(*b)) {
-                (Some(pp), Some(a2), Some(b2)) => Some(point_line_geometry(pp, a2, b2).1),
+            Constraint::PointLineDistance { p, a, b, offset, .. } => match (pt(*p), pt(*a), pt(*b)) {
+                (Some(pp), Some(a2), Some(b2)) => Some(point_line_geometry_off(pp, a2, b2, *offset as f32).1),
                 _ => None,
             },
-            Constraint::SlotWidth { a, b, value, .. } => match (pt(*a), pt(*b)) {
-                (Some(a2), Some(b2)) => Some(slot_width_geometry(a2, b2, (*value * 0.5) as f32).2),
+            Constraint::SlotWidth { a, b, value, offset } => match (pt(*a), pt(*b)) {
+                (Some(a2), Some(b2)) => Some(slot_width_geometry_off(a2, b2, (*value * 0.5) as f32, *offset as f32).2),
                 _ => None,
+            },
+            Constraint::RefCircleDistance { center, cx, cy, radius, mode, offset, .. } => match pt(*center) {
+                Some(csk) => {
+                    let rsk = circle_radius_of(sketch, *center).unwrap_or(0.0);
+                    Some(ref_circle_dim_geometry_off(Vec2::new(*cx as f32, *cy as f32), *radius as f32, csk, rsk, *mode, *offset as f32).2)
+                }
+                None => None,
             },
             _ => None,
         };
@@ -12329,11 +12366,59 @@ fn set_dim_offset_from_cursor(session: &mut SketchSession, ci: usize, uv: Vec2) 
             }
             _ => None,
         },
+        // Perpendicular distance from the line, signed so the label can sit on either side.
+        Some(Constraint::PointLineDistance { p, a, b, .. }) => match (pt(*p), pt(*a), pt(*b)) {
+            (Some(pp), Some(a2), Some(b2)) => {
+                let (foot, mid) = point_line_geometry(pp, a2, b2);
+                let mut n = (pp - foot).normalize_or_zero();
+                if n == Vec2::ZERO {
+                    let ab = (b2 - a2).normalize_or_zero();
+                    n = Vec2::new(-ab.y, ab.x);
+                }
+                Some((uv - mid).dot(n) as f64)
+            }
+            _ => None,
+        },
+        // Slides along the slot's own axis.
+        Some(Constraint::SlotWidth { a, b, .. }) => match (pt(*a), pt(*b)) {
+            (Some(a2), Some(b2)) => {
+                let centre = (a2 + b2) * 0.5;
+                let dir = (b2 - a2).normalize_or_zero();
+                Some(if dir == Vec2::ZERO { 0.0 } else { (uv - centre).dot(dir) as f64 })
+            }
+            _ => None,
+        },
+        // Slides along the line joining the two circle centres.
+        Some(Constraint::RefCircleDistance { center, cx, cy, radius, mode, .. }) => match pt(*center) {
+            Some(csk) => {
+                let rsk = circle_radius_of(&session.sketch, *center).unwrap_or(0.0);
+                let cref = Vec2::new(*cx as f32, *cy as f32);
+                let (_, _, home) = ref_circle_dim_geometry(cref, *radius as f32, csk, rsk, *mode);
+                let dir = (csk - cref).normalize_or_zero();
+                Some(if dir == Vec2::ZERO { 0.0 } else { (uv - home).dot(dir) as f64 })
+            }
+            None => None,
+        },
         _ => None,
     };
+    // Radius/diameter is placed in POLAR terms around the centre, so it carries an angle as
+    // well as a distance — the others only need a scalar.
+    if let Some(Constraint::Radius { center, .. }) = session.sketch.constraints.get(ci) {
+        let c = pt(*center);
+        if let (Some(cu), Some(Constraint::Radius { label, .. })) = (c, session.sketch.constraints.get_mut(ci)) {
+            let d = uv - cu;
+            if d.length() > 1e-4 {
+                *label = [d.y.atan2(d.x) as f64, d.length().max(0.15) as f64];
+            }
+        }
+        return;
+    }
     match (new_off, session.sketch.constraints.get_mut(ci)) {
         (Some(o), Some(Constraint::Distance { offset, .. })) => *offset = o,
         (Some(o), Some(Constraint::Angle { offset, .. })) => *offset = o,
+        (Some(o), Some(Constraint::PointLineDistance { offset, .. })) => *offset = o,
+        (Some(o), Some(Constraint::SlotWidth { offset, .. })) => *offset = o,
+        (Some(o), Some(Constraint::RefCircleDistance { offset, .. })) => *offset = o,
         _ => {}
     }
 }
@@ -19467,11 +19552,12 @@ fn draw_sketch(
                 }
             }
             // Radius/diameter dimension: a leader from centre to rim.
-            hworks_sketch::Constraint::Radius { center, value, .. } => {
+            hworks_sketch::Constraint::Radius { center, value, label, .. } => {
                 if let Some(cu) = pt(*center) {
-                    let r = *value as f32;
-                    let rim = cu + Vec2::new(r * 0.707, r * 0.707);
-                    gizmos.line(ap.to_world(cu), ap.to_world(rim), dim_col);
+                    // Leader runs from the centre out to wherever the text was dragged, so a
+                    // moved callout stays visibly tied to its circle.
+                    let tip = radius_label_pos(cu, *value as f32, *label);
+                    gizmos.line(ap.to_world(cu), ap.to_world(tip), dim_col);
                 }
             }
             // Angle dimension: an arc between the two lines, around their vertex.
@@ -23085,6 +23171,81 @@ mod tests {
             assert!(it.center[1] > 0.0 && it.center[1] < d.sheet.h, "view off sheet: {:?}", it.center);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dragging a dimension label must move it to (near) the cursor, and the hit test must
+    /// then find it there — otherwise you can drag a dimension once and never grab it again.
+    /// Covers every draggable type, because Radius and the reference dims were the ones that
+    /// silently ignored the drag.
+    #[test]
+    fn every_dimension_label_can_be_dragged_and_regrabbed() {
+        use hworks_sketch::{Constraint, DimAxis};
+
+        // Each case: a sketch, the constraint, where we drag its label, and a second drag
+        // along that dimension's own degree of freedom. Linear and slot dims slide on ONE
+        // axis (standard drafting); only radius/diameter is free in two.
+        let mut cases: Vec<(&str, SketchSession, usize, Vec2, Vec2)> = Vec::new();
+
+        // Distance (already worked — guards the regression).
+        let mut se = SketchSession::default();
+        let a = se.sketch.add_point(0.0, 0.0);
+        let b = se.sketch.add_point(10.0, 0.0);
+        se.sketch.constraints.push(Constraint::Distance { a, b, value: 10.0, offset: 0.5, axis: DimAxis::Aligned });
+        cases.push(("Distance", se, 0, Vec2::new(5.0, -4.0), Vec2::new(0.0, -3.0)));
+
+        // Radius — had no placement at all before.
+        let mut se = SketchSession::default();
+        let c = se.sketch.add_point(0.0, 0.0);
+        se.sketch.constraints.push(Constraint::Radius { center: c, value: 5.0, diameter: false, label: [0.0, 0.0] });
+        cases.push(("Radius", se, 0, Vec2::new(-7.0, 3.0), Vec2::new(4.0, -2.0)));
+
+        // Diameter uses the same placement.
+        let mut se = SketchSession::default();
+        let c = se.sketch.add_point(2.0, 2.0);
+        se.sketch.constraints.push(Constraint::Radius { center: c, value: 4.0, diameter: true, label: [0.0, 0.0] });
+        cases.push(("Diameter", se, 0, Vec2::new(2.0, 9.0), Vec2::new(-3.0, -4.0)));
+
+        // Point-to-line: offset field existed but was never applied.
+        let mut se = SketchSession::default();
+        let pp = se.sketch.add_point(0.0, 6.0);
+        let la = se.sketch.add_point(-5.0, 0.0);
+        let lb = se.sketch.add_point(5.0, 0.0);
+        se.sketch.constraints.push(Constraint::PointLineDistance { p: pp, a: la, b: lb, value: 6.0, offset: 0.0 });
+        cases.push(("PointLineDistance", se, 0, Vec2::new(0.0, 11.0), Vec2::new(0.0, -3.0)));
+
+        // Slot width: slides along the slot axis.
+        let mut se = SketchSession::default();
+        let sa = se.sketch.add_point(-4.0, 0.0);
+        let sb = se.sketch.add_point(4.0, 0.0);
+        se.sketch.constraints.push(Constraint::SlotWidth { a: sa, b: sb, value: 3.0, offset: 0.0 });
+        cases.push(("SlotWidth", se, 0, Vec2::new(3.0, 0.0), Vec2::new(-5.0, 0.0)));
+
+        for (name, mut session, ci, target, second_delta) in cases {
+            let before = dim_at(&session.sketch, target, 0.35);
+            set_dim_offset_from_cursor(&mut session, ci, target);
+
+            // The label must now hit-test at the drop point.
+            let found = dim_at(&session.sketch, target, 0.9);
+            assert_eq!(found, Some(ci), "{name}: label didn't move to the cursor (was {before:?})");
+
+            // And dragging again along its own axis must move it, not stick.
+            let second = target + second_delta;
+            set_dim_offset_from_cursor(&mut session, ci, second);
+            assert_eq!(dim_at(&session.sketch, second, 0.9), Some(ci), "{name}: second drag didn't take");
+            assert_ne!(dim_at(&session.sketch, target, 0.4), Some(ci), "{name}: label stayed at the old spot too");
+        }
+    }
+
+    /// A radius label with no stored placement must keep the historical 45-degrees-on-the-rim
+    /// position, so old sketches don't shift when they load.
+    #[test]
+    fn radius_label_defaults_to_the_classic_placement() {
+        let c = Vec2::new(3.0, -2.0);
+        let auto = radius_label_pos(c, 8.0, [0.0, 0.0]);
+        assert!((auto - (c + Vec2::new(8.0 * 0.707, 8.0 * 0.707))).length() < 1e-4, "auto placement moved: {auto:?}");
+        // An explicit placement is honoured exactly.
+        let placed = radius_label_pos(c, 8.0, [std::f64::consts::FRAC_PI_2, 5.0]);
+        assert!((placed - (c + Vec2::new(0.0, 5.0))).length() < 1e-4, "explicit placement wrong: {placed:?}");
     }
 
     #[test]
