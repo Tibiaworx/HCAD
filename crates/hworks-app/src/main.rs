@@ -130,6 +130,8 @@ fn main() {
         .init_resource::<Part>()
         .init_resource::<AsmRes>()
         .init_resource::<AsmRender>()
+        .init_resource::<DrawRes>()
+        .init_resource::<DrawCache>()
         .init_resource::<DocMode>()
         // Seamless on by default — build with the robust mesh kernel so shared/coincident
         // walls fuse without a seam. Toggle off in the toolbar for exact B-rep faces.
@@ -201,6 +203,7 @@ fn main() {
                 ),
             ),
         )
+        .add_systems(Update, smoke_exit)
         .run();
 }
 
@@ -3222,7 +3225,7 @@ fn open_cli_file(
     mut draw: ResMut<DrawRes>,
     mut cache: ResMut<DrawCache>,
 ) {
-    let Some(arg) = std::env::args().nth(1) else { return };
+    let Some(arg) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) else { return };
     let path = std::path::PathBuf::from(&arg);
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
     // Double-clicked assembly: load it, refresh caches from any present sources.
@@ -16753,6 +16756,23 @@ fn drawing_auto_layout(draw: &mut Drawing) {
             ViewDir::Back => [cx + step * 2.0, cy],
             ViewDir::Iso => [cx + step, cy + step * 0.8],
         };
+    }
+}
+
+/// `hcad.exe --smoke`: run a handful of real frames, then exit successfully.
+///
+/// Unit tests call functions directly and never boot the ECS, so they cannot catch a system
+/// asking for a resource nobody registered — which is exactly how a startup panic shipped.
+/// This runs the actual app: if any system fails parameter validation, the process panics and
+/// the exit code says so.
+fn smoke_exit(mut frames: Local<u32>, mut writer: bevy::prelude::MessageWriter<AppExit>) {
+    if !std::env::args().any(|a| a == "--smoke") {
+        return;
+    }
+    *frames += 1;
+    if *frames >= 10 {
+        info!("Smoke test: {} frames, no panics.", *frames);
+        writer.write(AppExit::Success);
     }
 }
 
