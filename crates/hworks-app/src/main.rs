@@ -8791,6 +8791,21 @@ fn infer_cursor(session: &SketchSession, cur: Vec2, start: Option<Vec2>, tol: f3
     anchors.extend(session.reference_points.iter().map(|p| (*p, None)));
     anchors.push((Vec2::ZERO, None));
 
+    // --- Landing ON an anchor beats aligning to it ---
+    // The H/V guides below deliberately exclude the case where the cursor is close on BOTH
+    // axes, so without this a click near a face corner fired only one guide: the aligned axis
+    // took the corner's value and the other kept the raw cursor. That is how a rectangle drawn
+    // on a face ended up with three corners exact and the fourth ~0.03mm out — enough to leave
+    // a sliver wall the edge detector then picks up. A point within tolerance is a Coincident
+    // snap, so take it whole.
+    if let Some((a, _)) = anchors
+        .iter()
+        .filter(|(a, _)| (a.x - cur.x).abs() <= tol && (a.y - cur.y).abs() <= tol)
+        .min_by(|(a, _), (b, _)| a.distance(cur).total_cmp(&b.distance(cur)))
+    {
+        return with_kind(*a, Vec::new(), InferBadge::Coincident);
+    }
+
     // --- Horizontal / vertical alignment with an anchor point ---
     // Pick the closest anchor sharing the cursor's X (vertical guide) and the closest sharing its
     // Y (horizontal guide); they can both fire, snapping the cursor onto their crossing.
@@ -14979,6 +14994,23 @@ fn handle_edit_sketch(
     let axis = match &f.kind {
         FeatureKind::Revolve { axis_pt, axis_dir, .. } => Some((*axis_pt, *axis_dir)),
         _ => None,
+    };
+    // Re-land the stored plane on the CURRENT body before sketching on it.
+    //
+    // Regeneration reprojects (so the solid builds on the right face), but reopening a sketch
+    // used the stored plane verbatim. Any upstream edit that moves the face — changing an
+    // extrude's depth is enough — left the sketch plane sitting microns off it. The snap pool
+    // only admits body geometry lying ON the sketch plane, so the face's edges and corners
+    // silently dropped out and points had nothing exact to catch, which is what left the
+    // small ledges. Datum planes are fixed in space and `reproject_plane_on_mesh` leaves them
+    // alone, so a centre-plane sketch can't be dragged onto a face.
+    let plane = match part.mesh.as_ref() {
+        Some(mesh) if !plane.datum => {
+            let regions = sketch.regions();
+            let samples = sketch_footprint_samples(&plane, &regions);
+            reproject_plane_on_mesh(&plane, mesh, &samples)
+        }
+        _ => plane,
     };
     let ap = active_plane_from_ref(&plane, "Face");
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
@@ -23381,7 +23413,7 @@ mod tests {
                 verts.push(w);
             }
         }
-        let on_plane: Vec<Vec3> = verts.iter().copied().filter(|w| (*w - o).dot(n).abs() < 1e-3).collect();
+        let on_plane: Vec<Vec3> = verts.iter().copied().filter(|w| (*w - o).dot(n).abs() < 0.02).collect();
         eprintln!("{} distinct verts, {} on the sketch plane", verts.len(), on_plane.len());
         eprintln!("--- face rim corners (plane uv):");
         for w in &on_plane {
@@ -23459,6 +23491,50 @@ mod tests {
         assert_eq!(admitted, face.len(), "{}/{} face vertices admitted at tol {tol}", admitted, face.len());
         // The old tolerance would have admitted none of them — that was the bug.
         assert_eq!(face.iter().filter(|w| (**w - origin).dot(n).abs() < 1e-3).count(), 0);
+    }
+
+    /// A click near a face corner must snap to the WHOLE corner, not just the axis that
+    /// happened to align.
+    ///
+    /// squarehelper2.hcad: a rectangle drawn on a face came out with three corners exact and
+    /// the fourth 0.033mm out in x — its y matched the corner exactly. The horizontal guide
+    /// had fired (taking the corner's y) while x kept the raw cursor, because the two guide
+    /// conditions exclude the both-axes-close case between them. The leftover sliver wall is
+    /// what the edge detector was picking up.
+    #[test]
+    fn a_click_on_a_corner_snaps_both_axes() {
+        let mut session = SketchSession::default();
+        // The real face corners from that file.
+        let corners = [
+            Vec2::new(-9.57214, 7.89697),
+            Vec2::new(9.57214, 7.89697),
+            Vec2::new(9.57214, -7.89697),
+            Vec2::new(-9.57214, -7.89697),
+        ];
+        session.reference_points = corners.to_vec();
+        let tol = 0.18 * 0.8; // the tolerance the placement path uses
+
+        for (i, c) in corners.iter().enumerate() {
+            // Cursor a little off the corner, but inside tolerance on both axes — exactly the
+            // situation that used to half-snap.
+            for off in [Vec2::new(0.033, 0.0), Vec2::new(-0.03, 0.02), Vec2::new(0.0, -0.04)] {
+                let inf = infer_cursor(&session, *c + off, None, tol);
+                let err = (inf.uv - *c).length();
+                assert!(err < 1e-5, "corner {i} with offset {off:?}: landed {err} away at {:?}", inf.uv);
+            }
+        }
+
+        // Well outside tolerance it must NOT snap — the cursor is respected.
+        let far = corners[0] + Vec2::new(2.0, 2.0);
+        let inf = infer_cursor(&session, far, None, tol);
+        assert!((inf.uv - corners[0]).length() > 1.0, "snapped from way too far: {:?}", inf.uv);
+
+        // Aligned on ONE axis only (far off on the other) must still give a guide, not a
+        // full snap — that behaviour is what makes edges line up.
+        let aligned = Vec2::new(corners[0].x + 5.0, corners[0].y + 0.02);
+        let inf = infer_cursor(&session, aligned, None, tol);
+        assert!((inf.uv.y - corners[0].y).abs() < 1e-5, "horizontal guide stopped working");
+        assert!((inf.uv.x - aligned.x).abs() < 1e-5, "x should stay where the cursor is");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
