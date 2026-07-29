@@ -10004,6 +10004,15 @@ fn hover_body_edge(
 // Interaction
 // ---------------------------------------------------------------------------
 
+/// How close a body vertex must sit to the sketch plane to count as "on" it and join the
+/// snap pool. Scaled to the model, with a 10-micron floor: reprojecting a sketch plane onto
+/// its face leaves a residual of a few microns, and a tolerance below that hides the whole
+/// face — corners included — from snapping. Nothing is deliberately modelled 10 microns
+/// apart, so the floor cannot merge features that are genuinely distinct.
+fn face_snap_plane_tol(body_diag: f32) -> f32 {
+    (body_diag * 2e-4).max(0.01)
+}
+
 fn sketch_interaction(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -10337,7 +10346,27 @@ fn sketch_interaction(
     session.reference_points.clear();
     session.reference_circles.clear();
     if let Some(ap) = session.plane.clone() {
-        let in_plane = |w: Vec3| (w - ap.origin).dot(ap.n).abs() < 1e-3;
+        // How close a body vertex must sit to the sketch plane to join the snap pool.
+        //
+        // This was 1e-3 mm — one micron — which is FINER than the residual left by
+        // reprojecting a sketch plane onto its face. On a plain extruded square the whole
+        // top face sat 2.3 microns off its own plane, so every vertex failed this test and
+        // the face's CORNERS never became snap targets. Points could then only catch the
+        // edge *lines* (PointOnLine, free to slide along them), so consecutive segments
+        // stopped short of the corners and the extrude came out with small ledges.
+        //
+        // Scale it to the model and keep a floor well above reprojection noise: 10 microns
+        // is far below anything anyone models deliberately, so it can't merge real features.
+        let body_diag = part
+            .mesh
+            .as_ref()
+            .map(|m| {
+                let (lo, hi) = mesh_bbox(m);
+                (hi - lo).length()
+            })
+            .unwrap_or(50.0);
+        let plane_tol = face_snap_plane_tol(body_diag);
+        let in_plane = |w: Vec3| (w - ap.origin).dot(ap.n).abs() < plane_tol;
         let to_uv = |w: Vec3| {
             let d = w - ap.origin;
             Vec2::new(d.dot(ap.u), d.dot(ap.v))
@@ -11225,7 +11254,7 @@ fn sketch_interaction(
                 let double = now - session.last_click_t < 0.4;
                 session.last_click_t = now;
                 if double {
-                    if let Some(ci) = active_uv.and_then(|uv| dim_at(&session.sketch, uv, snap * 2.0)) {
+                    if let Some(ci) = active_uv.and_then(|uv| dim_at(&session.sketch, uv, snap * 3.5)) {
                         open_dim_edit(&mut session, ci, None);
                         return;
                     }
@@ -11234,7 +11263,7 @@ fn sketch_interaction(
                 // offset — reposition the dimension line off the geometry.
                 let on_dim = active_uv
                     .filter(|uv| nearest_point(&session.sketch, *uv, snap).is_none())
-                    .and_then(|uv| dim_at(&session.sketch, uv, snap * 2.0));
+                    .and_then(|uv| dim_at(&session.sketch, uv, snap * 3.5));
                 if let Some(ci) = on_dim {
                     session.dim_drag = Some(ci);
                 }
@@ -11512,7 +11541,7 @@ fn sketch_interaction(
         Tool::Dimension if just_pressed => {
             if let Some(uv) = active_uv {
                 // Clicking an existing dimension's label reopens it for editing.
-                if let Some(ci) = dim_at(&session.sketch, uv, snap * 2.0) {
+                if let Some(ci) = dim_at(&session.sketch, uv, snap * 3.5) {
                     session.dim_first = None;
                     open_dim_edit(&mut session, ci, None);
                 } else {
@@ -12154,6 +12183,17 @@ fn add_ref_circle_dim(sketch: &mut Sketch, center: usize, rsk: f64, cref: Vec2, 
     Some(sketch.constraints.len() - 1)
 }
 
+/// Distance from `p` to the segment `a`-`b`.
+fn seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_squared();
+    if l2 < 1e-12 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / l2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
 fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
     let pt = |i: usize| sketch.points.get(i).copied().map(|p| Vec2::new(p.x as f32, p.y as f32));
     sketch.constraints.iter().enumerate().find_map(|(i, c)| {
@@ -12184,7 +12224,40 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
             },
             _ => None,
         };
-        anchor.filter(|p| (*p - uv).length() <= tol).map(|_| i)
+        // The whole dimension line grabs, not just the text — a linear dimension's label is a
+        // small target, and its line is the obvious thing to reach for.
+        let line: Option<(Vec2, Vec2)> = match c {
+            Constraint::Distance { a, b, offset, axis, .. } => match (pt(*a), pt(*b)) {
+                (Some(a2), Some(b2)) => {
+                    let (p0, p1, _) = distance_dim_geometry(a2, b2, *offset as f32, *axis);
+                    Some((p0, p1))
+                }
+                _ => None,
+            },
+            Constraint::Radius { center, value, label, .. } => pt(*center).map(|cu| {
+                let tip = radius_label_pos(cu, *value as f32, *label);
+                (cu, tip)
+            }),
+            Constraint::PointLineDistance { p: pp, a, b, offset, .. } => match (pt(*pp), pt(*a), pt(*b)) {
+                (Some(p3), Some(a2), Some(b2)) => {
+                    let (foot, _) = point_line_geometry_off(p3, a2, b2, *offset as f32);
+                    Some((foot, p3))
+                }
+                _ => None,
+            },
+            Constraint::SlotWidth { a, b, value, offset } => match (pt(*a), pt(*b)) {
+                (Some(a2), Some(b2)) => {
+                    let (p0, p1, _) = slot_width_geometry_off(a2, b2, (*value * 0.5) as f32, *offset as f32);
+                    Some((p0, p1))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let near_text = anchor.is_some_and(|p| (p - uv).length() <= tol);
+        // The line is a thinner target than the text, so it can't swamp a nearby point pick.
+        let near_line = line.is_some_and(|(p0, p1)| seg_dist(uv, p0, p1) <= tol * 0.45);
+        (near_text || near_line).then_some(i)
     })
 }
 
@@ -19551,13 +19624,40 @@ fn draw_sketch(
                     gizmos.line(ap.to_world(b2), ap.to_world(p1), dim_col);
                 }
             }
-            // Radius/diameter dimension: a leader from centre to rim.
-            hworks_sketch::Constraint::Radius { center, value, label, .. } => {
+            // Radius/diameter: a proper dimension line with an arrow into the rim and a
+            // horizontal shoulder under the text, so it reads like the linear dimensions
+            // rather than a bare leader to floating text.
+            hworks_sketch::Constraint::Radius { center, value, label, diameter } => {
                 if let Some(cu) = pt(*center) {
-                    // Leader runs from the centre out to wherever the text was dragged, so a
-                    // moved callout stays visibly tied to its circle.
-                    let tip = radius_label_pos(cu, *value as f32, *label);
-                    gizmos.line(ap.to_world(cu), ap.to_world(tip), dim_col);
+                    let r = *value as f32;
+                    let tip = radius_label_pos(cu, r, *label);
+                    let mut dir = (tip - cu).normalize_or_zero();
+                    if dir == Vec2::ZERO {
+                        dir = Vec2::new(0.707, 0.707);
+                    }
+                    let rim = cu + dir * r;
+                    let arrow = (r * 0.16).clamp(ms * 0.06, r.max(0.2));
+                    // The measured line: across the full circle for a diameter, centre-out
+                    // for a radius. It runs on to the text wherever that was dragged.
+                    let start = if *diameter { cu - dir * r } else { cu };
+                    let far = if (tip - cu).length() > r { tip } else { rim };
+                    gizmos.line(ap.to_world(start), ap.to_world(far), dim_col);
+                    // Shoulder: a short horizontal landing the text sits on, like the linear
+                    // dimension line under its own text.
+                    let side = if tip.x >= cu.x { 1.0 } else { -1.0 };
+                    let shoulder = (r * 0.45).clamp(ms * 0.15, r.max(0.3));
+                    gizmos.line(ap.to_world(tip), ap.to_world(tip + Vec2::new(side * shoulder, 0.0)), dim_col);
+                    // Arrowheads biting the rim, pointing in along the line. A diameter gets
+                    // one at each end; a radius only at the rim it measures.
+                    let mut heads = vec![(rim, -dir)];
+                    if *diameter {
+                        heads.push((cu - dir * r, dir));
+                    }
+                    for (at, into) in heads {
+                        let perp = Vec2::new(-into.y, into.x);
+                        gizmos.line(ap.to_world(at), ap.to_world(at + into * arrow + perp * arrow * 0.42), dim_col);
+                        gizmos.line(ap.to_world(at), ap.to_world(at + into * arrow - perp * arrow * 0.42), dim_col);
+                    }
                 }
             }
             // Angle dimension: an arc between the two lines, around their vertex.
@@ -23234,6 +23334,153 @@ mod tests {
             assert_eq!(dim_at(&session.sketch, second, 0.9), Some(ci), "{name}: second drag didn't take");
             assert_ne!(dim_at(&session.sketch, target, 0.4), Some(ci), "{name}: label stayed at the old spot too");
         }
+    }
+
+    /// How far a face-snapped sketch actually lands from the face it was snapped to.
+    /// `HCAD_FILE="…\\squarehelper.hcad" cargo test -p hworks-app diag_face_snap -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn diag_face_snap() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // The last feature carrying a sketch + plane is the one under test.
+        let mut target = None;
+        for (i, f) in doc.features.iter().enumerate() {
+            if matches!(f.kind, FeatureKind::Extrude { .. } | FeatureKind::Cut { .. }) {
+                target = Some(i);
+            }
+        }
+        let ti = target.expect("no extrude/cut");
+        let (sketch, plane) = match &doc.features[ti].kind {
+            FeatureKind::Extrude { sketch, plane, .. } | FeatureKind::Cut { sketch, plane, .. } => (sketch.clone(), plane.clone()),
+            _ => unreachable!(),
+        };
+        eprintln!("feature #{ti}  plane origin {:?} normal {:?}", plane.origin, plane.normal);
+
+        // The body as it stood BEFORE that feature — what the snap had to work with.
+        let mut before = doc.clone();
+        before.rollback = ti;
+        let Some((mesh, _)) = regenerate_mesh(&before) else {
+            eprintln!("no body before feature {ti}");
+            return;
+        };
+        eprintln!("body before: {} verts, {} tris", mesh.positions.len(), mesh.indices.len() / 3);
+
+        let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+        let to_world = |q: [f64; 2]| o + u * q[0] as f32 + v * q[1] as f32;
+
+        // Distinct body vertices, and the ones lying ON the sketch plane (the face rim).
+        let mut verts: Vec<Vec3> = Vec::new();
+        for pos in &mesh.positions {
+            let w = Vec3::from_array(*pos);
+            if !verts.iter().any(|q| (*q - w).length() < 1e-5) {
+                verts.push(w);
+            }
+        }
+        let on_plane: Vec<Vec3> = verts.iter().copied().filter(|w| (*w - o).dot(n).abs() < 1e-3).collect();
+        eprintln!("{} distinct verts, {} on the sketch plane", verts.len(), on_plane.len());
+        eprintln!("--- face rim corners (plane uv):");
+        for w in &on_plane {
+            let d = *w - o;
+            eprintln!("    ({:>9.5}, {:>9.5})", d.dot(u), d.dot(v));
+        }
+
+        eprintln!("--- sketch points, and distance to the nearest rim corner:");
+        let mut worst = 0.0f32;
+        for (i, sp) in sketch.points.iter().enumerate() {
+            let w = to_world([sp.x, sp.y]);
+            let best = on_plane.iter().map(|q| (*q - w).length()).fold(f32::INFINITY, f32::min);
+            if best.is_finite() {
+                worst = worst.max(best);
+            }
+            eprintln!("  p{i:<2} uv ({:>9.5}, {:>9.5})   nearest corner {:>10.6} mm", sp.x, sp.y, best);
+        }
+        eprintln!("WORST corner mismatch: {worst:.6} mm");
+
+        // Also: how far is each sketch point OFF the plane's own grid, i.e. is the plane
+        // itself offset from the face it claims to sit on?
+        // Distribution of |offset from plane| — shows which tolerance would admit the face.
+        let mut offs: Vec<f32> = verts.iter().map(|w| (*w - o).dot(n).abs()).collect();
+        offs.sort_by(f32::total_cmp);
+        for t in [1e-3f32, 2e-3, 5e-3, 1e-2, 5e-2] {
+            eprintln!("  tol {t:<8} admits {} verts", offs.iter().filter(|d| **d < t).count());
+        }
+        eprintln!("  smallest offsets: {:?}", &offs[..offs.len().min(8)]);
+        let plane_off = verts
+            .iter()
+            .map(|w| (*w - o).dot(n))
+            .filter(|d| d.abs() < 1.0)
+            .fold(f32::INFINITY, |a, b| if b.abs() < a.abs() { b } else { a });
+        eprintln!("nearest body vertex offset along the plane normal: {plane_off:.6} mm");
+    }
+
+    /// The face-snap tolerance must admit a face that a sketch plane was reprojected onto.
+    ///
+    /// squarehelper.hcad exposed the failure: its top face sat 2.35 microns off its own
+    /// sketch plane, and the old 1-micron tolerance admitted ZERO of the face's 132 vertices.
+    /// The corners were therefore never offered as snap targets, so points could only catch
+    /// the edge lines and slide along them — leaving the ledges that were reported.
+    #[test]
+    fn face_snap_tolerance_admits_a_reprojected_face() {
+        // The residual actually measured on that file.
+        const OBSERVED_RESIDUAL: f32 = 0.002_348_5;
+        let tol = face_snap_plane_tol(25.0); // ~ the diagonal of that part
+        assert!(tol > OBSERVED_RESIDUAL * 2.0, "tolerance {tol} leaves no headroom over a {OBSERVED_RESIDUAL} residual");
+        // Still far tighter than anything a user would model deliberately.
+        assert!(tol < 0.05, "tolerance {tol} is loose enough to merge real features");
+        // Scales up for large parts, where reprojection residual grows with the coordinates.
+        assert!(face_snap_plane_tol(2000.0) > face_snap_plane_tol(25.0));
+
+        // And against real geometry: a box's top face, with the plane sitting a residual off
+        // it, must be fully admitted.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 15.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("box");
+        let (lo, hi) = mesh_bbox(&mesh);
+        let diag = (hi - lo).length();
+        let tol = face_snap_plane_tol(diag);
+
+        // Plane nudged off the true face by the observed residual, as reprojection leaves it.
+        let n = Vec3::Z;
+        let origin = Vec3::new(0.0, 0.0, 10.0 + OBSERVED_RESIDUAL);
+        let face: Vec<Vec3> = mesh
+            .positions
+            .iter()
+            .map(|p| Vec3::from_array(*p))
+            .filter(|w| (w.z - 10.0).abs() < 1e-4)
+            .collect();
+        assert!(!face.is_empty(), "no top-face vertices found");
+        let admitted = face.iter().filter(|w| (**w - origin).dot(n).abs() < tol).count();
+        assert_eq!(admitted, face.len(), "{}/{} face vertices admitted at tol {tol}", admitted, face.len());
+        // The old tolerance would have admitted none of them — that was the bug.
+        assert_eq!(face.iter().filter(|w| (**w - origin).dot(n).abs() < 1e-3).count(), 0);
+    }
+
+    /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
+    /// of text — that was the complaint, and the text anchor alone is a tiny target.
+    #[test]
+    fn a_dimension_line_is_grabbable_along_its_length() {
+        use hworks_sketch::{Constraint, DimAxis};
+        let mut sk = Sketch::default();
+        let a = sk.add_point(0.0, 0.0);
+        let b = sk.add_point(20.0, 0.0);
+        // Dimension line sits 4mm below the measured span.
+        sk.constraints.push(Constraint::Distance { a, b, value: 20.0, offset: -4.0, axis: DimAxis::Aligned });
+
+        let tol = 1.0;
+        // On the text, at the middle of the line.
+        assert_eq!(dim_at(&sk, Vec2::new(10.0, -4.0), tol), Some(0), "not grabbable on the label");
+        // Out near one end of the dimension line, far from the text.
+        assert_eq!(dim_at(&sk, Vec2::new(3.0, -4.0), tol), Some(0), "not grabbable along the line");
+        assert_eq!(dim_at(&sk, Vec2::new(17.0, -4.0), tol), Some(0), "not grabbable near the far end");
+        // But not way off in empty space, or up on the geometry it measures.
+        assert_eq!(dim_at(&sk, Vec2::new(10.0, 6.0), tol), None, "grabbed from empty space");
+        assert_eq!(dim_at(&sk, Vec2::new(-9.0, -4.0), tol), None, "grabbed past the end of the line");
     }
 
     /// A radius label with no stored placement must keep the historical 45-degrees-on-the-rim
