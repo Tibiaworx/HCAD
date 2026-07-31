@@ -10891,6 +10891,33 @@ fn sketch_interaction(
             if snapped_to_target && !coincident {
                 // Keep the snap; no guides, no alignment nudge.
             } else if coincident {
+                // LAND on the target, don't just badge it.
+                //
+                // This branch used to push the Coincident badge and leave the cursor at its
+                // raw position, so a click within `snap * 0.5` of a corner reported a snap and
+                // then placed the point wherever the mouse happened to be. Being *closer* to
+                // the corner made it worse, because the nearer window skipped the inference
+                // path that actually snaps. Zooming out widens that window in model units,
+                // which is why the error tracked zoom — lines drawn zoomed out sat a fraction
+                // off, and extruding them left the ledges.
+                let mut best: Option<(Vec2, f32)> = None;
+                let mut consider = |q: Vec2| {
+                    let d = q.distance(cur);
+                    if d <= snap * 0.5 && best.is_none_or(|(_, bd)| d < bd) {
+                        best = Some((q, d));
+                    }
+                };
+                for r in &session.reference_points {
+                    consider(*r);
+                }
+                if let Some(i) = nearest_point(&session.sketch, cur, snap * 0.5) {
+                    if let Some(q) = session.sketch.points.get(i) {
+                        consider(Vec2::new(q.x as f32, q.y as f32));
+                    }
+                }
+                if let Some((q, _)) = best {
+                    session.cursor_uv = Some(q);
+                }
                 session.infer_badges.push(InferBadge::Coincident);
             } else {
                 let inf = infer_cursor(&session, cur, session.pending, snap * 0.8);
@@ -23758,6 +23785,50 @@ mod tests {
         let corner = face_depth_candidates(&edge_session, &part, Vec3::new(4.0, 4.0, 0.0), Vec3::Z);
         assert!(corner.iter().any(|c| (*c - 10.0).abs() < 0.01), "plate face missing off to the side: {corner:?}");
         assert!(!corner.iter().any(|c| (*c - 16.0).abs() < 0.01), "found the step's face where the step isn't: {corner:?}");
+    }
+
+    /// Snapping must get STRONGER as the cursor nears a corner, never weaker.
+    ///
+    /// The placement path splits on distance: inside `snap*0.5` it took a "coincident"
+    /// branch, further out it ran the inference. The coincident branch only raised a badge
+    /// and left the cursor raw, so the closer you aimed at a corner the worse the result --
+    /// and zooming out widened that dead window in model units, which is why lines drawn
+    /// zoomed out sat a fraction off and their extrudes left ledges.
+    #[test]
+    fn snapping_gets_tighter_closer_to_a_corner() {
+        let corner = Vec2::new(-9.57214, 7.89697);
+        let mut session = SketchSession::default();
+        session.reference_points = vec![corner, Vec2::new(9.57214, 7.89697), Vec2::new(9.57214, -7.89697)];
+        let snap = 0.18f32;
+
+        // Sweep from far outside the snap radius right down onto the corner. Everything
+        // inside the radius must land exactly; nothing outside should be dragged in.
+        for frac in [0.05f32, 0.2, 0.4, 0.49, 0.6, 0.79] {
+            let cur = corner + Vec2::new(snap * frac, 0.0);
+            // Mirrors the placement path: near targets resolve coincident, the rest infer.
+            let coincident = session.reference_points.iter().any(|r| r.distance(cur) <= snap * 0.5);
+            let landed = if coincident {
+                session
+                    .reference_points
+                    .iter()
+                    .copied()
+                    .filter(|r| r.distance(cur) <= snap * 0.5)
+                    .min_by(|a, b| a.distance(cur).total_cmp(&b.distance(cur)))
+                    .unwrap()
+            } else {
+                infer_cursor(&session, cur, None, snap * 0.8).uv
+            };
+            assert!(
+                (landed - corner).length() < 1e-5,
+                "at {frac} of the snap radius the point landed {:.6} off the corner",
+                (landed - corner).length()
+            );
+        }
+
+        // Well beyond the radius it must stay where the user put it.
+        let far = corner + Vec2::new(snap * 6.0, snap * 6.0);
+        let inf = infer_cursor(&session, far, None, snap * 0.8);
+        assert!((inf.uv - corner).length() > snap, "dragged in from far outside the radius");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
