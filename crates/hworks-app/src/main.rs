@@ -63,6 +63,10 @@ const GEAR_PNG: &[u8] = include_bytes!("../assets/gear.png");
 const EXTRUDE_DISTANCE: f64 = 2.0;
 const PLANE_SIZE: f32 = 8.0;
 const SNAP: f32 = 0.18;
+
+/// Target width for a dropdown row. Rows fill to this so the hover highlight is a tidy block;
+/// a longer label overrides it.
+const MENU_ROW_WIDTH: f32 = 158.0;
 /// Max entities held in the Select-tool selection (enough for an Equal across many lines).
 const MAX_SEL: usize = 32;
 /// How long (seconds) an edge's key points flash after it's selected.
@@ -3401,7 +3405,11 @@ fn icon_widget(ui: &mut egui::Ui, selected: bool, icon: icons::Icon, text: &str,
     let gap = 6.0;
     let mut desired = egui::vec2(pad.x * 2.0 + sz + gap + galley.size().x, galley.size().y.max(sz) + pad.y * 2.0);
     if stretch {
-        desired.x = desired.x.max(ui.available_width());
+        // Fill the row for a clean full-width highlight, but to a FIXED target — using
+        // `available_width()` inside a popup let the menu grow to the space it was offered
+        // (egui hands out a very wide default), which is what left a slab of blank space
+        // after every feature name. A longer label still wins, so nothing is clipped.
+        desired.x = desired.x.max(MENU_ROW_WIDTH.min(ui.available_width()));
     }
     let (rect, resp) = ui.allocate_at_least(desired, egui::Sense::click());
     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, text));
@@ -13470,7 +13478,19 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                         _ => false,
                     })
                 };
-                if !pinned(&session.sketch, a) && !pinned(&session.sketch, b) {
+                // Skip only when BOTH ends are pinned. The hazard above is real but needs
+                // both: an edge-pinned point has one degree of freedom left, and if the other
+                // end is pinned too an exact axis relation can pin the pair to a single point
+                // and collapse the line. With one end free, the relation simply drives that
+                // free end — which is safe, and necessary.
+                //
+                // Skipping whenever EITHER end was pinned is what let the ledges in: snapping
+                // a line's endpoint to a body edge silently cost it its horizontal/vertical
+                // relation, so it sat a fraction off axis. Extruding that gives a slightly
+                // tilted wall, the next sketch on that wall inherits the tilt, and the error
+                // compounds. extrudesnaptest.hcad shows the end of that chain — a face normal
+                // 0.09 degrees off, which is ~0.03mm of drift over a 20mm boss.
+                if !(pinned(&session.sketch, a) && pinned(&session.sketch, b)) {
                     add_square_relations(&mut session.sketch, a, b);
                 }
                 session.dirty = true;
@@ -19685,7 +19705,10 @@ fn draw_sketch(
         match session.sketch.entities.get(i) {
             Some(SketchEntity::Line { a, b, .. }) => {
                 let (wa, wb) = (ap.to_world(uv_of(*a)), ap.to_world(uv_of(*b)));
-                let off = ap.n.cross((wb - wa).normalize_or_zero()).normalize_or_zero() * 0.03;
+                // Scale the glow with the zoom (`ms` tracks it, as the markers do). A fixed
+                // world offset went sub-pixel zoomed out, collapsing the parallel lines into
+                // one hairline — the highlight faded exactly when geometry was smallest.
+                let off = ap.n.cross((wb - wa).normalize_or_zero()).normalize_or_zero() * (0.035 * ms).max(0.01);
                 gizmos.line(wa, wb, sel_col);
                 gizmos.line(wa + off, wb + off, sel_col);
                 gizmos.line(wa - off, wb - off, sel_col);
@@ -19694,8 +19717,10 @@ fn draw_sketch(
             }
             Some(SketchEntity::Circle { center, radius, .. }) => {
                 let iso = Isometry3d::new(ap.to_world(uv_of(*center)), plane_rot);
+                let glow = (0.035 * ms).max(0.01);
                 gizmos.circle(iso, *radius as f32, sel_col);
-                gizmos.circle(iso, *radius as f32 + 0.03, sel_col);
+                gizmos.circle(iso, *radius as f32 + glow, sel_col);
+                gizmos.circle(iso, (*radius as f32 - glow).max(1e-3), sel_col);
             }
             _ => {}
         }
@@ -19822,7 +19847,10 @@ fn draw_sketch(
             if let (Some(pa), Some(pb)) = (session.sketch.points.get(a), session.sketch.points.get(b)) {
                 let (va, vb) = (Vec2::new(pa.x as f32, pa.y as f32), Vec2::new(pb.x as f32, pb.y as f32));
                 let (wa, wb) = (ap.to_world(va), ap.to_world(vb));
-                let off = ap.n.cross((wb - wa).normalize_or_zero()).normalize_or_zero() * 0.03;
+                // Scale the glow with the zoom (`ms` tracks it, as the markers do). A fixed
+                // world offset went sub-pixel zoomed out, collapsing the parallel lines into
+                // one hairline — the highlight faded exactly when geometry was smallest.
+                let off = ap.n.cross((wb - wa).normalize_or_zero()).normalize_or_zero() * (0.035 * ms).max(0.01);
                 let hl = Color::srgb(1.0, 0.7, 0.1);
                 gizmos.line(wa + off, wb + off, hl);
                 gizmos.line(wa - off, wb - off, hl);
