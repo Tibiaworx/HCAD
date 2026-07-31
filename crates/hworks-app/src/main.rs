@@ -77,6 +77,9 @@ const EDGE_PICK_PX: f32 = 9.0;
 /// A tracing layer that writes every log event to `run.log` (truncated each launch),
 /// unbuffered, so failures show up live. Added on top of the default stdout layer.
 fn file_log_layer(_app: &mut App) -> Option<BoxedLayer> {
+    // Keep the PREVIOUS run before truncating. A crash is normally reported after relaunching,
+    // which used to overwrite the very log that explained it.
+    let _ = std::fs::rename("run.log", "run.prev.log");
     // `&File` writes are unbuffered syscalls, so each event lands on disk immediately.
     let file = std::fs::File::create("run.log").ok()?;
     let layer = bevy::log::tracing_subscriber::fmt::layer()
@@ -85,7 +88,39 @@ fn file_log_layer(_app: &mut App) -> Option<BoxedLayer> {
     Some(layer.boxed())
 }
 
+/// Mirror panics into `run.log`.
+///
+/// A windowed build has no console, and a Rust panic unwinds to a clean exit (code 101), so
+/// Windows records no crash event and shows no dialog — the window simply vanishes and the
+/// log stops mid-sentence with no clue why. That is exactly what a reported crash looked
+/// like. The hook appends the payload, the source location and a backtrace, then defers to
+/// the previous hook so stderr behaviour is unchanged.
+///
+/// It cannot catch a stack overflow or an OOM abort: those kill the process outright. If
+/// `run.log` ever ends with no PANIC block, that is the signal it was one of those.
+fn install_panic_logger() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let where_ = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_else(|| "unknown".into());
+        let msg = match info.payload().downcast_ref::<&str>() {
+            Some(m) => (*m).to_string(),
+            None => info.payload().downcast_ref::<String>().cloned().unwrap_or_else(|| "<non-string panic payload>".into()),
+        };
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("run.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "\n=== PANIC ===\nthread : {thread}\nat     : {where_}\nmessage: {msg}\n--- backtrace ---\n{bt}\n=== END PANIC ===");
+            let _ = f.flush();
+        }
+        prev(info);
+    }));
+}
+
 fn main() {
+    // Before anything else, so a panic during start-up is recorded too.
+    install_panic_logger();
+
     // GPU selection: the integrated Radeon's 2020-era driver crashes (device
     // lost) under DX12, so we let Bevy use the default (discrete) GPU, which is
     // stable. On hybrid laptops that can flicker (cross-GPU present); the proper
@@ -15006,9 +15041,20 @@ fn handle_edit_sketch(
     // alone, so a centre-plane sketch can't be dragged onto a face.
     let plane = match part.mesh.as_ref() {
         Some(mesh) if !plane.datum => {
-            let regions = sketch.regions();
-            let samples = sketch_footprint_samples(&plane, &regions);
-            reproject_plane_on_mesh(&plane, mesh, &samples)
+            // Regeneration runs this same geometry inside `catch_unwind`; this call sits on
+            // the UI thread, where a panic would take the whole app down. Keep the stored
+            // plane if it throws — a stale plane is a far better outcome than losing the
+            // session.
+            let stored = plane.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let regions = sketch.regions();
+                let samples = sketch_footprint_samples(&stored, &regions);
+                reproject_plane_on_mesh(&stored, mesh, &samples)
+            }))
+            .unwrap_or_else(|_| {
+                warn!("Sketch edit: reprojecting the plane onto the body panicked — using the stored plane.");
+                plane.clone()
+            })
         }
         _ => plane,
     };
@@ -16960,6 +17006,10 @@ fn smoke_exit(mut frames: Local<u32>, mut writer: bevy::prelude::MessageWriter<A
         return;
     }
     *frames += 1;
+    // Deliberate panic to prove the hook records it; only via an env var.
+    if std::env::var("HCAD_SMOKE_PANIC").is_ok() && *frames == 3 {
+        panic!("smoke-test panic (HCAD_SMOKE_PANIC)");
+    }
     if *frames >= 10 {
         info!("Smoke test: {} frames, no panics.", *frames);
         writer.write(AppExit::Success);
