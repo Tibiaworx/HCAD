@@ -2884,6 +2884,11 @@ struct SketchSession {
     snap_dist: f32,
     /// True while the user is dragging the extrude direction arrow to set the depth.
     arrow_drag: bool,
+    /// Grab anchor for the extrude arrow: the axis parameter under the cursor when it was
+    /// grabbed, and the signed depth at that moment. The drag applies RELATIVE to these.
+    arrow_grab: Option<(f32, f32)>,
+    /// The face depth the arrow is currently snapped to, if any.
+    arrow_snap: Option<f32>,
     /// True while dragging the *Direction 2* arrow (sets `depth2`).
     arrow_drag2: bool,
     /// Active section-gizmo rotation drag: (which angle 0 = rot_u / 1 = rot_v, the frozen
@@ -3543,6 +3548,10 @@ fn ui_system(
         let mut style = (*ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        // egui defaults dropdown menus to 400px wide, which left a slab of empty space after
+        // every feature name. This is a DEFAULT, not a cap — a longer entry still widens the
+        // menu to fit, so nothing gets clipped.
+        style.spacing.menu_width = 172.0;
         style.visuals.selection.bg_fill = egui::Color32::from_rgb(59, 110, 165);
         style.visuals.panel_fill = egui::Color32::from_rgb(34, 36, 41);
         ctx.set_style(style);
@@ -6196,6 +6205,15 @@ fn ui_system(
                         unit_drag(ui, &mut op.depth, ui_state.unit, 0.1, 0.1, 10_000.0);
                     }
                 });
+                // Say when the arrow has locked onto a face, so a flush boss is an obvious
+                // outcome rather than a lucky one.
+                if session.arrow_snap.is_some() {
+                    ui.label(
+                        egui::RichText::new("\u{2713} snapped flush to a face")
+                            .color(egui::Color32::from_rgb(90, 200, 120))
+                            .small(),
+                    );
+                }
             });
 
             // Direction 2 — extend the boss/cut the opposite way too. (Not for revolve.)
@@ -11043,7 +11061,7 @@ fn sketch_interaction(
         if extrude_dir2_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
-        if extrude_arrow_drag(&mut session, &mut ui_state, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
+        if extrude_arrow_drag(&mut session, &mut ui_state, &part, window, camera, cam_gt, &ray, just_pressed, pressed, just_released) {
             return;
         }
     }
@@ -20805,9 +20823,52 @@ fn plane_arrow_drag(
     false
 }
 
+/// Depths at which an extrusion from `base` along `n` lands exactly on existing geometry —
+/// the "up to face" stops.
+///
+/// Rays are cast from points spread across the profile rather than just its centroid, so a
+/// boss that only partly overlaps the body below still finds the face it actually meets.
+/// Stopping a whisker short of (or past) a face is precisely what leaves a sliver ledge.
+fn face_depth_candidates(session: &SketchSession, part: &Part, base: Vec3, n: Vec3) -> Vec<f32> {
+    let Some(mesh) = part.mesh.as_ref() else { return Vec::new() };
+    let Some(ap) = session.plane.as_ref() else { return Vec::new() };
+    if mesh.indices.len() < 3 {
+        return Vec::new();
+    }
+    let mut origins: Vec<Vec3> = vec![base];
+    for q in session.sketch.points.iter().take(64) {
+        origins.push(ap.to_world(Vec2::new(q.x as f32, q.y as f32)));
+    }
+    let mut hits: Vec<f32> = Vec::new();
+    // Start a touch behind the plane so a face coincident with the sketch still registers,
+    // then subtract that nudge again: a stop must be the TRUE distance from the sketch plane.
+    // Leaving it in would snap to 16.001 instead of 16 — a micron-thin ledge, which is the
+    // very thing these stops exist to prevent.
+    const NUDGE: f32 = 1e-3;
+    for o in &origins {
+        let start = *o - n * NUDGE;
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            if let Some(d) = ray_tri_hit(start, n, a, b, c) {
+                let d = d - NUDGE;
+                if d > 1e-4 && d < 100_000.0 {
+                    hits.push(d);
+                }
+            }
+        }
+    }
+    // Many triangles share a face plane — collapse them to one stop each.
+    hits.sort_by(f32::total_cmp);
+    hits.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    hits
+}
+
 fn extrude_arrow_drag(
     session: &mut SketchSession,
     ui_state: &mut UiState,
+    part: &Part,
     window: &Window,
     camera: &Camera,
     cam_gt: &GlobalTransform,
@@ -20838,6 +20899,12 @@ fn extrude_arrow_drag(
                 .unwrap_or(false);
             if near_shaft || near_tip {
                 session.arrow_drag = true;
+                // Anchor the grab. Without this the depth jumped to wherever the cursor
+                // happened to project onto the axis, so releasing and re-grabbing threw the
+                // extrusion back to an unrelated length instead of continuing from it.
+                let t0 = closest_t_on_axis(base, n, ray.origin, ray.direction.as_vec3());
+                let signed_now = op.depth * if op.reverse { -1.0 } else { 1.0 };
+                session.arrow_grab = t0.is_finite().then_some((t0, signed_now));
             }
         }
     }
@@ -20848,20 +20915,41 @@ fn extrude_arrow_drag(
         // crashes egui).
         let t = closest_t_on_axis(base, n, ray.origin, ray.direction.as_vec3());
         if t.is_finite() {
+            // Relative to the grab, so the arrow keeps the length it already had.
+            let (t0, d0) = session.arrow_grab.unwrap_or((t, op.depth * if op.reverse { -1.0 } else { 1.0 }));
+            let mut signed = d0 + (t - t0);
+
+            // Stick to a face the extrusion lands on.
+            let dir = if signed < 0.0 { -n } else { n };
+            let tol = (session.snap_dist * 0.8).clamp(0.05, 2.0);
+            let mag = signed.abs();
+            let best = face_depth_candidates(session, part, base, dir)
+                .into_iter()
+                .filter(|c| (*c - mag).abs() <= tol)
+                .min_by(|a, b| (*a - mag).abs().total_cmp(&(*b - mag).abs()));
+            session.arrow_snap = best;
+            if let Some(c) = best {
+                signed = if signed < 0.0 { -c } else { c };
+            }
+
             let mut p = op.clone();
-            p.depth = t.abs().clamp(0.1, 10_000.0);
-            if t.abs() > 0.05 {
-                p.reverse = t < 0.0;
+            p.depth = signed.abs().clamp(0.1, 10_000.0);
+            if signed.abs() > 0.05 {
+                p.reverse = signed < 0.0;
             }
             ui_state.pending = Some(p);
         }
         if just_released {
             session.arrow_drag = false;
+        session.arrow_grab = None;
+        session.arrow_snap = None;
         }
         return true;
     }
     if just_released {
         session.arrow_drag = false;
+        session.arrow_grab = None;
+        session.arrow_snap = None;
     }
     false
 }
@@ -23585,6 +23673,63 @@ mod tests {
         let inf = infer_cursor(&session, aligned, None, tol);
         assert!((inf.uv.y - corners[0].y).abs() < 1e-5, "horizontal guide stopped working");
         assert!((inf.uv.x - aligned.x).abs() < 1e-5, "x should stay where the cursor is");
+    }
+
+    /// The extrude arrow must offer the faces it lands on as depth stops, so a boss can be
+    /// made flush instead of a hair short (which leaves a sliver ledge).
+    #[test]
+    fn extrude_depth_snaps_to_faces_it_lands_on() {
+        // A 40x40 plate 10 thick, with a 20x20 step 6 more on top of it.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(40.0, 40.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut step = Sketch::default();
+        let a = step.add_point(10.0, 10.0);
+        let b = step.add_point(30.0, 10.0);
+        let c = step.add_point(30.0, 30.0);
+        let d = step.add_point(10.0, 30.0);
+        step.add_line(a, b, false);
+        step.add_line(b, c, false);
+        step.add_line(c, d, false);
+        step.add_line(d, a, false);
+        let top = PlaneRef { origin: [0.0, 0.0, 10.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Extrude { sketch: step, regions: vec![], region_pts: vec![], plane: top, distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("stepped body");
+
+        let mut part = Part::default();
+        part.mesh = Some(mesh);
+
+        // Sketch on the plate's underside, extruding UP through the part: the stops are the
+        // plate's top at 10 and the step's top at 16.
+        let mut session = SketchSession::default();
+        session.plane = Some(active_plane_from_ref(
+            &PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false },
+            "Face",
+        ));
+        // A small profile inside the step's footprint, so it meets both faces.
+        for (x, y) in [(18.0, 18.0), (22.0, 18.0), (22.0, 22.0), (18.0, 22.0)] {
+            session.sketch.add_point(x, y);
+        }
+
+        let cands = face_depth_candidates(&session, &part, Vec3::new(20.0, 20.0, 0.0), Vec3::Z);
+        assert!(!cands.is_empty(), "no face stops found");
+        let has = |d: f32| cands.iter().any(|c| (*c - d).abs() < 0.01);
+        // Directly under the step there is no face at 10 — the union fuses plate and step, so
+        // the only surface above is the step's top at 16. The stop must be exactly 16, not
+        // 16.001: a stop carrying the ray's own epsilon would leave the ledge it exists to
+        // prevent.
+        assert!(has(16.0), "missing (or imprecise) step top at 16: {cands:?}");
+        assert!(!has(10.0), "reported a face at 10 where plate and step are fused: {cands:?}");
+
+        // Outside the step's footprint only the plate's face is reachable.
+        let mut edge_session = SketchSession::default();
+        edge_session.plane = session.plane.clone();
+        for (x, y) in [(2.0, 2.0), (6.0, 2.0), (6.0, 6.0), (2.0, 6.0)] {
+            edge_session.sketch.add_point(x, y);
+        }
+        let corner = face_depth_candidates(&edge_session, &part, Vec3::new(4.0, 4.0, 0.0), Vec3::Z);
+        assert!(corner.iter().any(|c| (*c - 10.0).abs() < 0.01), "plate face missing off to the side: {corner:?}");
+        assert!(!corner.iter().any(|c| (*c - 16.0).abs() < 0.01), "found the step's face where the step isn't: {corner:?}");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
