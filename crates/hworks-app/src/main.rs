@@ -23831,6 +23831,140 @@ mod tests {
         assert!((inf.uv - corner).length() > snap, "dragged in from far outside the radius");
     }
 
+    /// What a drawing view actually contains for a saved part.
+    /// `HCAD_FILE="…\barthing.hcad" cargo test -p hworks-app diag_drawing_views -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn diag_drawing_views() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        let t = mesh_tessellation(mesh);
+        let (blo, bhi) = mesh_bbox(&t.mesh);
+        eprintln!("body bbox {:?} .. {:?}  ({} feature edges)", blo, bhi, t.edges.len());
+
+        // Are the feature edges actually ON the surface, or buried inside the solid?
+        let mut inside = 0usize;
+        let mut on_surf = 0usize;
+        for e in &t.edges {
+            let a = Vec3::from_array(e[0]);
+            let b = Vec3::from_array(e[1]);
+            let mid = (a + b) * 0.5;
+            if point_inside_mesh(&t.mesh, mid) {
+                inside += 1;
+            } else {
+                on_surf += 1;
+            }
+        }
+        eprintln!("edge midpoints: {inside} INSIDE the solid, {on_surf} on/outside the surface");
+
+        // Front view: edges sitting at the very FRONT of the part must be visible.
+        {
+            let basis = ViewBasis::looking_along([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]);
+            let zmax = bhi.z;
+            let (mut front_vis, mut front_hid) = (0, 0);
+            let mut sample_hidden: Vec<[f32; 3]> = Vec::new();
+            for e in &t.edges {
+                let zmid = (e[0][2] + e[1][2]) * 0.5;
+                if zmid < zmax - 0.5 {
+                    continue;
+                }
+                let runs = project_edges(&t.mesh, std::slice::from_ref(e), &basis, 24);
+                if runs.iter().any(|r| !r.hidden) {
+                    front_vis += 1;
+                } else {
+                    front_hid += 1;
+                    if sample_hidden.len() < 4 {
+                        sample_hidden.push([(e[0][0] + e[1][0]) * 0.5, (e[0][1] + e[1][1]) * 0.5, zmid]);
+                    }
+                }
+            }
+            eprintln!("front-most edges (z >= {:.2}): {front_vis} visible, {front_hid} WRONGLY hidden", zmax - 0.5);
+            for m in &sample_hidden {
+                eprintln!("   hidden front edge midpoint {m:?}");
+            }
+        }
+
+        // For every edge the RIGHT view calls hidden, fire a ray from its midpoint straight
+        // at the viewer. Nothing in the way => it was wrongly hidden.
+        {
+            let basis = ViewBasis::looking_along([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+            let toward_viewer = Vec3::X; // Right view looks along -X, so the eye is at +X
+            let (mut wrong, mut right) = (0, 0);
+            for e in &t.edges {
+                let runs = project_edges(&t.mesh, std::slice::from_ref(e), &basis, 24);
+                if runs.is_empty() || runs.iter().any(|r| !r.hidden) {
+                    continue;
+                }
+                let a = Vec3::from_array(e[0]);
+                let b = Vec3::from_array(e[1]);
+                let mid = (a + b) * 0.5 + toward_viewer * 1e-3;
+                let mut blocked = false;
+                for tri in t.mesh.indices.chunks_exact(3) {
+                    let p0 = Vec3::from_array(t.mesh.positions[tri[0] as usize]);
+                    let p1 = Vec3::from_array(t.mesh.positions[tri[1] as usize]);
+                    let p2 = Vec3::from_array(t.mesh.positions[tri[2] as usize]);
+                    if ray_tri_hit(mid, toward_viewer, p0, p1, p2).is_some_and(|d| d > 1e-3) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked { right += 1 } else { wrong += 1 }
+            }
+            eprintln!("RIGHT view hidden edges: {right} genuinely blocked, {wrong} WRONGLY hidden (clear line to viewer)");
+        }
+
+        // Dump the views so they can be rasterised and eyeballed.
+        if let Ok(dump) = std::env::var("HCAD_VIEW_DUMP") {
+            let mut out = String::new();
+            for dir in [ViewDir::Front, ViewDir::Top, ViewDir::Right] {
+                let (d, up) = dir.frame();
+                let basis = ViewBasis::looking_along(d, up);
+                out.push_str(&format!("VIEW {}
+", dir.label()));
+                for e in project_edges(&t.mesh, &t.edges, &basis, 24) {
+                    out.push_str(&format!("{} {} {} {} {}
+", e.a[0], e.a[1], e.b[0], e.b[1], if e.hidden { 1 } else { 0 }));
+                }
+            }
+            std::fs::write(&dump, out).unwrap();
+            eprintln!("wrote {dump}");
+        }
+
+        for dir in [ViewDir::Front, ViewDir::Top, ViewDir::Right, ViewDir::Iso] {
+            let (d, up) = dir.frame();
+            let basis = ViewBasis::looking_along(d, up);
+            let proj = project_edges(&t.mesh, &t.edges, &basis, 24);
+            let vis = proj.iter().filter(|e| !e.hidden).count();
+            let hid = proj.iter().filter(|e| e.hidden).count();
+            let (lo, hi) = edges_bounds(&proj);
+            let visible_only: Vec<ProjEdge> = proj.iter().copied().filter(|e| !e.hidden).collect();
+            let (vlo, vhi) = edges_bounds(&visible_only);
+            eprintln!(
+                "{:<10} runs {:>5} ({} vis / {} hidden)   all {:.2}x{:.2}   visible-only {:.2}x{:.2}",
+                dir.label(), proj.len(), vis, hid,
+                hi[0] - lo[0], hi[1] - lo[1],
+                vhi[0] - vlo[0], vhi[1] - vlo[1]
+            );
+        }
+    }
+
+    /// A new drawing view must show hidden detail. barthing.hcad has a cylinder that every
+    /// standard view occludes; with hidden lines off it vanished from the sheet completely
+    /// rather than reading as a dashed circle, which looked like the projector had lost it.
+    /// (It had not — a ray test confirmed all 267 hidden edges were genuinely blocked.)
+    #[test]
+    fn a_new_view_shows_hidden_detail() {
+        let mut d = Drawing::default();
+        let id = d.add_view(ViewDir::Front, 1.0);
+        assert!(d.view(id).unwrap().show_hidden, "new views must draw hidden lines");
+
+        // And an older file that predates the field still gets it, via the serde default.
+        let ron = r#"(sheet:(name:"A4",w:297.0,h:210.0),source:"p.hcad",views:[(id:1,dir:Front,center:(50.0,50.0),scale:1.0,label:true)],title:(title:"",drawn_by:"",date:"",material:"",notes:""))"#;
+        let old: Drawing = ron::from_str(ron).expect("legacy drawing");
+        assert!(old.views[0].show_hidden, "a drawing saved before the field must default to showing hidden lines");
+    }
+
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
     /// of text — that was the complaint, and the text anchor alone is a tiny target.
     #[test]

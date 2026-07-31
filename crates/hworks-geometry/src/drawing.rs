@@ -78,6 +78,25 @@ impl DepthGrid {
         let mut tris = Vec::with_capacity(mesh.indices.len() / 3);
         let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
         for t in mesh.indices.chunks_exact(3) {
+            // Only FRONT-facing triangles can occlude.
+            //
+            // On a closed solid the front faces already cover everything the viewer can see,
+            // while a back face sits behind its own surface — but in projection it lands on
+            // the same spot and, on a curved patch seen at a grazing angle, can come out a
+            // hair nearer than the edge lying between them. Including back faces therefore
+            // hid huge numbers of perfectly visible edges: a filleted bar reported 280 of its
+            // 303 runs hidden, and only 6 of 288 visible from the top.
+            let p0 = mesh.positions[t[0] as usize];
+            let p1 = mesh.positions[t[1] as usize];
+            let p2 = mesh.positions[t[2] as usize];
+            let e1 = [(p1[0] - p0[0]) as f64, (p1[1] - p0[1]) as f64, (p1[2] - p0[2]) as f64];
+            let e2 = [(p2[0] - p0[0]) as f64, (p2[1] - p0[1]) as f64, (p2[2] - p0[2]) as f64];
+            let fnrm = cross(e1, e2);
+            // `basis.f` points away from the viewer, so a face pointing back at us has a
+            // negative dot. Zero-area slivers are dropped either way.
+            if dot(fnrm, basis.f) >= 0.0 {
+                continue;
+            }
             let mut c2 = [[0.0f64; 2]; 3];
             let mut cd = [0.0f64; 3];
             for (k, &i) in t.iter().enumerate() {
@@ -478,6 +497,66 @@ mod tests {
         let e = [ProjEdge { a: [0.0, 0.0], b: [1.0, 0.0], hidden: false }];
         let low = to_svg(100.0, 100.0, &[SheetItem { edges: &e, center: [50.0, 10.0], scale: 1.0, show_hidden: false, label: None }], &[]);
         assert!(low.contains("M50.000,90.000"), "y not flipped:\n{low}");
+    }
+
+    /// A cylinder seen from the SIDE must draw its barrel outline. Its silhouette is not a
+    /// sharp edge in the mesh — it depends on where you look from — so projecting only the
+    /// feature edges leaves the cylinder invisible.
+    #[test]
+    fn a_cylinder_shows_its_silhouette_from_the_side() {
+        // A 10mm-radius, 30mm-long cylinder along +Z.
+        let mut sk = crate::TriMesh::default();
+        let _ = &mut sk;
+        let n = 64;
+        let circle: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [10.0 * a.cos(), 10.0 * a.sin()]
+            })
+            .collect();
+        let solid = extrude_solid(&circle, &[], &xy_basis(), 30.0).expect("cylinder");
+        let tess = tessellate(&solid, 0.05);
+        let t = mesh_tessellation(tess.mesh.clone());
+
+        // Look along -X: the sheet should show the 30mm length across and 20mm diameter up.
+        let basis = ViewBasis::looking_along([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj = project_edges(&t.mesh, &t.edges, &basis, 24);
+        assert!(!proj.is_empty(), "cylinder projected nothing at all");
+        let (lo, hi) = edges_bounds(&proj);
+        let (w, h) = (hi[0] - lo[0], hi[1] - lo[1]);
+        assert!((w - 30.0).abs() < 0.3, "width {w:.2}, wanted the 30mm length");
+        assert!((h - 20.0).abs() < 0.3, "height {h:.2}, wanted the 20mm diameter — the barrel silhouette is missing");
+    }
+
+    /// The NEAR face must be the visible one. A cube is symmetric, so the earlier
+    /// length-based tests pass whether or not the depth test is inverted — this one names
+    /// which face won.
+    #[test]
+    fn the_near_face_is_the_visible_one() {
+        let sq = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let solid = extrude_solid(&sq, &[], &xy_basis(), 10.0).expect("cube");
+        let tess = tessellate(&solid, 0.05);
+        let t = mesh_tessellation(tess.mesh.clone());
+
+        // Viewer on +Z looking toward -Z, so the z=10 face is nearest.
+        let basis = ViewBasis::looking_along([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]);
+
+        // Classify each ORIGINAL edge by the z of its midpoint, then ask what the projection
+        // said about it. Project one edge at a time so runs map back unambiguously.
+        let (mut near_vis, mut near_hid, mut far_vis, mut far_hid) = (0, 0, 0, 0);
+        for e in &t.edges {
+            let zmid = (e[0][2] + e[1][2]) * 0.5;
+            let runs = project_edges(&t.mesh, std::slice::from_ref(e), &basis, 24);
+            let vis = runs.iter().any(|r| !r.hidden);
+            if zmid > 9.9 {
+                if vis { near_vis += 1 } else { near_hid += 1 }
+            } else if zmid < 0.1 {
+                if vis { far_vis += 1 } else { far_hid += 1 }
+            }
+        }
+        eprintln!("near face: {near_vis} visible / {near_hid} hidden;  far face: {far_vis} visible / {far_hid} hidden");
+        assert!(near_vis > 0 && near_hid == 0, "the NEAR face should be fully visible ({near_vis} vis / {near_hid} hidden)");
+        assert!(far_hid > 0 && far_vis == 0, "the FAR face should be fully hidden ({far_vis} vis / {far_hid} hidden)");
     }
 
     /// An empty edge set must not panic or invent geometry.

@@ -572,8 +572,11 @@ pub struct DrawView {
     pub center: [f64; 2],
     /// Drawing scale: 1.0 is full size, 0.5 is half.
     pub scale: f64,
-    /// Draw the edges that are behind material as dashed hidden lines.
-    #[serde(default)]
+    /// Draw the edges that are behind material as dashed hidden lines. ON by default: a
+    /// drawing is expected to show internal features dashed, and with it off anything the
+    /// body occludes — a central bore, a boss inside a recess — vanishes from the sheet
+    /// entirely rather than reading as hidden detail.
+    #[serde(default = "yes")]
     pub show_hidden: bool,
     /// Print the view's name ("Front") under it.
     #[serde(default = "yes")]
@@ -604,6 +607,7 @@ pub struct Drawing {
     pub source: String,
     pub views: Vec<DrawView>,
     pub title: TitleBlock,
+    #[serde(default)]
     next_id: u64,
 }
 
@@ -611,14 +615,18 @@ impl Drawing {
     /// Place a view and return its stable id. New views land at the sheet centre; the caller
     /// positions them (or the auto-layout does).
     pub fn add_view(&mut self, dir: ViewDir, scale: f64) -> u64 {
-        self.next_id += 1;
+        // Derive from the views actually present as well as the counter: the counter is
+        // serde-defaulted (so a hand-written or older file still loads), and trusting it
+        // alone would hand out an id that an existing view already holds.
+        let used = self.views.iter().map(|v| v.id).max().unwrap_or(0);
+        self.next_id = self.next_id.max(used) + 1;
         let id = self.next_id;
         self.views.push(DrawView {
             id,
             dir,
             center: [self.sheet.w * 0.5, self.sheet.h * 0.5],
             scale,
-            show_hidden: false,
+            show_hidden: true,
             label: true,
         });
         id
