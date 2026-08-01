@@ -391,6 +391,295 @@ fn xml_escape(s: &str) -> String {
     o
 }
 
+// ---------------------------------------------------------------------------
+// Dimension references: what a drawing dimension attaches to
+// ---------------------------------------------------------------------------
+
+/// The kind of geometry a dimension end is attached to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefKind {
+    /// A corner — an endpoint shared by feature edges.
+    Vertex,
+    /// A straight edge, referenced at its midpoint and carrying its direction.
+    Edge,
+    /// A circular rim (hole or boss), carrying centre, axis and radius.
+    Circle,
+}
+
+/// Something in a view a dimension can be attached to, with both where it APPEARS on the
+/// sheet and what it IS in the model.
+#[derive(Clone, Copy, Debug)]
+pub struct SnapTarget {
+    pub kind: RefKind,
+    /// Position in sheet units for this view, before the view's scale is applied — this is
+    /// what a click is matched against, because it is what the user sees.
+    pub sheet: [f64; 2],
+    /// The model-space anchor: the corner, the edge midpoint, or the circle centre.
+    pub model: [f64; 3],
+    /// Edge direction, or circle axis. Zero for a vertex.
+    pub dir: [f64; 3],
+    /// Circle radius; 0 otherwise.
+    pub radius: f64,
+    /// Whether the target sits on visible geometry (vs behind material).
+    pub hidden: bool,
+}
+
+/// A stored, associative attachment point for a dimension.
+///
+/// It keeps a **geometry sample** rather than any index into the mesh: tessellation is rebuilt
+/// from scratch on every regeneration, so an index means nothing across edits. The same
+/// approach already carries assembly mates and region picks through rebuilds.
+///
+/// Resolution is nearest-match against the current geometry, scored on position, kind, and
+/// (for circles) radius. That survives the edits dimensions actually need to survive — a
+/// fillet changing, a hole moving, a neighbouring feature being added. It cannot follow an
+/// edit that moves the geometry further than it is from its neighbours; `resolve` returns
+/// `None` there so the dimension can be shown as dangling rather than silently measuring the
+/// wrong thing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DimRef {
+    pub kind: RefKind,
+    pub point: [f64; 3],
+    pub dir: [f64; 3],
+    pub radius: f64,
+}
+
+impl DimRef {
+    pub fn from_target(t: &SnapTarget) -> DimRef {
+        DimRef { kind: t.kind, point: t.model, dir: t.dir, radius: t.radius }
+    }
+}
+
+/// Where a [`DimRef`] currently sits, after resolving against rebuilt geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedRef {
+    pub point: [f64; 3],
+    pub dir: [f64; 3],
+    pub radius: f64,
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn len3(a: [f64; 3]) -> f64 {
+    dot(a, a).sqrt()
+}
+
+/// Everything in this view a dimension could attach to: corners, straight-edge midpoints, and
+/// circular rims.
+///
+/// `hidden` is carried through so a pick can prefer visible geometry, and the sheet position
+/// is the projected one, so matching a click means comparing what the user actually sees.
+pub fn snap_targets(mesh: &TriMesh, edges: &[[[f32; 3]; 2]], basis: &ViewBasis) -> Vec<SnapTarget> {
+    let mut out: Vec<SnapTarget> = Vec::new();
+    if edges.is_empty() {
+        return out;
+    }
+    let grid = DepthGrid::build(mesh, basis);
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for q in &mesh.positions {
+        for a in 0..3 {
+            lo[a] = lo[a].min(q[a] as f64);
+            hi[a] = hi[a].max(q[a] as f64);
+        }
+    }
+    let diag = if mesh.positions.is_empty() { 1.0 } else { len3(sub3(hi, lo)).max(1e-9) };
+    let eps = diag * 1e-4;
+    let weld = diag * 1e-5;
+
+    let mut push = |kind: RefKind, model: [f64; 3], dir: [f64; 3], radius: f64, out: &mut Vec<SnapTarget>| {
+        let (sheet, depth) = basis.project(model);
+        // Nudge toward the viewer so a target sitting exactly on the surface isn't judged
+        // hidden by its own face. Smaller depth is NEARER, so this subtracts — adding pushed
+        // every target behind its own surface and reported the whole model hidden.
+        let hidden = grid.occluded(sheet, depth - eps * 2.0, eps);
+        if out.iter().any(|t| t.kind == kind && len3(sub3(t.model, model)) < weld) {
+            return;
+        }
+        out.push(SnapTarget { kind, sheet, model, dir, radius, hidden });
+    };
+
+    for e in edges {
+        let a = [e[0][0] as f64, e[0][1] as f64, e[0][2] as f64];
+        let b = [e[1][0] as f64, e[1][1] as f64, e[1][2] as f64];
+        let d = sub3(b, a);
+        let l = len3(d);
+        if l < weld {
+            continue;
+        }
+        push(RefKind::Vertex, a, [0.0; 3], 0.0, &mut out);
+        push(RefKind::Vertex, b, [0.0; 3], 0.0, &mut out);
+        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+        push(RefKind::Edge, mid, [d[0] / l, d[1] / l, d[2] / l], 0.0, &mut out);
+    }
+
+    for c in circle_rims(edges, weld) {
+        push(RefKind::Circle, c.centre, c.axis, c.radius, &mut out);
+    }
+    out
+}
+
+/// A circular rim recovered from a closed chain of feature edges.
+struct Rim {
+    centre: [f64; 3],
+    axis: [f64; 3],
+    radius: f64,
+}
+
+/// Find circular rims: closed chains of edges whose points are equidistant from their own
+/// centroid and lie in one plane. That is what a hole or a boss end presents, and it is what
+/// a diameter dimension will attach to.
+fn circle_rims(edges: &[[[f32; 3]; 2]], weld: f64) -> Vec<Rim> {
+    // Weld endpoints so a chain can be walked.
+    let key = |q: [f64; 3]| {
+        let s = if weld > 0.0 { weld } else { 1e-9 };
+        ((q[0] / s).round() as i64, (q[1] / s).round() as i64, (q[2] / s).round() as i64)
+    };
+    let mut pts: Vec<[f64; 3]> = Vec::new();
+    let mut ids: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+    let mut adj: Vec<Vec<usize>> = Vec::new();
+    let mut id_of = |q: [f64; 3], pts: &mut Vec<[f64; 3]>, adj: &mut Vec<Vec<usize>>, ids: &mut std::collections::HashMap<(i64, i64, i64), usize>| {
+        *ids.entry(key(q)).or_insert_with(|| {
+            pts.push(q);
+            adj.push(Vec::new());
+            pts.len() - 1
+        })
+    };
+    for e in edges {
+        let a = [e[0][0] as f64, e[0][1] as f64, e[0][2] as f64];
+        let b = [e[1][0] as f64, e[1][1] as f64, e[1][2] as f64];
+        let (ia, ib) = (id_of(a, &mut pts, &mut adj, &mut ids), id_of(b, &mut pts, &mut adj, &mut ids));
+        if ia != ib {
+            adj[ia].push(ib);
+            adj[ib].push(ia);
+        }
+    }
+    // Walk components made only of degree-2 vertices — a clean closed chain.
+    let mut seen = vec![false; pts.len()];
+    let mut out = Vec::new();
+    for start in 0..pts.len() {
+        if seen[start] || adj[start].len() != 2 {
+            continue;
+        }
+        let mut chain = vec![start];
+        seen[start] = true;
+        let mut prev = start;
+        let mut cur = adj[start][0];
+        let mut closed = false;
+        while adj[cur].len() == 2 && !seen[cur] {
+            seen[cur] = true;
+            chain.push(cur);
+            let nxt = if adj[cur][0] == prev { adj[cur][1] } else { adj[cur][0] };
+            prev = cur;
+            cur = nxt;
+            if cur == start {
+                closed = true;
+                break;
+            }
+            if chain.len() > 100_000 {
+                break;
+            }
+        }
+        // A circle needs enough segments to be a curve rather than a polygon corner.
+        if !closed || chain.len() < 8 {
+            continue;
+        }
+        let n = chain.len() as f64;
+        let mut c = [0.0f64; 3];
+        for &i in &chain {
+            for a in 0..3 {
+                c[a] += pts[i][a];
+            }
+        }
+        for a in 0..3 {
+            c[a] /= n;
+        }
+        // Equidistant from the centroid?
+        let rs: Vec<f64> = chain.iter().map(|&i| len3(sub3(pts[i], c))).collect();
+        let rmean = rs.iter().sum::<f64>() / n;
+        if rmean <= weld * 10.0 || rs.iter().any(|r| (r - rmean).abs() > rmean * 0.02) {
+            continue;
+        }
+        // Planar? Take the axis from two spokes and check every point lies in that plane.
+        let a0 = sub3(pts[chain[0]], c);
+        let a1 = sub3(pts[chain[chain.len() / 4]], c);
+        let axis = norm(cross(a0, a1));
+        if len3(axis) < 0.5 {
+            continue;
+        }
+        if chain.iter().any(|&i| dot(sub3(pts[i], c), axis).abs() > rmean * 0.02) {
+            continue;
+        }
+        out.push(Rim { centre: c, axis, radius: rmean });
+    }
+    out
+}
+
+/// Re-find what a stored reference points at, in freshly rebuilt geometry.
+///
+/// Scores candidates on distance first, then agreement of kind, direction and radius, and
+/// requires the winner to be within `tol` — so an edit that moves geometry further than that
+/// yields `None` (a dangling dimension) instead of silently latching onto a neighbour.
+pub fn resolve_ref(targets: &[SnapTarget], r: &DimRef, tol: f64) -> Option<ResolvedRef> {
+    let mut best: Option<(f64, &SnapTarget)> = None;
+    for t in targets {
+        if t.kind != r.kind {
+            continue;
+        }
+        let d = len3(sub3(t.model, r.point));
+        if d > tol {
+            continue;
+        }
+        // Direction agreement (edges are undirected, so compare absolutely); radius match for
+        // circles. Both only break ties — position leads.
+        let mut score = d;
+        if r.kind == RefKind::Edge {
+            let align = dot(t.dir, r.dir).abs().clamp(0.0, 1.0);
+            score += (1.0 - align) * tol;
+        }
+        if r.kind == RefKind::Circle {
+            score += (t.radius - r.radius).abs();
+            let align = dot(t.axis_or_dir(), r.dir).abs().clamp(0.0, 1.0);
+            score += (1.0 - align) * tol * 0.5;
+        }
+        if best.is_none_or(|(bs, _)| score < bs) {
+            best = Some((score, t));
+        }
+    }
+    best.map(|(_, t)| ResolvedRef { point: t.model, dir: t.dir, radius: t.radius })
+}
+
+impl SnapTarget {
+    fn axis_or_dir(&self) -> [f64; 3] {
+        self.dir
+    }
+}
+
+/// The target nearest a click, in sheet units. Visible geometry wins ties within `bias` so
+/// tracing an outline doesn't keep catching hidden detail behind it.
+pub fn pick_target<'a>(targets: &'a [SnapTarget], sheet: [f64; 2], tol: f64) -> Option<&'a SnapTarget> {
+    let mut best: Option<(f64, &SnapTarget)> = None;
+    for t in targets {
+        let d = ((t.sheet[0] - sheet[0]).powi(2) + (t.sheet[1] - sheet[1]).powi(2)).sqrt();
+        if d > tol {
+            continue;
+        }
+        // Prefer, in order: circles (a hole centre is what you usually want), then corners,
+        // then edges; and visible over hidden. Encoded as a small penalty so position still
+        // dominates.
+        let kind_pen = match t.kind {
+            RefKind::Circle => 0.0,
+            RefKind::Vertex => tol * 0.15,
+            RefKind::Edge => tol * 0.35,
+        };
+        let score = d + kind_pen + if t.hidden { tol * 0.5 } else { 0.0 };
+        if best.is_none_or(|(bs, _)| score < bs) {
+            best = Some((score, t));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +846,137 @@ mod tests {
         eprintln!("near face: {near_vis} visible / {near_hid} hidden;  far face: {far_vis} visible / {far_hid} hidden");
         assert!(near_vis > 0 && near_hid == 0, "the NEAR face should be fully visible ({near_vis} vis / {near_hid} hidden)");
         assert!(far_hid > 0 && far_vis == 0, "the FAR face should be fully hidden ({far_vis} vis / {far_hid} hidden)");
+    }
+
+    /// Build a box `w` x `d` x `h` and return the pieces a view needs.
+    fn box_geom(w: f64, d: f64, h: f64) -> (TriMesh, Vec<[[f32; 3]; 2]>) {
+        let sq = vec![[0.0, 0.0], [w, 0.0], [w, d], [0.0, d]];
+        let solid = extrude_solid(&sq, &[], &xy_basis(), h).expect("box");
+        let t = mesh_tessellation(tessellate(&solid, 0.05).mesh);
+        (t.mesh, t.edges)
+    }
+
+    fn front() -> ViewBasis {
+        ViewBasis::looking_along([0.0, 0.0, -1.0], [0.0, 1.0, 0.0])
+    }
+
+    /// A box must offer its eight corners and twelve edge midpoints to attach to.
+    #[test]
+    fn snap_targets_cover_a_box() {
+        let (mesh, edges) = box_geom(20.0, 15.0, 10.0);
+        let ts = snap_targets(&mesh, &edges, &front());
+
+        let corners: Vec<&SnapTarget> = ts.iter().filter(|t| t.kind == RefKind::Vertex).collect();
+        assert_eq!(corners.len(), 8, "expected 8 corners, got {}", corners.len());
+        let mids: Vec<&SnapTarget> = ts.iter().filter(|t| t.kind == RefKind::Edge).collect();
+        assert_eq!(mids.len(), 12, "expected 12 edge midpoints, got {}", mids.len());
+
+        // Every corner of the box is present.
+        for c in [
+            [0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 15.0, 0.0], [0.0, 15.0, 0.0],
+            [0.0, 0.0, 10.0], [20.0, 0.0, 10.0], [20.0, 15.0, 10.0], [0.0, 15.0, 10.0],
+        ] {
+            assert!(corners.iter().any(|t| len3(sub3(t.model, c)) < 1e-6), "missing corner {c:?}");
+        }
+        // Corners on the far face are behind the near one.
+        assert!(corners.iter().any(|t| t.hidden), "no corner reported hidden");
+        assert!(corners.iter().any(|t| !t.hidden), "no corner reported visible");
+    }
+
+    /// A hole's rim must be offered as a Circle, with its true centre and radius — that is
+    /// what a diameter dimension will attach to.
+    #[test]
+    fn snap_targets_find_a_hole_rim() {
+        let outer = vec![[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]];
+        let n = 48;
+        let hole: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [20.0 + 6.0 * a.cos(), 20.0 + 6.0 * a.sin()]
+            })
+            .collect();
+        let solid = extrude_solid(&outer, &[hole], &xy_basis(), 8.0).expect("plate with hole");
+        let t = mesh_tessellation(tessellate(&solid, 0.05).mesh);
+        let ts = snap_targets(&t.mesh, &t.edges, &front());
+
+        let circles: Vec<&SnapTarget> = ts.iter().filter(|c| c.kind == RefKind::Circle).collect();
+        assert!(!circles.is_empty(), "the hole rim was not offered as a circle");
+        let top = circles
+            .iter()
+            .find(|c| (c.model[2] - 8.0).abs() < 0.1)
+            .expect("no rim on the top face");
+        assert!((top.radius - 6.0).abs() < 0.05, "radius {:.3}, wanted 6", top.radius);
+        assert!((top.model[0] - 20.0).abs() < 0.05 && (top.model[1] - 20.0).abs() < 0.05, "centre off: {:?}", top.model);
+        // Its axis is the hole's, i.e. the extrude direction.
+        assert!(dot(top.dir, [0.0, 0.0, 1.0]).abs() > 0.99, "axis not along Z: {:?}", top.dir);
+    }
+
+    /// THE associativity test: a reference taken on one build must resolve to the SAME
+    /// feature after the part is rebuilt at a different size — following the geometry to its
+    /// new position rather than staying at the old coordinates or latching onto a neighbour.
+    #[test]
+    fn a_reference_follows_the_geometry_through_an_edit() {
+        let (m1, e1) = box_geom(20.0, 15.0, 10.0);
+        let t1 = snap_targets(&m1, &e1, &front());
+
+        // Attach to the top-front-right corner (20, 0, 10).
+        let picked = t1
+            .iter()
+            .find(|t| t.kind == RefKind::Vertex && len3(sub3(t.model, [20.0, 0.0, 10.0])) < 1e-6)
+            .expect("corner not offered");
+        let r = DimRef::from_target(picked);
+
+        // Rebuild 2mm taller and 2mm wider: that corner moves to (22, 0, 12).
+        let (m2, e2) = box_geom(22.0, 15.0, 12.0);
+        let t2 = snap_targets(&m2, &e2, &front());
+        let got = resolve_ref(&t2, &r, 5.0).expect("reference went dangling on a small edit");
+        assert!(
+            len3(sub3(got.point, [22.0, 0.0, 12.0])) < 1e-6,
+            "resolved to {:?}, wanted the moved corner (22, 0, 12)",
+            got.point
+        );
+        // And emphatically NOT the stale coordinates.
+        assert!(len3(sub3(got.point, r.point)) > 1.0, "resolved back to the old position");
+    }
+
+    /// An edit that moves geometry further than the tolerance must go dangling, not silently
+    /// grab a neighbouring corner and measure something else.
+    #[test]
+    fn a_reference_goes_dangling_rather_than_grabbing_a_neighbour() {
+        let (m1, e1) = box_geom(20.0, 15.0, 10.0);
+        let t1 = snap_targets(&m1, &e1, &front());
+        let picked = t1
+            .iter()
+            .find(|t| t.kind == RefKind::Vertex && len3(sub3(t.model, [20.0, 0.0, 10.0])) < 1e-6)
+            .unwrap();
+        let r = DimRef::from_target(picked);
+
+        // Rebuild far larger, with a tight tolerance: nothing is close enough to be honest.
+        let (m2, e2) = box_geom(60.0, 15.0, 40.0);
+        let t2 = snap_targets(&m2, &e2, &front());
+        assert!(resolve_ref(&t2, &r, 2.0).is_none(), "latched onto a neighbour instead of going dangling");
+
+        // A kind mismatch never resolves either.
+        let edge_ref = DimRef { kind: RefKind::Edge, ..r };
+        let vertex_only: Vec<SnapTarget> = t2.iter().copied().filter(|t| t.kind == RefKind::Vertex).collect();
+        assert!(resolve_ref(&vertex_only, &edge_ref, 100.0).is_none(), "an Edge ref matched a Vertex target");
+    }
+
+    /// A click on the sheet resolves to the target under it, preferring a hole centre over
+    /// the edges around it, and visible geometry over hidden.
+    #[test]
+    fn picking_prefers_the_useful_target() {
+        let (mesh, edges) = box_geom(20.0, 15.0, 10.0);
+        let ts = snap_targets(&mesh, &edges, &front());
+
+        // The front-top-right corner projects to sheet (20, 15) in this view.
+        let (sheet, _) = front().project([20.0, 15.0, 10.0]);
+        let hit = pick_target(&ts, sheet, 1.0).expect("nothing picked at a corner");
+        assert_eq!(hit.kind, RefKind::Vertex, "expected the corner, got {:?}", hit.kind);
+        assert!(!hit.hidden, "picked the hidden corner behind the visible one");
+
+        // Far from anything, nothing is picked.
+        assert!(pick_target(&ts, [500.0, 500.0], 1.0).is_none(), "picked something from far away");
     }
 
     /// An empty edge set must not panic or invent geometry.
