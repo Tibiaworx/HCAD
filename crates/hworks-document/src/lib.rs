@@ -597,6 +597,62 @@ pub struct TitleBlock {
     pub notes: String,
 }
 
+
+/// What a drawing dimension attaches to, as plain data.
+///
+/// Mirrors the geometry kernel's `DimRef` deliberately: the document format must not depend
+/// on the kernel, and a saved drawing has to keep loading if the kernel's types move.
+/// `kind`: 0 = corner, 1 = edge (dir = its direction), 2 = circle (dir = axis, radius set).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct DimAnchor {
+    pub kind: u8,
+    pub point: [f64; 3],
+    pub dir: [f64; 3],
+    #[serde(default)]
+    pub radius: f64,
+    /// The part's bounding diagonal when this anchor was picked.
+    ///
+    /// Resolution allows the geometry to move by a fraction of THIS, not of whatever the part
+    /// measures now. Judging by the current size lets a reference follow a part that grew
+    /// enormously (matching some unrelated corner) while refusing a modest edit on a small
+    /// one — the tolerance moved in the wrong direction with the part.
+    #[serde(default)]
+    pub scale: f64,
+}
+
+/// How a linear dimension measures: along the line between the points, or along one sheet
+/// axis (the usual choice on an orthographic view).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DimStyle {
+    #[default]
+    Aligned,
+    Horizontal,
+    Vertical,
+}
+
+/// A dimension placed on a drawing sheet.
+///
+/// It stores WHAT it measures, not the number: the value is recomputed from the model on
+/// every rebuild, so editing the part updates the drawing. If an anchor can no longer be
+/// resolved the dimension is dangling and says so rather than showing a stale figure.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DrawDim {
+    pub id: u64,
+    /// The view this dimension belongs to.
+    pub view: u64,
+    pub a: DimAnchor,
+    pub b: DimAnchor,
+    pub style: DimStyle,
+    /// Perpendicular offset of the dimension line from the measured span, in model units.
+    pub offset: f64,
+    /// Slide of the text along the dimension line.
+    #[serde(default)]
+    pub slide: f64,
+    /// Replaces the measured text when set (for a note like "2x" or a tolerance).
+    #[serde(default)]
+    pub text_override: Option<String>,
+}
+
 /// A drawing: standard views of ONE part, placed on a sheet. The part is referenced by a
 /// path relative to the drawing file (same scheme as assembly components), so moving the pair
 /// together keeps the link.
@@ -606,6 +662,9 @@ pub struct Drawing {
     /// Relative path to the `.hcad` part this drawing documents.
     pub source: String,
     pub views: Vec<DrawView>,
+    /// Dimensions placed on the sheet.
+    #[serde(default)]
+    pub dims: Vec<DrawDim>,
     pub title: TitleBlock,
     #[serde(default)]
     next_id: u64,
@@ -642,5 +701,25 @@ impl Drawing {
 
     pub fn remove_view(&mut self, id: u64) {
         self.views.retain(|v| v.id != id);
+        // A dimension without its view has nothing to be drawn against.
+        self.dims.retain(|d| d.view != id);
+    }
+
+    /// Place a dimension and return its id. Ids are shared with views (one counter), and
+    /// derived from what is actually present so a hand-written file can't collide.
+    pub fn add_dim(&mut self, view: u64, a: DimAnchor, b: DimAnchor, style: DimStyle, offset: f64) -> u64 {
+        let used = self.views.iter().map(|v| v.id).chain(self.dims.iter().map(|d| d.id)).max().unwrap_or(0);
+        self.next_id = self.next_id.max(used) + 1;
+        let id = self.next_id;
+        self.dims.push(DrawDim { id, view, a, b, style, offset, slide: 0.0, text_override: None });
+        id
+    }
+
+    pub fn dim_mut(&mut self, id: u64) -> Option<&mut DrawDim> {
+        self.dims.iter_mut().find(|d| d.id == id)
+    }
+
+    pub fn remove_dim(&mut self, id: u64) {
+        self.dims.retain(|d| d.id != id);
     }
 }

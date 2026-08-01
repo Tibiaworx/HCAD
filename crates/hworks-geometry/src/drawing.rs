@@ -287,6 +287,17 @@ pub struct SheetItem<'a> {
 /// SVG's y axis runs down the page while sheet coordinates run up from the bottom-left, so
 /// every point is flipped on the way out. Hidden lines use the drafting dash pattern.
 pub fn to_svg(sheet_w: f64, sheet_h: f64, items: &[SheetItem], title: &[(String, String)]) -> String {
+    to_svg_with_dims(sheet_w, sheet_h, items, &[], title)
+}
+
+/// As `to_svg`, plus dimensions already laid out in final sheet coordinates.
+pub fn to_svg_with_dims(
+    sheet_w: f64,
+    sheet_h: f64,
+    items: &[SheetItem],
+    dims: &[(DimGeom, String)],
+    title: &[(String, String)],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{sheet_w}mm\" height=\"{sheet_h}mm\" viewBox=\"0 0 {sheet_w} {sheet_h}\">\n"
@@ -339,6 +350,43 @@ pub fn to_svg(sheet_w: f64, sheet_h: f64, items: &[SheetItem], title: &[(String,
                 xml_escape(lbl)
             ));
         }
+    }
+
+    // Dimensions. Arrowheads are drawn as filled triangles at each end of the dimension
+    // line, with witness lines running from the measured points back to it.
+    for (g, text) in dims {
+        let fy = |y: f64| sheet_h - y;
+        let (dx, dy) = (g.p1[0] - g.p0[0], g.p1[1] - g.p0[1]);
+        let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+        let (ux, uy) = (dx / l, dy / l);
+        let (px, py) = (-uy, ux);
+        out.push_str(&format!(
+            "<path d=\"M{:.3},{:.3} L{:.3},{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.25\"/>\n",
+            g.p0[0], fy(g.p0[1]), g.p1[0], fy(g.p1[1])
+        ));
+        // Witness lines, extended slightly past the dimension line as drafting expects.
+        for (from, to) in [(g.a, g.p0), (g.b, g.p1)] {
+            let ex = [to[0] + (to[0] - from[0]) * 0.0 + px * 1.2, to[1] + py * 1.2];
+            out.push_str(&format!(
+                "<path d=\"M{:.3},{:.3} L{:.3},{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.18\"/>\n",
+                from[0], fy(from[1]), ex[0], fy(ex[1])
+            ));
+        }
+        let head = 1.6_f64;
+        for (tip, s) in [(g.p0, 1.0), (g.p1, -1.0)] {
+            let bx = tip[0] + ux * head * s;
+            let by = tip[1] + uy * head * s;
+            out.push_str(&format!(
+                "<polygon points=\"{:.3},{:.3} {:.3},{:.3} {:.3},{:.3}\" fill=\"black\"/>\n",
+                tip[0], fy(tip[1]),
+                bx + px * head * 0.32, fy(by + py * head * 0.32),
+                bx - px * head * 0.32, fy(by - py * head * 0.32)
+            ));
+        }
+        out.push_str(&format!(
+            "<text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"3.2\" text-anchor=\"middle\" fill=\"black\">{}</text>\n",
+            g.label[0], fy(g.label[1]) - 1.0, xml_escape(text)
+        ));
     }
 
     // Title block, bottom-right inside the border.
@@ -678,6 +726,77 @@ pub fn pick_target<'a>(targets: &'a [SnapTarget], sheet: [f64; 2], tol: f64) -> 
         }
     }
     best.map(|(_, t)| t)
+}
+
+/// How a linear dimension measures. Mirrors the document's `DimStyle`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DimStyle {
+    Aligned,
+    Horizontal,
+    Vertical,
+}
+
+/// A laid-out dimension, ready to draw: the dimension line, the witness lines back to the
+/// measured points, the text anchor, and the measured value.
+#[derive(Clone, Copy, Debug)]
+pub struct DimGeom {
+    /// The measured points themselves.
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    /// The dimension line, offset off the geometry.
+    pub p0: [f64; 2],
+    pub p1: [f64; 2],
+    /// Where the text sits.
+    pub label: [f64; 2],
+    pub value: f64,
+}
+
+/// Lay out a linear dimension between two projected points.
+///
+/// The value is measured in SHEET space, which is what a drawing states: an orthographic view
+/// shows the projected length, and a feature that is foreshortened in this view should read
+/// as its foreshortened size, not its true 3D length.
+pub fn dim_geometry(a: [f64; 2], b: [f64; 2], style: DimStyle, offset: f64, slide: f64) -> DimGeom {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let (dir, value) = match style {
+        DimStyle::Aligned => {
+            let l = (dx * dx + dy * dy).sqrt();
+            if l > 1e-9 { ([dx / l, dy / l], l) } else { ([1.0, 0.0], 0.0) }
+        }
+        DimStyle::Horizontal => ([1.0, 0.0], dx.abs()),
+        DimStyle::Vertical => ([0.0, 1.0], dy.abs()),
+    };
+    let perp = [-dir[1], dir[0]];
+    let off = [perp[0] * offset, perp[1] * offset];
+    // For an axis-locked style the dimension line spans the projection of each point onto
+    // that axis, so the witness lines run square off the geometry as drafting expects.
+    let (e0, e1) = match style {
+        DimStyle::Aligned => (a, b),
+        DimStyle::Horizontal => {
+            let y = if offset >= 0.0 { a[1].max(b[1]) } else { a[1].min(b[1]) };
+            ([a[0], y], [b[0], y])
+        }
+        DimStyle::Vertical => {
+            let x = if offset >= 0.0 { a[0].max(b[0]) } else { a[0].min(b[0]) };
+            ([x, a[1]], [x, b[1]])
+        }
+    };
+    let p0 = [e0[0] + off[0], e0[1] + off[1]];
+    let p1 = [e1[0] + off[0], e1[1] + off[1]];
+    let mid = [(p0[0] + p1[0]) * 0.5 + dir[0] * slide, (p0[1] + p1[1]) * 0.5 + dir[1] * slide];
+    DimGeom { a, b, p0, p1, label: mid, value }
+}
+
+/// Format a measured length the way a drawing states it: trailing zeros trimmed, but never
+/// bare-integer when the value isn't one.
+pub fn format_dim(value: f64) -> String {
+    let r = (value * 100.0).round() / 100.0;
+    if (r - r.round()).abs() < 1e-9 {
+        format!("{}", r.round() as i64)
+    } else {
+        let t = format!("{r:.2}");
+        t.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
 }
 
 #[cfg(test)]

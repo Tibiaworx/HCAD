@@ -22,8 +22,11 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use hworks_geometry::drawing::{edges_bounds, project_edges, to_svg, ProjEdge, SheetItem, ViewBasis};
-use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet};
+use hworks_geometry::drawing::{
+    dim_geometry, edges_bounds, format_dim, pick_target, project_edges, resolve_ref, snap_targets, to_svg_with_dims,
+    DimGeom, DimRef, ProjEdge, RefKind, SheetItem, SnapTarget, ViewBasis,
+};
+use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
@@ -279,6 +282,9 @@ struct DrawCache {
     edges: Vec<[[f32; 3]; 2]>,
     /// Projected runs per view direction.
     proj: std::collections::HashMap<String, Vec<hworks_geometry::drawing::ProjEdge>>,
+    /// What dimensions can attach to, per view direction. Rebuilt with the projection, so a
+    /// dimension always resolves against the geometry currently on the sheet.
+    targets: std::collections::HashMap<String, Vec<SnapTarget>>,
 }
 
 /// The open assembly document (empty & unused in Part mode).
@@ -2194,6 +2200,14 @@ struct UiState {
     /// The view being dragged on the sheet, and the id of the selected view.
     draw_drag: Option<(u64, egui::Vec2)>,
     draw_sel: Option<u64>,
+    /// Drawing dimension tool: on, and the first anchor picked (view id + anchor).
+    draw_dim_tool: bool,
+    draw_dim_first: Option<(u64, DimAnchor)>,
+    /// How the next dimension will measure.
+    draw_dim_style: DimStyle,
+    /// The dimension being dragged, and the offset it had when grabbed.
+    draw_dim_drag: Option<(u64, f64, f64)>,
+    draw_dim_sel: Option<u64>,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
     pattern_spec: Option<PatternSpec>,
@@ -14301,7 +14315,10 @@ fn handle_file_io(
                     path.set_extension("svg");
                 }
                 let items = drawing_sheet_items(&draw.0, &cache);
-                let svg = to_svg(draw.0.sheet.w, draw.0.sheet.h, &items, &drawing_title_rows(&draw.0));
+                // Dimensions are exported with the geometry, each resolved against the
+                // current model so the sheet states what the part actually measures.
+                let dims: Vec<(DimGeom, String)> = draw.0.dims.iter().filter_map(|d| resolve_dim(&draw.0, &cache, d)).collect();
+                let svg = to_svg_with_dims(draw.0.sheet.w, draw.0.sheet.h, &items, &dims, &drawing_title_rows(&draw.0));
                 match std::fs::write(&path, svg) {
                     Ok(()) => ui_state.toasts.push((format!("Exported {}", path.display()), 3.5)),
                     Err(e) => ui_state.last_error = Some(format!("Couldn't write {}: {e}", path.display())),
@@ -16877,6 +16894,142 @@ fn drawing_ui(
                 }
             }
 
+            // Dimensions. Each is resolved against the current model every frame, so editing
+            // the part restates the drawing; one that can no longer find its geometry draws
+            // red and says so rather than showing a stale number.
+            let dim_col = egui::Color32::from_gray(30);
+            let dangling_col = egui::Color32::from_rgb(200, 60, 60);
+            let mut dim_hit: Option<u64> = None;
+            for d in &draw.0.dims {
+                let sel = ui_state.draw_dim_sel == Some(d.id);
+                match resolve_dim(&draw.0, &cache, d) {
+                    Some((g, text)) => {
+                        let col = if sel { egui::Color32::from_rgb(40, 110, 200) } else { dim_col };
+                        let (p0, p1) = (to_screen(g.p0), to_screen(g.p1));
+                        painter.line_segment([p0, p1], egui::Stroke::new(1.0, col));
+                        painter.line_segment([to_screen(g.a), p0], egui::Stroke::new(0.7, col));
+                        painter.line_segment([to_screen(g.b), p1], egui::Stroke::new(0.7, col));
+                        // Arrowheads.
+                        let dv = (p1 - p0).normalized();
+                        let pv = egui::vec2(-dv.y, dv.x);
+                        let hl = 7.0_f32;
+                        for (tip, sgn) in [(p0, 1.0), (p1, -1.0)] {
+                            let base = tip + dv * hl * sgn;
+                            painter.add(egui::Shape::convex_polygon(
+                                vec![tip, base + pv * hl * 0.32, base - pv * hl * 0.32],
+                                col,
+                                egui::Stroke::NONE,
+                            ));
+                        }
+                        let lp = to_screen(g.label);
+                        let fs = (3.2 * z).clamp(8.0, 20.0);
+                        // A plate behind the text so it stays readable over geometry.
+                        let gal = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(fs), col);
+                        let r = egui::Rect::from_center_size(lp - egui::vec2(0.0, gal.size().y * 0.7), gal.size() + egui::vec2(4.0, 1.0));
+                        painter.rect_filled(r, 2.0, egui::Color32::from_rgb(250, 250, 248));
+                        painter.galley(r.min + egui::vec2(2.0, 0.5), gal, col);
+                        if let Some(pos) = resp.hover_pos() {
+                            if r.expand(3.0).contains(pos) || seg_dist_screen(pos, p0, p1) < 6.0 {
+                                dim_hit = Some(d.id);
+                            }
+                        }
+                    }
+                    None => {
+                        // Dangling: mark it at the view so it can be found and repaired.
+                        if let Some(v) = draw.0.views.iter().find(|v| v.id == d.view) {
+                            let at = to_screen([v.center[0], v.center[1]]);
+                            painter.text(at, egui::Align2::CENTER_CENTER, "⚠ dimension lost its geometry", egui::FontId::proportional(12.0), dangling_col);
+                        }
+                    }
+                }
+            }
+
+            // Dimension tool: click a snap target, then a second, to place a dimension.
+            if ui_state.draw_dim_tool {
+                if let Some(pos) = resp.hover_pos() {
+                    let sheet = to_sheet(pos);
+                    // Which view is the cursor over, and where in that view's own space?
+                    let mut best: Option<(f64, u64, [f64; 2])> = None;
+                    for v in &draw.0.views {
+                        let local = [(sheet[0] - v.center[0]) / v.scale, (sheet[1] - v.center[1]) / v.scale];
+                        if let Some(ts) = cache.targets.get(v.dir.label()) {
+                            let tol = 6.0 / (z as f64 * v.scale); // ~6px, in that view's units
+                            if let Some(t) = pick_target(ts, local, tol) {
+                                let d = ((t.sheet[0] - local[0]).powi(2) + (t.sheet[1] - local[1]).powi(2)).sqrt() * v.scale;
+                                if best.is_none_or(|(bd, _, _)| d < bd) {
+                                    best = Some((d, v.id, [v.center[0] + t.sheet[0] * v.scale, v.center[1] + t.sheet[1] * v.scale]));
+                                }
+                            }
+                        }
+                    }
+                    // Highlight what a click would take.
+                    if let Some((_, vid, at)) = best {
+                        let sp = to_screen(at);
+                        painter.circle_stroke(sp, 5.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 150, 30)));
+                        if resp.clicked() {
+                            // Re-pick in view space to get the actual target.
+                            if let Some(v) = draw.0.views.iter().find(|v| v.id == vid) {
+                                let local = [(sheet[0] - v.center[0]) / v.scale, (sheet[1] - v.center[1]) / v.scale];
+                                if let Some(ts) = cache.targets.get(v.dir.label()) {
+                                    let tol = 6.0 / (z as f64 * v.scale);
+                                    if let Some(t) = pick_target(ts, local, tol) {
+                                        let anchor = target_to_anchor(t, cache_part_diag(&cache));
+                                        match ui_state.draw_dim_first.take() {
+                                            None => ui_state.draw_dim_first = Some((vid, anchor)),
+                                            Some((fv, fa)) if fv == vid => {
+                                                let style = ui_state.draw_dim_style;
+                                                let id = draw.0.add_dim(vid, fa, anchor, style, 8.0);
+                                                ui_state.draw_dim_sel = Some(id);
+                                            }
+                                            // Two views can't share a dimension.
+                                            Some(_) => ui_state.draw_dim_first = Some((vid, anchor)),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Show the first pick while waiting for the second.
+                    if let Some((fv, fa)) = ui_state.draw_dim_first {
+                        if let Some(v) = draw.0.views.iter().find(|v| v.id == fv) {
+                            let (dir, up) = v.dir.frame();
+                            let b = ViewBasis::looking_along(dir, up);
+                            let (sp, _) = b.project(fa.point);
+                            let at = to_screen([v.center[0] + sp[0] * v.scale, v.center[1] + sp[1] * v.scale]);
+                            painter.circle_filled(at, 4.0, egui::Color32::from_rgb(255, 150, 30));
+                        }
+                    }
+                }
+            } else if resp.clicked() {
+                ui_state.draw_dim_sel = dim_hit;
+            }
+
+            // Drag a dimension to change its offset.
+            if !ui_state.draw_dim_tool {
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    if let (Some(id), Some(pos)) = (dim_hit, resp.hover_pos()) {
+                        if let Some(d) = draw.0.dims.iter().find(|d| d.id == id) {
+                            ui_state.draw_dim_sel = Some(id);
+                            let sheet = to_sheet(pos);
+                            ui_state.draw_dim_drag = Some((id, d.offset, sheet[1]));
+                        }
+                    }
+                }
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    if let (Some((id, off0, y0)), Some(pos)) = (ui_state.draw_dim_drag, resp.hover_pos()) {
+                        let sheet = to_sheet(pos);
+                        // Relative to the grab, like every other drag in the app.
+                        let scale = draw.0.dims.iter().find(|d| d.id == id).and_then(|d| draw.0.views.iter().find(|v| v.id == d.view)).map(|v| v.scale).unwrap_or(1.0);
+                        if let Some(d) = draw.0.dim_mut(id) {
+                            d.offset = off0 + (sheet[1] - y0) / scale;
+                        }
+                    }
+                }
+                if resp.drag_stopped() {
+                    ui_state.draw_dim_drag = None;
+                }
+            }
+
             // Title block.
             let rows = drawing_title_rows(&draw.0);
             if !rows.is_empty() {
@@ -17034,6 +17187,59 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
         }
     });
     ui.separator();
+    // Dimensions.
+    ui.horizontal(|ui| {
+        let on = ui_state.draw_dim_tool;
+        if ui
+            .selectable_label(on, "\u{21d4} Dimension")
+            .on_hover_text("Click two points on a view — corners, edge midpoints or hole centres — to dimension between them")
+            .clicked()
+        {
+            ui_state.draw_dim_tool = !on;
+            ui_state.draw_dim_first = None;
+        }
+        if ui_state.draw_dim_tool && ui.small_button("Done").clicked() {
+            ui_state.draw_dim_tool = false;
+            ui_state.draw_dim_first = None;
+        }
+    });
+    if ui_state.draw_dim_tool {
+        ui.horizontal(|ui| {
+            for (lbl, st) in [("Aligned", DimStyle::Aligned), ("Horiz", DimStyle::Horizontal), ("Vert", DimStyle::Vertical)] {
+                if ui.selectable_label(ui_state.draw_dim_style == st, lbl).clicked() {
+                    ui_state.draw_dim_style = st;
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(if ui_state.draw_dim_first.is_some() {
+                "Now click the second point."
+            } else {
+                "Click the first point."
+            })
+            .weak()
+            .small(),
+        );
+    }
+    if !draw.dims.is_empty() {
+        ui.label(egui::RichText::new(format!("{} dimension(s)", draw.dims.len())).weak().small());
+        if let Some(id) = ui_state.draw_dim_sel {
+            if draw.dims.iter().any(|d| d.id == id) {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Delete").clicked() {
+                        draw.remove_dim(id);
+                        ui_state.draw_dim_sel = None;
+                    }
+                    if ui.small_button("Flip side").clicked() {
+                        if let Some(d) = draw.dim_mut(id) {
+                            d.offset = -d.offset;
+                        }
+                    }
+                });
+            }
+        }
+    }
+    ui.separator();
     if ui
         .add(egui::Button::new(egui::RichText::new("Export SVG…").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 110, 160)))
         .on_hover_text("Vector sheet at true scale — opens in any browser, and prints 1:1")
@@ -17081,6 +17287,96 @@ fn smoke_exit(mut frames: Local<u32>, mut writer: bevy::prelude::MessageWriter<A
     }
 }
 
+/// Convert between the document's plain anchor data and the kernel's reference type.
+fn anchor_to_ref(a: &DimAnchor) -> DimRef {
+    DimRef {
+        kind: match a.kind {
+            1 => RefKind::Edge,
+            2 => RefKind::Circle,
+            _ => RefKind::Vertex,
+        },
+        point: a.point,
+        dir: a.dir,
+        radius: a.radius,
+    }
+}
+
+fn target_to_anchor(t: &SnapTarget, part_diag: f64) -> DimAnchor {
+    DimAnchor {
+        kind: match t.kind {
+            RefKind::Edge => 1,
+            RefKind::Circle => 2,
+            RefKind::Vertex => 0,
+        },
+        point: t.model,
+        dir: t.dir,
+        radius: t.radius,
+        scale: part_diag,
+    }
+}
+
+/// The part's bounding diagonal, used to size reference tolerances.
+fn cache_part_diag(cache: &DrawCache) -> f64 {
+    cache
+        .mesh
+        .as_ref()
+        .map(|m| {
+            let (lo, hi) = mesh_bbox(m);
+            (hi - lo).length() as f64
+        })
+        .unwrap_or(50.0)
+}
+
+/// Lay out one dimension in FINAL sheet coordinates, resolving both anchors against the
+/// geometry currently on the sheet. `None` means an anchor no longer resolves — the part was
+/// edited past what nearest-match can follow — and the caller shows it as dangling rather
+/// than printing a stale number.
+fn resolve_dim(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<(DimGeom, String)> {
+    let view = draw.views.iter().find(|v| v.id == d.view)?;
+    let targets = cache.targets.get(view.dir.label())?;
+    let (dir, up) = view.dir.frame();
+    let basis = ViewBasis::looking_along(dir, up);
+    // How far the geometry is allowed to have moved: a quarter of the part's size AS IT WAS
+    // when the anchor was taken. Sizing this from the current part instead let a reference
+    // survive a wholesale change (latching onto an unrelated corner of a much bigger part)
+    // while a modest edit on a small part went dangling.
+    let tol_of = |a: &DimAnchor| if a.scale > 1e-9 { a.scale * 0.25 } else { cache_part_diag(cache) * 0.1 };
+    let ra = resolve_ref(targets, &anchor_to_ref(&d.a), tol_of(&d.a))?;
+    let rb = resolve_ref(targets, &anchor_to_ref(&d.b), tol_of(&d.b))?;
+    let (a2, _) = basis.project(ra.point);
+    let (b2, _) = basis.project(rb.point);
+    let style = match d.style {
+        DimStyle::Aligned => hworks_geometry::drawing::DimStyle::Aligned,
+        DimStyle::Horizontal => hworks_geometry::drawing::DimStyle::Horizontal,
+        DimStyle::Vertical => hworks_geometry::drawing::DimStyle::Vertical,
+    };
+    let g = dim_geometry(a2, b2, style, d.offset, d.slide);
+    // Into sheet space: the view's placement and scale.
+    let place = |q: [f64; 2]| [view.center[0] + q[0] * view.scale, view.center[1] + q[1] * view.scale];
+    let placed = DimGeom {
+        a: place(g.a),
+        b: place(g.b),
+        p0: place(g.p0),
+        p1: place(g.p1),
+        label: place(g.label),
+        value: g.value,
+    };
+    // The stated value is the MODEL size, never the scaled-on-paper size.
+    let text = d.text_override.clone().unwrap_or_else(|| format_dim(g.value));
+    Some((placed, text))
+}
+
+/// Distance from a screen point to a screen segment — for hit-testing a dimension line.
+fn seg_dist_screen(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_sq();
+    if l2 < 1e-6 {
+        return (p - a).length();
+    }
+    let t = (((p - a).dot(ab)) / l2).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
 fn drawing_part_geometry(path: &std::path::Path) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let doc: Document = ron::from_str(&text).ok()?;
@@ -17124,10 +17420,12 @@ fn drawing_regenerate(mode: Res<DocMode>, draw: Res<DrawRes>, mut cache: ResMut<
                 cache.edges = e;
                 cache.source = draw.0.source.clone();
                 cache.proj.clear();
+                cache.targets.clear();
             }
             None => {
                 cache.mesh = None;
                 cache.proj.clear();
+                cache.targets.clear();
                 ui_state.last_error = Some(format!("Drawing: couldn't build the part {}", path.display()));
                 return;
             }
@@ -17136,6 +17434,7 @@ fn drawing_regenerate(mode: Res<DocMode>, draw: Res<DrawRes>, mut cache: ResMut<
     let (Some(mesh), edges) = (cache.mesh.clone(), cache.edges.clone()) else { return };
     let want: Vec<ViewDir> = draw.0.views.iter().map(|v| v.dir).collect();
     cache.proj.clear();
+    cache.targets.clear();
     for dir in want {
         let key = dir.label().to_string();
         if cache.proj.contains_key(&key) {
@@ -17143,7 +17442,8 @@ fn drawing_regenerate(mode: Res<DocMode>, draw: Res<DrawRes>, mut cache: ResMut<
         }
         let (d, up) = dir.frame();
         let basis = ViewBasis::looking_along(d, up);
-        cache.proj.insert(key, project_edges(&mesh, &edges, &basis, 24));
+        cache.proj.insert(key.clone(), project_edges(&mesh, &edges, &basis, 24));
+        cache.targets.insert(key, snap_targets(&mesh, &edges, &basis));
     }
 }
 
@@ -23482,10 +23782,10 @@ mod tests {
             proj.insert(v.dir.label().to_string(), e);
         }
 
-        let cache = DrawCache { source: d.source.clone(), mesh: Some(mesh), edges, proj };
+        let cache = DrawCache { source: d.source.clone(), mesh: Some(mesh), edges, proj, targets: Default::default() };
         let items = drawing_sheet_items(&d, &cache);
         assert_eq!(items.len(), 3);
-        let svg = to_svg(d.sheet.w, d.sheet.h, &items, &drawing_title_rows(&d));
+        let svg = to_svg_with_dims(d.sheet.w, d.sheet.h, &items, &[], &drawing_title_rows(&d));
         assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
         assert!(svg.contains("297mm") && svg.contains("210mm"), "A4 sheet not sized in mm");
         assert!(svg.contains("PLATE"), "title block missing the part name");
@@ -23963,6 +24263,116 @@ mod tests {
         let ron = r#"(sheet:(name:"A4",w:297.0,h:210.0),source:"p.hcad",views:[(id:1,dir:Front,center:(50.0,50.0),scale:1.0,label:true)],title:(title:"",drawn_by:"",date:"",material:"",notes:""))"#;
         let old: Drawing = ron::from_str(ron).expect("legacy drawing");
         assert!(old.views[0].show_hidden, "a drawing saved before the field must default to showing hidden lines");
+    }
+
+    /// Build a drawing of a `w` x `d` x `h` box with one Front view, plus the cache the
+    /// sheet draws from.
+    fn box_drawing(w: f64, d: f64, h: f64) -> (Drawing, DrawCache) {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(w, d), regions: vec![], region_pts: vec![], plane: xy(), distance: h, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("box");
+        let t = mesh_tessellation(mesh);
+
+        let mut drawing = Drawing::default();
+        drawing.source = "box.hcad".into();
+        let vid = drawing.add_view(ViewDir::Front, 1.0);
+        drawing.view_mut(vid).unwrap().center = [100.0, 100.0];
+
+        let (dir, up) = ViewDir::Front.frame();
+        let basis = ViewBasis::looking_along(dir, up);
+        let mut cache = DrawCache::default();
+        cache.proj.insert("Front".into(), project_edges(&t.mesh, &t.edges, &basis, 24));
+        cache.targets.insert("Front".into(), snap_targets(&t.mesh, &t.edges, &basis));
+        cache.mesh = Some(t.mesh);
+        cache.edges = t.edges;
+        (drawing, cache)
+    }
+
+    fn corner_anchor(cache: &DrawCache, at: [f64; 3]) -> DimAnchor {
+        let t = cache.targets["Front"]
+            .iter()
+            .find(|t| t.kind == RefKind::Vertex && ((t.model[0] - at[0]).powi(2) + (t.model[1] - at[1]).powi(2) + (t.model[2] - at[2]).powi(2)).sqrt() < 1e-6)
+            .unwrap_or_else(|| panic!("no corner at {at:?}"));
+        target_to_anchor(t, cache_part_diag(cache))
+    }
+
+    /// A dimension states the MODEL size, and keeps stating the right one after the part is
+    /// edited — that is the whole point of storing what it measures instead of a number.
+    #[test]
+    fn a_dimension_restates_itself_when_the_part_changes() {
+        let (mut drawing, cache) = box_drawing(20.0, 15.0, 10.0);
+        let vid = drawing.views[0].id;
+        // Across the front face: (0,0,10) to (20,0,10) — 20mm wide.
+        let a = corner_anchor(&cache, [0.0, 0.0, 10.0]);
+        let b = corner_anchor(&cache, [20.0, 0.0, 10.0]);
+        let id = drawing.add_dim(vid, a, b, DimStyle::Horizontal, 8.0);
+
+        let (g, text) = resolve_dim(&drawing, &cache, drawing.dims.iter().find(|d| d.id == id).unwrap()).expect("dimension didn't resolve");
+        assert!((g.value - 20.0).abs() < 1e-6, "measured {:.4}, wanted 20", g.value);
+        assert_eq!(text, "20");
+
+        // Rebuild the part 4mm wider. The SAME stored dimension must now read 24.
+        let (_, cache2) = box_drawing(24.0, 15.0, 10.0);
+        let (g2, text2) = resolve_dim(&drawing, &cache2, drawing.dims.iter().find(|d| d.id == id).unwrap()).expect("dimension went dangling on a 4mm edit");
+        assert!((g2.value - 24.0).abs() < 1e-6, "after the edit it measured {:.4}, wanted 24", g2.value);
+        assert_eq!(text2, "24");
+    }
+
+    /// The stated value is the model size, NOT the size it is drawn at — a half-scale view
+    /// still says 20.
+    #[test]
+    fn scale_changes_the_drawing_not_the_number() {
+        let (mut drawing, cache) = box_drawing(20.0, 15.0, 10.0);
+        let vid = drawing.views[0].id;
+        let a = corner_anchor(&cache, [0.0, 0.0, 10.0]);
+        let b = corner_anchor(&cache, [20.0, 0.0, 10.0]);
+        let id = drawing.add_dim(vid, a, b, DimStyle::Horizontal, 8.0);
+
+        drawing.view_mut(vid).unwrap().scale = 0.5;
+        let d = drawing.dims.iter().find(|x| x.id == id).unwrap().clone();
+        let (g, text) = resolve_dim(&drawing, &cache, &d).expect("resolve");
+        assert_eq!(text, "20", "a half-scale view must still state 20");
+        // ...but it is DRAWN half size: the dimension line spans 10mm of paper.
+        let span = ((g.p1[0] - g.p0[0]).powi(2) + (g.p1[1] - g.p0[1]).powi(2)).sqrt();
+        assert!((span - 10.0).abs() < 1e-6, "drawn span {span:.4}, wanted 10mm of paper");
+    }
+
+    /// A dimension whose geometry is edited beyond recognition must go dangling, not print a
+    /// confidently wrong number.
+    #[test]
+    fn a_dimension_goes_dangling_when_its_geometry_is_gone() {
+        let (mut drawing, cache) = box_drawing(20.0, 15.0, 10.0);
+        let vid = drawing.views[0].id;
+        let a = corner_anchor(&cache, [0.0, 0.0, 10.0]);
+        let b = corner_anchor(&cache, [20.0, 0.0, 10.0]);
+        let id = drawing.add_dim(vid, a, b, DimStyle::Horizontal, 8.0);
+
+        // A part of a wholly different size: nothing is near the stored anchors.
+        let (_, far) = box_drawing(400.0, 300.0, 200.0);
+        let d = drawing.dims.iter().find(|x| x.id == id).unwrap().clone();
+        assert!(resolve_dim(&drawing, &far, &d).is_none(), "measured something anyway instead of going dangling");
+    }
+
+    /// Dimensions reach the exported sheet, and a deleted view takes its dimensions with it.
+    #[test]
+    fn dimensions_export_and_are_cleaned_up_with_their_view() {
+        let (mut drawing, cache) = box_drawing(20.0, 15.0, 10.0);
+        let vid = drawing.views[0].id;
+        let a = corner_anchor(&cache, [0.0, 0.0, 10.0]);
+        let b = corner_anchor(&cache, [20.0, 0.0, 10.0]);
+        drawing.add_dim(vid, a, b, DimStyle::Horizontal, 8.0);
+
+        let items = drawing_sheet_items(&drawing, &cache);
+        let dims: Vec<(DimGeom, String)> = drawing.dims.iter().filter_map(|d| resolve_dim(&drawing, &cache, d)).collect();
+        assert_eq!(dims.len(), 1, "the dimension didn't resolve for export");
+        let svg = to_svg_with_dims(drawing.sheet.w, drawing.sheet.h, &items, &dims, &drawing_title_rows(&drawing));
+        assert!(svg.contains(">20</text>"), "the measured value is missing from the SVG");
+        assert!(svg.contains("<polygon"), "no arrowheads in the SVG");
+
+        // Removing the view removes its dimensions — otherwise they'd have nothing to hang on.
+        drawing.remove_view(vid);
+        assert!(drawing.dims.is_empty(), "dimensions outlived their view");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
