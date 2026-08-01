@@ -196,7 +196,10 @@ fn main() {
         .init_resource::<EdgeSelection>()
         .init_resource::<RegenJob>()
         .add_systems(Startup, (setup, open_cli_file))
-        .add_systems(EguiPrimaryContextPass, ui_system)
+        // The sheet canvas MUST live in the egui pass, and after `ui_system` so the side
+        // panel is registered before the central panel. Registered in `Update` it still drew,
+        // but received no pointer input at all — clicks and scroll-zoom went nowhere.
+        .add_systems(EguiPrimaryContextPass, (ui_system, drawing_ui).chain())
         .add_systems(
             Update,
             (
@@ -224,7 +227,7 @@ fn main() {
                 ),
                 (
                     (handle_new_part, asm_regenerate, mate_hover_highlight, asm_interaction, asm_solve_mates, check_interference, sync_asm_instances, draw_asm_edges, draw_asm_gizmo, sync_asm_ghosts).chain(),
-                    (highlight_face, shell_overlays, (drawing_regenerate, drawing_ui).chain()),
+                    (highlight_face, shell_overlays, drawing_regenerate),
                     hover_body_edge,
                     sync_ref_planes,
                     scale_ref_planes,
@@ -16946,6 +16949,25 @@ fn drawing_ui(
 
             // Dimension tool: click a snap target, then a second, to place a dimension.
             if ui_state.draw_dim_tool {
+                // Show EVERY point that can be picked, not just the one under the cursor —
+                // otherwise there is no way to know what the tool will accept, and a click on
+                // empty paper looks like the tool is broken rather than like a miss.
+                for v in &draw.0.views {
+                    if let Some(ts) = cache.targets.get(v.dir.label()) {
+                        for t in ts {
+                            if t.hidden {
+                                continue;
+                            }
+                            let at = to_screen([v.center[0] + t.sheet[0] * v.scale, v.center[1] + t.sheet[1] * v.scale]);
+                            let (r, col) = match t.kind {
+                                RefKind::Circle => (3.0, egui::Color32::from_rgb(70, 170, 240)),
+                                RefKind::Vertex => (2.4, egui::Color32::from_rgb(90, 190, 120)),
+                                RefKind::Edge => (1.8, egui::Color32::from_gray(150)),
+                            };
+                            painter.circle_filled(at, r, col);
+                        }
+                    }
+                }
                 if let Some(pos) = resp.hover_pos() {
                     let sheet = to_sheet(pos);
                     // Which view is the cursor over, and where in that view's own space?
@@ -17111,6 +17133,22 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
         }
     });
     ui.label(egui::RichText::new(format!("Part: {}", if draw.source.is_empty() { "(none)" } else { draw.source.as_str() })).weak().small());
+    ui.horizontal(|ui| {
+        ui.label("Zoom");
+        if ui.small_button("\u{2212}").on_hover_text("Zoom out").clicked() {
+            ui_state.draw_zoom = (ui_state.draw_zoom * 0.8).max(0.05);
+        }
+        if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+            ui_state.draw_zoom = (ui_state.draw_zoom * 1.25).min(40.0);
+        }
+        if ui.small_button("Fit").on_hover_text("Fit the sheet to the window").clicked() {
+            ui_state.draw_zoom = 0.0; // re-fits on the next frame
+        }
+        if ui_state.draw_zoom > 0.0 {
+            ui.label(egui::RichText::new(format!("{:.0}%", ui_state.draw_zoom * 100.0 / 3.78)).weak().small());
+        }
+    });
+    ui.label(egui::RichText::new("Scroll to zoom, right-drag to pan.").weak().small());
     ui.separator();
 
     ui.label("Add view:");
@@ -17213,9 +17251,9 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
         });
         ui.label(
             egui::RichText::new(if ui_state.draw_dim_first.is_some() {
-                "Now click the second point."
+                "Now click the SECOND point."
             } else {
-                "Click the first point."
+                "Click the FIRST point. Pickable points show as dots: blue = hole centre, green = corner, grey = edge midpoint."
             })
             .weak()
             .small(),
