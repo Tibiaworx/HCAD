@@ -2208,8 +2208,8 @@ struct UiState {
     draw_dim_first: Option<(u64, DimAnchor)>,
     /// How the next dimension will measure.
     draw_dim_style: DimStyle,
-    /// The dimension being dragged, and the offset it had when grabbed.
-    draw_dim_drag: Option<(u64, f64, f64)>,
+    /// The dimension being dragged, anchored at the grab.
+    draw_dim_drag: Option<DimDrag>,
     draw_dim_sel: Option<u64>,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
@@ -17000,7 +17000,20 @@ fn drawing_ui(
                                             None => ui_state.draw_dim_first = Some((vid, anchor)),
                                             Some((fv, fa)) if fv == vid => {
                                                 let style = ui_state.draw_dim_style;
-                                                let id = draw.0.add_dim(vid, fa, anchor, style, 8.0);
+                                                // Park it outside the part, not across it.
+                                                let (dirv, upv) = v.dir.frame();
+                                                let bs = ViewBasis::looking_along(dirv, upv);
+                                                let (a2, _) = bs.project(fa.point);
+                                                let (b2, _) = bs.project(anchor.point);
+                                                let (vlo, vhi) = cache
+                                                    .proj
+                                                    .get(v.dir.label())
+                                                    .map(|e| edges_bounds(e))
+                                                    .unwrap_or(([0.0; 2], [0.0; 2]));
+                                                let taken: Vec<f64> =
+                                                    draw.0.dims.iter().filter(|d| d.view == vid && d.style == style).map(|d| d.offset).collect();
+                                                let off = default_dim_offset(vlo, vhi, a2, b2, style, &taken);
+                                                let id = draw.0.add_dim(vid, fa, anchor, style, off);
                                                 ui_state.draw_dim_sel = Some(id);
                                             }
                                             // Two views can't share a dimension.
@@ -17026,24 +17039,51 @@ fn drawing_ui(
                 ui_state.draw_dim_sel = dim_hit;
             }
 
-            // Drag a dimension to change its offset.
+            // Drag a dimension freely: away from the geometry AND along its own line.
             if !ui_state.draw_dim_tool {
                 if resp.drag_started_by(egui::PointerButton::Primary) {
                     if let (Some(id), Some(pos)) = (dim_hit, resp.hover_pos()) {
-                        if let Some(d) = draw.0.dims.iter().find(|d| d.id == id) {
+                        // Take the dimension's current axis so the cursor's motion can be
+                        // split into offset (perpendicular) and slide (along the line).
+                        let axis = draw
+                            .0
+                            .dims
+                            .iter()
+                            .find(|d| d.id == id)
+                            .and_then(|d| resolve_dim(&draw.0, &cache, d).map(|(g, _)| (d.offset, d.slide, g)));
+                        if let Some((off0, slide0, g)) = axis {
+                            let dv = [g.p1[0] - g.p0[0], g.p1[1] - g.p0[1]];
+                            let l = (dv[0] * dv[0] + dv[1] * dv[1]).sqrt().max(1e-9);
                             ui_state.draw_dim_sel = Some(id);
-                            let sheet = to_sheet(pos);
-                            ui_state.draw_dim_drag = Some((id, d.offset, sheet[1]));
+                            ui_state.draw_dim_drag = Some(DimDrag {
+                                id,
+                                offset0: off0,
+                                slide0,
+                                grab: to_sheet(pos),
+                                dir: [dv[0] / l, dv[1] / l],
+                            });
                         }
                     }
                 }
                 if resp.dragged_by(egui::PointerButton::Primary) {
-                    if let (Some((id, off0, y0)), Some(pos)) = (ui_state.draw_dim_drag, resp.hover_pos()) {
+                    if let (Some(dd), Some(pos)) = (ui_state.draw_dim_drag, resp.hover_pos()) {
                         let sheet = to_sheet(pos);
-                        // Relative to the grab, like every other drag in the app.
-                        let scale = draw.0.dims.iter().find(|d| d.id == id).and_then(|d| draw.0.views.iter().find(|v| v.id == d.view)).map(|v| v.scale).unwrap_or(1.0);
-                        if let Some(d) = draw.0.dim_mut(id) {
-                            d.offset = off0 + (sheet[1] - y0) / scale;
+                        let scale = draw
+                            .0
+                            .dims
+                            .iter()
+                            .find(|d| d.id == dd.id)
+                            .and_then(|d| draw.0.views.iter().find(|v| v.id == d.view))
+                            .map(|v| v.scale)
+                            .unwrap_or(1.0);
+                        // Delta in the VIEW's own units, split along and across the line.
+                        let dx = (sheet[0] - dd.grab[0]) / scale;
+                        let dy = (sheet[1] - dd.grab[1]) / scale;
+                        let along = dx * dd.dir[0] + dy * dd.dir[1];
+                        let across = dx * -dd.dir[1] + dy * dd.dir[0];
+                        if let Some(d) = draw.0.dim_mut(dd.id) {
+                            d.offset = dd.offset0 + across;
+                            d.slide = dd.slide0 + along;
                         }
                     }
                 }
@@ -17273,6 +17313,11 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
                             d.offset = -d.offset;
                         }
                     }
+                    if ui.small_button("Centre text").on_hover_text("Put the text back in the middle of the dimension line").clicked() {
+                        if let Some(d) = draw.dim_mut(id) {
+                            d.slide = 0.0;
+                        }
+                    }
                 });
             }
         }
@@ -17405,6 +17450,63 @@ fn resolve_dim(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<(DimGeo
 }
 
 /// Distance from a screen point to a screen segment — for hit-testing a dimension line.
+/// A dimension drag in progress. Anchored so the drag is applied RELATIVE to the grab, and
+/// carrying the dimension's own axis so the cursor's motion can be split into "along the
+/// dimension line" (slide) and "away from the geometry" (offset).
+#[derive(Clone, Copy)]
+struct DimDrag {
+    id: u64,
+    offset0: f64,
+    slide0: f64,
+    /// Sheet position where the drag began.
+    grab: [f64; 2],
+    /// The dimension line's direction, in sheet space.
+    dir: [f64; 2],
+}
+
+/// Where a new dimension's line should sit so it lands CLEAR of the part rather than across
+/// it. Pushes out past the view's own extents, on the side the measured span already leans
+/// toward, and steps over any dimension already parked at that distance.
+fn default_dim_offset(
+    view_lo: [f64; 2],
+    view_hi: [f64; 2],
+    a2: [f64; 2],
+    b2: [f64; 2],
+    style: DimStyle,
+    taken: &[f64],
+) -> f64 {
+    let mid = [(a2[0] + b2[0]) * 0.5, (a2[1] + b2[1]) * 0.5];
+    let centre = [(view_lo[0] + view_hi[0]) * 0.5, (view_lo[1] + view_hi[1]) * 0.5];
+    let margin = ((view_hi[0] - view_lo[0]).max(view_hi[1] - view_lo[1]) * 0.12).clamp(4.0, 15.0);
+    let mut off = match style {
+        // Perpendicular is Y: clear the top or the bottom.
+        DimStyle::Horizontal => {
+            if mid[1] >= centre[1] { view_hi[1] + margin - mid[1] } else { view_lo[1] - margin - mid[1] }
+        }
+        // Perpendicular is X.
+        DimStyle::Vertical => {
+            if mid[0] >= centre[0] { view_hi[0] + margin - mid[0] } else { view_lo[0] - margin - mid[0] }
+        }
+        DimStyle::Aligned => {
+            let d = [b2[0] - a2[0], b2[1] - a2[1]];
+            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
+            let perp = [-d[1] / l, d[0] / l];
+            // Push along whichever way leads away from the middle of the view.
+            let away = (mid[0] - centre[0]) * perp[0] + (mid[1] - centre[1]) * perp[1];
+            let reach = ((view_hi[0] - view_lo[0]).powi(2) + (view_hi[1] - view_lo[1]).powi(2)).sqrt() * 0.5 + margin;
+            if away >= 0.0 { reach } else { -reach }
+        }
+    };
+    // Don't stack on top of a dimension already at that distance.
+    let step = margin.max(4.0);
+    let mut guard = 0;
+    while taken.iter().any(|t| (t - off).abs() < step * 0.7) && guard < 40 {
+        off += if off >= 0.0 { step } else { -step };
+        guard += 1;
+    }
+    off
+}
+
 fn seg_dist_screen(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let ab = b - a;
     let l2 = ab.length_sq();
@@ -24411,6 +24513,36 @@ mod tests {
         // Removing the view removes its dimensions — otherwise they'd have nothing to hang on.
         drawing.remove_view(vid);
         assert!(drawing.dims.is_empty(), "dimensions outlived their view");
+    }
+
+    /// A new dimension must land OUTSIDE the part, and stack clear of ones already there —
+    /// dropping every dimension at a fixed offset piled them onto the middle of the view.
+    #[test]
+    fn new_dimensions_land_clear_of_the_geometry() {
+        // A view spanning 0..20 across and 0..15 up.
+        let (lo, hi) = ([0.0, 0.0], [20.0, 15.0]);
+
+        // Measuring along the BOTTOM edge: the dimension belongs below the part.
+        let off = default_dim_offset(lo, hi, [0.0, 0.0], [20.0, 0.0], DimStyle::Horizontal, &[]);
+        assert!(off < 0.0, "a dimension on the bottom edge went upward into the part: {off}");
+        assert!(off <= -4.0, "it sits too close to the geometry: {off}");
+
+        // Along the TOP edge: above it.
+        let up = default_dim_offset(lo, hi, [0.0, 15.0], [20.0, 15.0], DimStyle::Horizontal, &[]);
+        assert!(up > 0.0, "a dimension on the top edge went down into the part: {up}");
+
+        // A vertical dimension clears left or right, not top/bottom.
+        let right = default_dim_offset(lo, hi, [20.0, 0.0], [20.0, 15.0], DimStyle::Vertical, &[]);
+        assert!(right > 0.0, "a vertical dimension on the right edge went the wrong way: {right}");
+
+        // Stacking: a second dimension at the same place steps clear of the first.
+        let second = default_dim_offset(lo, hi, [0.0, 0.0], [20.0, 0.0], DimStyle::Horizontal, &[off]);
+        assert!((second - off).abs() > 2.0, "the second dimension landed on top of the first ({off} vs {second})");
+        // ...and keeps going out, not back through the part.
+        assert!(second < off, "the second dimension stepped back toward the geometry");
+
+        let third = default_dim_offset(lo, hi, [0.0, 0.0], [20.0, 0.0], DimStyle::Horizontal, &[off, second]);
+        assert!(third < second, "the third didn't clear the second");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
