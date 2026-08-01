@@ -628,6 +628,17 @@ pub enum DimStyle {
     Aligned,
     Horizontal,
     Vertical,
+    /// Radius of a circular rim — measures anchor `a` alone.
+    Radius,
+    /// Full diameter of a circular rim — measures anchor `a` alone.
+    Diameter,
+}
+
+impl DimStyle {
+    /// Radial styles measure ONE anchor; `b` is unused for them.
+    pub fn is_radial(self) -> bool {
+        matches!(self, DimStyle::Radius | DimStyle::Diameter)
+    }
 }
 
 /// A dimension placed on a drawing sheet.
@@ -648,6 +659,10 @@ pub struct DrawDim {
     /// Slide of the text along the dimension line.
     #[serde(default)]
     pub slide: f64,
+    /// Radial dimensions only: which way the leader leaves the centre, in radians. Paired
+    /// with `offset`, which is how far out the text sits.
+    #[serde(default)]
+    pub angle: f64,
     /// Replaces the measured text when set (for a note like "2x" or a tolerance).
     #[serde(default)]
     pub text_override: Option<String>,
@@ -711,7 +726,7 @@ impl Drawing {
         let used = self.views.iter().map(|v| v.id).chain(self.dims.iter().map(|d| d.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(used) + 1;
         let id = self.next_id;
-        self.dims.push(DrawDim { id, view, a, b, style, offset, slide: 0.0, text_override: None });
+        self.dims.push(DrawDim { id, view, a, b, style, offset, slide: 0.0, angle: 0.0, text_override: None });
         id
     }
 

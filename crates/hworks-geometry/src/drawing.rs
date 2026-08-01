@@ -295,7 +295,7 @@ pub fn to_svg_with_dims(
     sheet_w: f64,
     sheet_h: f64,
     items: &[SheetItem],
-    dims: &[(DimGeom, String)],
+    dims: &[SheetDim],
     title: &[(String, String)],
 ) -> String {
     let mut out = String::new();
@@ -354,8 +354,48 @@ pub fn to_svg_with_dims(
 
     // Dimensions. Arrowheads are drawn as filled triangles at each end of the dimension
     // line, with witness lines running from the measured points back to it.
-    for (g, text) in dims {
+    for dim in dims {
         let fy = |y: f64| sheet_h - y;
+        let (g, text) = match dim {
+            SheetDim::Linear(g, t) => (g, t),
+            SheetDim::Radial(r, t) => {
+                // Leader, landing, and an arrow biting each rim.
+                let d = [r.label[0] - r.centre[0], r.label[1] - r.centre[1]];
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
+                let u = [d[0] / l, d[1] / l];
+                let start = r.rim_far.unwrap_or(r.centre);
+                out.push_str(&format!(
+                    "<path d=\"M{:.3},{:.3} L{:.3},{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.25\"/>\n",
+                    start[0], fy(start[1]), r.label[0], fy(r.label[1])
+                ));
+                out.push_str(&format!(
+                    "<path d=\"M{:.3},{:.3} L{:.3},{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.25\"/>\n",
+                    r.label[0], fy(r.label[1]), r.shoulder[0], fy(r.shoulder[1])
+                ));
+                let head = 1.6_f64;
+                let mut heads = vec![(r.rim, [-u[0], -u[1]])];
+                if let Some(f) = r.rim_far {
+                    heads.push((f, u));
+                }
+                for (tip, into) in heads {
+                    let (px, py) = (-into[1], into[0]);
+                    let bx = tip[0] + into[0] * head;
+                    let by = tip[1] + into[1] * head;
+                    out.push_str(&format!(
+                        "<polygon points=\"{:.3},{:.3} {:.3},{:.3} {:.3},{:.3}\" fill=\"black\"/>\n",
+                        tip[0], fy(tip[1]),
+                        bx + px * head * 0.32, fy(by + py * head * 0.32),
+                        bx - px * head * 0.32, fy(by - py * head * 0.32)
+                    ));
+                }
+                let tx = (r.label[0] + r.shoulder[0]) * 0.5;
+                out.push_str(&format!(
+                    "<text x=\"{:.3}\" y=\"{:.3}\" font-family=\"sans-serif\" font-size=\"3.2\" text-anchor=\"middle\" fill=\"black\">{}</text>\n",
+                    tx, fy(r.label[1]) - 1.0, xml_escape(t)
+                ));
+                continue;
+            }
+        };
         let (dx, dy) = (g.p1[0] - g.p0[0], g.p1[1] - g.p0[1]);
         let l = (dx * dx + dy * dy).sqrt().max(1e-9);
         let (ux, uy) = (dx / l, dy / l);
@@ -797,6 +837,54 @@ pub fn format_dim(value: f64) -> String {
         let t = format!("{r:.2}");
         t.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+/// A laid-out radius or diameter dimension.
+///
+/// Drafting convention: a leader bites the rim with an arrow, runs out to the text, and the
+/// text sits on a short horizontal landing. A diameter takes the leader clean across the
+/// circle with an arrow at each rim.
+#[derive(Clone, Copy, Debug)]
+pub struct RadialGeom {
+    pub centre: [f64; 2],
+    /// Where the arrow meets the rim, on the side the label was dragged to.
+    pub rim: [f64; 2],
+    /// The opposite rim — only for a diameter, which is arrowed at both ends.
+    pub rim_far: Option<[f64; 2]>,
+    /// Where the text sits.
+    pub label: [f64; 2],
+    /// Far end of the horizontal landing under the text.
+    pub shoulder: [f64; 2],
+    /// The measured value: the radius, or the full diameter.
+    pub value: f64,
+}
+
+/// Lay out a radial dimension. `angle` is the leader's direction from the centre and `dist`
+/// how far out the text sits; together they let the label be dragged anywhere around the
+/// circle. `dist` is clamped so the text can never sit inside the rim, where the leader would
+/// have nothing to point at.
+pub fn radial_dim_geometry(centre: [f64; 2], radius: f64, angle: f64, dist: f64, diameter: bool) -> RadialGeom {
+    let d = [angle.cos(), angle.sin()];
+    let out = dist.max(radius * 1.25 + 1.0);
+    let rim = [centre[0] + d[0] * radius, centre[1] + d[1] * radius];
+    let label = [centre[0] + d[0] * out, centre[1] + d[1] * out];
+    // The landing runs away from the circle, so the text never overhangs back over it.
+    let side = if d[0] >= 0.0 { 1.0 } else { -1.0 };
+    let shoulder = [label[0] + side * (radius * 0.5).clamp(1.5, 6.0), label[1]];
+    RadialGeom {
+        centre,
+        rim,
+        rim_far: diameter.then(|| [centre[0] - d[0] * radius, centre[1] - d[1] * radius]),
+        label,
+        shoulder,
+        value: if diameter { radius * 2.0 } else { radius },
+    }
+}
+
+/// A dimension ready for export, in final sheet coordinates.
+pub enum SheetDim {
+    Linear(DimGeom, String),
+    Radial(RadialGeom, String),
 }
 
 #[cfg(test)]

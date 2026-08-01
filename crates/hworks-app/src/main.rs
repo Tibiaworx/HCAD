@@ -24,7 +24,7 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_geometry::drawing::{
     dim_geometry, edges_bounds, format_dim, pick_target, project_edges, resolve_ref, snap_targets, to_svg_with_dims,
-    DimGeom, DimRef, ProjEdge, RefKind, SheetItem, SnapTarget, ViewBasis,
+    radial_dim_geometry, DimGeom, DimRef, ProjEdge, RadialGeom, RefKind, SheetDim, SheetItem, SnapTarget, ViewBasis,
 };
 use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle};
 use hworks_geometry::{
@@ -14320,7 +14320,7 @@ fn handle_file_io(
                 let items = drawing_sheet_items(&draw.0, &cache);
                 // Dimensions are exported with the geometry, each resolved against the
                 // current model so the sheet states what the part actually measures.
-                let dims: Vec<(DimGeom, String)> = draw.0.dims.iter().filter_map(|d| resolve_dim(&draw.0, &cache, d)).collect();
+                let dims: Vec<SheetDim> = draw.0.dims.iter().filter_map(|d| resolve_any(&draw.0, &cache, d)).map(|l| l.to_sheet_dim()).collect();
                 let svg = to_svg_with_dims(draw.0.sheet.w, draw.0.sheet.h, &items, &dims, &drawing_title_rows(&draw.0));
                 match std::fs::write(&path, svg) {
                     Ok(()) => ui_state.toasts.push((format!("Exported {}", path.display()), 3.5)),
@@ -16905,6 +16905,51 @@ fn drawing_ui(
             let mut dim_hit: Option<u64> = None;
             for d in &draw.0.dims {
                 let sel = ui_state.draw_dim_sel == Some(d.id);
+                // Radial dimensions: leader from the rim out to the text, on a landing.
+                if d.style.is_radial() {
+                    match resolve_radial(&draw.0, &cache, d) {
+                        Some((g, text)) => {
+                            let col = if sel { egui::Color32::from_rgb(40, 110, 200) } else { egui::Color32::from_gray(30) };
+                            let start = g.rim_far.unwrap_or(g.centre);
+                            let (sp, lp, shp) = (to_screen(start), to_screen(g.label), to_screen(g.shoulder));
+                            painter.line_segment([sp, lp], egui::Stroke::new(1.0, col));
+                            painter.line_segment([lp, shp], egui::Stroke::new(1.0, col));
+                            let u = (lp - to_screen(g.centre)).normalized();
+                            let hl = 7.0_f32;
+                            let mut heads = vec![(to_screen(g.rim), -u)];
+                            if let Some(f) = g.rim_far {
+                                heads.push((to_screen(f), u));
+                            }
+                            for (tip, into) in heads {
+                                let pv = egui::vec2(-into.y, into.x);
+                                let base = tip + into * hl;
+                                painter.add(egui::Shape::convex_polygon(
+                                    vec![tip, base + pv * hl * 0.32, base - pv * hl * 0.32],
+                                    col,
+                                    egui::Stroke::NONE,
+                                ));
+                            }
+                            let fs = (3.2 * z).clamp(8.0, 20.0);
+                            let gal = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(fs), col);
+                            let mid = egui::pos2((lp.x + shp.x) * 0.5, lp.y);
+                            let r = egui::Rect::from_center_size(mid - egui::vec2(0.0, gal.size().y * 0.7), gal.size() + egui::vec2(4.0, 1.0));
+                            painter.rect_filled(r, 2.0, egui::Color32::from_rgb(250, 250, 248));
+                            painter.galley(r.min + egui::vec2(2.0, 0.5), gal, col);
+                            if let Some(pos) = resp.hover_pos() {
+                                if r.expand(3.0).contains(pos) || seg_dist_screen(pos, sp, lp) < 6.0 {
+                                    dim_hit = Some(d.id);
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(v) = draw.0.views.iter().find(|v| v.id == d.view) {
+                                let at = to_screen([v.center[0], v.center[1]]);
+                                painter.text(at, egui::Align2::CENTER_CENTER, "\u{26a0} dimension lost its geometry", egui::FontId::proportional(12.0), dangling_col);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match resolve_dim(&draw.0, &cache, d) {
                     Some((g, text)) => {
                         let col = if sel { egui::Color32::from_rgb(40, 110, 200) } else { dim_col };
@@ -16996,6 +17041,22 @@ fn drawing_ui(
                                     let tol = 6.0 / (z as f64 * v.scale);
                                     if let Some(t) = pick_target(ts, local, tol) {
                                         let anchor = target_to_anchor(t, cache_part_diag(&cache));
+                                        // A radial dimension measures ONE rim: place it on the
+                                        // first click, and only on a circle.
+                                        if ui_state.draw_dim_style.is_radial() {
+                                            if t.kind == RefKind::Circle {
+                                                let style = ui_state.draw_dim_style;
+                                                let id = draw.0.add_dim(vid, anchor, anchor, style, t.radius * 2.2 + 4.0);
+                                                if let Some(nd) = draw.0.dim_mut(id) {
+                                                    nd.angle = std::f64::consts::FRAC_PI_4;
+                                                }
+                                                ui_state.draw_dim_sel = Some(id);
+                                                ui_state.draw_dim_first = None;
+                                            } else {
+                                                ui_state.toasts.push(("Radius/diameter needs a circular edge — the blue dots".into(), 2.5));
+                                            }
+                                            return;
+                                        }
                                         match ui_state.draw_dim_first.take() {
                                             None => ui_state.draw_dim_first = Some((vid, anchor)),
                                             Some((fv, fa)) if fv == vid => {
@@ -17050,7 +17111,17 @@ fn drawing_ui(
                             .dims
                             .iter()
                             .find(|d| d.id == id)
-                            .and_then(|d| resolve_dim(&draw.0, &cache, d).map(|(g, _)| (d.offset, d.slide, g)));
+                            .and_then(|d| match resolve_any(&draw.0, &cache, d) {
+                                Some(LaidOut::Linear(g, _)) => Some((d.offset, d.slide, g)),
+                                // A radial drag is polar and doesn't need the axis, but the
+                                // grab still has to be recorded so the drag starts.
+                                Some(LaidOut::Radial(r, _)) => Some((
+                                    d.offset,
+                                    d.slide,
+                                    DimGeom { a: r.centre, b: r.rim, p0: r.centre, p1: r.label, label: r.label, value: r.value },
+                                )),
+                                None => None,
+                            });
                         if let Some((off0, slide0, g)) = axis {
                             let dv = [g.p1[0] - g.p0[0], g.p1[1] - g.p0[1]];
                             let l = (dv[0] * dv[0] + dv[1] * dv[1]).sqrt().max(1e-9);
@@ -17081,7 +17152,27 @@ fn drawing_ui(
                         let dy = (sheet[1] - dd.grab[1]) / scale;
                         let along = dx * dd.dir[0] + dy * dd.dir[1];
                         let across = dx * -dd.dir[1] + dy * dd.dir[0];
-                        if let Some(d) = draw.0.dim_mut(dd.id) {
+                        // A radial label swings around its circle: the cursor's position
+                        // relative to the centre gives both the leader angle and how far out.
+                        let radial = draw.0.dims.iter().find(|d| d.id == dd.id).map(|d| d.style.is_radial()).unwrap_or(false);
+                        if radial {
+                            let polar = draw
+                                .0
+                                .dims
+                                .iter()
+                                .find(|d| d.id == dd.id)
+                                .and_then(|d| resolve_radial(&draw.0, &cache, d).map(|(g, _)| g.centre))
+                                .map(|c| {
+                                    let v = [sheet[0] - c[0], sheet[1] - c[1]];
+                                    (v[1].atan2(v[0]), (v[0] * v[0] + v[1] * v[1]).sqrt() / scale)
+                                });
+                            if let Some((ang, dist)) = polar {
+                                if let Some(d) = draw.0.dim_mut(dd.id) {
+                                    d.angle = ang;
+                                    d.offset = dist;
+                                }
+                            }
+                        } else if let Some(d) = draw.0.dim_mut(dd.id) {
                             d.offset = dd.offset0 + across;
                             d.slide = dd.slide0 + along;
                         }
@@ -17286,6 +17377,19 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
             for (lbl, st) in [("Aligned", DimStyle::Aligned), ("Horiz", DimStyle::Horizontal), ("Vert", DimStyle::Vertical)] {
                 if ui.selectable_label(ui_state.draw_dim_style == st, lbl).clicked() {
                     ui_state.draw_dim_style = st;
+                    ui_state.draw_dim_first = None;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            for (lbl, st) in [("\u{00d8} Diameter", DimStyle::Diameter), ("R Radius", DimStyle::Radius)] {
+                if ui
+                    .selectable_label(ui_state.draw_dim_style == st, lbl)
+                    .on_hover_text("One click on a circular edge (a blue dot)")
+                    .clicked()
+                {
+                    ui_state.draw_dim_style = st;
+                    ui_state.draw_dim_first = None;
                 }
             }
         });
@@ -17293,7 +17397,11 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
             egui::RichText::new(if ui_state.draw_dim_first.is_some() {
                 "Now click the SECOND point."
             } else {
-                "Click the FIRST point. Pickable points show as dots: blue = hole centre, green = corner, grey = edge midpoint."
+                if ui_state.draw_dim_style.is_radial() {
+                    "Click a circular edge — the blue dots."
+                } else {
+                    "Click the FIRST point. Pickable points show as dots: blue = hole centre, green = corner, grey = edge midpoint."
+                }
             })
             .weak()
             .small(),
@@ -17410,6 +17518,63 @@ fn cache_part_diag(cache: &DrawCache) -> f64 {
         .unwrap_or(50.0)
 }
 
+/// A resolved dimension, ready to draw or export.
+enum LaidOut {
+    Linear(DimGeom, String),
+    Radial(RadialGeom, String),
+}
+
+impl LaidOut {
+    fn to_sheet_dim(self) -> SheetDim {
+        match self {
+            LaidOut::Linear(g, t) => SheetDim::Linear(g, t),
+            LaidOut::Radial(r, t) => SheetDim::Radial(r, t),
+        }
+    }
+}
+
+/// Lay out a radius/diameter dimension in FINAL sheet coordinates. Radial dimensions measure
+/// ONE anchor — a circular rim — so only `a` is resolved.
+fn resolve_radial(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<(RadialGeom, String)> {
+    let view = draw.views.iter().find(|v| v.id == d.view)?;
+    let targets = cache.targets.get(view.dir.label())?;
+    let (dir, up) = view.dir.frame();
+    let basis = ViewBasis::looking_along(dir, up);
+    let tol = if d.a.scale > 1e-9 { d.a.scale * 0.25 } else { cache_part_diag(cache) * 0.1 };
+    let r = resolve_ref(targets, &anchor_to_ref(&d.a), tol)?;
+    if r.radius <= 1e-9 {
+        return None; // no longer a circle — treat as dangling rather than draw a zero
+    }
+    let (c2, _) = basis.project(r.point);
+    // A rim seen at an angle projects to an ellipse; its on-sheet radius is the projected
+    // one, but the STATED value is always the true model radius.
+    let diameter = d.style == DimStyle::Diameter;
+    let g = radial_dim_geometry(c2, r.radius, d.angle, d.offset, diameter);
+    let place = |q: [f64; 2]| [view.center[0] + q[0] * view.scale, view.center[1] + q[1] * view.scale];
+    let placed = RadialGeom {
+        centre: place(g.centre),
+        rim: place(g.rim),
+        rim_far: g.rim_far.map(place),
+        label: place(g.label),
+        shoulder: place(g.shoulder),
+        value: g.value,
+    };
+    let text = d.text_override.clone().unwrap_or_else(|| {
+        let prefix = if diameter { "\u{00d8}" } else { "R" };
+        format!("{prefix}{}", format_dim(g.value))
+    });
+    Some((placed, text))
+}
+
+/// Lay out any dimension, linear or radial.
+fn resolve_any(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<LaidOut> {
+    if d.style.is_radial() {
+        resolve_radial(draw, cache, d).map(|(g, t)| LaidOut::Radial(g, t))
+    } else {
+        resolve_dim(draw, cache, d).map(|(g, t)| LaidOut::Linear(g, t))
+    }
+}
+
 /// Lay out one dimension in FINAL sheet coordinates, resolving both anchors against the
 /// geometry currently on the sheet. `None` means an anchor no longer resolves — the part was
 /// edited past what nearest-match can follow — and the caller shows it as dangling rather
@@ -17432,6 +17597,8 @@ fn resolve_dim(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<(DimGeo
         DimStyle::Aligned => hworks_geometry::drawing::DimStyle::Aligned,
         DimStyle::Horizontal => hworks_geometry::drawing::DimStyle::Horizontal,
         DimStyle::Vertical => hworks_geometry::drawing::DimStyle::Vertical,
+        // Radial dimensions measure one rim and are laid out by `resolve_radial`.
+        DimStyle::Radius | DimStyle::Diameter => return None,
     };
     let g = dim_geometry(a2, b2, style, d.offset, d.slide);
     // Into sheet space: the view's placement and scale.
@@ -17487,6 +17654,8 @@ fn default_dim_offset(
         DimStyle::Vertical => {
             if mid[0] >= centre[0] { view_hi[0] + margin - mid[0] } else { view_lo[0] - margin - mid[0] }
         }
+        // Radial dimensions place themselves from the rim outward, not from a span.
+        DimStyle::Radius | DimStyle::Diameter => return 0.0,
         DimStyle::Aligned => {
             let d = [b2[0] - a2[0], b2[1] - a2[1]];
             let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
@@ -24504,7 +24673,7 @@ mod tests {
         drawing.add_dim(vid, a, b, DimStyle::Horizontal, 8.0);
 
         let items = drawing_sheet_items(&drawing, &cache);
-        let dims: Vec<(DimGeom, String)> = drawing.dims.iter().filter_map(|d| resolve_dim(&drawing, &cache, d)).collect();
+        let dims: Vec<SheetDim> = drawing.dims.iter().filter_map(|d| resolve_any(&drawing, &cache, d)).map(|l| l.to_sheet_dim()).collect();
         assert_eq!(dims.len(), 1, "the dimension didn't resolve for export");
         let svg = to_svg_with_dims(drawing.sheet.w, drawing.sheet.h, &items, &dims, &drawing_title_rows(&drawing));
         assert!(svg.contains(">20</text>"), "the measured value is missing from the SVG");
@@ -24543,6 +24712,128 @@ mod tests {
 
         let third = default_dim_offset(lo, hi, [0.0, 0.0], [20.0, 0.0], DimStyle::Horizontal, &[off, second]);
         assert!(third < second, "the third didn't clear the second");
+    }
+
+    /// A plate with a hole, plus the cache a sheet draws from.
+    fn holed_plate_drawing(radius: f64) -> (Drawing, DrawCache) {
+        let mut sk = Sketch::default();
+        let c0 = sk.add_point(0.0, 0.0);
+        let c1 = sk.add_point(40.0, 0.0);
+        let c2 = sk.add_point(40.0, 40.0);
+        let c3 = sk.add_point(0.0, 40.0);
+        sk.add_line(c0, c1, false);
+        sk.add_line(c1, c2, false);
+        sk.add_line(c2, c3, false);
+        sk.add_line(c3, c0, false);
+        let hc = sk.add_point(20.0, 20.0);
+        sk.add_circle(hc, radius);
+
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 8.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("plate");
+        let t = mesh_tessellation(mesh);
+
+        let mut drawing = Drawing::default();
+        drawing.source = "plate.hcad".into();
+        let vid = drawing.add_view(ViewDir::Front, 1.0);
+        drawing.view_mut(vid).unwrap().center = [100.0, 100.0];
+
+        let (dir, up) = ViewDir::Front.frame();
+        let basis = ViewBasis::looking_along(dir, up);
+        let mut cache = DrawCache::default();
+        cache.proj.insert("Front".into(), project_edges(&t.mesh, &t.edges, &basis, 24));
+        cache.targets.insert("Front".into(), snap_targets(&t.mesh, &t.edges, &basis));
+        cache.mesh = Some(t.mesh);
+        cache.edges = t.edges;
+        (drawing, cache)
+    }
+
+    fn hole_anchor(cache: &DrawCache) -> DimAnchor {
+        let t = cache.targets["Front"]
+            .iter()
+            .filter(|t| t.kind == RefKind::Circle)
+            .max_by(|a, b| a.model[2].total_cmp(&b.model[2])) // the rim on the top face
+            .expect("no circular rim offered");
+        target_to_anchor(t, cache_part_diag(cache))
+    }
+
+    /// A diameter states twice the radius, a radius states the radius, and both carry the
+    /// drafting prefix.
+    #[test]
+    fn radial_dimensions_state_the_right_value() {
+        let (mut drawing, cache) = holed_plate_drawing(6.0);
+        let vid = drawing.views[0].id;
+        let a = hole_anchor(&cache);
+
+        let dia = drawing.add_dim(vid, a, a, DimStyle::Diameter, 15.0);
+        let rad = drawing.add_dim(vid, a, a, DimStyle::Radius, 15.0);
+
+        let d = drawing.dims.iter().find(|x| x.id == dia).unwrap().clone();
+        let (g, text) = resolve_radial(&drawing, &cache, &d).expect("diameter didn't resolve");
+        assert!((g.value - 12.0).abs() < 0.05, "diameter measured {:.3}, wanted 12", g.value);
+        assert!(text.starts_with('\u{00d8}'), "no diameter symbol: {text}");
+        assert!(text.contains("12"), "diameter text wrong: {text}");
+        // Arrowed at BOTH rims.
+        assert!(g.rim_far.is_some(), "a diameter must be arrowed at both rims");
+
+        let r = drawing.dims.iter().find(|x| x.id == rad).unwrap().clone();
+        let (gr, tr) = resolve_radial(&drawing, &cache, &r).expect("radius didn't resolve");
+        assert!((gr.value - 6.0).abs() < 0.05, "radius measured {:.3}, wanted 6", gr.value);
+        assert!(tr.starts_with('R') && tr.contains('6'), "radius text wrong: {tr}");
+        assert!(gr.rim_far.is_none(), "a radius is arrowed at one rim only");
+    }
+
+    /// Radial dimensions are associative too: change the hole and the callout restates.
+    #[test]
+    fn a_diameter_restates_when_the_hole_changes() {
+        let (mut drawing, cache) = holed_plate_drawing(6.0);
+        let vid = drawing.views[0].id;
+        let a = hole_anchor(&cache);
+        let id = drawing.add_dim(vid, a, a, DimStyle::Diameter, 15.0);
+
+        let d = drawing.dims.iter().find(|x| x.id == id).unwrap().clone();
+        let (g, _) = resolve_radial(&drawing, &cache, &d).expect("resolve");
+        assert!((g.value - 12.0).abs() < 0.05);
+
+        // Re-bore the hole to 7mm radius; the SAME dimension must now read 14.
+        let (_, bigger) = holed_plate_drawing(7.0);
+        let (g2, t2) = resolve_radial(&drawing, &bigger, &d).expect("went dangling on a 1mm bore change");
+        assert!((g2.value - 14.0).abs() < 0.05, "after re-boring it measured {:.3}, wanted 14", g2.value);
+        assert!(t2.contains("14"), "text didn't restate: {t2}");
+    }
+
+    /// The label can be swung anywhere around the circle, and never ends up inside the rim
+    /// where the leader would have nothing to point at.
+    #[test]
+    fn a_radial_label_swings_around_and_stays_outside_the_rim() {
+        let (mut drawing, cache) = holed_plate_drawing(6.0);
+        let vid = drawing.views[0].id;
+        let a = hole_anchor(&cache);
+        let id = drawing.add_dim(vid, a, a, DimStyle::Radius, 15.0);
+
+        for ang in [0.0_f64, 1.2, 3.0, -2.0] {
+            if let Some(d) = drawing.dim_mut(id) {
+                d.angle = ang;
+                d.offset = 14.0;
+            }
+            let d = drawing.dims.iter().find(|x| x.id == id).unwrap().clone();
+            let (g, _) = resolve_radial(&drawing, &cache, &d).expect("resolve");
+            // The label lies along the requested direction from the centre.
+            let v = [g.label[0] - g.centre[0], g.label[1] - g.centre[1]];
+            let got = v[1].atan2(v[0]);
+            let diff = ((got - ang + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)) - std::f64::consts::PI;
+            assert!(diff.abs() < 1e-6, "leader pointed {got:.3}, asked for {ang:.3}");
+        }
+
+        // Dragged hard inward, the text still clears the rim.
+        if let Some(d) = drawing.dim_mut(id) {
+            d.offset = 0.0;
+        }
+        let d = drawing.dims.iter().find(|x| x.id == id).unwrap().clone();
+        let (g, _) = resolve_radial(&drawing, &cache, &d).expect("resolve");
+        let dist = ((g.label[0] - g.centre[0]).powi(2) + (g.label[1] - g.centre[1]).powi(2)).sqrt();
+        assert!(dist > 6.0, "the label sat inside the rim ({dist:.2} from a 6mm centre)");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
