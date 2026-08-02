@@ -2239,6 +2239,8 @@ struct UiState {
     /// what the panel's "Open this face" checkbox applies to.
     shell_sel: Option<([f64; 3], [f64; 3])>,
     shell_request: Option<ShellSpec>,
+    /// True while the see-through shell preview is being rebuilt in the background.
+    shell_preview_busy: bool,
     /// Sweep feature: the spec while its PM is open (profile + path chosen from the tree's sketches).
     sweep_spec: Option<SweepSpec>,
     sweep_request: Option<SweepSpec>,
@@ -3130,13 +3132,19 @@ struct ShellOverlay {
     open_mesh: Handle<Mesh>,
     sel_mesh: Handle<Mesh>,
     preview_mesh: Handle<Mesh>,
-    /// The spec the preview was last built from — rebuild only when it actually changes.
+    /// The spec the preview currently ON SCREEN was built from.
     last: Option<u64>,
+    /// The spec a background build is running for, if any.
+    pending: Option<u64>,
     /// Seconds until the next rebuild is allowed; dragging the thickness would otherwise
-    /// re-run the boolean every frame.
+    /// queue a boolean every frame.
     cooldown: f32,
     /// Whether `preview_mesh` currently holds a usable result.
     ready: bool,
+    /// The running build. The preview boolean is a full mesh difference — on a real part it
+    /// takes long enough to drop frames, which is why it used to be skipped entirely above a
+    /// triangle budget. Off the main thread there is no need for that limit.
+    task: Option<bevy::tasks::Task<Option<TriMesh>>>,
 }
 
 /// The translucent overlay that highlights the hovered / active face.
@@ -3251,7 +3259,16 @@ fn setup(
     commands.spawn((Mesh3d(open_mesh.clone()), MeshMaterial3d(open_mat), Visibility::Hidden, ShellOpenHl, Name::new("ShellOpenHl")));
     commands.spawn((Mesh3d(sel_mesh.clone()), MeshMaterial3d(sel_mat), Visibility::Hidden, ShellSelHl, Name::new("ShellSelHl")));
     commands.spawn((Mesh3d(preview_mesh.clone()), MeshMaterial3d(preview_mat), Visibility::Hidden, ShellPreviewMesh, Name::new("ShellPreview")));
-    commands.insert_resource(ShellOverlay { open_mesh, sel_mesh, preview_mesh, last: None, cooldown: 0.0, ready: false });
+    commands.insert_resource(ShellOverlay {
+        open_mesh,
+        sel_mesh,
+        preview_mesh,
+        last: None,
+        pending: None,
+        cooldown: 0.0,
+        ready: false,
+        task: None,
+    });
 
     println!("HCAD ready — mouse-driven UI. Click a reference plane to start sketching.");
 }
@@ -5199,6 +5216,11 @@ fn ui_system(
                 }
             });
             ui.label(egui::RichText::new("...or click any face on the body, including ones not square to an axis.").weak().small());
+            // On a large part the background build takes a moment; silence would read as the
+            // preview being broken — which is exactly what the old triangle cap looked like.
+            if ui_state.shell_preview_busy {
+                ui.label(egui::RichText::new("\u{22ef} building the see-through preview\u{2026}").weak().small());
+            }
             ui.separator();
             // The clicked face, with a plain checkbox to open or close it. Simpler than
             // remembering that a viewport click toggles, and it shows what's selected.
@@ -10053,17 +10075,13 @@ fn shell_spec_key(spec: &ShellSpec) -> u64 {
     h
 }
 
-/// Above this the live boolean is too slow to run interactively; the preview is skipped and
-/// the solid body stays on screen (the committed feature still builds normally).
-const SHELL_PREVIEW_TRI_BUDGET: usize = 40_000;
-
 /// Drives everything the Shell PropertyManager shows in the viewport: the orange faces that
 /// will be opened, the yellow selected face, and a translucent preview of the hollowed body
 /// so the cavity is visible before committing (a sealed shell is otherwise invisible).
 fn shell_overlays(
     time: Res<Time>,
     part: Res<Part>,
-    ui_state: Res<UiState>,
+    mut ui_state: ResMut<UiState>,
     mut ov: ResMut<ShellOverlay>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut q: Query<(&mut Visibility, Option<&ShellOpenHl>, Option<&ShellSelHl>, Option<&ShellPreviewMesh>, Option<&SolidPart>)>,
@@ -10104,40 +10122,70 @@ fn shell_overlays(
                 }
             }
         }
-        // The see-through preview, rebuilt only when the spec changes (and rate-limited, so
-        // dragging the thickness doesn't re-run the boolean every frame).
+        // The see-through preview, built on a BACKGROUND thread.
+        //
+        // The old build ran inline and was skipped above 40k triangles, because a mesh
+        // difference on a real part drops frames. Off-thread there is no reason to cap it:
+        // the UI keeps running while it crunches, and the previous preview stays on screen
+        // until the new one lands, so changing the thickness doesn't flicker.
         ov.cooldown = (ov.cooldown - time.delta_secs()).max(0.0);
         let key = shell_spec_key(spec);
-        if ov.last != Some(key) && ov.cooldown <= 0.0 {
-            ov.cooldown = 0.15;
-            ov.last = Some(key);
-            ov.ready = false;
-            if body.indices.len() / 3 <= SHELL_PREVIEW_TRI_BUDGET {
-                let (lo, hi) = mesh_bbox_f64(body);
-                let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
-                let overshoot = spec.thickness as f64 + diag * 0.02 + 0.5;
-                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shell_tool(body, spec.thickness as f64, &spec.open, overshoot).map(|tool| mesh_difference(body, &tool))
-                }))
-                .ok()
-                .flatten();
-                // A preview must not raise a banner about the real model.
+
+        // Land a finished build.
+        let landed = ov
+            .task
+            .as_mut()
+            .and_then(|t| bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(t)));
+        if let Some(result) = landed {
+            ov.task = None;
+            // A preview must never raise a banner about the real model.
             let _ = take_fallback_count();
             let _ = hworks_geometry::take_loft_hole_mismatch_count();
             let _ = take_sweep_region_fallbacks();
             let _ = take_cut_direction_guesses();
-                if let Some(m) = built.filter(|m| !m.positions.is_empty()) {
+            match result.filter(|m| !m.positions.is_empty()) {
+                Some(m) => {
                     if let Some(slot) = meshes.get_mut(&ov.preview_mesh) {
                         *slot = trimesh_to_bevy(m);
                     }
                     ov.ready = true;
+                    ov.last = ov.pending;
                 }
+                // Nothing built (a thickness the walls can't support): keep showing the last
+                // good preview rather than blanking, and don't retry this same spec.
+                None => ov.last = ov.pending,
             }
+            ov.pending = None;
+        }
+
+        // Queue one when the spec has moved on and nothing is already running for it.
+        if ov.last != Some(key) && ov.pending != Some(key) && ov.task.is_none() && ov.cooldown <= 0.0 {
+            ov.cooldown = 0.1;
+            ov.pending = Some(key);
+            let mesh = body.clone();
+            let (thickness, open) = (spec.thickness as f64, spec.open.clone());
+            let (lo, hi) = mesh_bbox_f64(body);
+            let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+            let overshoot = thickness + diag * 0.02 + 0.5;
+            ov.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    shell_tool(&mesh, thickness, &open, overshoot).map(|tool| mesh_difference(&mesh, &tool))
+                }))
+                .ok()
+                .flatten()
+            }));
         }
         show_prev = ov.ready;
-    } else if ov.last.is_some() {
-        ov.last = None;
-        ov.ready = false;
+        ui_state.shell_preview_busy = ov.task.is_some();
+    } else {
+        ui_state.shell_preview_busy = false;
+        // The panel closed: drop any running build and forget the preview.
+        if ov.last.is_some() || ov.task.is_some() {
+            ov.task = None;
+            ov.pending = None;
+            ov.last = None;
+            ov.ready = false;
+        }
     }
 
     for (mut vis, open, sel, prev, solid) in &mut q {
