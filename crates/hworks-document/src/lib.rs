@@ -632,12 +632,26 @@ pub enum DimStyle {
     Radius,
     /// Full diameter of a circular rim — measures anchor `a` alone.
     Diameter,
+    /// A centre mark on a circular rim: a cross plus centrelines. Measures nothing; `offset`
+    /// is how far the centrelines reach past the rim.
+    CentreMark,
 }
 
 impl DimStyle {
-    /// Radial styles measure ONE anchor; `b` is unused for them.
+    /// Radial styles state a radius or diameter.
     pub fn is_radial(self) -> bool {
         matches!(self, DimStyle::Radius | DimStyle::Diameter)
+    }
+
+    /// Styles that attach to a single circular rim, so one click places them and `b` is
+    /// unused.
+    pub fn takes_one_anchor(self) -> bool {
+        matches!(self, DimStyle::Radius | DimStyle::Diameter | DimStyle::CentreMark)
+    }
+
+    /// A centre mark is an annotation, not a measurement — it carries no value or text.
+    pub fn is_mark(self) -> bool {
+        matches!(self, DimStyle::CentreMark)
     }
 }
 

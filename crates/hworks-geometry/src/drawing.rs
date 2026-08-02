@@ -358,6 +358,21 @@ pub fn to_svg_with_dims(
         let fy = |y: f64| sheet_h - y;
         let (g, text) = match dim {
             SheetDim::Linear(g, t) => (g, t),
+            SheetDim::Mark(m) => {
+                for (a, b) in &m.cross {
+                    out.push_str(&format!(
+                        "<path d=\"M{:.3},{:.3} L{:.3},{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.25\"/>\n",
+                        a[0], fy(a[1]), b[0], fy(b[1])
+                    ));
+                }
+                for (a, b) in &m.arms {
+                    out.push_str(&format!(
+                        "<path d=\"M{:.3},{:.3} L{:.3},{:.3}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.2\" stroke-dasharray=\"3,1,0.6,1\"/>\n",
+                        a[0], fy(a[1]), b[0], fy(b[1])
+                    ));
+                }
+                continue;
+            }
             SheetDim::Radial(r, t) => {
                 // Leader, landing, and an arrow biting each rim.
                 let d = [r.label[0] - r.centre[0], r.label[1] - r.centre[1]];
@@ -881,10 +896,48 @@ pub fn radial_dim_geometry(centre: [f64; 2], radius: f64, angle: f64, dist: f64,
     }
 }
 
+/// A laid-out centre mark: the little cross at a hole's centre, with centrelines running out
+/// past the rim.
+#[derive(Clone, Debug)]
+pub struct CentreMarkGeom {
+    pub centre: [f64; 2],
+    /// The short solid cross at the centre.
+    pub cross: Vec<([f64; 2], [f64; 2])>,
+    /// The centrelines reaching out past the rim, drawn dash-dot.
+    pub arms: Vec<([f64; 2], [f64; 2])>,
+}
+
+/// Lay out a centre mark, drafting-style: a small cross on the centre, then a break, then a
+/// centreline out through the rim by `overshoot`. Arms run along the sheet axes, which is the
+/// convention for a hole on an orthographic view.
+pub fn centre_mark_geometry(centre: [f64; 2], radius: f64, overshoot: f64) -> CentreMarkGeom {
+    let r = radius.max(1e-6);
+    // The cross stays small and readable; the arms scale with the hole.
+    let cross_arm = (r * 0.28).clamp(0.4, 3.0);
+    let inner = r * 0.55;
+    let outer = r + overshoot.max(r * 0.15).min(r * 3.0);
+    let mut cross = Vec::with_capacity(2);
+    let mut arms = Vec::with_capacity(4);
+    for (dx, dy) in [(1.0f64, 0.0f64), (0.0, 1.0)] {
+        cross.push((
+            [centre[0] - dx * cross_arm, centre[1] - dy * cross_arm],
+            [centre[0] + dx * cross_arm, centre[1] + dy * cross_arm],
+        ));
+    }
+    for (dx, dy) in [(1.0f64, 0.0f64), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        arms.push((
+            [centre[0] + dx * inner, centre[1] + dy * inner],
+            [centre[0] + dx * outer, centre[1] + dy * outer],
+        ));
+    }
+    CentreMarkGeom { centre, cross, arms }
+}
+
 /// A dimension ready for export, in final sheet coordinates.
 pub enum SheetDim {
     Linear(DimGeom, String),
     Radial(RadialGeom, String),
+    Mark(CentreMarkGeom),
 }
 
 #[cfg(test)]

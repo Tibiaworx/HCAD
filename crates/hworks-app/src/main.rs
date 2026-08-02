@@ -24,7 +24,8 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_geometry::drawing::{
     dim_geometry, edges_bounds, format_dim, pick_target, project_edges, resolve_ref, snap_targets, to_svg_with_dims,
-    radial_dim_geometry, DimGeom, DimRef, ProjEdge, RadialGeom, RefKind, SheetDim, SheetItem, SnapTarget, ViewBasis,
+    centre_mark_geometry, radial_dim_geometry, CentreMarkGeom, DimGeom, DimRef, ProjEdge, RadialGeom, RefKind, SheetDim,
+    SheetItem, SnapTarget, ViewBasis,
 };
 use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle};
 use hworks_geometry::{
@@ -2211,6 +2212,8 @@ struct UiState {
     /// The dimension being dragged, anchored at the grab.
     draw_dim_drag: Option<DimDrag>,
     draw_dim_sel: Option<u64>,
+    /// One-shot: centre-mark every circular rim that hasn't got one.
+    draw_mark_all: bool,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
     pattern_spec: Option<PatternSpec>,
@@ -4353,7 +4356,9 @@ fn ui_system(
       egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // Drawing mode owns the whole panel — none of the modelling tools apply to a sheet.
         if in_draw {
-            drawing_panel(ui, &mut asm_ctx.3.0, &mut ui_state);
+            if drawing_panel(ui, &mut asm_ctx.3.0, &mut ui_state) {
+                ui_state.draw_mark_all = true;
+            }
             return;
         }
         // Polygon-tool parameters (SolidWorks-style PropertyManager): the side count.
@@ -16799,6 +16804,14 @@ fn drawing_ui(
     }
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
+    if std::mem::take(&mut ui_state.draw_mark_all) {
+        let n = centre_mark_all_holes(&mut draw.0, &cache);
+        ui_state.toasts.push((
+            if n == 0 { "Every hole already has a centre mark".to_string() } else { format!("Centre-marked {n} hole(s)") },
+            3.0,
+        ));
+    }
+
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(38, 40, 45)))
         .show(ctx, |ui| {
@@ -16905,6 +16918,39 @@ fn drawing_ui(
             let mut dim_hit: Option<u64> = None;
             for d in &draw.0.dims {
                 let sel = ui_state.draw_dim_sel == Some(d.id);
+                // Centre marks: a cross on the hole centre with dash-dot centrelines.
+                if d.style.is_mark() {
+                    if let Some(m) = resolve_mark(&draw.0, &cache, d) {
+                        let col = if sel { egui::Color32::from_rgb(40, 110, 200) } else { egui::Color32::from_gray(30) };
+                        for (a, b) in &m.cross {
+                            painter.line_segment([to_screen(*a), to_screen(*b)], egui::Stroke::new(1.0, col));
+                        }
+                        for (a, b) in &m.arms {
+                            // Dash-dot, the drafting convention for a centreline.
+                            let (sa, sb) = (to_screen(*a), to_screen(*b));
+                            let len = (sb - sa).length().max(1e-3);
+                            let u = (sb - sa) / len;
+                            let mut t = 0.0;
+                            let mut long = true;
+                            while t < len {
+                                let seg = if long { 6.0 } else { 1.6 };
+                                let e = (t + seg).min(len);
+                                painter.line_segment([sa + u * t, sa + u * e], egui::Stroke::new(0.9, col));
+                                t = e + 2.2;
+                                long = !long;
+                            }
+                        }
+                        if let Some(pos) = resp.hover_pos() {
+                            if (pos - to_screen(m.centre)).length() < 8.0 {
+                                dim_hit = Some(d.id);
+                            }
+                        }
+                    } else if let Some(v) = draw.0.views.iter().find(|v| v.id == d.view) {
+                        let at = to_screen([v.center[0], v.center[1]]);
+                        painter.text(at, egui::Align2::CENTER_CENTER, "\u{26a0} centre mark lost its hole", egui::FontId::proportional(12.0), dangling_col);
+                    }
+                    continue;
+                }
                 // Radial dimensions: leader from the rim out to the text, on a landing.
                 if d.style.is_radial() {
                     match resolve_radial(&draw.0, &cache, d) {
@@ -17043,17 +17089,18 @@ fn drawing_ui(
                                         let anchor = target_to_anchor(t, cache_part_diag(&cache));
                                         // A radial dimension measures ONE rim: place it on the
                                         // first click, and only on a circle.
-                                        if ui_state.draw_dim_style.is_radial() {
+                                        if ui_state.draw_dim_style.takes_one_anchor() {
                                             if t.kind == RefKind::Circle {
                                                 let style = ui_state.draw_dim_style;
-                                                let id = draw.0.add_dim(vid, anchor, anchor, style, t.radius * 2.2 + 4.0);
+                                                let off = if style.is_mark() { t.radius * 0.35 } else { t.radius * 2.2 + 4.0 };
+                                                let id = draw.0.add_dim(vid, anchor, anchor, style, off);
                                                 if let Some(nd) = draw.0.dim_mut(id) {
                                                     nd.angle = std::f64::consts::FRAC_PI_4;
                                                 }
                                                 ui_state.draw_dim_sel = Some(id);
                                                 ui_state.draw_dim_first = None;
                                             } else {
-                                                ui_state.toasts.push(("Radius/diameter needs a circular edge — the blue dots".into(), 2.5));
+                                                ui_state.toasts.push(("That one needs a circular edge — the blue dots".into(), 2.5));
                                             }
                                             return;
                                         }
@@ -17120,6 +17167,11 @@ fn drawing_ui(
                                     d.slide,
                                     DimGeom { a: r.centre, b: r.rim, p0: r.centre, p1: r.label, label: r.label, value: r.value },
                                 )),
+                                Some(LaidOut::Mark(m)) => Some((
+                                    d.offset,
+                                    d.slide,
+                                    DimGeom { a: m.centre, b: m.centre, p0: m.centre, p1: m.centre, label: m.centre, value: 0.0 },
+                                )),
                                 None => None,
                             });
                         if let Some((off0, slide0, g)) = axis {
@@ -17154,8 +17206,23 @@ fn drawing_ui(
                         let across = dx * -dd.dir[1] + dy * dd.dir[0];
                         // A radial label swings around its circle: the cursor's position
                         // relative to the centre gives both the leader angle and how far out.
-                        let radial = draw.0.dims.iter().find(|d| d.id == dd.id).map(|d| d.style.is_radial()).unwrap_or(false);
-                        if radial {
+                        let style = draw.0.dims.iter().find(|d| d.id == dd.id).map(|d| d.style);
+                        if style.is_some_and(|st| st.is_mark()) {
+                            // Dragging a centre mark stretches its centrelines out from the
+                            // hole; it has no label to reposition.
+                            let centre = draw
+                                .0
+                                .dims
+                                .iter()
+                                .find(|d| d.id == dd.id)
+                                .and_then(|d| resolve_mark(&draw.0, &cache, d).map(|m| m.centre));
+                            if let Some(c) = centre {
+                                let reach = (((sheet[0] - c[0]).powi(2) + (sheet[1] - c[1]).powi(2)).sqrt()) / scale;
+                                if let Some(d) = draw.0.dim_mut(dd.id) {
+                                    d.offset = reach;
+                                }
+                            }
+                        } else if style.is_some_and(|st| st.is_radial()) {
                             let polar = draw
                                 .0
                                 .dims
@@ -17244,7 +17311,10 @@ fn drawing_ui(
 }
 
 /// The Drawing-mode side panel: sheet size, the views on it, and the title block.
-fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) {
+fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) -> bool {
+    // Returns whether the caller should centre-mark every hole (needs the geometry cache,
+    // which the panel doesn't have).
+    let mut mark_all_holes = false;
     ui.heading("Drawing");
     ui.horizontal(|ui| {
         ui.label("Sheet");
@@ -17382,7 +17452,7 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
             }
         });
         ui.horizontal(|ui| {
-            for (lbl, st) in [("\u{00d8} Diameter", DimStyle::Diameter), ("R Radius", DimStyle::Radius)] {
+            for (lbl, st) in [("\u{00d8} Diameter", DimStyle::Diameter), ("R Radius", DimStyle::Radius), ("\u{2295} Centre", DimStyle::CentreMark)] {
                 if ui
                     .selectable_label(ui_state.draw_dim_style == st, lbl)
                     .on_hover_text("One click on a circular edge (a blue dot)")
@@ -17397,7 +17467,7 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
             egui::RichText::new(if ui_state.draw_dim_first.is_some() {
                 "Now click the SECOND point."
             } else {
-                if ui_state.draw_dim_style.is_radial() {
+                if ui_state.draw_dim_style.takes_one_anchor() {
                     "Click a circular edge — the blue dots."
                 } else {
                     "Click the FIRST point. Pickable points show as dots: blue = hole centre, green = corner, grey = edge midpoint."
@@ -17407,8 +17477,15 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
             .small(),
         );
     }
+    if ui
+        .button("\u{2295} Centre-mark every hole")
+        .on_hover_text("Put a centre mark on every circular edge in every view that hasn't got one")
+        .clicked()
+    {
+        mark_all_holes = true;
+    }
     if !draw.dims.is_empty() {
-        ui.label(egui::RichText::new(format!("{} dimension(s)", draw.dims.len())).weak().small());
+        ui.label(egui::RichText::new(format!("{} annotation(s)", draw.dims.len())).weak().small());
         if let Some(id) = ui_state.draw_dim_sel {
             if draw.dims.iter().any(|d| d.id == id) {
                 ui.horizontal(|ui| {
@@ -17438,6 +17515,7 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
     {
         ui_state.export_svg_request = true;
     }
+    mark_all_holes
 }
 
 /// Third-angle layout: front at the centre, top above it, right to its right, iso top-right.
@@ -17518,10 +17596,11 @@ fn cache_part_diag(cache: &DrawCache) -> f64 {
         .unwrap_or(50.0)
 }
 
-/// A resolved dimension, ready to draw or export.
+/// A resolved dimension or annotation, ready to draw or export.
 enum LaidOut {
     Linear(DimGeom, String),
     Radial(RadialGeom, String),
+    Mark(CentreMarkGeom),
 }
 
 impl LaidOut {
@@ -17529,8 +17608,59 @@ impl LaidOut {
         match self {
             LaidOut::Linear(g, t) => SheetDim::Linear(g, t),
             LaidOut::Radial(r, t) => SheetDim::Radial(r, t),
+            LaidOut::Mark(m) => SheetDim::Mark(m),
         }
     }
+}
+
+/// Put a centre mark on every circular rim in every view that hasn't already got one.
+///
+/// Skips rims that are already marked (matched by proximity in the model), so pressing it
+/// twice doesn't stack duplicates. Returns how many were added.
+fn centre_mark_all_holes(draw: &mut Drawing, cache: &DrawCache) -> usize {
+    let diag = cache_part_diag(cache);
+    let mut added = 0;
+    let views: Vec<(u64, String)> = draw.views.iter().map(|v| (v.id, v.dir.label().to_string())).collect();
+    for (vid, label) in views {
+        let Some(targets) = cache.targets.get(&label) else { continue };
+        for t in targets.iter().filter(|t| t.kind == RefKind::Circle) {
+            let already = draw.dims.iter().any(|d| {
+                d.view == vid
+                    && d.style.is_mark()
+                    && (d.a.point[0] - t.model[0]).powi(2) + (d.a.point[1] - t.model[1]).powi(2) + (d.a.point[2] - t.model[2]).powi(2)
+                        < (diag * 1e-3).max(1e-4).powi(2)
+            });
+            if already {
+                continue;
+            }
+            let anchor = target_to_anchor(t, diag);
+            draw.add_dim(vid, anchor, anchor, DimStyle::CentreMark, t.radius * 0.35);
+            added += 1;
+        }
+    }
+    added
+}
+
+/// Lay out a centre mark in FINAL sheet coordinates. Like the radial dimensions it measures
+/// one rim, so only `a` is resolved — and it follows the hole if the part is edited.
+fn resolve_mark(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<CentreMarkGeom> {
+    let view = draw.views.iter().find(|v| v.id == d.view)?;
+    let targets = cache.targets.get(view.dir.label())?;
+    let (dir, up) = view.dir.frame();
+    let basis = ViewBasis::looking_along(dir, up);
+    let tol = if d.a.scale > 1e-9 { d.a.scale * 0.25 } else { cache_part_diag(cache) * 0.1 };
+    let r = resolve_ref(targets, &anchor_to_ref(&d.a), tol)?;
+    if r.radius <= 1e-9 {
+        return None;
+    }
+    let (c2, _) = basis.project(r.point);
+    let g = centre_mark_geometry(c2, r.radius, d.offset);
+    let place = |q: [f64; 2]| [view.center[0] + q[0] * view.scale, view.center[1] + q[1] * view.scale];
+    Some(CentreMarkGeom {
+        centre: place(g.centre),
+        cross: g.cross.iter().map(|(a, b)| (place(*a), place(*b))).collect(),
+        arms: g.arms.iter().map(|(a, b)| (place(*a), place(*b))).collect(),
+    })
 }
 
 /// Lay out a radius/diameter dimension in FINAL sheet coordinates. Radial dimensions measure
@@ -17568,7 +17698,9 @@ fn resolve_radial(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<(Rad
 
 /// Lay out any dimension, linear or radial.
 fn resolve_any(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<LaidOut> {
-    if d.style.is_radial() {
+    if d.style.is_mark() {
+        resolve_mark(draw, cache, d).map(LaidOut::Mark)
+    } else if d.style.is_radial() {
         resolve_radial(draw, cache, d).map(|(g, t)| LaidOut::Radial(g, t))
     } else {
         resolve_dim(draw, cache, d).map(|(g, t)| LaidOut::Linear(g, t))
@@ -17597,8 +17729,8 @@ fn resolve_dim(draw: &Drawing, cache: &DrawCache, d: &DrawDim) -> Option<(DimGeo
         DimStyle::Aligned => hworks_geometry::drawing::DimStyle::Aligned,
         DimStyle::Horizontal => hworks_geometry::drawing::DimStyle::Horizontal,
         DimStyle::Vertical => hworks_geometry::drawing::DimStyle::Vertical,
-        // Radial dimensions measure one rim and are laid out by `resolve_radial`.
-        DimStyle::Radius | DimStyle::Diameter => return None,
+        // These attach to one rim and are laid out by `resolve_radial` / `resolve_mark`.
+        DimStyle::Radius | DimStyle::Diameter | DimStyle::CentreMark => return None,
     };
     let g = dim_geometry(a2, b2, style, d.offset, d.slide);
     // Into sheet space: the view's placement and scale.
@@ -17654,8 +17786,8 @@ fn default_dim_offset(
         DimStyle::Vertical => {
             if mid[0] >= centre[0] { view_hi[0] + margin - mid[0] } else { view_lo[0] - margin - mid[0] }
         }
-        // Radial dimensions place themselves from the rim outward, not from a span.
-        DimStyle::Radius | DimStyle::Diameter => return 0.0,
+        // Rim-attached annotations place themselves from the rim outward, not from a span.
+        DimStyle::Radius | DimStyle::Diameter | DimStyle::CentreMark => return 0.0,
         DimStyle::Aligned => {
             let d = [b2[0] - a2[0], b2[1] - a2[1]];
             let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-9);
@@ -24834,6 +24966,61 @@ mod tests {
         let (g, _) = resolve_radial(&drawing, &cache, &d).expect("resolve");
         let dist = ((g.label[0] - g.centre[0]).powi(2) + (g.label[1] - g.centre[1]).powi(2)).sqrt();
         assert!(dist > 6.0, "the label sat inside the rim ({dist:.2} from a 6mm centre)");
+    }
+
+    /// A centre mark sits on the hole centre, reaches past the rim, and follows the hole
+    /// when the part is edited.
+    #[test]
+    fn centre_marks_sit_on_the_hole_and_reach_past_the_rim() {
+        let (mut drawing, cache) = holed_plate_drawing(6.0);
+        let vid = drawing.views[0].id;
+        let a = hole_anchor(&cache);
+        let id = drawing.add_dim(vid, a, a, DimStyle::CentreMark, 2.0);
+
+        let d = drawing.dims.iter().find(|x| x.id == id).unwrap().clone();
+        let m = resolve_mark(&drawing, &cache, &d).expect("centre mark didn't resolve");
+        assert_eq!(m.cross.len(), 2, "the centre cross needs two strokes");
+        assert_eq!(m.arms.len(), 4, "a centre mark has four centrelines");
+
+        // Every arm must START inside the rim and END outside it.
+        for (p0, p1) in &m.arms {
+            let d0 = ((p0[0] - m.centre[0]).powi(2) + (p0[1] - m.centre[1]).powi(2)).sqrt();
+            let d1 = ((p1[0] - m.centre[0]).powi(2) + (p1[1] - m.centre[1]).powi(2)).sqrt();
+            assert!(d0 < 6.0, "an arm started outside the rim ({d0:.2})");
+            assert!(d1 > 6.0, "an arm stopped short of the rim ({d1:.2})");
+        }
+        // The cross is centred on the hole.
+        for (p0, p1) in &m.cross {
+            let mid = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+            assert!((mid[0] - m.centre[0]).abs() < 1e-6 && (mid[1] - m.centre[1]).abs() < 1e-6, "cross off centre");
+        }
+
+        // Re-bore the hole: the mark follows and its arms grow with it.
+        let (_, bigger) = holed_plate_drawing(9.0);
+        let m2 = resolve_mark(&drawing, &bigger, &d).expect("went dangling on a re-bore");
+        for (_, p1) in &m2.arms {
+            let d1 = ((p1[0] - m2.centre[0]).powi(2) + (p1[1] - m2.centre[1]).powi(2)).sqrt();
+            assert!(d1 > 9.0, "after re-boring an arm no longer clears the rim ({d1:.2})");
+        }
+    }
+
+    /// "Centre-mark every hole" marks each rim once, and pressing it again adds nothing.
+    #[test]
+    fn marking_every_hole_is_idempotent() {
+        let (mut drawing, cache) = holed_plate_drawing(6.0);
+        let first = centre_mark_all_holes(&mut drawing, &cache);
+        assert!(first > 0, "no holes were marked");
+        assert_eq!(drawing.dims.len(), first, "unexpected extra annotations");
+
+        let second = centre_mark_all_holes(&mut drawing, &cache);
+        assert_eq!(second, 0, "pressing it again stacked {second} duplicate marks");
+        assert_eq!(drawing.dims.len(), first, "the annotation count changed on a no-op");
+
+        // They all resolve and are marks.
+        for d in &drawing.dims {
+            assert!(d.style.is_mark());
+            assert!(resolve_mark(&drawing, &cache, d).is_some(), "a generated mark didn't resolve");
+        }
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
