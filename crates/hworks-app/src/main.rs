@@ -10018,7 +10018,11 @@ fn shell_overlays(
                 }))
                 .ok()
                 .flatten();
-                let _ = take_fallback_count(); // a preview boolean must not raise the torn-surface banner
+                // A preview must not raise a banner about the real model.
+            let _ = take_fallback_count();
+            let _ = hworks_geometry::take_loft_hole_mismatch_count();
+            let _ = take_sweep_region_fallbacks();
+            let _ = take_cut_direction_guesses();
                 if let Some(m) = built.filter(|m| !m.positions.is_empty()) {
                     if let Some(slot) = meshes.get_mut(&ov.preview_mesh) {
                         *slot = trimesh_to_bevy(m);
@@ -15453,10 +15457,19 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                         -1.0
                     } else if pos_in && !neg_in {
                         1.0
-                    } else if (mesh_centroid(&tessm) - origin).dot(n) < 0.0 {
-                        -1.0 // ambiguous → fall back to the centroid heuristic
                     } else {
-                        1.0
+                        // Both probes agreed, so this point tells us nothing. Ask the rest of
+                        // the footprint before falling back to the whole-body centroid — that
+                        // heuristic is what used to flip a pocket to face open air when a tall
+                        // boss sat elsewhere on the part.
+                        match footprint_cut_vote(&tessm, &resolved, &merged[ri], eps) {
+                            Some(v) => v as f64,
+                            None => {
+                                CUT_DIRECTION_GUESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                warn!("Cut: couldn't tell which side is material — guessing from the body centroid.");
+                                if (mesh_centroid(&tessm) - origin).dot(n) < 0.0 { -1.0 } else { 1.0 }
+                            }
+                        }
                     };
                     let signed = into * *distance;
                     // Coincident-wall guard: geometry snapped onto an existing hole cuts only
@@ -15899,10 +15912,17 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     -1.0
                 } else if pos_in && !neg_in {
                     1.0
-                } else if (mesh_centroid(cur0) - origin).dot(n) < 0.0 {
-                    -1.0 // ambiguous → fall back to the centroid heuristic
                 } else {
-                    1.0
+                    // See the exact path: poll the whole footprint before resorting to the
+                    // whole-body centroid, which is direction-blind to what's under the cut.
+                    match cut_regs.first().and_then(|r| footprint_cut_vote(cur0, &plane, r, eps)) {
+                        Some(v) => v as f64,
+                        None => {
+                            CUT_DIRECTION_GUESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            warn!("Cut: couldn't tell which side is material — guessing from the body centroid.");
+                            if (mesh_centroid(cur0) - origin).dot(n) < 0.0 { -1.0 } else { 1.0 }
+                        }
+                    }
                 };
                 // A circle snapped onto an existing hole's rim would give the tool walls
                 // exactly coincident with the hole — prune footprint-over-void geometry.
@@ -16193,6 +16213,65 @@ fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
 /// Build the sweep's loft sections: the profile region carried along the path with
 /// parallel-transport (rotation-minimising) frames, holes included. The profile is centred
 /// on the path (its own centroid rides the path points).
+/// Sweeps that fell back to a different profile region because the recorded one was gone.
+static SWEEP_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Cuts whose direction could not be determined by probing and had to guess.
+static CUT_DIRECTION_GUESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn take_sweep_region_fallbacks() -> u32 {
+    SWEEP_REGION_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn take_cut_direction_guesses() -> u32 {
+    CUT_DIRECTION_GUESSES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which way is material, decided across the whole cut footprint rather than one point.
+///
+/// Probes just above and below the plane at several points inside the profile and takes a
+/// majority. Returns `None` only when the samples genuinely disagree or find nothing, which
+/// is the caller's cue to say it is guessing instead of quietly picking a side.
+fn footprint_cut_vote(mesh: &TriMesh, plane: &PlaneRef, region: &hworks_sketch::Region, eps: f32) -> Option<f32> {
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+    // Sample the outer loop's interior: the centroid, and points pulled back toward it from
+    // each vertex so a concave profile still lands inside.
+    let mut c = [0.0f64; 2];
+    for p in &region.outer {
+        c[0] += p[0];
+        c[1] += p[1];
+    }
+    let nn = region.outer.len().max(1) as f64;
+    c = [c[0] / nn, c[1] / nn];
+    let mut samples: Vec<[f64; 2]> = vec![c];
+    for p in region.outer.iter().take(24) {
+        for t in [0.35, 0.7] {
+            samples.push([c[0] + (p[0] - c[0]) * t, c[1] + (p[1] - c[1]) * t]);
+        }
+    }
+    let (mut neg, mut pos) = (0i32, 0i32);
+    for sp in &samples {
+        let w = o + u * sp[0] as f32 + v * sp[1] as f32;
+        let below = point_inside_mesh(mesh, w - n * eps);
+        let above = point_inside_mesh(mesh, w + n * eps);
+        if below && !above {
+            neg += 1;
+        } else if above && !below {
+            pos += 1;
+        }
+    }
+    // A clear majority decides; a tie or no information at all does not.
+    if neg > pos * 2 && neg > 0 {
+        Some(-1.0)
+    } else if pos > neg * 2 && pos > 0 {
+        Some(1.0)
+    } else {
+        None
+    }
+}
+
 fn sweep_sections(
     profile: &LoftProfile,
     path_sketch: &Sketch,
@@ -16223,7 +16302,22 @@ fn sweep_sections(
 
     // Profile region loops in its own uv, relative to the outer centroid.
     let regions = profile.sketch.regions();
-    let r = regions.get(profile.region).or_else(|| regions.first())?;
+    // A stale region index means the profile sketch was edited after the sweep was made.
+    // Falling through to `regions.first()` swept a DIFFERENT cross-section than the feature
+    // recorded, silently — the sweep still built, just not the shape asked for. Count it so
+    // the app can say the profile moved.
+    let r = match regions.get(profile.region) {
+        Some(r) => r,
+        None => {
+            SWEEP_REGION_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "Sweep: profile region {} no longer exists ({} region(s) in the sketch) — using the first.",
+                profile.region,
+                regions.len()
+            );
+            regions.first()?
+        }
+    };
     let cen = {
         let mut c = [0.0f64; 2];
         for p in &r.outer {
@@ -16466,7 +16560,28 @@ fn finish_regen_job(
             // A dense-skip means a cut couldn't apply because the imported mesh isn't a closed
             // solid — point the user at Solidify (the actionable fix) rather than the generic
             // torn-surface warning.
-            ui_state.last_error = if dense_skips > 0 {
+            // Anomalies that would otherwise be silent: a feature that BUILT, but not the way
+            // it was asked to. These matter more than the torn-surface warning, because the
+            // result looks perfectly fine and is simply wrong — so they are reported first.
+            let loft_holes = hworks_geometry::take_loft_hole_mismatch_count();
+            let sweep_regions = take_sweep_region_fallbacks();
+            let cut_guesses = take_cut_direction_guesses();
+            ui_state.last_error = if loft_holes > 0 {
+                warn!("{loft_holes} loft(s) dropped their holes — profiles disagree on hole count.");
+                Some(format!(
+                    "⚠ {loft_holes} loft(s) came out SOLID: their profiles have different numbers of holes, so the holes couldn't be paired up and were skipped. Give every profile the same hole count to skin them through."
+                ))
+            } else if sweep_regions > 0 {
+                warn!("{sweep_regions} sweep(s) fell back to a different profile region.");
+                Some(format!(
+                    "⚠ {sweep_regions} sweep(s) used the WRONG profile: the region they recorded no longer exists (the profile sketch was edited), so the first one was swept instead. Reopen the sweep and re-pick its profile."
+                ))
+            } else if cut_guesses > 0 {
+                warn!("{cut_guesses} cut(s) guessed their direction.");
+                Some(format!(
+                    "⚠ {cut_guesses} cut(s) couldn't tell which side holds material and guessed. If one cut the wrong way, tick Reverse — or move the sketch so it sits clearly on the face it cuts into."
+                ))
+            } else if dense_skips > 0 {
                 warn!("{dense_skips} boolean(s) skipped — imported mesh isn't a closed solid.");
                 Some("⚠ The cut couldn't apply — this imported mesh isn't a closed solid. Open its mesh properties and turn on \"Solidify for cutting\" to make it cuttable.".to_string())
             } else {
@@ -22416,7 +22531,7 @@ mod tests {
     use super::*;
     // Only the tests build plain prisms directly; the app goes through the arc-aware variants.
     use hworks_geometry::extrude_solid;
-    use hworks_document::{Document, FeatureKind, PlaneRef};
+    use hworks_document::{Document, FeatureKind, LoftProfile, PlaneRef};
     use hworks_sketch::Sketch;
 
     /// On-demand manifold check of a saved part: load the `.hcad`, regenerate the mesh body, and
@@ -25180,6 +25295,118 @@ mod tests {
             "a plain face should still centre, got {:?}",
             ap2.origin
         );
+    }
+
+    /// A square profile of side `w` centred on the origin, with an optional square hole.
+    fn ring_profile(w: f64, hole: Option<f64>) -> Sketch {
+        let mut sk = Sketch::default();
+        let h = w * 0.5;
+        let o = [
+            sk.add_point(-h, -h),
+            sk.add_point(h, -h),
+            sk.add_point(h, h),
+            sk.add_point(-h, h),
+        ];
+        for i in 0..4 {
+            sk.add_line(o[i], o[(i + 1) % 4], false);
+        }
+        if let Some(hw) = hole {
+            let g = hw * 0.5;
+            let p = [
+                sk.add_point(-g, -g),
+                sk.add_point(g, -g),
+                sk.add_point(g, g),
+                sk.add_point(-g, g),
+            ];
+            for i in 0..4 {
+                sk.add_line(p[i], p[(i + 1) % 4], false);
+            }
+        }
+        sk
+    }
+
+    /// A loft between profiles with different hole counts must REPORT that it dropped the
+    /// holes. It used to come out silently solid where a tube was drawn.
+    #[test]
+    fn a_loft_that_cannot_pair_holes_says_so() {
+        let _ = hworks_geometry::take_loft_hole_mismatch_count(); // clear
+
+        let upper = PlaneRef { origin: [0.0, 0.0, 20.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        let prof = |sk: Sketch, plane: PlaneRef| LoftProfile { sketch: sk, plane, region: 0 };
+
+        // Both profiles holed and matching: no complaint, and the hole is skinned through.
+        let mut ok = Document::with_default_planes();
+        ok.add_feature(FeatureKind::Loft {
+            profiles: vec![prof(ring_profile(30.0, Some(14.0)), xy()), prof(ring_profile(20.0, Some(9.0)), upper.clone())],
+            cut: false,
+        });
+        ok.rollback = ok.features.len();
+        let (matched, _) = regenerate_mesh(&ok).expect("matched loft");
+        assert_eq!(hworks_geometry::take_loft_hole_mismatch_count(), 0, "a matched loft complained");
+
+        // One profile holed, one not: the holes cannot be paired, and that must be reported.
+        let mut bad = Document::with_default_planes();
+        bad.add_feature(FeatureKind::Loft {
+            profiles: vec![prof(ring_profile(30.0, Some(14.0)), xy()), prof(ring_profile(20.0, None), upper)],
+            cut: false,
+        });
+        bad.rollback = bad.features.len();
+        let (dropped, _) = regenerate_mesh(&bad).expect("mismatched loft");
+        assert!(
+            hworks_geometry::take_loft_hole_mismatch_count() > 0,
+            "a loft dropped its holes without reporting it"
+        );
+
+        // And the report is true: the one that dropped its holes really is more solid.
+        assert!(
+            tri_vol(&dropped) > tri_vol(&matched) * 1.15,
+            "expected the hole-less loft to be markedly more solid ({:.0} vs {:.0})",
+            tri_vol(&dropped),
+            tri_vol(&matched)
+        );
+    }
+
+    /// A cut whose direction genuinely can't be probed must record that it guessed — while a
+    /// perfectly ordinary cut must NOT, or the warning becomes noise.
+    #[test]
+    fn an_ordinary_cut_never_reports_guessing() {
+        let _ = take_cut_direction_guesses();
+
+        // A plate with a tall boss elsewhere — the case that used to flip via the centroid.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(40.0, 40.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        let mut boss = Sketch::default();
+        let b = [
+            boss.add_point(30.0, 30.0),
+            boss.add_point(38.0, 30.0),
+            boss.add_point(38.0, 38.0),
+            boss.add_point(30.0, 38.0),
+        ];
+        for i in 0..4 {
+            boss.add_line(b[i], b[(i + 1) % 4], false);
+        }
+        let top = PlaneRef { origin: [0.0, 0.0, 6.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: top.clone(), distance: 40.0, back: 0.0, thin: 0.0, thin_side: 0 });
+
+        // Pocket the plate's top, well away from the boss.
+        let mut pocket = Sketch::default();
+        let q = [
+            pocket.add_point(5.0, 5.0),
+            pocket.add_point(15.0, 5.0),
+            pocket.add_point(15.0, 15.0),
+            pocket.add_point(5.0, 15.0),
+        ];
+        for i in 0..4 {
+            pocket.add_line(q[i], q[(i + 1) % 4], false);
+        }
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![], region_pts: vec![], plane: top, distance: 3.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("body");
+
+        assert_eq!(take_cut_direction_guesses(), 0, "an ordinary pocket reported a guess — the warning would be noise");
+        // And it cut the right way: material is gone just under the plate's top face.
+        assert!(!point_inside_mesh(&m, Vec3::new(10.0, 10.0, 5.0)), "the pocket didn't cut down into the plate");
+        assert!(point_inside_mesh(&m, Vec3::new(20.0, 20.0, 3.0)), "the plate itself vanished");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres

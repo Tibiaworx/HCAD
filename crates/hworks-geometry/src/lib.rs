@@ -751,6 +751,15 @@ pub fn direct_prism_mesh(
     Some(mesh)
 }
 
+/// Lofts whose profiles disagreed on hole count, so their holes were not skinned. Drained by
+/// the app to warn, in the same way boolean fallbacks are.
+static LOFT_HOLE_MISMATCHES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Take and clear the count of lofts that had to drop their holes.
+pub fn take_loft_hole_mismatch_count() -> u32 {
+    LOFT_HOLE_MISMATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Revolve a closed region (outer loop + optional holes, in plane-local uv) around an axis
 /// line — the line through `axis_pt` with direction `axis_dir`, both in the same uv plane — by
 /// `angle` radians, into a solid of revolution. `None` if degenerate. The profile must lie to
@@ -2122,8 +2131,20 @@ pub fn loft_mesh(profiles: &[(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)]) -> Option<Tri
     };
 
     let prof_outer = process(valid.iter().map(|(o, _)| o).collect(), true);
-    // Holes are skinned only when every profile has the same count (matched by index).
-    let hole_count = if valid.iter().all(|(_, h)| h.len() == valid[0].1.len()) { valid[0].1.len() } else { 0 };
+    // Holes are skinned only when every profile has the same count (matched by index) —
+    // pairing 2 holes against 1 by index would skin something arbitrary.
+    //
+    // Dropping them SILENTLY is the problem: a loft between a 2-hole and a 1-hole profile
+    // came out as a solid where a tube was drawn, with nothing to say why. Count it so the
+    // caller can say so.
+    let hole_count = if valid.iter().all(|(_, h)| h.len() == valid[0].1.len()) {
+        valid[0].1.len()
+    } else {
+        if valid.iter().any(|(_, h)| !h.is_empty()) {
+            LOFT_HOLE_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        0
+    };
     let mut prof_holes: Vec<Vec<Vec<[f64; 3]>>> = vec![Vec::new(); valid.len()]; // [profile][hole][pt]
     for h in 0..hole_count {
         let processed = process(valid.iter().map(|(_, holes)| &holes[h]).collect(), false); // CW → inner faces the hole
