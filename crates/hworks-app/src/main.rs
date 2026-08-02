@@ -173,6 +173,7 @@ fn main() {
         .init_resource::<Part>()
         .init_resource::<AsmRes>()
         .init_resource::<AsmRender>()
+        .init_resource::<AsmHistory>()
         .init_resource::<DrawRes>()
         .init_resource::<DrawCache>()
         .init_resource::<DocMode>()
@@ -1443,6 +1444,7 @@ fn asm_interaction(
     blocking: Res<UiBlocking>,
     mode: Res<DocMode>,
     mut asm: ResMut<AsmRes>,
+    mut asm_history: ResMut<AsmHistory>,
     render: Res<AsmRender>,
     mut ui_state: ResMut<UiState>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -1454,6 +1456,10 @@ fn asm_interaction(
     let just_pressed = buttons.just_pressed(MouseButton::Left);
     let pressed = buttons.pressed(MouseButton::Left);
     let just_released = buttons.just_released(MouseButton::Left);
+    if just_released {
+        // Releasing closes the gesture: the next drag becomes its own undo step.
+        asm_history.end_gesture();
+    }
     if !just_pressed && !pressed && !just_released {
         return;
     }
@@ -1577,6 +1583,8 @@ fn asm_interaction(
             let dir = [Vec3::X, Vec3::Y, Vec3::Z][axis_i as usize];
             if let Some(cur) = section_rot_dir(center, dir, &ray) {
                 let delta = last.cross(cur).dot(dir).atan2(last.dot(cur).clamp(-1.0, 1.0));
+                // One undo step per rotation gesture, not one per frame.
+                asm_history.snapshot_gesture(&asm.0, (cid, "rotate"));
                 if let Some(comp) = asm.0.component_mut(cid) {
                     let rd = Quat::from_axis_angle(dir, delta);
                     let q = Quat::from_xyzw(comp.rotation[0] as f32, comp.rotation[1] as f32, comp.rotation[2] as f32, comp.rotation[3] as f32);
@@ -1606,6 +1614,7 @@ fn asm_interaction(
             let dir = [Vec3::X, Vec3::Y, Vec3::Z][drag.axis as usize];
             let t = closest_t_on_axis(drag.anchor, dir, ray.origin, ray.direction.as_vec3());
             if t.is_finite() {
+                asm_history.snapshot_gesture(&asm.0, (drag.comp, "move"));
                 if let Some(comp) = asm.0.component_mut(drag.comp) {
                     let a = drag.axis as usize;
                     // Absolute raw position from the grab point (never accumulates)…
@@ -2974,6 +2983,51 @@ impl History {
     }
 }
 
+/// Undo/redo for the assembly, alongside `History` for parts.
+///
+/// Assemblies are edited by DRAGGING — gizmos and spinners both fire every frame — so a
+/// snapshot per mutation would bury the stack under hundreds of entries for one gesture.
+/// `snapshot_gesture` takes one entry per gesture and ignores the rest until the gesture
+/// ends; discrete actions (adding a mate, deleting a component) use `snapshot` directly.
+#[derive(Resource, Default)]
+struct AsmHistory {
+    undo: Vec<Assembly>,
+    redo: Vec<Assembly>,
+    /// What the open gesture is editing, so its later frames don't each push an entry.
+    gesture: Option<(u64, &'static str)>,
+}
+
+impl AsmHistory {
+    /// Snapshot before a discrete edit.
+    fn snapshot(&mut self, asm: &Assembly) {
+        self.gesture = None;
+        self.push(asm);
+    }
+
+    /// Snapshot the FIRST frame of a gesture on `key`; later frames of the same gesture are
+    /// ignored so one drag is one undo step.
+    fn snapshot_gesture(&mut self, asm: &Assembly, key: (u64, &'static str)) {
+        if self.gesture == Some(key) {
+            return;
+        }
+        self.gesture = Some(key);
+        self.push(asm);
+    }
+
+    /// The pointer was released (or the mode changed) — the next edit starts a new step.
+    fn end_gesture(&mut self) {
+        self.gesture = None;
+    }
+
+    fn push(&mut self, asm: &Assembly) {
+        self.undo.push(asm.clone());
+        if self.undo.len() > 64 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+}
+
 #[derive(Component)]
 struct OrbitCamera {
     focus: Vec3,
@@ -3503,7 +3557,7 @@ fn ui_system(
     mut ui_state: ResMut<UiState>,
     mut blocking: ResMut<UiBlocking>,
     mut doc: ResMut<DocRes>,
-    mut asm_ctx: (ResMut<AsmRes>, ResMut<AsmRender>, Res<DocMode>, ResMut<DrawRes>),
+    mut asm_ctx: (ResMut<AsmRes>, ResMut<AsmRender>, Res<DocMode>, ResMut<DrawRes>, ResMut<AsmHistory>),
     mut history: ResMut<History>,
     mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
     cam_read: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
@@ -3516,8 +3570,17 @@ fn ui_system(
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let (asm, asm_render, asm_mode) = (&mut asm_ctx.0, &mut asm_ctx.1, &asm_ctx.2);
+    let asm_history = &mut asm_ctx.4;
     let in_asm = **asm_mode == DocMode::Assembly;
     let in_draw = **asm_mode == DocMode::Drawing;
+    // Undo/redo availability follows the MODE: in an assembly the part history is irrelevant
+    // (and usually empty), which would have left the buttons greyed out with a full assembly
+    // stack sitting behind them.
+    let (can_undo, can_redo) = if in_asm {
+        (!asm_history.undo.is_empty(), !asm_history.redo.is_empty())
+    } else {
+        (!history.undo.is_empty(), !history.redo.is_empty())
+    };
     let unit = ui_state.unit; // display unit for this frame's readouts/labels
 
     // While a 3D gizmo arrow is being dragged, drop egui keyboard focus: a focused DragValue
@@ -3661,8 +3724,8 @@ fn ui_system(
                 });
             });
             ui.menu_button("Edit", |ui| {
-                if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).clicked() { ui_state.undo_request = true; ui.close(); }
-                if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).clicked() { ui_state.redo_request = true; ui.close(); }
+                if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() { ui_state.undo_request = true; ui.close(); }
+                if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() { ui_state.redo_request = true; ui.close(); }
             });
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut ui_state.show_tangent_edges, "Tangent edges");
@@ -3749,10 +3812,10 @@ fn ui_system(
             if ui.button("New").on_hover_text("Clear the model and start over").clicked() {
                 ui_state.new_part = true;
             }
-            if ui.add_enabled(!history.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
+            if ui.add_enabled(can_undo, egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
                 ui_state.undo_request = true;
             }
-            if ui.add_enabled(!history.redo.is_empty(), egui::Button::new("Redo")).on_hover_text("Redo (Ctrl+Y)").clicked() {
+            if ui.add_enabled(can_redo, egui::Button::new("Redo")).on_hover_text("Redo (Ctrl+Y)").clicked() {
                 ui_state.redo_request = true;
             }
             ui.separator();
@@ -6826,6 +6889,7 @@ fn ui_system(
                 ui.label(egui::RichText::new("Pick a face or edge on each component. Two flat faces \u{2192} flush; a round face or a circular edge (a hole rim) \u{2192} bolt-in-hole (concentric).").weak().small());
                 if commit {
                     if let (Some(a), Some(b)) = (spec.a.clone(), spec.b.clone()) {
+                        asm_history.snapshot(&asm.0);
                         asm.0.add_mate(spec.kind, spec.value as f64, spec.flip, a, b);
                         ui_state.asm_solve = true;
                     }
@@ -6908,6 +6972,7 @@ fn ui_system(
                 });
             }
             if let Some(id) = delete {
+                asm_history.snapshot(&asm.0);
                 asm.0.components.retain(|c| c.id != id);
                 asm.0.mates.retain(|m| m.a.comp != id && m.b.comp != id);
                 if ui_state.asm_selected == Some(id) {
@@ -6968,12 +7033,14 @@ fn ui_system(
                     });
                 }
                 if let Some(id) = flip_mate {
+                    asm_history.snapshot(&asm.0);
                     if let Some(m) = asm.0.mates.iter_mut().find(|m| m.id == id) {
                         m.flip = !m.flip;
                     }
                     ui_state.asm_solve = true;
                 }
                 if let Some(id) = del_mate {
+                    asm_history.snapshot(&asm.0);
                     asm.0.mates.retain(|m| m.id != id);
                     ui_state.asm_solve = true;
                 }
@@ -7018,13 +7085,22 @@ fn ui_system(
             }
             // Component PM: exact placement + fixed flag for the selected instance.
             if let Some(id) = ui_state.asm_selected {
+                // Snapshot BEFORE the edit, but only once per gesture: the position spinners
+                // fire on every frame of a drag, and one entry per frame would bury the
+                // stack. The "before" copy is taken up front and pushed only if something
+                // actually changed, so merely selecting a component costs nothing.
+                let before = asm.0.component(id).cloned();
+                let mut spun = false;
+                let mut stepped = false;
                 if let Some(comp) = asm.0.component_mut(id) {
                     ui.separator();
                     ui.heading(comp.name.clone());
                     ui.horizontal(|ui| {
                         ui.label("Position");
                         for a in 0..3 {
-                            ui.add(egui::DragValue::new(&mut comp.translation[a]).speed(0.5).suffix(" mm"));
+                            if ui.add(egui::DragValue::new(&mut comp.translation[a]).speed(0.5).suffix(" mm")).changed() {
+                                spun = true;
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -7034,15 +7110,36 @@ fn ui_system(
                                 let q = Quat::from_xyzw(comp.rotation[0] as f32, comp.rotation[1] as f32, comp.rotation[2] as f32, comp.rotation[3] as f32);
                                 let r = (Quat::from_axis_angle(axis, std::f32::consts::FRAC_PI_2) * q).normalize();
                                 comp.rotation = [r.x as f64, r.y as f64, r.z as f64, r.w as f64];
+                                stepped = true;
                             }
                         }
                         if ui.small_button("Reset").clicked() {
                             comp.rotation = [0.0, 0.0, 0.0, 1.0];
+                            stepped = true;
                         }
                     });
-                    ui.checkbox(&mut comp.fixed, "Fixed").on_hover_text("Anchored — can't be dragged");
+                    if ui.checkbox(&mut comp.fixed, "Fixed").on_hover_text("Anchored — can't be dragged").changed() {
+                        stepped = true;
+                    }
                     if !comp.source.is_empty() {
                         ui.label(egui::RichText::new(comp.source.clone()).weak().small());
+                    }
+                }
+                // Put the pre-edit state on the stack, with the edited one restored after.
+                if let Some(prev) = before.filter(|_| spun || stepped) {
+                    let edited = asm.0.component(id).cloned();
+                    if let Some(slot) = asm.0.component_mut(id) {
+                        *slot = prev;
+                    }
+                    // A rotate button or a checkbox is one discrete step; the spinners
+                    // coalesce so a drag across them is a single undo.
+                    if stepped {
+                        asm_history.snapshot(&asm.0);
+                    } else {
+                        asm_history.snapshot_gesture(&asm.0, (id, "place"));
+                    }
+                    if let (Some(slot), Some(e)) = (asm.0.component_mut(id), edited) {
+                        *slot = e;
                     }
                 }
             }
@@ -14235,6 +14332,7 @@ fn handle_file_io(
     mut mode: ResMut<DocMode>,
     mut draw: ResMut<DrawRes>,
     mut cache: ResMut<DrawCache>,
+    mut asm_history: ResMut<AsmHistory>,
 ) {
     // ---- Edit-in-place: load a component's part into Part mode ----
     if let Some(id) = ui_state.edit_component_request.take() {
@@ -14295,6 +14393,7 @@ fn handle_file_io(
                     asm_render.cache.remove(&k); // force a rebuild of the edited part's geometry
                 }
             }
+            *asm_history = AsmHistory::default();
             *mode = DocMode::Assembly;
             ui_state.current_file = ui_state.asm_return_file.take();
             ui_state.asm_selected = Some(id);
@@ -14376,6 +14475,9 @@ fn handle_file_io(
     // ---- Assembly document requests ----
     if ui_state.new_asm_request {
         ui_state.new_asm_request = false;
+        // A fresh assembly starts with a fresh history: undoing into the previous one would
+        // resurrect components from a document the user has left.
+        *asm_history = AsmHistory::default();
         ui_state.editing_component = None;
         ui_state.asm_return_file = None;
         *mode = DocMode::Assembly;
@@ -14483,6 +14585,7 @@ fn handle_file_io(
                             };
                             // Stagger inserts so instances don't land exactly on each other.
                             let off = asm.0.components.len() as f64 * 40.0;
+                            asm_history.snapshot(&asm.0);
                             let id = asm.0.add_component(name, source, part_doc, [off, 0.0, 0.0]);
                             ui_state.asm_selected = Some(id);
                             added += 1;
@@ -14935,6 +15038,9 @@ fn apply_history(
     mut doc: ResMut<DocRes>,
     mut ui_state: ResMut<UiState>,
     mut session: ResMut<SketchSession>,
+    mut asm: ResMut<AsmRes>,
+    mut asm_history: ResMut<AsmHistory>,
+    mode: Res<DocMode>,
 ) {
     if ui_state.undo_request {
         ui_state.undo_request = false;
@@ -14949,6 +15055,16 @@ fn apply_history(
             session.selected_entities.clear();
             session.selected_dim = None;
             clear_pending_picks(&mut session); // stale indices into the pre-undo sketch → OOB
+        } else if *mode == DocMode::Assembly {
+            if let Some(prev) = asm_history.undo.pop() {
+                asm_history.redo.push(asm.0.clone());
+                asm.0 = prev;
+                asm_history.end_gesture();
+                // The placement changed under the renderer, and any selection may be gone.
+                ui_state.asm_selected = None;
+                ui_state.asm_drag = None;
+                ui_state.asm_rot = None;
+            }
         } else if let Some(prev) = history.undo.pop() {
             history.redo.push(doc.0.clone());
             doc.0 = prev;
@@ -14969,6 +15085,15 @@ fn apply_history(
             session.selected_entities.clear();
             session.selected_dim = None;
             clear_pending_picks(&mut session); // stale indices into the pre-redo sketch → OOB
+        } else if *mode == DocMode::Assembly {
+            if let Some(next) = asm_history.redo.pop() {
+                asm_history.undo.push(asm.0.clone());
+                asm.0 = next;
+                asm_history.end_gesture();
+                ui_state.asm_selected = None;
+                ui_state.asm_drag = None;
+                ui_state.asm_rot = None;
+            }
         } else if let Some(next) = history.redo.pop() {
             history.undo.push(doc.0.clone());
             doc.0 = next;
@@ -25407,6 +25532,115 @@ mod tests {
         // And it cut the right way: material is gone just under the plate's top face.
         assert!(!point_inside_mesh(&m, Vec3::new(10.0, 10.0, 5.0)), "the pocket didn't cut down into the plate");
         assert!(point_inside_mesh(&m, Vec3::new(20.0, 20.0, 3.0)), "the plate itself vanished");
+    }
+
+    /// A dragged gesture must be ONE undo step, however many frames it spans — assemblies are
+    /// edited by dragging, so a snapshot per mutation would bury the stack.
+    #[test]
+    fn a_drag_is_one_undo_step() {
+        let part = Document::with_default_planes();
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), "a.hcad".into(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("b".into(), "b.hcad".into(), part, [30.0, 0.0, 0.0]);
+        let mut h = AsmHistory::default();
+
+        // 100 frames of dragging component `a`.
+        for i in 0..100 {
+            h.snapshot_gesture(&asm, (a, "move"));
+            if let Some(c) = asm.component_mut(a) {
+                c.translation[0] = i as f64 * 0.1;
+            }
+        }
+        assert_eq!(h.undo.len(), 1, "a single drag left {} undo entries", h.undo.len());
+
+        // Releasing and dragging again is a SECOND step.
+        h.end_gesture();
+        for _ in 0..40 {
+            h.snapshot_gesture(&asm, (a, "move"));
+            if let Some(c) = asm.component_mut(a) {
+                c.translation[1] += 0.1;
+            }
+        }
+        assert_eq!(h.undo.len(), 2, "the second drag didn't start a new step");
+
+        // Dragging a DIFFERENT component is its own step, without needing a release.
+        for _ in 0..10 {
+            h.snapshot_gesture(&asm, (b, "move"));
+            if let Some(c) = asm.component_mut(b) {
+                c.translation[0] += 0.1;
+            }
+        }
+        assert_eq!(h.undo.len(), 3, "moving another component reused the open gesture");
+
+        // A discrete edit always stands alone, and closes any open gesture.
+        h.snapshot(&asm);
+        assert_eq!(h.undo.len(), 4);
+        assert!(h.gesture.is_none(), "a discrete edit left a gesture open");
+    }
+
+    /// Undo must restore the previous placement, redo must put it back, and a fresh edit
+    /// after undoing must discard the redo branch.
+    #[test]
+    fn assembly_undo_redo_round_trips() {
+        let part = Document::with_default_planes();
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), "a.hcad".into(), part, [0.0, 0.0, 0.0]);
+        let mut h = AsmHistory::default();
+
+        // Move it, twice, as two separate steps.
+        h.snapshot(&asm);
+        asm.component_mut(a).unwrap().translation[0] = 10.0;
+        h.snapshot(&asm);
+        asm.component_mut(a).unwrap().translation[0] = 25.0;
+        assert_eq!(h.undo.len(), 2);
+
+        // Undo once → 10, twice → 0.
+        let mut undo = |asm: &mut Assembly, h: &mut AsmHistory| {
+            if let Some(prev) = h.undo.pop() {
+                h.redo.push(asm.clone());
+                *asm = prev;
+            }
+        };
+        undo(&mut asm, &mut h);
+        assert_eq!(asm.component(a).unwrap().translation[0], 10.0, "first undo didn't restore 10");
+        undo(&mut asm, &mut h);
+        assert_eq!(asm.component(a).unwrap().translation[0], 0.0, "second undo didn't restore 0");
+
+        // Redo returns to 10.
+        if let Some(next) = h.redo.pop() {
+            h.undo.push(asm.clone());
+            asm = next;
+        }
+        assert_eq!(asm.component(a).unwrap().translation[0], 10.0, "redo didn't restore 10");
+
+        // A new edit after undoing drops the redo branch — otherwise redo would jump to a
+        // future that no longer follows from the present.
+        h.snapshot(&asm);
+        assert!(h.redo.is_empty(), "a fresh edit left a stale redo branch");
+    }
+
+    /// Deleting a component takes its mates with it, and undo brings BOTH back.
+    #[test]
+    fn undoing_a_delete_restores_its_mates() {
+        let part = Document::with_default_planes();
+        let mut asm = Assembly::default();
+        let a = asm.add_component("a".into(), "a.hcad".into(), part.clone(), [0.0, 0.0, 0.0]);
+        let b = asm.add_component("b".into(), "b.hcad".into(), part, [30.0, 0.0, 0.0]);
+        let mk = |comp: u64| hworks_document::MateRef { comp, kind: 0, point: [0.0; 3], dir: [0.0, 0.0, 1.0] };
+        asm.add_mate(0, 0.0, false, mk(a), mk(b));
+        assert_eq!(asm.mates.len(), 1);
+
+        let mut h = AsmHistory::default();
+        h.snapshot(&asm);
+        asm.components.retain(|c| c.id != b);
+        asm.mates.retain(|m| m.a.comp != b && m.b.comp != b);
+        assert_eq!(asm.components.len(), 1);
+        assert!(asm.mates.is_empty(), "the mate should go with its component");
+
+        let prev = h.undo.pop().expect("nothing to undo");
+        asm = prev;
+        assert_eq!(asm.components.len(), 2, "undo didn't bring the component back");
+        assert_eq!(asm.mates.len(), 1, "undo brought the component back but not its mate");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
