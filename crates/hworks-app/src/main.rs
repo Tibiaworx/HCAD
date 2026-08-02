@@ -9738,6 +9738,26 @@ fn ray_triangle(orig: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32>
 /// Ray-pick a planar face of a tessellated body. Returns the hit distance and the
 /// sketch plane on that face (origin at the face centroid, normal facing the
 /// camera, with derived in-plane axes).
+/// Is `p` inside any of these coplanar triangles? Barycentric, so it works directly in 3D on
+/// a set of triangles already known to share a plane.
+fn point_in_tris(p: Vec3, tris: &[[Vec3; 3]]) -> bool {
+    tris.iter().any(|t| {
+        let (v0, v1, v2) = (t[1] - t[0], t[2] - t[0], p - t[0]);
+        let d00 = v0.dot(v0);
+        let d01 = v0.dot(v1);
+        let d11 = v1.dot(v1);
+        let d20 = v2.dot(v0);
+        let d21 = v2.dot(v1);
+        let den = d00 * d11 - d01 * d01;
+        if den.abs() < 1e-12 {
+            return false;
+        }
+        let u = (d11 * d20 - d01 * d21) / den;
+        let v = (d00 * d21 - d01 * d20) / den;
+        u >= -1e-4 && v >= -1e-4 && u + v <= 1.0 + 1e-4
+    })
+}
+
 fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
     let dir = ray.direction.as_vec3();
     let pos = &mesh.positions;
@@ -9775,6 +9795,7 @@ fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
     let plane_d = n.dot(hit);
     let mut sum = Vec3::ZERO;
     let mut total_area = 0.0_f32;
+    let mut face_tris: Vec<[Vec3; 3]> = Vec::new();
     for tri in mesh.indices.chunks(3) {
         let a = Vec3::from_array(pos[tri[0] as usize]);
         let b = Vec3::from_array(pos[tri[1] as usize]);
@@ -9789,10 +9810,23 @@ fn pick_face(mesh: &TriMesh, ray: &Ray3d) -> Option<(f32, ActivePlane)> {
             let area = cross.length() * 0.5;
             sum += centroid * area;
             total_area += area;
+            face_tris.push([a, b, c]);
         }
     }
     let mut origin = if total_area > 1e-12 { sum / total_area } else { hit };
     origin -= n * (n.dot(origin) - plane_d); // snap exactly onto the plane
+
+    // A face with a hole has its centroid in the VOID.
+    //
+    // The area-weighted centroid centres a plain face nicely (and puts a cylinder's circular
+    // top exactly on its axis, which is why it is used), but for a ring — a washer, or a
+    // triangular frame — the centroid lands inside the hole, off the material entirely. The
+    // sketch then opened with its origin and grid floating in mid-air in the middle of the
+    // opening. Fall back to the point the user actually clicked, which is on the face by
+    // construction.
+    if !point_in_tris(origin, &face_tris) {
+        origin = hit - n * (n.dot(hit) - plane_d);
+    }
 
     // In-plane axes from the normal.
     let seed = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Z };
@@ -25021,6 +25055,131 @@ mod tests {
             assert!(d.style.is_mark());
             assert!(resolve_mark(&drawing, &cache, d).is_some(), "a generated mark didn't resolve");
         }
+    }
+
+    /// For every planar face of a saved part, does the area-weighted centroid that
+    /// `pick_face` uses as the sketch-plane origin actually LIE on that face?
+    /// `HCAD_FILE="…\triangleproblem.hcad" cargo test -p hworks-app diag_face_origin -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn diag_face_origin() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        let pos = &mesh.positions;
+
+        // Group triangles into planar, same-facing faces, exactly as pick_face gathers them.
+        let mut faces: Vec<(Vec3, f32, Vec<[Vec3; 3]>)> = Vec::new();
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(pos[t[0] as usize]);
+            let b = Vec3::from_array(pos[t[1] as usize]);
+            let c = Vec3::from_array(pos[t[2] as usize]);
+            let n = (b - a).cross(c - a).normalize_or_zero();
+            if n.length_squared() < 0.5 {
+                continue;
+            }
+            let d = n.dot(a);
+            match faces.iter_mut().find(|(fn_, fd, _)| fn_.dot(n) > 0.99 && (fd - d).abs() < 0.01) {
+                Some((_, _, tris)) => tris.push([a, b, c]),
+                None => faces.push((n, d, vec![[a, b, c]])),
+            }
+        }
+        eprintln!("{} planar faces", faces.len());
+
+        for (i, (n, _, tris)) in faces.iter().enumerate() {
+            let mut sum = Vec3::ZERO;
+            let mut area = 0.0f32;
+            for t in tris {
+                let ar = (t[1] - t[0]).cross(t[2] - t[0]).length() * 0.5;
+                sum += (t[0] + t[1] + t[2]) / 3.0 * ar;
+                area += ar;
+            }
+            if area <= 1e-9 {
+                continue;
+            }
+            let centroid = sum / area;
+            // Is the centroid inside any triangle of this face?
+            let inside = tris.iter().any(|t| {
+                let (v0, v1, v2) = (t[1] - t[0], t[2] - t[0], centroid - t[0]);
+                let d00 = v0.dot(v0);
+                let d01 = v0.dot(v1);
+                let d11 = v1.dot(v1);
+                let d20 = v2.dot(v0);
+                let d21 = v2.dot(v1);
+                let den = d00 * d11 - d01 * d01;
+                if den.abs() < 1e-12 {
+                    return false;
+                }
+                let u = (d11 * d20 - d01 * d21) / den;
+                let v = (d00 * d21 - d01 * d20) / den;
+                u >= -1e-4 && v >= -1e-4 && u + v <= 1.0 + 1e-4
+            });
+            if area > 1.0 {
+                eprintln!(
+                    "face {i:>2}  n {:>6.2},{:>6.2},{:>6.2}  area {:>8.2}  {:>3} tris  centroid {:?}  {}",
+                    n.x, n.y, n.z, area, tris.len(), centroid,
+                    if inside { "on the face" } else { "*** OFF THE FACE (in a hole) ***" }
+                );
+            }
+        }
+    }
+
+    /// Sketching on a face with a hole must put the plane origin ON the material.
+    ///
+    /// triangleproblem.hcad: a triangular frame. Its top and bottom faces are rings, so the
+    /// area-weighted centroid — which centres a plain face nicely, and is why it's used —
+    /// lands inside the opening. The sketch then opened with its origin and grid floating in
+    /// mid-air in the middle of the hole.
+    #[test]
+    fn a_sketch_on_a_holed_face_starts_on_the_material() {
+        // A 40x40 plate with a big 24mm-wide square hole: the top face is a ring, and its
+        // centroid is dead centre — inside the hole.
+        let mut sk = Sketch::default();
+        let o = [
+            sk.add_point(0.0, 0.0),
+            sk.add_point(40.0, 0.0),
+            sk.add_point(40.0, 40.0),
+            sk.add_point(0.0, 40.0),
+        ];
+        for i in 0..4 {
+            sk.add_line(o[i], o[(i + 1) % 4], false);
+        }
+        let h = [
+            sk.add_point(8.0, 8.0),
+            sk.add_point(32.0, 8.0),
+            sk.add_point(32.0, 32.0),
+            sk.add_point(8.0, 32.0),
+        ];
+        for i in 0..4 {
+            sk.add_line(h[i], h[(i + 1) % 4], false);
+        }
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("frame");
+
+        // Aim at the material on the top face — not the middle, which is the hole.
+        let ray = Ray3d::new(Vec3::new(4.0, 4.0, 50.0), Dir3::new(Vec3::new(0.0, 0.0, -1.0)).unwrap());
+        let (_, ap) = pick_face(&mesh, &ray).expect("no face under the ray");
+        assert!((ap.n - Vec3::Z).length() < 1e-3, "picked the wrong face: normal {:?}", ap.n);
+        assert!((ap.origin.z - 6.0).abs() < 1e-3, "origin off the face plane: {:?}", ap.origin);
+
+        // THE POINT: the origin must be on material, not hovering in the opening.
+        let in_hole = ap.origin.x > 8.0 && ap.origin.x < 32.0 && ap.origin.y > 8.0 && ap.origin.y < 32.0;
+        assert!(!in_hole, "the sketch origin landed inside the hole at {:?}", ap.origin);
+
+        // A plain face (no hole) still centres, which is what the centroid is for.
+        let mut solid = Document::with_default_planes();
+        solid.add_feature(FeatureKind::Extrude { sketch: rect_sketch(40.0, 40.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 6.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        solid.rollback = solid.features.len();
+        let (m2, _) = regenerate_mesh(&solid).expect("plate");
+        let ray2 = Ray3d::new(Vec3::new(4.0, 4.0, 50.0), Dir3::new(Vec3::new(0.0, 0.0, -1.0)).unwrap());
+        let (_, ap2) = pick_face(&m2, &ray2).expect("no face");
+        assert!(
+            (ap2.origin.x - 20.0).abs() < 0.2 && (ap2.origin.y - 20.0).abs() < 0.2,
+            "a plain face should still centre, got {:?}",
+            ap2.origin
+        );
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres
