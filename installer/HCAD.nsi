@@ -56,7 +56,7 @@ Section "HCAD (required)" SecMain
   WriteRegStr HKLM "Software\HCAD" "InstallDir" "$INSTDIR"
   !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\HCAD"
   WriteRegStr HKLM "${UNINST}" "DisplayName" "HCAD"
-  WriteRegStr HKLM "${UNINST}" "DisplayVersion" "0.21.0"
+  WriteRegStr HKLM "${UNINST}" "DisplayVersion" "0.22.0"
   WriteRegStr HKLM "${UNINST}" "Publisher" "HCAD"
   WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\hcad.ico"
   WriteRegStr HKLM "${UNINST}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
@@ -74,6 +74,11 @@ Section "HCAD (required)" SecMain
   WriteRegStr HKLM "Software\Classes\HCAD.Assembly" "" "HCAD Assembly"
   WriteRegStr HKLM "Software\Classes\HCAD.Assembly\DefaultIcon" "" "$INSTDIR\hcad.ico"
   WriteRegStr HKLM "Software\Classes\HCAD.Assembly\shell\open\command" "" '"$INSTDIR\HCAD.exe" "%1"'
+  ; .hdrw file association: drawing sheets open the same way.
+  WriteRegStr HKLM "Software\Classes\.hdrw" "" "HCAD.Drawing"
+  WriteRegStr HKLM "Software\Classes\HCAD.Drawing" "" "HCAD Drawing"
+  WriteRegStr HKLM "Software\Classes\HCAD.Drawing\DefaultIcon" "" "$INSTDIR\hcad.ico"
+  WriteRegStr HKLM "Software\Classes\HCAD.Drawing\shell\open\command" "" '"$INSTDIR\HCAD.exe" "%1"'
   ; Tell Explorer the associations changed (SHCNE_ASSOCCHANGED, SHCNF_IDLIST).
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
@@ -98,5 +103,7 @@ Section "Uninstall"
   DeleteRegKey HKLM "Software\Classes\.hcad"
   DeleteRegKey HKLM "Software\Classes\HCAD.Assembly"
   DeleteRegKey HKLM "Software\Classes\.hasm"
+  DeleteRegKey HKLM "Software\Classes\HCAD.Drawing"
+  DeleteRegKey HKLM "Software\Classes\.hdrw"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd
