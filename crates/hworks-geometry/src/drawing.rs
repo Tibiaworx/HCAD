@@ -280,6 +280,8 @@ pub struct SheetItem<'a> {
     pub show_hidden: bool,
     /// Caption printed under the view, if any.
     pub label: Option<String>,
+    /// Section hatching, in the same pre-scale view units as `edges`.
+    pub hatch: &'a [([f64; 2], [f64; 2])],
 }
 
 /// Render a sheet to SVG, in real millimetres so it prints at true scale.
@@ -338,6 +340,17 @@ pub fn to_svg_with_dims(
             out.push_str(&format!(
                 "<path d=\"{hidden}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.25\" stroke-dasharray=\"1.5,1\"/>\n"
             ));
+        }
+        // Section hatching: thinner than the outline, so the cut face reads as fill.
+        if !it.hatch.is_empty() {
+            let mut d = String::new();
+            for (a, b) in it.hatch {
+                let (x0, y0) = map(*a);
+                let (x1, y1) = map(*b);
+                d.push_str(&format!("M{x0:.3},{y0:.3} L{x1:.3},{y1:.3} "));
+            }
+            out.push_str(&format!("<path d=\"{d}\" fill=\"none\" stroke=\"black\" stroke-width=\"0.18\"/>
+"));
         }
         if let Some(lbl) = &it.label {
             // Caption under the view's own extents, so it never lands on the geometry.
@@ -940,6 +953,116 @@ pub enum SheetDim {
     Mark(CentreMarkGeom),
 }
 
+// ---------------------------------------------------------------------------
+// Section views
+// ---------------------------------------------------------------------------
+
+/// A part cut by a plane, ready to draw as a section view.
+pub struct SectionCut {
+    /// The half of the part BEHIND the plane — what a section view shows.
+    pub mesh: TriMesh,
+    /// 45-degree hatch lines across the exposed cut face, in model space.
+    pub hatch: Vec<[[f32; 3]; 2]>,
+}
+
+/// Cut `mesh` with the plane through `point` with normal `n`, keeping the half the normal
+/// points AWAY from, and hatch the exposed face.
+///
+/// The cut is a boolean against a half-space box, the same way the 3D section view does it —
+/// a real solid, so the projector's hidden-line removal works on it unchanged and the cut
+/// face is genuine geometry rather than an overlay.
+pub fn section_cut(mesh: &TriMesh, point: [f64; 3], n: [f64; 3], hatch_spacing: f64) -> Option<SectionCut> {
+    if mesh.indices.len() < 3 {
+        return None;
+    }
+    let n = norm(n);
+    if len3(n) < 0.5 {
+        return None;
+    }
+    // A frame on the cutting plane.
+    let seed = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 1.0] };
+    let u = norm(cross(seed, n));
+    let v = norm(cross(n, u));
+
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for q in &mesh.positions {
+        for a in 0..3 {
+            lo[a] = lo[a].min(q[a] as f64);
+            hi[a] = hi[a].max(q[a] as f64);
+        }
+    }
+    let l = len3(sub3(hi, lo)).max(1.0);
+
+    // A box covering everything on the +n side of the plane, subtracted away.
+    let basis = crate::PlaneBasis { origin: point, u, v, normal: n };
+    let sq = vec![[-2.0 * l, -2.0 * l], [2.0 * l, -2.0 * l], [2.0 * l, 2.0 * l], [-2.0 * l, 2.0 * l]];
+    let tool = crate::extrude_tool_mesh(&sq, &[], &basis, 0.0, 2.0 * l)?;
+    let cut = crate::mesh_difference(mesh, &tool);
+    let _ = crate::take_fallback_count(); // a section is a view, never a torn-surface warning
+    if cut.indices.len() < 3 {
+        return None;
+    }
+
+    // Hatch the exposed face: the triangles the boolean left lying ON the plane, facing the
+    // side that was removed. A pre-existing face that merely touches the plane from behind
+    // faces the other way and is skipped, so it isn't hatched as if it were cut.
+    let eps = (l * 5e-4).max(1e-4);
+    let d0 = dot(point, n);
+    let sweep = norm([u[0] - v[0], u[1] - v[1], u[2] - v[2]]); // hatch lines run 45° to u
+    let along = norm(cross(n, sweep));
+    let step = if hatch_spacing > 1e-6 { hatch_spacing } else { (l / 45.0).max(1e-3) };
+    let mut hatch: Vec<[[f32; 3]; 2]> = Vec::new();
+    for t in cut.indices.chunks_exact(3) {
+        let p: Vec<[f64; 3]> = t
+            .iter()
+            .map(|&i| {
+                let q = cut.positions[i as usize];
+                [q[0] as f64, q[1] as f64, q[2] as f64]
+            })
+            .collect();
+        if p.iter().any(|q| (dot(*q, n) - d0).abs() > eps) {
+            continue;
+        }
+        let gn = cross(sub3(p[1], p[0]), sub3(p[2], p[0]));
+        if len3(gn) < 1e-12 || dot(norm(gn), n) < 0.5 {
+            continue;
+        }
+        // Sweep hatch planes across the triangle and clip each to it.
+        let w: Vec<f64> = p.iter().map(|q| dot(*q, sweep)).collect();
+        let (wmin, wmax) = (w[0].min(w[1]).min(w[2]), w[0].max(w[1]).max(w[2]));
+        let mut k = (wmin / step).ceil();
+        while k * step <= wmax {
+            let wk = k * step;
+            k += 1.0;
+            // Where the hatch plane crosses this triangle's edges.
+            let mut xs: Vec<[f64; 3]> = Vec::new();
+            for e in 0..3 {
+                let (a, b) = (e, (e + 1) % 3);
+                let (wa, wb) = (w[a], w[b]);
+                if (wa - wk) * (wb - wk) > 0.0 || (wa - wb).abs() < 1e-12 {
+                    continue;
+                }
+                let tt = (wk - wa) / (wb - wa);
+                xs.push([
+                    p[a][0] + (p[b][0] - p[a][0]) * tt,
+                    p[a][1] + (p[b][1] - p[a][1]) * tt,
+                    p[a][2] + (p[b][2] - p[a][2]) * tt,
+                ]);
+            }
+            if xs.len() < 2 {
+                continue;
+            }
+            // Two crossings bound the segment; sort along the line so it spans them.
+            xs.sort_by(|x, y| dot(*x, along).total_cmp(&dot(*y, along)));
+            let (a, b) = (xs[0], xs[xs.len() - 1]);
+            if len3(sub3(b, a)) > 1e-6 {
+                hatch.push([[a[0] as f32, a[1] as f32, a[2] as f32], [b[0] as f32, b[1] as f32, b[2] as f32]]);
+            }
+        }
+    }
+    Some(SectionCut { mesh: cut, hatch })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,7 +1146,7 @@ mod tests {
             ProjEdge { a: [0.0, 0.0], b: [10.0, 0.0], hidden: false },
             ProjEdge { a: [0.0, 0.0], b: [0.0, 10.0], hidden: true },
         ];
-        let items = [SheetItem { edges: &edges, center: [100.0, 100.0], scale: 2.0, show_hidden: true, label: Some("Front".into()) }];
+        let items = [SheetItem { edges: &edges, center: [100.0, 100.0], scale: 2.0, show_hidden: true, label: Some("Front".into()), hatch: &[] }];
         let svg = to_svg(297.0, 210.0, &items, &[("PART".into(), "bracket & pin".into())]);
         assert!(svg.starts_with("<svg"), "no svg root");
         assert!(svg.trim_end().ends_with("</svg>"));
@@ -1032,7 +1155,7 @@ mod tests {
         assert!(svg.contains("M100.000,110.000 L120.000,110.000"), "solid edge misplaced:\n{svg}");
         // Hidden edges are dashed, and only drawn when asked for.
         assert!(svg.contains("stroke-dasharray"));
-        let no_hidden = to_svg(297.0, 210.0, &[SheetItem { edges: &edges, center: [100.0, 100.0], scale: 2.0, show_hidden: false, label: None }], &[]);
+        let no_hidden = to_svg(297.0, 210.0, &[SheetItem { edges: &edges, center: [100.0, 100.0], scale: 2.0, show_hidden: false, label: None, hatch: &[] }], &[]);
         assert!(!no_hidden.contains("stroke-dasharray"), "hidden lines drawn when switched off");
         // A part name with an ampersand must not produce invalid XML.
         assert!(svg.contains("bracket &amp; pin"));
@@ -1044,7 +1167,7 @@ mod tests {
     #[test]
     fn svg_flips_the_y_axis() {
         let e = [ProjEdge { a: [0.0, 0.0], b: [1.0, 0.0], hidden: false }];
-        let low = to_svg(100.0, 100.0, &[SheetItem { edges: &e, center: [50.0, 10.0], scale: 1.0, show_hidden: false, label: None }], &[]);
+        let low = to_svg(100.0, 100.0, &[SheetItem { edges: &e, center: [50.0, 10.0], scale: 1.0, show_hidden: false, label: None, hatch: &[] }], &[]);
         assert!(low.contains("M50.000,90.000"), "y not flipped:\n{low}");
     }
 
@@ -1237,6 +1360,63 @@ mod tests {
 
         // Far from anything, nothing is picked.
         assert!(pick_target(&ts, [500.0, 500.0], 1.0).is_none(), "picked something from far away");
+    }
+
+    /// Cutting a box in half must leave half the volume and hatch the exposed face.
+    #[test]
+    fn a_section_cut_halves_the_part_and_hatches_the_face() {
+        let sq = vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]];
+        let solid = extrude_solid(&sq, &[], &xy_basis(), 10.0).expect("box");
+        let mesh = tessellate(&solid, 0.05).mesh;
+        let full = crate::signed_mesh_volume(&mesh).abs();
+        assert!((full - 4000.0).abs() < 5.0, "box volume {full:.1}");
+
+        // Cut at x = 10, keeping the -X half.
+        let cut = section_cut(&mesh, [10.0, 0.0, 0.0], [1.0, 0.0, 0.0], 2.0).expect("section");
+        let half = crate::signed_mesh_volume(&cut.mesh).abs();
+        assert!((half - 2000.0).abs() < 20.0, "kept {half:.1}, wanted half of {full:.1}");
+
+        // The hatch must exist and lie ON the cut plane.
+        assert!(!cut.hatch.is_empty(), "the cut face wasn't hatched");
+        for h in &cut.hatch {
+            for q in h {
+                assert!((q[0] as f64 - 10.0).abs() < 0.05, "a hatch line left the cut plane: {q:?}");
+            }
+        }
+        // ...and inside the face, not running off it.
+        for h in &cut.hatch {
+            for q in h {
+                assert!(q[1] >= -0.05 && q[1] <= 20.05 && q[2] >= -0.05 && q[2] <= 10.05, "hatch outside the face: {q:?}");
+            }
+        }
+    }
+
+    /// Flipping the normal keeps the OTHER half — the two together make the whole part.
+    #[test]
+    fn flipping_a_section_keeps_the_other_half() {
+        let sq = vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]];
+        let solid = extrude_solid(&sq, &[], &xy_basis(), 10.0).expect("box");
+        let mesh = tessellate(&solid, 0.05).mesh;
+
+        let a = section_cut(&mesh, [10.0, 0.0, 0.0], [1.0, 0.0, 0.0], 2.0).expect("a");
+        let b = section_cut(&mesh, [10.0, 0.0, 0.0], [-1.0, 0.0, 0.0], 2.0).expect("b");
+        let (va, vb) = (crate::signed_mesh_volume(&a.mesh).abs(), crate::signed_mesh_volume(&b.mesh).abs());
+        assert!((va + vb - 4000.0).abs() < 40.0, "the halves ({va:.0} + {vb:.0}) don't make the whole");
+        // Each half sits on its own side of the cut.
+        let bbox = |m: &TriMesh| {
+            let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+            for q in &m.positions {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(q[k] as f64);
+                    hi[k] = hi[k].max(q[k] as f64);
+                }
+            }
+            (lo, hi)
+        };
+        let (lo_a, hi_a) = bbox(&a.mesh);
+        let (lo_b, _) = bbox(&b.mesh);
+        assert!(hi_a[0] < 10.05 && lo_a[0] < 1.0, "the kept half is on the wrong side: {lo_a:?}..{hi_a:?}");
+        assert!(lo_b[0] > 9.95, "the flipped half is on the wrong side: {lo_b:?}");
     }
 
     /// An empty edge set must not panic or invent geometry.

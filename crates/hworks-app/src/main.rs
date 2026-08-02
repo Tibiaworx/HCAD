@@ -24,10 +24,10 @@ use bevy::window::PrimaryWindow;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use hworks_geometry::drawing::{
     dim_geometry, edges_bounds, format_dim, pick_target, project_edges, resolve_ref, snap_targets, to_svg_with_dims,
-    centre_mark_geometry, radial_dim_geometry, CentreMarkGeom, DimGeom, DimRef, ProjEdge, RadialGeom, RefKind, SheetDim,
-    SheetItem, SnapTarget, ViewBasis,
+    centre_mark_geometry, radial_dim_geometry, section_cut, CentreMarkGeom, DimGeom, DimRef, ProjEdge, RadialGeom, RefKind,
+    SheetDim, SheetItem, SnapTarget, ViewBasis,
 };
-use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle};
+use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle, SectionSpec as DrawSection, DrawView};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
@@ -290,6 +290,9 @@ struct DrawCache {
     /// What dimensions can attach to, per view direction. Rebuilt with the projection, so a
     /// dimension always resolves against the geometry currently on the sheet.
     targets: std::collections::HashMap<String, Vec<SnapTarget>>,
+    /// Section views, keyed by VIEW id (each has its own cutting plane, so they can't share
+    /// the by-direction caches): the projected edges and the projected hatch.
+    sections: std::collections::HashMap<u64, (Vec<ProjEdge>, Vec<([f64; 2], [f64; 2])>)>,
 }
 
 /// The open assembly document (empty & unused in Part mode).
@@ -2223,6 +2226,9 @@ struct UiState {
     draw_dim_sel: Option<u64>,
     /// One-shot: centre-mark every circular rim that hasn't got one.
     draw_mark_all: bool,
+    /// Section tool: active, and where the cut line started.
+    draw_section_tool: bool,
+    draw_section_from: Option<[f64; 2]>,
     insert_component_request: bool,
     /// Pattern feature: the spec while its PM is open, and a confirmed pattern to append.
     pattern_spec: Option<PatternSpec>,
@@ -17184,6 +17190,50 @@ fn drawing_ui(
                 }
             }
 
+            // Section hatching, and the section line on the parent view it was cut from.
+            for v in &draw.0.views {
+                let Some(sp) = &v.section else { continue };
+                if let Some((_, hatch)) = cache.sections.get(&v.id) {
+                    let hc = egui::Color32::from_gray(120);
+                    for (a, b) in hatch {
+                        let pa = to_screen([v.center[0] + a[0] * v.scale, v.center[1] + a[1] * v.scale]);
+                        let pb = to_screen([v.center[0] + b[0] * v.scale, v.center[1] + b[1] * v.scale]);
+                        painter.line_segment([pa, pb], egui::Stroke::new(0.8, hc));
+                    }
+                }
+                // The cut line on the parent, with arrows showing which way the section looks
+                // and the letter at each end — how a section is called out on a drawing.
+                if let Some(par) = draw.0.views.iter().find(|p| p.id == sp.parent) {
+                    let col = egui::Color32::from_rgb(180, 40, 40);
+                    let pa = to_screen([par.center[0] + sp.a[0] * par.scale, par.center[1] + sp.a[1] * par.scale]);
+                    let pb = to_screen([par.center[0] + sp.b[0] * par.scale, par.center[1] + sp.b[1] * par.scale]);
+                    // Dash-dot, the drafting convention for a cutting plane.
+                    let len = (pb - pa).length().max(1e-3);
+                    let u = (pb - pa) / len;
+                    let (mut t, mut long) = (0.0, true);
+                    while t < len {
+                        let seg = if long { 9.0 } else { 2.0 };
+                        let e = (t + seg).min(len);
+                        painter.line_segment([pa + u * t, pa + u * e], egui::Stroke::new(1.4, col));
+                        t = e + 3.0;
+                        long = !long;
+                    }
+                    // Arrows at both ends, pointing the way the section is viewed.
+                    let pv = egui::vec2(-u.y, u.x) * if sp.flip { -1.0 } else { 1.0 };
+                    for tip in [pa, pb] {
+                        let base = tip + pv * 14.0;
+                        painter.line_segment([tip, base], egui::Stroke::new(1.4, col));
+                        let head = base + pv * -5.0;
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![base, head + egui::vec2(-pv.y, pv.x) * 3.0, head - egui::vec2(-pv.y, pv.x) * 3.0],
+                            col,
+                            egui::Stroke::NONE,
+                        ));
+                        painter.text(tip - u * 8.0, egui::Align2::CENTER_CENTER, &sp.label, egui::FontId::proportional(13.0), col);
+                    }
+                }
+            }
+
             // Dimensions. Each is resolved against the current model every frame, so editing
             // the part restates the drawing; one that can no longer find its geometry draws
             // red and says so rather than showing a stale number.
@@ -17307,6 +17357,57 @@ fn drawing_ui(
                         if let Some(v) = draw.0.views.iter().find(|v| v.id == d.view) {
                             let at = to_screen([v.center[0], v.center[1]]);
                             painter.text(at, egui::Align2::CENTER_CENTER, "⚠ dimension lost its geometry", egui::FontId::proportional(12.0), dangling_col);
+                        }
+                    }
+                }
+            }
+
+            // Section tool: drag a line across a view to cut it.
+            if ui_state.draw_section_tool {
+                if let Some(pos) = resp.hover_pos() {
+                    let sheet = to_sheet(pos);
+                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                        ui_state.draw_section_from = Some(sheet);
+                    }
+                    if let Some(from) = ui_state.draw_section_from {
+                        let a = to_screen(from);
+                        painter.line_segment([a, pos], egui::Stroke::new(1.6, egui::Color32::from_rgb(180, 40, 40)));
+                        painter.circle_filled(a, 4.0, egui::Color32::from_rgb(180, 40, 40));
+                    }
+                    if resp.drag_stopped() {
+                        if let Some(from) = ui_state.draw_section_from.take() {
+                            // Which view was the line drawn across? The one whose projected
+                            // extents it actually crosses.
+                            let hit = draw.0.views.iter().find(|v| {
+                                if v.section.is_some() {
+                                    return false; // no sections of sections, for now
+                                }
+                                let Some(e) = cache.proj.get(v.dir.label()) else { return false };
+                                let (lo, hi) = edges_bounds(e);
+                                let mid = [(from[0] + sheet[0]) * 0.5, (from[1] + sheet[1]) * 0.5];
+                                let local = [(mid[0] - v.center[0]) / v.scale, (mid[1] - v.center[1]) / v.scale];
+                                local[0] >= lo[0] - 2.0 && local[0] <= hi[0] + 2.0 && local[1] >= lo[1] - 2.0 && local[1] <= hi[1] + 2.0
+                            });
+                            match hit {
+                                Some(v) => {
+                                    let (vid, vscale, vcentre) = (v.id, v.scale, v.center);
+                                    let la = [(from[0] - vcentre[0]) / vscale, (from[1] - vcentre[1]) / vscale];
+                                    let lb = [(sheet[0] - vcentre[0]) / vscale, (sheet[1] - vcentre[1]) / vscale];
+                                    if ((lb[0] - la[0]).powi(2) + (lb[1] - la[1]).powi(2)).sqrt() < 1.0 {
+                                        ui_state.toasts.push(("Drag a line right across the view to cut it".into(), 2.5));
+                                    } else {
+                                        let id = draw.0.add_section(vid, la, lb, vscale);
+                                        // Park it clear of its parent.
+                                        if let Some(nv) = draw.0.view_mut(id) {
+                                            nv.center = [vcentre[0] + 70.0, vcentre[1]];
+                                        }
+                                        ui_state.draw_sel = Some(id);
+                                        ui_state.draw_dirty = true;
+                                        ui_state.draw_section_tool = false;
+                                    }
+                                }
+                                None => ui_state.toasts.push(("Draw the line across a view".into(), 2.5)),
+                            }
                         }
                     }
                 }
@@ -17751,6 +17852,31 @@ fn drawing_panel(ui: &mut egui::Ui, draw: &mut Drawing, ui_state: &mut UiState) 
             .small(),
         );
     }
+    ui.horizontal(|ui| {
+        let on = ui_state.draw_section_tool;
+        if ui
+            .selectable_label(on, "\u{2702} Section view")
+            .on_hover_text("Drag a line right across a view to cut the part there")
+            .clicked()
+        {
+            ui_state.draw_section_tool = !on;
+            ui_state.draw_section_from = None;
+        }
+        if let Some(id) = ui_state.draw_sel {
+            let is_sec = draw.view(id).is_some_and(|v| v.section.is_some());
+            if is_sec && ui.small_button("Flip cut").on_hover_text("Look at the section from the other side").clicked() {
+                if let Some(v) = draw.view_mut(id) {
+                    if let Some(sp) = v.section.as_mut() {
+                        sp.flip = !sp.flip;
+                    }
+                }
+                ui_state.draw_dirty = true;
+            }
+        }
+    });
+    if ui_state.draw_section_tool {
+        ui.label(egui::RichText::new("Drag a line across a view — the part is cut along it and the new view looks along the arrows.").weak().small());
+    }
     if ui
         .button("\u{2295} Centre-mark every hole")
         .on_hover_text("Put a centre mark on every circular edge in every view that hasn't got one")
@@ -18092,6 +18218,49 @@ fn seg_dist_screen(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     (p - (a + ab * t)).length()
 }
 
+/// The cutting plane a section view's line defines, in model space: `(point, normal)`.
+///
+/// The line is drawn on the parent view, so the plane contains that line AND the parent's
+/// viewing direction — sweeping the line straight back into the sheet, which is what a
+/// section line means on a drawing.
+fn section_plane(parent: &DrawView, spec: &DrawSection) -> ([f64; 3], [f64; 3]) {
+    let (d, up) = parent.dir.frame();
+    let b = ViewBasis::looking_along(d, up);
+    let dir2 = [spec.b[0] - spec.a[0], spec.b[1] - spec.a[1]];
+    let l = (dir2[0] * dir2[0] + dir2[1] * dir2[1]).sqrt().max(1e-9);
+    // The line, lifted into model space.
+    let along = [
+        b.r[0] * dir2[0] / l + b.u[0] * dir2[1] / l,
+        b.r[1] * dir2[0] / l + b.u[1] * dir2[1] / l,
+        b.r[2] * dir2[0] / l + b.u[2] * dir2[1] / l,
+    ];
+    // Perpendicular to the line and to the view direction → the plane's normal.
+    let mut n = [
+        along[1] * b.f[2] - along[2] * b.f[1],
+        along[2] * b.f[0] - along[0] * b.f[2],
+        along[0] * b.f[1] - along[1] * b.f[0],
+    ];
+    if spec.flip {
+        n = [-n[0], -n[1], -n[2]];
+    }
+    // Any point on the line will do — the plane runs through the whole depth of the view.
+    let point = [
+        b.r[0] * spec.a[0] + b.u[0] * spec.a[1],
+        b.r[1] * spec.a[0] + b.u[1] * spec.a[1],
+        b.r[2] * spec.a[0] + b.u[2] * spec.a[1],
+    ];
+    (point, n)
+}
+
+/// The frame a section view is drawn through: looking along the cut, with the parent's
+/// viewing direction running up the sheet — so depth reads vertically, as drafting expects.
+fn section_basis(parent: &DrawView, spec: &DrawSection) -> ViewBasis {
+    let (_, n) = section_plane(parent, spec);
+    let (d, up) = parent.dir.frame();
+    let pb = ViewBasis::looking_along(d, up);
+    ViewBasis::looking_along(n, pb.f)
+}
+
 fn drawing_part_geometry(path: &std::path::Path) -> Option<(TriMesh, Vec<[[f32; 3]; 2]>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let doc: Document = ron::from_str(&text).ok()?;
@@ -18147,9 +18316,10 @@ fn drawing_regenerate(mode: Res<DocMode>, draw: Res<DrawRes>, mut cache: ResMut<
         }
     }
     let (Some(mesh), edges) = (cache.mesh.clone(), cache.edges.clone()) else { return };
-    let want: Vec<ViewDir> = draw.0.views.iter().map(|v| v.dir).collect();
+    let want: Vec<ViewDir> = draw.0.views.iter().filter(|v| v.section.is_none()).map(|v| v.dir).collect();
     cache.proj.clear();
     cache.targets.clear();
+    cache.sections.clear();
     for dir in want {
         let key = dir.label().to_string();
         if cache.proj.contains_key(&key) {
@@ -18160,6 +18330,45 @@ fn drawing_regenerate(mode: Res<DocMode>, draw: Res<DrawRes>, mut cache: ResMut<
         cache.proj.insert(key.clone(), project_edges(&mesh, &edges, &basis, 24));
         cache.targets.insert(key, snap_targets(&mesh, &edges, &basis));
     }
+
+    // Section views each need their own cut of the part, so they are built per view rather
+    // than per direction. The cut is a boolean, so this is the expensive part of a rebuild —
+    // it runs only when the drawing is regenerated, never per frame.
+    let sections: Vec<(u64, DrawView, DrawSection)> = draw
+        .0
+        .views
+        .iter()
+        .filter_map(|v| {
+            let sp = v.section.clone()?;
+            let parent = draw.0.views.iter().find(|p| p.id == sp.parent)?.clone();
+            Some((v.id, parent, sp))
+        })
+        .collect();
+    for (vid, parent, sp) in sections {
+        let (point, n) = section_plane(&parent, &sp);
+        let basis = section_basis(&parent, &sp);
+        let span = {
+            let (lo, hi) = mesh_bbox(&mesh);
+            (hi - lo).length() as f64
+        };
+        let Some(cut) = section_cut(&mesh, point, n, (span / 40.0).max(0.5)) else {
+            warn!("Section {}: the cut produced nothing.", sp.label);
+            continue;
+        };
+        let t = mesh_tessellation(cut.mesh);
+        let proj = project_edges(&t.mesh, &t.edges, &basis, 24);
+        // The hatch is already on the cut plane, so it only needs flattening into the view.
+        let hatch: Vec<([f64; 2], [f64; 2])> = cut
+            .hatch
+            .iter()
+            .map(|h| {
+                let a = basis.project([h[0][0] as f64, h[0][1] as f64, h[0][2] as f64]).0;
+                let b = basis.project([h[1][0] as f64, h[1][1] as f64, h[1][2] as f64]).0;
+                (a, b)
+            })
+            .collect();
+        cache.sections.insert(vid, (proj, hatch));
+    }
 }
 
 /// Assemble the sheet items an export needs: each view's projected edges with its placement.
@@ -18168,11 +18377,21 @@ fn drawing_sheet_items<'a>(draw: &'a Drawing, cache: &'a DrawCache) -> Vec<Sheet
     draw.views
         .iter()
         .map(|v| SheetItem {
-            edges: cache.proj.get(v.dir.label()).map(|e| e.as_slice()).unwrap_or(empty),
+            edges: match &v.section {
+                Some(_) => cache.sections.get(&v.id).map(|(e, _)| e.as_slice()).unwrap_or(empty),
+                None => cache.proj.get(v.dir.label()).map(|e| e.as_slice()).unwrap_or(empty),
+            },
             center: v.center,
             scale: v.scale,
             show_hidden: v.show_hidden,
-            label: v.label.then(|| v.dir.label().to_string()),
+            hatch: match &v.section {
+                Some(_) => cache.sections.get(&v.id).map(|(_, h)| h.as_slice()).unwrap_or(&[]),
+                None => &[],
+            },
+            label: v.label.then(|| match &v.section {
+                Some(sp) => format!("SECTION {}-{}", sp.label, sp.label),
+                None => v.dir.label().to_string(),
+            }),
         })
         .collect()
 }
@@ -24497,7 +24716,7 @@ mod tests {
             proj.insert(v.dir.label().to_string(), e);
         }
 
-        let cache = DrawCache { source: d.source.clone(), mesh: Some(mesh), edges, proj, targets: Default::default() };
+        let cache = DrawCache { source: d.source.clone(), mesh: Some(mesh), edges, proj, targets: Default::default(), sections: Default::default() };
         let items = drawing_sheet_items(&d, &cache);
         assert_eq!(items.len(), 3);
         let svg = to_svg_with_dims(d.sheet.w, d.sheet.h, &items, &[], &drawing_title_rows(&d));
@@ -25641,6 +25860,84 @@ mod tests {
         asm = prev;
         assert_eq!(asm.components.len(), 2, "undo didn't bring the component back");
         assert_eq!(asm.mates.len(), 1, "undo brought the component back but not its mate");
+    }
+
+    /// A section line drawn across a view must define a plane that cuts the part where the
+    /// line is — and produce a view looking ALONG the cut, not through the parent again.
+    #[test]
+    fn a_section_line_cuts_where_it_was_drawn() {
+        let mut drawing = Drawing::default();
+        let front = drawing.add_view(ViewDir::Front, 1.0);
+
+        // A vertical line at x = 5 on the Front view: cuts the part on the plane x = 5.
+        let sec = drawing.add_section(front, [5.0, -20.0], [5.0, 20.0], 1.0);
+        let sv = drawing.view(sec).unwrap().clone();
+        let sp = sv.section.clone().expect("no section spec");
+        assert_eq!(sp.label, "A", "the first section should be A");
+
+        let parent = drawing.view(front).unwrap().clone();
+        let (point, n) = section_plane(&parent, &sp);
+        // The plane's normal must be horizontal (across the line), not along it or into the
+        // sheet — a vertical line cuts left-from-right.
+        assert!(n[0].abs() > 0.99, "a vertical section line gave normal {n:?}");
+        assert!((point[0] - 5.0).abs() < 1e-6, "the plane isn't at the line: {point:?}");
+
+        // And the section is viewed ALONG that normal, with the parent's depth running up.
+        let basis = section_basis(&parent, &sp);
+        assert!(basis.f[0].abs() > 0.99, "the section looks the wrong way: {:?}", basis.f);
+        assert!(basis.u[2].abs() > 0.9, "depth should run up the section view: {:?}", basis.u);
+
+        // A second section takes the next letter.
+        let sec2 = drawing.add_section(front, [-20.0, 3.0], [20.0, 3.0], 1.0);
+        assert_eq!(drawing.view(sec2).unwrap().section.as_ref().unwrap().label, "B");
+        // ...and a horizontal line cuts the other way.
+        let sp2 = drawing.view(sec2).unwrap().section.clone().unwrap();
+        let (_, n2) = section_plane(&parent, &sp2);
+        assert!(n2[1].abs() > 0.99, "a horizontal section line gave normal {n2:?}");
+
+        // Deleting the parent takes its sections with it — they have no line left to cut on.
+        drawing.remove_view(front);
+        assert!(drawing.views.is_empty(), "sections outlived the view they were cut from");
+    }
+
+    /// End to end: a section of a hollow box must expose its wall — the cut face is hatched,
+    /// and the section shows material the outside view cannot.
+    #[test]
+    fn a_section_of_a_hollow_box_shows_its_wall() {
+        // A 30mm box, shelled to a 3mm wall with the top open.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(30.0, 30.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 20.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Shell { thickness: 3.0, open: vec![([15.0, 15.0, 20.0], [0.0, 0.0, 1.0])] });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("shelled box");
+
+        // Cut straight down the middle, on the plane x = 15.
+        let cut = hworks_geometry::drawing::section_cut(&mesh, [15.0, 0.0, 0.0], [1.0, 0.0, 0.0], 1.5).expect("section");
+        assert!(!cut.hatch.is_empty(), "the cut wall wasn't hatched");
+
+        // The hatch lies on the cut plane...
+        for h in &cut.hatch {
+            for q in h {
+                assert!((q[0] as f64 - 15.0).abs() < 0.05, "hatch off the cut plane: {q:?}");
+            }
+        }
+        // ...and marks the WALL, not the hollow: every hatch line should sit within 3mm of
+        // an outer face, never out in the middle of the cavity.
+        let in_cavity = |y: f32, z: f32| y > 4.0 && y < 26.0 && z > 4.0;
+        let stray = cut
+            .hatch
+            .iter()
+            .filter(|h| {
+                let (my, mz) = ((h[0][1] + h[1][1]) * 0.5, (h[0][2] + h[1][2]) * 0.5);
+                in_cavity(my, mz)
+            })
+            .count();
+        assert_eq!(stray, 0, "{stray} hatch line(s) crossed the hollow interior");
+
+        // The cut half is genuinely less than the whole.
+        let whole = hworks_geometry::signed_mesh_volume(&mesh).abs();
+        let half = hworks_geometry::signed_mesh_volume(&cut.mesh).abs();
+        assert!(half < whole * 0.65 && half > whole * 0.35, "cut kept {half:.0} of {whole:.0}");
     }
 
     /// A linear dimension must be grabbable ALONG ITS LINE, not only on the few millimetres

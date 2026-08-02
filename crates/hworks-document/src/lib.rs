@@ -563,6 +563,25 @@ impl ViewDir {
     }
 }
 
+/// A view that is a SECTION: the part cut by a plane, drawn with the cut face hatched.
+///
+/// The cutting plane is defined by a line drawn on the PARENT view — that line plus the
+/// parent's viewing direction span the plane — which is how a section is specified on a real
+/// drawing, and means the line can be shown on the parent with arrows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SectionSpec {
+    /// The view the section line was drawn on.
+    pub parent: u64,
+    /// The section line's ends, in the PARENT view's own coordinates.
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    /// Look from the other side.
+    #[serde(default)]
+    pub flip: bool,
+    /// The letter: "A" gives a view captioned "SECTION A-A".
+    pub label: String,
+}
+
 /// One projected view placed on the sheet.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DrawView {
@@ -581,6 +600,9 @@ pub struct DrawView {
     /// Print the view's name ("Front") under it.
     #[serde(default = "yes")]
     pub label: bool,
+    /// Set when this view is a section rather than a plain projection.
+    #[serde(default)]
+    pub section: Option<SectionSpec>,
 }
 
 fn yes() -> bool {
@@ -716,6 +738,7 @@ impl Drawing {
             scale,
             show_hidden: true,
             label: true,
+            section: None,
         });
         id
     }
@@ -728,8 +751,27 @@ impl Drawing {
         self.views.iter_mut().find(|v| v.id == id)
     }
 
+    /// Add a section view cut by a line drawn on `parent`. The letter is the next unused one.
+    pub fn add_section(&mut self, parent: u64, a: [f64; 2], b: [f64; 2], scale: f64) -> u64 {
+        // Section letters run A, B, C… skipping any already taken.
+        let used: Vec<String> = self.views.iter().filter_map(|v| v.section.as_ref().map(|s| s.label.clone())).collect();
+        let label = ('A'..='Z').map(|c| c.to_string()).find(|c| !used.contains(c)).unwrap_or_else(|| "A".into());
+        // A section is drawn looking along the cut, so it needs its own direction. The
+        // parent's is kept only as the frame the line was drawn in.
+        let dir = self.view(parent).map(|v| v.dir).unwrap_or(ViewDir::Front);
+        let id = self.add_view(dir, scale);
+        if let Some(v) = self.view_mut(id) {
+            v.section = Some(SectionSpec { parent, a, b, flip: false, label });
+        }
+        id
+    }
+
     pub fn remove_view(&mut self, id: u64) {
         self.views.retain(|v| v.id != id);
+        // A section hanging off a deleted view has no line to be cut by. Collect the
+        // survivors first — `retain` can't consult the list it is filtering.
+        let alive: Vec<u64> = self.views.iter().map(|v| v.id).collect();
+        self.views.retain(|v| v.section.as_ref().is_none_or(|sp| alive.contains(&sp.parent)));
         // A dimension without its view has nothing to be drawn against.
         self.dims.retain(|d| d.view != id);
     }
