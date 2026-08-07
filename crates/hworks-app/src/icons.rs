@@ -62,6 +62,7 @@ pub enum Icon {
     LinearPattern,
     CircularPattern,
     MirrorFeature,
+    Gear,
     // --- reference geometry ---
     Plane,
     Sketch,
@@ -145,7 +146,7 @@ pub const ALL: &[(&str, Icon)] = &[
     ("Cut", Icon::Cut), ("RevolveCut", Icon::RevolveCut), ("LoftCut", Icon::LoftCut), ("SweepCut", Icon::SweepCut),
     ("Hole", Icon::Hole), ("Fillet", Icon::Fillet), ("Chamfer", Icon::Chamfer), ("Shell", Icon::Shell),
     ("LinearPattern", Icon::LinearPattern), ("CircularPattern", Icon::CircularPattern),
-    ("MirrorFeature", Icon::MirrorFeature), ("Plane", Icon::Plane), ("Sketch", Icon::Sketch),
+    ("MirrorFeature", Icon::MirrorFeature), ("Gear", Icon::Gear), ("Plane", Icon::Plane), ("Sketch", Icon::Sketch),
 ];
 
 /// The artwork for one icon, in the 0..1 unit box.
@@ -385,6 +386,22 @@ pub fn prims(icon: Icon) -> Vec<Prim> {
             Prim::Dash(vec![[0.16, 0.16], [0.50, 0.16]]),
         ],
         // A box hollowed out — outer wall plus the inner void, open at the top.
+        // A gear: hub circle plus a toothed rim, drawn from the same numbers the feature uses
+        // (so the icon reads as an involute gear rather than a cog-shaped decoration).
+        Gear => {
+            let (c, rr, rt, n) = ([0.5_f32, 0.5_f32], 0.30_f32, 0.42_f32, 8_usize);
+            let mut rim: Vec<[f32; 2]> = Vec::new();
+            for i in 0..n {
+                // Quarter of a tooth pitch each: root, up, across the tip, back down.
+                let step = std::f32::consts::TAU / n as f32;
+                let a0 = i as f32 * step;
+                for (t, r) in [(0.00, rr), (0.14, rt), (0.36, rt), (0.50, rr)] {
+                    let a = a0 + step * t;
+                    rim.push([c[0] + r * a.cos(), c[1] + r * a.sin()]);
+                }
+            }
+            vec![Prim::Path(rim, true), Prim::Circle(c, 0.12)]
+        }
         Shell => vec![
             Prim::Path(vec![[0.12, 0.16], [0.12, 0.88], [0.88, 0.88], [0.88, 0.16]], false),
             Prim::Path(vec![[0.30, 0.16], [0.30, 0.70], [0.70, 0.70], [0.70, 0.16]], false),

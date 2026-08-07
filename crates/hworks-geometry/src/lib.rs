@@ -12,6 +12,7 @@ use truck_meshalgo::prelude::*;
 use truck_modeling::{builder, Point3, Vector3};
 
 pub mod drawing;
+pub mod gear;
 mod bevel;
 mod csg;
 mod fillet;
@@ -740,6 +741,101 @@ pub fn direct_prism_mesh(
         return None;
     }
     // Orient outward (the loop windings vary — the signed volume settles it).
+    if signed_mesh_volume(&mesh) < 0.0 {
+        for t in mesh.indices.chunks_exact_mut(3) {
+            t.swap(1, 2);
+        }
+        for n2 in &mut mesh.normals {
+            *n2 = [-n2[0], -n2[1], -n2[2]];
+        }
+    }
+    Some(mesh)
+}
+
+/// One cross-section of a layered solid: the profile rotated by `rot` radians and scaled by
+/// `scale` about the plane origin, placed `w` along the plane normal.
+#[derive(Clone, Copy, Debug)]
+pub struct Layer {
+    pub w: f64,
+    pub rot: f64,
+    pub scale: f64,
+}
+
+/// Build a solid from ONE 2D profile repeated at every layer, each copy rotated and scaled
+/// about the origin. Unlike `loft_mesh` this keeps exact point correspondence between layers
+/// (no resampling), so a thousand-point involute survives intact — which is what makes it the
+/// right primitive for helical, herringbone and bevel gears. `None` if the input is degenerate.
+pub fn layered_profile_mesh(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>], basis: &PlaneBasis, layers: &[Layer]) -> Option<TriMesh> {
+    if outer.len() < 3 || layers.len() < 2 {
+        return None;
+    }
+    if layers.iter().any(|l| l.scale.abs() < 1e-9) {
+        return None; // a layer collapsed to a point: the taper ran past the apex
+    }
+    let o = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+    let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+    let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+    let nrm = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
+    let place = |p: [f64; 2], l: &Layer| {
+        let (c, s) = (l.rot.cos(), l.rot.sin());
+        let (x, y) = ((p[0] * c - p[1] * s) * l.scale, (p[0] * s + p[1] * c) * l.scale);
+        let q = o + u * x + v * y + nrm * l.w;
+        [q.x, q.y, q.z]
+    };
+    // Same winding discipline as the straight prism: outer CCW, holes CW, so the wall quads
+    // all face outward and the caps agree with them.
+    let signed = |l: &[[f64; 2]]| {
+        let mut a = 0.0;
+        for k in 0..l.len() {
+            let (p, q) = (l[k], l[(k + 1) % l.len()]);
+            a += p[0] * q[1] - q[0] * p[1];
+        }
+        a
+    };
+    let mut outer_n = outer.to_vec();
+    if signed(&outer_n) < 0.0 {
+        outer_n.reverse();
+    }
+    let holes_n: Vec<Vec<[f64; 2]>> = holes
+        .iter()
+        .filter(|h| h.len() >= 3)
+        .map(|h| {
+            let mut hv = h.to_vec();
+            if signed(&hv) > 0.0 {
+                hv.reverse();
+            }
+            hv
+        })
+        .collect();
+
+    let mut mesh = TriMesh::default();
+    // Caps. Rotation and uniform scale are a similarity, so the bridged polygon stays simple
+    // at every layer and one triangulation serves both ends.
+    let cap_poly = bridge_holes(&outer_n, &holes_n);
+    let (first, last) = (layers[0], layers[layers.len() - 1]);
+    for t in earcut_simple(&cap_poly) {
+        let (a, b, c) = (cap_poly[t[0]], cap_poly[t[1]], cap_poly[t[2]]);
+        push_tri(&mut mesh, place(a, &last), place(b, &last), place(c, &last));
+        push_tri(&mut mesh, place(a, &first), place(c, &first), place(b, &first));
+    }
+    // Walls: a quad band per loop between every consecutive pair of layers.
+    for loop_ in std::iter::once(&outer_n).chain(holes_n.iter()) {
+        let m = loop_.len();
+        for pair in layers.windows(2) {
+            let (l0, l1) = (pair[0], pair[1]);
+            for k in 0..m {
+                let (a, b) = (loop_[k], loop_[(k + 1) % m]);
+                if (a[0] - b[0]).abs() < 1e-12 && (a[1] - b[1]).abs() < 1e-12 {
+                    continue;
+                }
+                push_tri(&mut mesh, place(a, &l0), place(b, &l0), place(b, &l1));
+                push_tri(&mut mesh, place(a, &l0), place(b, &l1), place(a, &l1));
+            }
+        }
+    }
+    if mesh.indices.is_empty() {
+        return None;
+    }
     if signed_mesh_volume(&mesh) < 0.0 {
         for t in mesh.indices.chunks_exact_mut(3) {
             t.swap(1, 2);
@@ -1989,7 +2085,7 @@ pub fn export_step(solid: &KSolid) -> Option<String> {
 }
 
 /// Append a triangle (with a winding-derived flat normal) to a mesh.
-fn push_tri(mesh: &mut TriMesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
+pub(crate) fn push_tri(mesh: &mut TriMesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
     let sub = |p: [f64; 3], q: [f64; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
     let (e1, e2) = (sub(b, a), sub(c, a));
     let mut n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];

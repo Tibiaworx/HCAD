@@ -61,6 +61,49 @@ pub struct PlaneRef {
     pub datum: bool,
 }
 
+/// Which kind of gear a [`FeatureKind::Gear`] builds.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GearType {
+    /// Straight involute teeth, parallel to the axis. The default and the common case.
+    #[default]
+    Spur,
+    /// Involute teeth wound along a helix. Meshes more quietly than a spur because contact
+    /// rolls across the face instead of slamming on tooth by tooth, at the cost of an axial
+    /// thrust the bearings have to take.
+    Helical,
+    /// Two opposed helices meeting in a V, so their axial thrusts cancel. All the quietness of
+    /// a helical with none of the thrust; harder to machine, trivial to print.
+    Herringbone,
+    /// Teeth on a cone, for shafts that meet at an angle. This builds the printable conical
+    /// approximation (the spur profile tapered to the cone apex), not a true octoid bevel —
+    /// good for models and light drives, not for cut gears.
+    Bevel,
+    /// A GT2 timing-belt pulley: round grooves at the 2 mm belt pitch. Not a gear at all, but
+    /// it belongs on the same menu because it is made from numbers the same way.
+    Gt2Pulley,
+}
+
+impl GearType {
+    /// Human name for menus and the feature tree.
+    pub fn label(&self) -> &'static str {
+        match self {
+            GearType::Spur => "Spur",
+            GearType::Helical => "Helical",
+            GearType::Herringbone => "Herringbone",
+            GearType::Bevel => "Bevel",
+            GearType::Gt2Pulley => "GT2 pulley",
+        }
+    }
+
+    /// Every type, in menu order.
+    pub const ALL: [GearType; 5] = [GearType::Spur, GearType::Helical, GearType::Herringbone, GearType::Bevel, GearType::Gt2Pulley];
+
+    /// True if this type twists along the face, so it needs a helix angle.
+    pub fn uses_helix(&self) -> bool {
+        matches!(self, GearType::Helical | GearType::Herringbone)
+    }
+}
+
 /// The kinds of feature a timeline can hold. Grows along the roadmap.
 ///
 /// Operation features are *self-contained* — they carry the sketch and the plane
@@ -155,6 +198,37 @@ pub enum FeatureKind {
     /// reverse-engineer. Renders as a translucent ghost, contributes NOTHING to the solid,
     /// and its sketch-plane cross-sections become snappable reference curves. Same embedded
     /// `data` format as [`ImportMesh`].
+    /// A gear built from its standard numbers rather than a sketch — so it stays editable as a
+    /// gear (change the tooth count, get a new gear) instead of becoming an un-editable pile of
+    /// profile points. `gear_type` picks which kind; the numbers below mean the same thing for
+    /// all of them except where noted.
+    Gear {
+        teeth: u32,
+        /// Millimetres of pitch diameter per tooth. Ignored for a GT2 pulley, whose pitch is
+        /// fixed at 2 mm by the belt standard.
+        module: f64,
+        /// Degrees; 20 is standard.
+        pressure_angle: f64,
+        /// Centre bore diameter; 0 for solid.
+        bore: f64,
+        /// Flank trim so a printed pair isn't a press fit, mm.
+        #[serde(default)]
+        backlash: f64,
+        /// Face width — how thick the gear is. On a bevel this is measured ALONG the cone, so
+        /// the part is shorter than this along its axis.
+        thickness: f64,
+        /// Which kind of gear. Absent in files written before the type picker existed, which
+        /// were all spur gears.
+        #[serde(default)]
+        gear_type: GearType,
+        /// Helix angle in degrees, for helical and herringbone. How far the tooth wraps.
+        #[serde(default)]
+        helix_deg: f64,
+        /// Pitch cone angle in degrees, for bevel. 45 gives a 1:1 mitre pair.
+        #[serde(default)]
+        cone_deg: f64,
+        plane: PlaneRef,
+    },
     RefMesh {
         data: String,
         name: String,
@@ -274,6 +348,10 @@ impl Document {
             .iter()
             .map(|f| match &f.kind {
                 FeatureKind::Plane(p) => format!("[plane]  {}", p.name),
+                FeatureKind::Gear { teeth, module, gear_type, .. } => match gear_type {
+                    GearType::Gt2Pulley => format!("[gear]   GT2 pulley {teeth}T"),
+                    g => format!("[gear]   {} gear {teeth}T m{module}", g.label()),
+                },
                 FeatureKind::Sketch { .. } => {
                     sk += 1;
                     format!("[sketch] Sketch{sk}")

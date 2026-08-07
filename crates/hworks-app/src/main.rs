@@ -27,7 +27,7 @@ use hworks_geometry::drawing::{
     centre_mark_geometry, radial_dim_geometry, section_cut, CentreMarkGeom, DimGeom, DimRef, ProjEdge, RadialGeom, RefKind,
     SheetDim, SheetItem, SnapTarget, ViewBasis,
 };
-use hworks_document::{Assembly, Document, FeatureId, FeatureKind, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle, SectionSpec as DrawSection, DrawView};
+use hworks_document::{Assembly, Document, FeatureId, FeatureKind, GearType, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle, SectionSpec as DrawSection, DrawView};
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
@@ -216,7 +216,7 @@ fn main() {
                     do_solid_op,
                     apply_fillet,
                     apply_chamfer,
-                    (apply_mirror_feature, apply_pattern_feature, apply_shell_feature, apply_sweep_feature),
+                    (apply_mirror_feature, apply_pattern_feature, apply_shell_feature, apply_sweep_feature, apply_gear_feature),
                     apply_thread,
                     (do_regenerate, finish_regen_job),
                     apply_section,
@@ -2239,6 +2239,9 @@ struct UiState {
     /// what the panel's "Open this face" checkbox applies to.
     shell_sel: Option<([f64; 3], [f64; 3])>,
     shell_request: Option<ShellSpec>,
+    /// Gear Genie: the open panel, and the confirmed spec the apply system drains.
+    gear_spec: Option<GearGenieSpec>,
+    gear_request: Option<GearGenieSpec>,
     /// True while the see-through shell preview is being rebuilt in the background.
     shell_preview_busy: bool,
     /// Sweep feature: the spec while its PM is open (profile + path chosen from the tree's sketches).
@@ -2387,6 +2390,58 @@ struct PatternSpec {
 impl Default for PatternSpec {
     fn default() -> Self {
         Self { seed: 0, circular: false, axis: 0, flip: false, spacing: 10.0, total_deg: 360.0, count: 3 }
+    }
+}
+
+/// Gear Genie PM state. Holds the gear's *numbers* rather than its outline: the profile is
+/// regenerated from these every rebuild, so changing the tooth count gives a real new gear.
+/// `to_sketch` is set when the panel was opened from inside a sketch - OK then drops the
+/// profile into that sketch instead of adding a 3D feature.
+#[derive(Clone)]
+struct GearGenieSpec {
+    teeth: u32,
+    module: f64,
+    pressure_angle: f64,
+    bore: f64,
+    backlash: f64,
+    thickness: f64,
+    gear_type: GearType,
+    /// Degrees of helix, for helical and herringbone.
+    helix_deg: f64,
+    /// Pitch cone angle in degrees, for bevel.
+    cone_deg: f64,
+    plane: ActivePlane,
+    plane_name: String,
+    to_sketch: bool,
+    /// Where the gear centre lands, in the sketch/plane's own u,v.
+    centre: [f64; 2],
+    /// True while waiting for a click in the sketch to set `centre`. Suppresses the drawing
+    /// tools for that one click so placing a gear can't also start a line.
+    placing: bool,
+}
+
+impl GearGenieSpec {
+    /// The pitch radius this gear will actually have. GT2 pitch is fixed by the belt.
+    fn pitch_radius(&self) -> f64 {
+        match self.gear_type {
+            GearType::Gt2Pulley => hworks_geometry::gear::gt2::pitch_radius(self.teeth),
+            _ => self.module * self.teeth as f64 * 0.5,
+        }
+    }
+
+    /// The outline this gear builds from, for previews and for the sketch drop.
+    fn outline(&self) -> Option<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> {
+        gear_outline(self.teeth, self.module, self.pressure_angle, self.bore, self.backlash, self.gear_type)
+    }
+
+    fn kernel(&self) -> hworks_geometry::gear::GearSpec {
+        hworks_geometry::gear::GearSpec {
+            teeth: self.teeth,
+            module: self.module,
+            pressure_angle: self.pressure_angle,
+            bore: self.bore,
+            backlash: self.backlash,
+        }
     }
 }
 
@@ -4148,6 +4203,14 @@ fn ui_system(
                             session.tool = Tool::Polygon;
                             session.pending = None;
                         }
+                        // Gear Genie in a sketch: not a click-to-place tool - it generates the
+                        // whole profile from numbers, so it opens the panel straight away.
+                        if icon_label(ui, ui_state.gear_spec.is_some(), icons::Icon::Gear, "Gear Genie")
+                            .on_hover_text("Draw an involute gear profile into this sketch from its numbers")
+                            .clicked()
+                        {
+                            ui_state.gear_spec = Some(default_gear_spec(&doc.0, true));
+                        }
                         // Text tool: parameters (font, style, arc, …) live in the left panel.
                         if icon_label(ui, session.tool == Tool::Text, icons::Icon::Text, "Text")
                             .on_hover_text("Place outlined text — font and options in the panel on the left")
@@ -4405,6 +4468,11 @@ fn ui_system(
                         }
                         if icon_item(ui, bevel_ok, icons::Icon::Shell, "Shell").on_hover_text("Hollow the body leaving walls of a set thickness — click faces to open them (a box, a case)").clicked() {
                             ui_state.shell_spec = Some(ShellSpec { thickness: 1.5, open: Vec::new() });
+                            ui.close();
+                        }
+                        // Gear Genie needs no body and no sketch - it generates its own profile.
+                        if icon_item(ui, true, icons::Icon::Gear, "Gear Genie").on_hover_text("An involute spur gear from its numbers (teeth, module, bore) - stays editable as a gear").clicked() {
+                            ui_state.gear_spec = Some(default_gear_spec(&doc.0, false));
                             ui.close();
                         }
                     });
@@ -5167,6 +5235,228 @@ fn ui_system(
                 }
             } else {
                 ui_state.pattern_spec = Some(spec);
+            }
+        }
+        // Gear Genie: an involute spur gear from its standard numbers. The same panel serves
+        // both jobs - inside a sketch it drops the profile in as sketch geometry, outside one it
+        // adds an editable 3D Gear feature.
+        if let Some(mut spec) = ui_state.gear_spec.clone() {
+            ui.heading("Gear Genie");
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2714}  OK").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(40, 140, 70))).clicked() {
+                    commit = true;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("\u{2716}  Cancel").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 55, 55))).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                egui::ComboBox::from_id_salt("gear_type").selected_text(spec.gear_type.label()).show_ui(ui, |ui| {
+                    for t in GearType::ALL {
+                        let tip = match t {
+                            GearType::Spur => "Straight teeth. The default.",
+                            GearType::Helical => "Teeth wound along a helix - quieter, but pushes along the shaft.",
+                            GearType::Herringbone => "Two opposed helices in a V, so the axial thrust cancels.",
+                            GearType::Bevel => "Teeth on a cone, for shafts meeting at an angle.",
+                            GearType::Gt2Pulley => "A 2 mm GT2 timing-belt pulley. Pitch is fixed by the belt.",
+                        };
+                        if ui.selectable_label(spec.gear_type == t, t.label()).on_hover_text(tip).clicked() {
+                            spec.gear_type = t;
+                        }
+                    }
+                });
+            });
+            let is_pulley = spec.gear_type == GearType::Gt2Pulley;
+            // A sketch is flat, so a helix or a cone has nowhere to go. Say that plainly rather
+            // than drawing the straight-toothed cross-section and letting it read as a bug.
+            if spec.to_sketch && (spec.gear_type.uses_helix() || spec.gear_type == GearType::Bevel) {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\u{26a0} A sketch is flat, so this draws the {} gear's cross-section with straight teeth. Use the 3D Gear Genie (Features menu) for the real twist or taper.",
+                        spec.gear_type.label().to_lowercase()
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 165, 60)),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label("Teeth");
+                ui.add(egui::DragValue::new(&mut spec.teeth).speed(0.2).range(4..=400))
+                    .on_hover_text("How many teeth. With the module fixed, more teeth means a bigger gear.");
+            });
+            if is_pulley {
+                ui.label(egui::RichText::new("Pitch is fixed at 2 mm by the GT2 belt standard, so there is no module to set.").weak().small());
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Module");
+                    ui.add(egui::DragValue::new(&mut spec.module).speed(0.05).suffix(" mm").range(0.1..=50.0))
+                        .on_hover_text("Tooth size: pitch diameter divided by tooth count. Two gears only mesh if their modules match.");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pressure angle");
+                    egui::ComboBox::from_id_salt("gear_pa")
+                        .selected_text(format!("{}\u{b0}", spec.pressure_angle))
+                        .show_ui(ui, |ui| {
+                            for pa in [14.5_f64, 20.0, 25.0] {
+                                if ui.selectable_label((spec.pressure_angle - pa).abs() < 1e-9, format!("{pa}\u{b0}")).clicked() {
+                                    spec.pressure_angle = pa;
+                                }
+                            }
+                        });
+                });
+            }
+            if !spec.to_sketch && spec.gear_type.uses_helix() {
+                ui.horizontal(|ui| {
+                    ui.label("Helix angle");
+                    ui.add(egui::DragValue::new(&mut spec.helix_deg).speed(0.5).suffix("\u{b0}").range(1.0..=45.0))
+                        .on_hover_text("How steeply the teeth wind along the face. Steeper runs quieter and pushes harder along the shaft.");
+                });
+            }
+            if !spec.to_sketch && spec.gear_type == GearType::Bevel {
+                ui.horizontal(|ui| {
+                    ui.label("Cone angle");
+                    ui.add(egui::DragValue::new(&mut spec.cone_deg).speed(0.5).suffix("\u{b0}").range(5.0..=85.0))
+                        .on_hover_text("Pitch cone half-angle. 45\u{b0} gives a matched 1:1 mitre pair; the two angles of a pair must add up to the shaft angle.");
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Bore \u{2300}");
+                ui.add(egui::DragValue::new(&mut spec.bore).speed(0.1).suffix(" mm").range(0.0..=10_000.0))
+                    .on_hover_text("Centre hole diameter. 0 leaves it solid.");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Backlash");
+                ui.add(egui::DragValue::new(&mut spec.backlash).speed(0.01).suffix(" mm").range(0.0..=5.0))
+                    .on_hover_text("Thins both flanks so a printed pair isn't a press fit. 0.1-0.3 mm suits FDM. Not used by a GT2 pulley.");
+            });
+            if !spec.to_sketch {
+                ui.horizontal(|ui| {
+                    ui.label("Face width");
+                    ui.add(egui::DragValue::new(&mut spec.thickness).speed(0.2).suffix(" mm").range(0.1..=10_000.0))
+                        .on_hover_text("How thick the gear is.");
+                });
+                let datums: Vec<(String, ActivePlane)> = doc.0.planes().map(|(_, p)| (p.name.clone(), ActivePlane::from_doc(p))).collect();
+                ui.horizontal(|ui| {
+                    ui.label("Plane");
+                    egui::ComboBox::from_id_salt("gear_plane").selected_text(&spec.plane_name).show_ui(ui, |ui| {
+                        for (n, ap) in &datums {
+                            if ui.selectable_label(spec.plane_name == *n, n).clicked() {
+                                spec.plane = ap.clone();
+                                spec.plane_name = n.clone();
+                            }
+                        }
+                    });
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Centre");
+                if ui.add(egui::DragValue::new(&mut spec.centre[0]).speed(0.5).prefix("x ").suffix(" mm")).changed() {
+                    spec.placing = false; // typing a number wins over an armed click
+                }
+                if ui.add(egui::DragValue::new(&mut spec.centre[1]).speed(0.5).prefix("y ").suffix(" mm")).changed() {
+                    spec.placing = false;
+                }
+            });
+            // Clicking the centre is how you stack gears: snap onto an existing point, a hole
+            // centre or a body corner and the new gear lands exactly there.
+            if spec.to_sketch {
+                let armed = spec.placing;
+                if ui
+                    .selectable_label(armed, if armed { "\u{25c9}  Click in the sketch to place it" } else { "\u{25ce}  Pick centre by clicking" })
+                    .on_hover_text("Then click in the sketch. It snaps to points, hole centres and body corners, so gears stack exactly.")
+                    .clicked()
+                {
+                    spec.placing = !armed;
+                }
+                if armed {
+                    ui.label(egui::RichText::new("The outline follows the cursor. Click to drop it; the panel stays open.").weak().small());
+                }
+            }
+            ui.separator();
+            // The numbers a machinist actually needs off a gear, computed live so a bad
+            // combination shows up here rather than as a mystery failure after OK.
+            let k = spec.kernel();
+            egui::Grid::new("gear_readout").num_columns(2).spacing([10.0, 2.0]).show(ui, |ui| {
+                let row = |ui: &mut egui::Ui, key: &str, v: String| {
+                    ui.label(egui::RichText::new(key).weak().small());
+                    ui.label(egui::RichText::new(v).small());
+                    ui.end_row();
+                };
+                if is_pulley {
+                    row(ui, "Pitch \u{2300}", format!("{:.3} mm", 2.0 * hworks_geometry::gear::gt2::pitch_radius(spec.teeth)));
+                    row(ui, "Outside \u{2300}", format!("{:.3} mm", 2.0 * hworks_geometry::gear::gt2::outside_radius(spec.teeth)));
+                    row(ui, "Root \u{2300}", format!("{:.3} mm", 2.0 * hworks_geometry::gear::gt2::root_radius(spec.teeth)));
+                    row(ui, "Belt travel per turn", format!("{:.2} mm", spec.teeth as f64 * hworks_geometry::gear::gt2::PITCH));
+                } else {
+                    row(ui, "Pitch \u{2300}", format!("{:.3} mm", 2.0 * k.pitch_radius()));
+                    row(ui, "Outside \u{2300}", format!("{:.3} mm", 2.0 * k.tip_radius()));
+                    row(ui, "Root \u{2300}", format!("{:.3} mm", 2.0 * k.root_radius()));
+                    row(ui, "Centres (matched pair)", format!("{:.3} mm", k.centre_distance(&k)));
+                }
+                if !spec.to_sketch {
+                    match spec.gear_type {
+                        // A bevel's face width runs along the cone, so it is shorter than that
+                        // along its own axis - worth stating, since the number you typed is not
+                        // the height you get.
+                        GearType::Bevel => {
+                            let cone = k.pitch_radius() / spec.cone_deg.to_radians().sin().max(1e-6);
+                            let face = spec.thickness.min(cone * 0.9);
+                            row(ui, "Height on axis", format!("{:.3} mm", face * spec.cone_deg.to_radians().cos()));
+                            row(ui, "Small end \u{2300}", format!("{:.3} mm", 2.0 * k.tip_radius() * (cone - face) / cone));
+                        }
+                        GearType::Helical | GearType::Herringbone => {
+                            let span = if spec.gear_type == GearType::Herringbone { spec.thickness * 0.5 } else { spec.thickness };
+                            let twist = span * spec.helix_deg.to_radians().tan() / k.pitch_radius().max(1e-9);
+                            row(ui, "Tooth wrap", format!("{:.1}\u{b0}", twist.to_degrees()));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            if !is_pulley && k.is_undercut() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\u{26a0} Undercut: below {} teeth at {}\u{b0} the cutter digs into the flank root. It still builds and meshes, just weaker.",
+                        k.undercut_limit(),
+                        spec.pressure_angle
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 165, 60)),
+                );
+            }
+            let root_r = if is_pulley { hworks_geometry::gear::gt2::root_radius(spec.teeth) } else { k.root_radius() };
+            if spec.bore > 0.0 && spec.bore * 0.5 >= root_r {
+                ui.label(
+                    egui::RichText::new("\u{26a0} The bore is wider than the root circle - there'd be no gear left. Shrink the bore or raise the tooth count.")
+                        .small()
+                        .color(egui::Color32::from_rgb(220, 90, 90)),
+                );
+            }
+            ui.label(
+                egui::RichText::new(if spec.to_sketch {
+                    "OK draws the profile into this sketch as lines you can extrude yourself."
+                } else {
+                    "OK adds an editable Gear feature - reopen it any time to change the numbers."
+                })
+                .weak()
+                .small(),
+            );
+            ui.separator();
+            if commit {
+                ui_state.gear_request = Some(spec);
+                ui_state.gear_spec = None;
+            } else if cancel {
+                ui_state.gear_spec = None;
+                if ui_state.editing_feature.take().is_some() {
+                    doc.0.rollback = doc.0.features.len();
+                    ui_state.regen = true;
+                }
+            } else {
+                ui_state.gear_spec = Some(spec);
             }
         }
         if let Some(mut spec) = ui_state.shell_spec.clone() {
@@ -7304,6 +7594,28 @@ fn ui_system(
 
                     let row = match &f.kind {
                         FeatureKind::Plane(_) => continue,
+                        FeatureKind::Gear { teeth, module, .. } => {
+                            ex += 1;
+                            let label = format!("Gear{ex}  ({teeth}T  m{module})");
+                            let resp = ui.selectable_label(selected, styled(label));
+                            if resp.clicked() {
+                                ui_state.selected = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                action = Some(TreeAction::EditPm(i));
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("Edit gear").clicked() {
+                                    action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if ui.button("Delete feature").clicked() {
+                                    action = Some(TreeAction::Delete(i));
+                                    ui.close();
+                                }
+                            });
+                            resp.rect
+                        }
                         FeatureKind::Sketch { sketch, .. } => {
                             sk += 1;
                             // A sketch made of text reads as a "Text" feature in the tree (SolidWorks
@@ -7873,6 +8185,29 @@ fn ui_system(
                                         spacing: *spacing as f32,
                                         total_deg: (step.abs() * (*count).max(1) as f64).to_degrees() as f32,
                                         count: *count,
+                                    });
+                                    ui_state.editing_feature = Some(i);
+                                    doc.0.rollback = i;
+                                    ui_state.regen = true;
+                                }
+                                FeatureKind::Gear { teeth, module, pressure_angle, bore, backlash, thickness, gear_type, helix_deg, cone_deg, plane } => {
+                                    ui_state.gear_spec = Some(GearGenieSpec {
+                                        teeth: *teeth,
+                                        module: *module,
+                                        pressure_angle: *pressure_angle,
+                                        bore: *bore,
+                                        backlash: *backlash,
+                                        thickness: *thickness,
+                                        gear_type: *gear_type,
+                                        helix_deg: if *helix_deg == 0.0 { 20.0 } else { *helix_deg },
+                                        cone_deg: if *cone_deg == 0.0 { 45.0 } else { *cone_deg },
+                                        plane_name: "(stored)".to_string(),
+                                        plane: ActivePlane::from_ref(plane),
+                                        to_sketch: false,
+                                        // The centre is already baked into the stored plane origin,
+                                        // so re-opening starts at zero offset from it.
+                                        centre: [0.0, 0.0],
+                                        placing: false,
                                     });
                                     ui_state.editing_feature = Some(i);
                                     doc.0.rollback = i;
@@ -10143,6 +10478,7 @@ fn shell_overlays(
             let _ = hworks_geometry::take_loft_hole_mismatch_count();
             let _ = take_sweep_region_fallbacks();
             let _ = take_cut_direction_guesses();
+            let _ = take_gear_failures();
             match result.filter(|m| !m.positions.is_empty()) {
                 Some(m) => {
                     if let Some(slot) = meshes.get_mut(&ov.preview_mesh) {
@@ -11514,6 +11850,20 @@ fn sketch_interaction(
     }
     if !matches!(session.tool, Tool::Select | Tool::Pattern | Tool::Mirror) {
         session.box_select = None;
+    }
+
+    // Gear Genie placement takes the click before any drawing tool sees it. The centre comes
+    // from the SNAPPED cursor, so dropping a gear on an existing point, hole centre or body
+    // corner lands it exactly there - which is the whole point of stacking gears.
+    if ui_state.gear_spec.as_ref().is_some_and(|g| g.to_sketch && g.placing) && session.plane.is_some() {
+        if let (true, Some(uv)) = (just_pressed, session.cursor_uv) {
+            if let Some(g) = ui_state.gear_spec.as_mut() {
+                g.centre = [uv.x as f64, uv.y as f64];
+                g.placing = false;
+            }
+            ui_state.toasts.push((format!("Gear centre set to ({:.2}, {:.2}) - press OK to draw it", uv.x, uv.y), 3.0));
+        }
+        return; // no drawing, no selection, no drag while placing
     }
 
     match session.tool {
@@ -15329,7 +15679,7 @@ fn handle_edit_sketch(
         | FeatureKind::Revolve { sketch, plane, regions, .. } => {
             (sketch.clone(), plane.clone(), regions.clone())
         }
-        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::RefMesh { .. } => return,
+        FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::RefMesh { .. } | FeatureKind::Gear { .. } => return,
     };
     // A revolve also remembers its axis (point + direction) — re-select the matching line so the
     // PropertyManager's Axis box is filled and the preview shows when reopening it.
@@ -15480,7 +15830,7 @@ fn handle_exit_sketch(
                     *r = contours;
                     ui_state.regen = true;
                 }
-                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::RefMesh { .. } => {}
+                FeatureKind::Plane(_) | FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::RefImage { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::RefMesh { .. } | FeatureKind::Gear { .. } => {}
             }
             ui_state.selected = Some(i);
         }
@@ -15533,7 +15883,7 @@ fn doc_has_text(doc: &Document) -> bool {
 fn doc_has_fillet(doc: &Document) -> bool {
     doc.features
         .iter()
-        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. }))
+        .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::Gear { .. }))
 }
 
 /// True if any extrude/cut is a **thin feature** (wall thickness > 0). The exact B-rep path
@@ -15696,8 +16046,8 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
             }
             // These reshape the mesh, so a model with one always builds via the mesh path —
             // this exact-kernel path never runs with one present.
-            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } => {
-                failures.push("Fillet/chamfer/mirror/thread/loft/pattern/shell/sweep/mesh-import needs the mesh kernel.".into());
+            FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Loft { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::Gear { .. } => {
+                failures.push("Fillet/chamfer/mirror/thread/loft/pattern/shell/sweep/mesh-import/gear needs the mesh kernel.".into());
             }
             FeatureKind::RefMesh { .. } => {} // reference only — no solid contribution
         }
@@ -15944,6 +16294,71 @@ fn import_mesh_cached(data: &str, scale: f64, rot_deg: [f64; 3], offset: [f64; 3
     Some(m)
 }
 
+/// The outline a gear feature builds from, before it is stacked into a solid. GT2 pulleys have
+/// their own profile; every other type uses the involute one.
+fn gear_outline(teeth: u32, module: f64, pressure_angle: f64, bore: f64, backlash: f64, gear_type: GearType) -> Option<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> {
+    match gear_type {
+        GearType::Gt2Pulley => hworks_geometry::gear::gt2_profile(teeth, bore, 16),
+        _ => hworks_geometry::gear::gear_profile(
+            &hworks_geometry::gear::GearSpec { teeth, module, pressure_angle, bore, backlash },
+            GEAR_FLANK_STEPS,
+        ),
+    }
+}
+
+/// How a gear's cross-section is stacked through its face width.
+///
+/// Spur, GT2: two flat layers — a plain prism. Helical: the profile rotates steadily, by the
+/// angle the helix wraps across the face. Herringbone: the same twist run up and back so the
+/// two halves meet in a V and their axial thrusts cancel. Bevel: no twist, but each layer
+/// shrinks toward the cone apex, and the layers close up axially because the face width is
+/// measured along the cone rather than along the axis.
+fn gear_layers(gear_type: GearType, thickness: f64, helix_deg: f64, cone_deg: f64, pitch_radius: f64) -> Vec<hworks_geometry::Layer> {
+    use hworks_geometry::Layer;
+    let flat = |w0: f64, w1: f64| vec![Layer { w: w0, rot: 0.0, scale: 1.0 }, Layer { w: w1, rot: 0.0, scale: 1.0 }];
+    match gear_type {
+        GearType::Spur | GearType::Gt2Pulley => flat(0.0, thickness),
+        GearType::Helical | GearType::Herringbone => {
+            if pitch_radius <= 1e-9 {
+                return flat(0.0, thickness);
+            }
+            let half = matches!(gear_type, GearType::Herringbone);
+            // Angle swept by a tooth across the face (or across half of it, for the V).
+            let span = if half { thickness * 0.5 } else { thickness };
+            let twist = span * helix_deg.to_radians().tan() / pitch_radius;
+            if twist.abs() < 1e-6 {
+                return flat(0.0, thickness);
+            }
+            // Enough layers that no single step turns more than ~1.5°, so the flank stays
+            // smooth rather than faceted; bounded so a wild helix angle can't explode the mesh.
+            let n = ((twist.abs() / 0.026).ceil() as usize).clamp(2, 200) * if half { 2 } else { 1 };
+            (0..=n)
+                .map(|i| {
+                    let t = i as f64 / n as f64;
+                    // The V: twist up to the midpoint, then back down by the same amount.
+                    let rot = if half { twist * (1.0 - (2.0 * t - 1.0).abs()) } else { twist * t };
+                    Layer { w: thickness * t, rot, scale: 1.0 }
+                })
+                .collect()
+        }
+        GearType::Bevel => {
+            let gamma = cone_deg.to_radians();
+            let (sin_g, cos_g) = (gamma.sin(), gamma.cos());
+            if sin_g <= 1e-6 || pitch_radius <= 1e-9 {
+                return flat(0.0, thickness);
+            }
+            // Cone distance: from the apex out to the back of the teeth.
+            let cone = pitch_radius / sin_g;
+            // Never let the face width run past the apex — that inverts the gear.
+            let face = thickness.min(cone * 0.9);
+            let scale = (cone - face) / cone;
+            // A cone is ruled, so two layers describe it exactly. The axial height is the face
+            // width projected onto the axis, which is why a bevel is shorter than it is wide.
+            vec![Layer { w: 0.0, rot: 0.0, scale: 1.0 }, Layer { w: face * cos_g, rot: 0.0, scale }]
+        }
+    }
+}
+
 /// Rebuild the mesh-kernel body, plus the selectable feature edges emitted by the *last*
 /// bevel (fillet/chamfer) if it's still the final body operation — those tangent/hard edges
 /// are otherwise invisible to angle-based edge extraction, so we plumb them out explicitly.
@@ -15971,6 +16386,37 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                         });
                     }
                     None => warn!("Import {name}: embedded mesh data could not be decoded."),
+                }
+            }
+            // Gear Genie: the profile is generated from the gear's numbers each regen, so
+            // editing the tooth count rebuilds a real gear rather than scaling an old outline.
+            FeatureKind::Gear { teeth, module, pressure_angle, bore, backlash, thickness, gear_type, helix_deg, cone_deg, plane } => {
+                let basis = basis_from_ref(plane);
+                let pitch_r = match gear_type {
+                    GearType::Gt2Pulley => hworks_geometry::gear::gt2::pitch_radius(*teeth),
+                    _ => *module * *teeth as f64 * 0.5,
+                };
+                let layers = gear_layers(*gear_type, *thickness, *helix_deg, *cone_deg, pitch_r);
+                match gear_outline(*teeth, *module, *pressure_angle, *bore, *backlash, *gear_type) {
+                    Some((outer, holes)) => match hworks_geometry::layered_profile_mesh(&outer, &holes, &basis, &layers) {
+                        Some(tool) => {
+                            feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(tool.clone());
+                            body = Some(match body.take() {
+                                Some(b) => mesh_union(&b, &tool),
+                                None => tool,
+                            });
+                        }
+                        None => {
+                            warn!("Gear: the profile could not be stacked into a solid (thickness {thickness}, {} layers).", layers.len());
+                            GEAR_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    },
+                    None => {
+                        // Impossible numbers (too few teeth for the pressure angle, bore bigger
+                        // than the root circle). Silently building nothing would read as a bug.
+                        warn!("Gear: {} {teeth}T m{module} PA{pressure_angle} bore {bore} is not buildable.", gear_type.label());
+                        GEAR_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             FeatureKind::Extrude { sketch, regions, region_pts, plane, distance, back, thin, thin_side } => {
@@ -16394,6 +16840,10 @@ fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
 /// on the path (its own centroid rides the path points).
 /// Sweeps that fell back to a different profile region because the recorded one was gone.
 static SWEEP_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Gears whose numbers don't describe a buildable gear.
+static GEAR_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// How finely each involute flank is sampled.
+pub const GEAR_FLANK_STEPS: usize = 24;
 /// Cuts whose direction could not be determined by probing and had to guess.
 static CUT_DIRECTION_GUESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -16403,6 +16853,10 @@ fn take_sweep_region_fallbacks() -> u32 {
 
 fn take_cut_direction_guesses() -> u32 {
     CUT_DIRECTION_GUESSES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn take_gear_failures() -> u32 {
+    GEAR_FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Which way is material, decided across the whole cut footprint rather than one point.
@@ -16745,7 +17199,13 @@ fn finish_regen_job(
             let loft_holes = hworks_geometry::take_loft_hole_mismatch_count();
             let sweep_regions = take_sweep_region_fallbacks();
             let cut_guesses = take_cut_direction_guesses();
-            ui_state.last_error = if loft_holes > 0 {
+            let gear_fails = take_gear_failures();
+            ui_state.last_error = if gear_fails > 0 {
+                warn!("{gear_fails} gear(s) could not be built from their numbers.");
+                Some(format!(
+                    "\u{26a0} {gear_fails} gear(s) BUILT NOTHING: those numbers don't describe a real gear. Usually the bore is wider than the root circle, or there are too few teeth for the pressure angle \u{2014} raise the tooth count or shrink the bore."
+                ))
+            } else if loft_holes > 0 {
                 warn!("{loft_holes} loft(s) dropped their holes — profiles disagree on hole count.");
                 Some(format!(
                     "⚠ {loft_holes} loft(s) came out SOLID: their profiles have different numbers of holes, so the holes couldn't be paired up and were skipped. Give every profile the same hole count to skin them through."
@@ -18468,6 +18928,109 @@ fn drawing_title_rows(draw: &Drawing) -> Vec<(String, String)> {
         rows.push(("NOTES".into(), t.notes.clone()));
     }
     rows
+}
+
+/// A sensible starting gear: 20 teeth at module 2 is the textbook example, and 20 is exactly
+/// the undercut limit at 20 degrees, so the default never opens already warning.
+fn default_gear_spec(doc: &Document, to_sketch: bool) -> GearGenieSpec {
+    let (plane, plane_name) = match doc.planes().next() {
+        Some((_, p)) => (ActivePlane::from_doc(p), p.name.clone()),
+        None => (
+            ActivePlane::from_ref(&PlaneRef { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: true }),
+            "Front".to_string(),
+        ),
+    };
+    GearGenieSpec {
+        teeth: 20,
+        module: 2.0,
+        pressure_angle: 20.0,
+        bore: 6.0,
+        backlash: 0.0,
+        thickness: 8.0,
+        gear_type: GearType::Spur,
+        // 20 degrees is the usual compromise: quiet enough to be worth it, not so steep that
+        // the axial thrust needs a bearing change. 45 makes a 1:1 mitre pair.
+        helix_deg: 20.0,
+        cone_deg: 45.0,
+        plane,
+        plane_name,
+        to_sketch,
+        centre: [0.0, 0.0],
+        // In a sketch the gear is placed by clicking, so arm that straight away.
+        placing: to_sketch,
+    }
+}
+
+/// Drain a confirmed Gear Genie request. In sketch mode the profile becomes sketch geometry;
+/// otherwise it becomes (or replaces) an editable `Gear` feature.
+fn apply_gear_feature(
+    mut ui_state: ResMut<UiState>,
+    mut doc: ResMut<DocRes>,
+    mut history: ResMut<History>,
+    mut session: ResMut<SketchSession>,
+) {
+    let Some(spec) = ui_state.gear_request.take() else { return };
+    if spec.to_sketch {
+        let Some((outer, holes)) = spec.outline() else {
+            ui_state.toasts.push((
+                "Gear Genie: those numbers do not describe a real gear (bore wider than the root circle, or too few teeth) - nothing was drawn".to_string(),
+                5.0,
+            ));
+            return;
+        };
+        history.snapshot(&doc.0);
+        let (cx, cy) = (spec.centre[0], spec.centre[1]);
+        // The flank shape comes from the gear numbers, not from constraints - leaving the
+        // points free would let the solver drag an involute into something that is not one.
+        let ids: Vec<usize> = outer.iter().map(|q| session.sketch.add_fixed_point(cx + q[0], cy + q[1])).collect();
+        for k in 0..ids.len() {
+            session.sketch.add_line(ids[k], ids[(k + 1) % ids.len()], false);
+        }
+        // The bore goes in as a real circle rather than the polygon the mesh path uses, so it
+        // dimensions and machines as a hole.
+        if spec.bore > 0.0 && !holes.is_empty() {
+            let c = session.sketch.add_fixed_point(cx, cy);
+            session.sketch.add_circle(c, spec.bore * 0.5);
+        }
+        session.dirty = true;
+        ui_state.toasts.push((
+            format!("Gear Genie: drew a {}-tooth {} profile at ({:.2}, {:.2})", spec.teeth, spec.gear_type.label(), cx, cy),
+            3.5,
+        ));
+        return;
+    }
+    history.snapshot(&doc.0);
+    let kind = FeatureKind::Gear {
+        teeth: spec.teeth,
+        module: spec.module,
+        pressure_angle: spec.pressure_angle,
+        bore: spec.bore,
+        backlash: spec.backlash,
+        thickness: spec.thickness,
+        gear_type: spec.gear_type,
+        helix_deg: spec.helix_deg,
+        cone_deg: spec.cone_deg,
+        plane: {
+            let mut pr = plane_ref(&spec.plane);
+            // Shift the plane origin to the requested centre so the gear lands where asked.
+            let o = spec.plane.to_world(Vec2::new(spec.centre[0] as f32, spec.centre[1] as f32));
+            pr.origin = [o.x as f64, o.y as f64, o.z as f64];
+            pr
+        },
+    };
+    if let Some(i) = ui_state.editing_feature.take() {
+        if let Some(f) = doc.0.features.get_mut(i) {
+            f.kind = kind;
+            doc.0.rollback = doc.0.features.len();
+            ui_state.selected = Some(i);
+            ui_state.regen = true;
+            return;
+        }
+    }
+    doc.0.add_feature(kind);
+    doc.0.rollback = doc.0.features.len();
+    ui_state.selected = Some(doc.0.features.len() - 1);
+    ui_state.regen = true;
 }
 
 fn apply_shell_feature(
@@ -21142,6 +21705,41 @@ fn draw_sketch(
         }
     }
 
+    // Gear Genie preview: the outline it would drop, either following the cursor while a
+    // centre is being picked or parked at the centre already chosen. Placing a gear blind and
+    // finding out after OK is the failure this avoids.
+    if let Some(g) = ui_state.gear_spec.as_ref().filter(|g| g.to_sketch) {
+        let centre = if g.placing {
+            session.cursor_uv.map(|uv| [uv.x as f64, uv.y as f64])
+        } else {
+            Some(g.centre)
+        };
+        if let (Some(c), Some((outer, holes))) = (centre, g.outline()) {
+            let col = if g.placing { Color::srgb(0.47, 0.78, 1.0) } else { Color::srgb(0.35, 0.62, 0.90) };
+            let mut ring = |loop_: &[[f64; 2]]| {
+                let n = loop_.len();
+                for k in 0..n {
+                    let a = loop_[k];
+                    let b = loop_[(k + 1) % n];
+                    gizmos.line(
+                        ap.to_world(Vec2::new((c[0] + a[0]) as f32, (c[1] + a[1]) as f32)),
+                        ap.to_world(Vec2::new((c[0] + b[0]) as f32, (c[1] + b[1]) as f32)),
+                        col,
+                    );
+                }
+            };
+            ring(&outer);
+            for h in &holes {
+                ring(h);
+            }
+            // A cross on the centre, so it reads as a placement and not just a floating outline.
+            let m = 1.5 * ms;
+            let cv = Vec2::new(c[0] as f32, c[1] as f32);
+            gizmos.line(ap.to_world(cv - Vec2::X * m), ap.to_world(cv + Vec2::X * m), col);
+            gizmos.line(ap.to_world(cv - Vec2::Y * m), ap.to_world(cv + Vec2::Y * m), col);
+        }
+    }
+
     // Highlight the Dimension tool's first-picked point.
     if let Some(i) = session.dim_first {
         if let Some(p) = session.sketch.points.get(i) {
@@ -23764,6 +24362,137 @@ mod tests {
         );
     }
 
+    /// Reports the contour quality of every region in a .hcad's sketches: shortest segment,
+    /// duplicate points, and any segment pair that crosses. A prism can only be manifold if
+    /// its outline is clean, so this separates "bad profile" from "bad boolean".
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_profile_quality -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_profile_quality() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let text = std::fs::read_to_string(&path).expect("read .hcad");
+        let doc: Document = ron::from_str(&text).expect("parse RON");
+        for (fi, f) in doc.features.iter().enumerate() {
+            let (sketch, regions, region_pts) = match &f.kind {
+                FeatureKind::Extrude { sketch, regions, region_pts, .. } | FeatureKind::Cut { sketch, regions, region_pts, .. } => (sketch, regions, region_pts),
+                _ => continue,
+            };
+            let all = sketch.regions();
+            let merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
+            eprintln!("feature[{fi}]: {} raw regions -> {} merged", all.len(), merged.len());
+            for (ri, r) in merged.iter().enumerate() {
+                let report = |tag: &str, loop_: &Vec<[f64; 2]>| {
+                    let n = loop_.len();
+                    if n < 3 {
+                        eprintln!("    {tag}: only {n} points");
+                        return;
+                    }
+                    let mut shortest = f64::MAX;
+                    let mut dupes = 0;
+                    let mut hist = [0u32; 6]; // <1e-9, <1e-6, <1e-4, <1e-2, <1, rest
+                    for k in 0..n {
+                        let a = loop_[k];
+                        let b = loop_[(k + 1) % n];
+                        let d = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                        shortest = shortest.min(d);
+                        if d < 1e-9 {
+                            dupes += 1;
+                        }
+                        let bucket = [1e-9, 1e-6, 1e-4, 1e-2, 1.0].iter().position(|t| d < *t).unwrap_or(5);
+                        hist[bucket] += 1;
+                    }
+                    // Any non-adjacent segment pair that actually crosses makes the outline
+                    // self-intersecting, which no triangulator can turn into a clean prism.
+                    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+                    let mut crossings = 0;
+                    for i in 0..n {
+                        let (p1, p2) = (loop_[i], loop_[(i + 1) % n]);
+                        for j in (i + 2)..n {
+                            if i == 0 && j == n - 1 {
+                                continue; // shares the wrap-around vertex
+                            }
+                            let (q1, q2) = (loop_[j], loop_[(j + 1) % n]);
+                            let (d1, d2) = (cross(p1, p2, q1), cross(p1, p2, q2));
+                            let (d3, d4) = (cross(q1, q2, p1), cross(q1, q2, p2));
+                            if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+                                crossings += 1;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "    {tag}: {n} pts  shortest={shortest:.3e}  dupes={dupes}  crossings={crossings}  len<[1e-9,1e-6,1e-4,1e-2,1,+]={hist:?}"
+                    );
+                };
+                report(&format!("region{ri} outer"), &r.outer);
+                for (hi, h) in r.holes.iter().enumerate() {
+                    report(&format!("region{ri} hole{hi}"), h);
+                }
+            }
+        }
+    }
+
+    /// Walks a .hcad one feature at a time, reporting after each whether the body is still a
+    /// closed 2-manifold and how many booleans fell back to the lossy BSP path. Names the
+    /// exact feature that tears the surface instead of guessing from the final mesh.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_manifold_walk -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_manifold_walk() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let text = std::fs::read_to_string(&path).expect("read .hcad");
+        let full: Document = ron::from_str(&text).expect("parse RON");
+        for end in 1..=full.features.len() {
+            let mut doc = full.clone();
+            doc.rollback = end;
+            let _ = take_fallback_count();
+            let built = regenerate_mesh(&doc);
+            let fb = take_fallback_count();
+            let kind = format!("{:?}", doc.features[end - 1].kind);
+            let name: String = kind.chars().take_while(|c| c.is_alphanumeric()).collect();
+            match built {
+                Some((m, _)) => {
+                    // Count boundary (1 face) and non-manifold (3+) edges on the welded mesh.
+                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    for q in &m.positions {
+                        for k in 0..3 {
+                            lo[k] = lo[k].min(q[k]);
+                            hi[k] = hi[k].max(q[k]);
+                        }
+                    }
+                    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+                    let cell = (diag * 2.0e-4).max(1e-6);
+                    let sc = 1.0 / cell;
+                    let mut canon: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+                    let mut vid = vec![0usize; m.positions.len()];
+                    for (i, q) in m.positions.iter().enumerate() {
+                        let key = ((q[0] * sc).round() as i64, (q[1] * sc).round() as i64, (q[2] * sc).round() as i64);
+                        let n = canon.len();
+                        vid[i] = *canon.entry(key).or_insert(n);
+                    }
+                    let mut emap: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+                    let mut degen = 0u32;
+                    for t in m.indices.chunks_exact(3) {
+                        let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+                        if a == b || b == c || a == c {
+                            degen += 1;
+                        }
+                        for (i, j) in [(a, b), (b, c), (c, a)] {
+                            *emap.entry(if i < j { (i, j) } else { (j, i) }).or_insert(0) += 1;
+                        }
+                    }
+                    let boundary = emap.values().filter(|v| **v == 1).count();
+                    let nonman = emap.values().filter(|v| **v > 2).count();
+                    eprintln!(
+                        "[{end}] {name:<12} tris={:<7} verts={:<6} boundary={boundary:<6} nonmanifold={nonman:<6} degenerate={degen:<5} bsp_fallbacks={fb}",
+                        m.indices.len() / 3,
+                        canon.len()
+                    );
+                }
+                None => eprintln!("[{end}] {name:<12} NO BODY  bsp_fallbacks={fb}"),
+            }
+        }
+    }
+
     /// Detailed feature-edge diagnostics for a real model — characterises the strays so the edge
     /// detector can be tuned. Run:
     ///   HCAD_FILE="C:\path\to\part.hcad" cargo test -p hworks-app analyze_hcad_edges -- --ignored --nocapture
@@ -24686,6 +25415,322 @@ mod tests {
 
         // A direction with no flat face square to it yields nothing (the panel toasts).
         assert!(outermost_face_toward(&m, Vec3::new(1.0, 1.0, 1.0).normalize()).is_none());
+    }
+
+    /// The anomaly counters (BSP fallbacks, cut-direction guesses, gear failures) are process
+    /// globals, and cargo runs tests concurrently in one process - so a test that clears a
+    /// counter, builds, then reads it can pick up a *different* test's increment. Every test
+    /// that asserts on a counter takes this lock for the whole clear-build-read window.
+    #[cfg(test)]
+    fn counter_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Count welded edges that don't have exactly two faces. A closed solid has none; anything
+    /// else is a torn surface, which is what makes Manifold reject the next boolean.
+    #[cfg(test)]
+    fn surface_tears(m: &TriMesh) -> (usize, usize, usize) {
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for q in &m.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+        let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+        let sc = 1.0 / (diag * 2.0e-4).max(1e-6);
+        let mut canon: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+        let mut vid = vec![0usize; m.positions.len()];
+        for (i, q) in m.positions.iter().enumerate() {
+            let key = ((q[0] * sc).round() as i64, (q[1] * sc).round() as i64, (q[2] * sc).round() as i64);
+            let n = canon.len();
+            vid[i] = *canon.entry(key).or_insert(n);
+        }
+        let mut emap: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+        let mut degen = 0;
+        for t in m.indices.chunks_exact(3) {
+            let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+            if a == b || b == c || a == c {
+                degen += 1;
+            }
+            for (i, j) in [(a, b), (b, c), (c, a)] {
+                *emap.entry(if i < j { (i, j) } else { (j, i) }).or_insert(0) += 1;
+            }
+        }
+        (emap.values().filter(|v| **v == 1).count(), emap.values().filter(|v| **v > 2).count(), degen)
+    }
+
+    /// The geartest.hcad regression, end to end. Generate a gear profile the way the sketch
+    /// button does (fixed points + lines), extrude it, then stack a boss on top - exactly the
+    /// stack the user built. Before the sampler fix the prism alone came out with 84 degenerate
+    /// triangles and 60 non-manifold edges, Manifold refused the union, and the lossy BSP
+    /// fallback left 3248 non-manifold edges for the edge detector to trip over.
+    #[test]
+    fn a_generated_gear_takes_a_boss_without_tearing() {
+        let _guard = counter_lock();
+        let g = hworks_geometry::gear::GearSpec::default();
+        let (outer, _) = hworks_geometry::gear::gear_profile(&g, GEAR_FLANK_STEPS).expect("profile");
+
+        // Exactly what apply_gear_feature writes into the sketch.
+        let mut sk = hworks_sketch::Sketch::default();
+        let ids: Vec<usize> = outer.iter().map(|q| sk.add_fixed_point(q[0], q[1])).collect();
+        for k in 0..ids.len() {
+            sk.add_line(ids[k], ids[(k + 1) % ids.len()], false);
+        }
+
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 8.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let _ = take_fallback_count();
+        let (gear_mesh, _) = regenerate_mesh(&doc).expect("the gear prism built nothing");
+        let (b, nm, d) = surface_tears(&gear_mesh);
+        assert_eq!((b, nm, d), (0, 0, 0), "the gear prism itself is torn: boundary={b} nonmanifold={nm} degenerate={d}");
+
+        // Now the boss on top - a plain 12 mm disc, like the one in geartest.hcad.
+        let mut boss = hworks_sketch::Sketch::default();
+        let c = boss.add_point(0.0, 0.0);
+        boss.add_circle(c, 6.0);
+        let top = PlaneRef { origin: [0.0, 0.0, 8.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Extrude { sketch: boss, regions: vec![], region_pts: vec![], plane: top, distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let _ = take_fallback_count();
+        let (stacked, _) = regenerate_mesh(&doc).expect("the boss built nothing");
+        let fallbacks = take_fallback_count();
+        assert_eq!(fallbacks, 0, "the boss union fell back to the lossy BSP path {fallbacks} time(s)");
+        let (b, nm, d) = surface_tears(&stacked);
+        assert_eq!((b, nm, d), (0, 0, 0), "the stacked body is torn: boundary={b} nonmanifold={nm} degenerate={d}");
+    }
+
+    /// A gear of any type, on the Front plane, with the standard defaults.
+    #[cfg(test)]
+    fn gear_doc(gear_type: GearType, teeth: u32, thickness: f64) -> Document {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Gear {
+            teeth,
+            module: 2.0,
+            pressure_angle: 20.0,
+            bore: 6.0,
+            backlash: 0.0,
+            thickness,
+            gear_type,
+            helix_deg: 20.0,
+            cone_deg: 45.0,
+            plane: xy(),
+        });
+        doc.rollback = doc.features.len();
+        doc
+    }
+
+    /// Every gear type must build a closed, untorn solid. A type that comes out non-manifold
+    /// poisons every boolean after it - that is exactly what geartest.hcad showed.
+    #[test]
+    fn every_gear_type_builds_a_closed_solid() {
+        let _guard = counter_lock();
+        for gear_type in GearType::ALL {
+            let _ = take_gear_failures();
+            let doc = gear_doc(gear_type, 20, 8.0);
+            let (m, _) = regenerate_mesh(&doc).unwrap_or_else(|| panic!("{} built nothing", gear_type.label()));
+            assert_eq!(take_gear_failures(), 0, "{} reported a failure", gear_type.label());
+            let (b, nm, d) = surface_tears(&m);
+            assert_eq!((b, nm, d), (0, 0, 0), "{} is torn: boundary={b} nonmanifold={nm} degenerate={d}", gear_type.label());
+            assert!(hworks_geometry::signed_mesh_volume(&m) > 0.0, "{} came out inside-out", gear_type.label());
+        }
+    }
+
+    /// Helical teeth must actually wind, herringbone must come back, and neither may change how
+    /// big the gear is. Without this a "helical" gear that quietly built a spur would look fine.
+    #[test]
+    fn helical_twists_and_herringbone_comes_back() {
+        // Angle of the tooth pattern at a given height, measured by the extreme point's bearing.
+        let bearing_at = |m: &TriMesh, z: f32| -> Option<f32> {
+            let mut best: Option<(f32, f32)> = None;
+            for q in &m.positions {
+                if (q[2] - z).abs() > 0.35 {
+                    continue;
+                }
+                let r = q[0].hypot(q[1]);
+                if best.is_none_or(|(br, _)| r > br) {
+                    best = Some((r, q[1].atan2(q[0])));
+                }
+            }
+            best.map(|(_, a)| a)
+        };
+        let spur = regenerate_mesh(&gear_doc(GearType::Spur, 20, 10.0)).expect("spur").0;
+        let helical = regenerate_mesh(&gear_doc(GearType::Helical, 20, 10.0)).expect("helical").0;
+        let herring = regenerate_mesh(&gear_doc(GearType::Herringbone, 20, 10.0)).expect("herringbone").0;
+
+        // Predicted wrap: face width x tan(helix) / pitch radius.
+        let want = 10.0_f64 * 20.0_f64.to_radians().tan() / 20.0;
+        let (h0, h1) = (bearing_at(&helical, 0.05).unwrap(), bearing_at(&helical, 9.95).unwrap());
+        let got = (h1 - h0).rem_euclid(std::f32::consts::TAU / 20.0) as f64;
+        assert!((got - want).abs() < 0.02, "helical wrapped {got:.4} rad, expected {want:.4}");
+
+        // Herringbone: the two faces line up again, with the apex turned away in between.
+        let (v0, vm, v1) = (
+            bearing_at(&herring, 0.05).unwrap(),
+            bearing_at(&herring, 5.0).unwrap(),
+            bearing_at(&herring, 9.95).unwrap(),
+        );
+        let step = std::f32::consts::TAU / 20.0;
+        let wrap = |a: f32| ((a % step) + step) % step;
+        assert!((wrap(v1) - wrap(v0)).abs() < 0.02, "herringbone faces disagree: {v0:.4} vs {v1:.4}");
+        assert!((wrap(vm) - wrap(v0)).abs() > 0.05, "herringbone never turned - it built a spur");
+
+        // Twisting must not resize the gear: same outside diameter, same face width.
+        for (name, m) in [("helical", &helical), ("herringbone", &herring)] {
+            let (slo, shi) = mesh_bbox(&spur);
+            let (lo, hi) = mesh_bbox(m);
+            assert!((hi.x - lo.x - (shi.x - slo.x)).abs() < 0.05, "{name} changed the outside diameter");
+            assert!((hi.z - lo.z - (shi.z - slo.z)).abs() < 1e-3, "{name} changed the face width");
+        }
+    }
+
+    /// A bevel must taper, and its axial height must be the face width projected onto the axis -
+    /// not the face width itself. Reporting the typed number as the height would mislead anyone
+    /// laying out a gearbox.
+    #[test]
+    fn a_bevel_tapers_and_is_shorter_than_its_face_width() {
+        let (face, cone_deg) = (8.0_f64, 45.0_f64);
+        let m = regenerate_mesh(&gear_doc(GearType::Bevel, 20, face)).expect("bevel").0;
+        let (lo, hi) = mesh_bbox(&m);
+        let want_h = face * cone_deg.to_radians().cos();
+        assert!((hi.z - lo.z - want_h as f32).abs() < 1e-3, "axial height {} , expected {want_h}", hi.z - lo.z);
+
+        // Widest at the back, narrower at the front: that is the taper.
+        let span_at = |z: f32| {
+            let (mut a, mut b) = (f32::MAX, f32::MIN);
+            for q in &m.positions {
+                if (q[2] - z).abs() < 0.15 {
+                    a = a.min(q[0]);
+                    b = b.max(q[0]);
+                }
+            }
+            b - a
+        };
+        let (back, front) = (span_at(0.05), span_at(want_h as f32 - 0.05));
+        let cone = 20.0 / cone_deg.to_radians().sin();
+        let want_ratio = (cone - face) / cone;
+        assert!(front < back, "the bevel did not taper: {front} at the front vs {back} at the back");
+        assert!(
+            ((front / back) as f64 - want_ratio).abs() < 0.02,
+            "taper ratio {:.4}, expected {want_ratio:.4}",
+            front / back
+        );
+    }
+
+    /// Dump every gear type's triangles so they can be rendered and LOOKED at - measurements
+    /// confirm sizes, not that the thing looks like a gear.
+    ///   cargo test -p hworks-app dump_gear_shapes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_gear_shapes() {
+        let dir = std::env::var("HCAD_OUT").unwrap_or_else(|_| ".".to_string());
+        for gear_type in GearType::ALL {
+            let doc = gear_doc(gear_type, 20, 10.0);
+            let Some((m, _)) = regenerate_mesh(&doc) else { continue };
+            let mut out = String::new();
+            for t in m.indices.chunks_exact(3) {
+                for i in t {
+                    let q = m.positions[*i as usize];
+                    out.push_str(&format!("{} {} {}\n", q[0], q[1], q[2]));
+                }
+            }
+            let path = format!("{dir}/gear_{}.xyz", gear_type.label().replace(' ', "_"));
+            std::fs::write(&path, out).expect("write");
+            eprintln!("wrote {path}  ({} tris)", m.indices.len() / 3);
+        }
+    }
+
+    /// GT2 is a published standard - a pulley off by a fraction of a millimetre skips belt
+    /// teeth. These are the Gates numbers, checked against the built solid rather than the
+    /// formula. Measured by radius, not by bounding box: whether a groove or a land sits on
+    /// the x-axis depends on the tooth count, so a bbox reads narrow for half of them.
+    #[test]
+    fn a_gt2_pulley_matches_the_belt_standard() {
+        for teeth in [16_u32, 20, 36] {
+            let m = regenerate_mesh(&gear_doc(GearType::Gt2Pulley, teeth, 6.0)).unwrap_or_else(|| panic!("{teeth}T pulley")).0;
+            // Pitch diameter = teeth x 2 mm / pi; the pulley OD is one PLD inside it per side.
+            let pitch_d = teeth as f64 * 2.0 / std::f64::consts::PI;
+            let want_od = pitch_d - 2.0 * 0.254;
+            let want_root = want_od * 0.5 - 0.764;
+            // Only the rim, not the bore: everything outside the midpoint between the two.
+            let cutoff = (3.0 + want_root) * 0.5; // bore is 6 mm across in gear_doc
+            let rim: Vec<f64> = m
+                .positions
+                .iter()
+                .map(|q| q[0].hypot(q[1]) as f64)
+                .filter(|r| *r > cutoff)
+                .collect();
+            let max_r = rim.iter().cloned().fold(f64::MIN, f64::max);
+            let min_r = rim.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                (2.0 * max_r - want_od).abs() < 1e-3,
+                "{teeth}T outside diameter {:.4}, expected {want_od:.4}",
+                2.0 * max_r
+            );
+            assert!(
+                (min_r - want_root).abs() < 0.01,
+                "{teeth}T grooves bottom at r={min_r:.4}, expected {want_root:.4} - wrong tooth depth"
+            );
+            // The grooves have to be grooves: some real amount of material between OD and root.
+            assert!(
+                (max_r - min_r - 0.764).abs() < 0.01,
+                "{teeth}T tooth depth {:.4}, expected 0.7640",
+                max_r - min_r
+            );
+        }
+    }
+
+    /// A gear feature has to come out the size its numbers say, and with a real bore. This is
+    /// the whole promise of Gear Genie: type the standard numbers, get the standard gear.
+    #[test]
+    fn a_gear_feature_builds_to_its_nominal_size() {
+        let _guard = counter_lock();
+        let (teeth, module, bore) = (20_u32, 2.0_f64, 6.0_f64);
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Gear { teeth, module, pressure_angle: 20.0, bore, backlash: 0.0, thickness: 8.0, gear_type: GearType::Spur, helix_deg: 0.0, cone_deg: 0.0, plane: xy() });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("the gear built nothing");
+        assert_eq!(take_gear_failures(), 0, "a textbook 20T module-2 gear reported a failure");
+
+        let (lo, hi) = mesh_bbox(&mesh);
+        let k = hworks_geometry::gear::GearSpec { teeth, module, pressure_angle: 20.0, bore, backlash: 0.0 };
+        let tip_d = 2.0 * k.tip_radius() as f32;
+        // The outline is sampled, so the extreme point can sit a hair inside the true tip
+        // circle; a tenth of a percent is far tighter than any real gear tolerance.
+        for (span, axis) in [(hi.x - lo.x, "x"), (hi.y - lo.y, "y")] {
+            assert!((span - tip_d).abs() < tip_d * 1e-3, "outside diameter on {axis} was {span}, expected {tip_d}");
+        }
+        assert!((hi.z - lo.z - 8.0).abs() < 1e-3, "face width was {}", hi.z - lo.z);
+        // The bore has to be a genuine hole: the axis must be outside the solid.
+        let mid = Vec3::new(0.0, 0.0, 4.0);
+        assert!(!point_inside_mesh(&mesh, mid), "the bore did not go through - the centre is still solid");
+        assert!(point_inside_mesh(&mesh, Vec3::new((k.pitch_radius() * 0.5) as f32 + 2.0, 0.0, 4.0)) || point_inside_mesh(&mesh, Vec3::new(k.root_radius() as f32 * 0.9, 0.0, 4.0)), "the web between bore and teeth is missing");
+    }
+
+    /// Impossible numbers must SAY they built nothing. A gear that silently vanishes reads as
+    /// the user's mistake, which is the failure mode this app keeps having to stamp out.
+    #[test]
+    fn an_impossible_gear_reports_instead_of_vanishing() {
+        let _guard = counter_lock();
+        let _ = take_gear_failures(); // clear anything a previous test left
+        let mut doc = Document::with_default_planes();
+        // A 40 mm bore through a gear whose root circle is ~17 mm across: nothing left to cut.
+        doc.add_feature(FeatureKind::Gear { teeth: 10, module: 2.0, pressure_angle: 20.0, bore: 40.0, backlash: 0.0, thickness: 5.0, gear_type: GearType::Spur, helix_deg: 0.0, cone_deg: 0.0, plane: xy() });
+        doc.rollback = doc.features.len();
+        let built = regenerate_mesh(&doc);
+        assert_eq!(take_gear_failures(), 1, "an unbuildable gear passed without a word");
+        assert!(built.is_none(), "an unbuildable gear still produced a body");
+    }
+
+    /// Gears must force the mesh path: the exact kernel has no gear builder, and letting a
+    /// document take the exact route would produce an empty part with a cryptic message.
+    #[test]
+    fn a_gear_forces_the_mesh_path() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Gear { teeth: 20, module: 2.0, pressure_angle: 20.0, bore: 6.0, backlash: 0.0, thickness: 8.0, gear_type: GearType::Spur, helix_deg: 0.0, cone_deg: 0.0, plane: xy() });
+        assert!(doc_has_fillet(&doc), "a gear did not force the mesh kernel");
     }
 
     #[test]
@@ -25762,6 +26807,7 @@ mod tests {
     /// perfectly ordinary cut must NOT, or the warning becomes noise.
     #[test]
     fn an_ordinary_cut_never_reports_guessing() {
+        let _guard = counter_lock();
         let _ = take_cut_direction_guesses();
 
         // A plate with a tall boss elsewhere — the case that used to flip via the centroid.
