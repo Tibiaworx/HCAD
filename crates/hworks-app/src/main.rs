@@ -21120,6 +21120,24 @@ fn draw_selected_feature(
     }
 }
 
+/// Size a radius dimension's arrowhead or shoulder.
+///
+/// Three pulls: a proportion of the radius (so it looks right), a screen-relative minimum (so
+/// it stays visible zoomed out), and the radius itself as a ceiling (so the mark never dwarfs
+/// the circle it annotates). When the minimum and the ceiling fight — a small circle viewed
+/// from a long way off — the minimum wins: an invisible dimension is worse than an oversized
+/// one, and that is the direction the zoomed-out complaints came from.
+///
+/// Written as max/min rather than `clamp` on purpose. `clamp` PANICS when min > max, and that
+/// is exactly what took the app down: a 3.25 mm radius with the screen minimum grown to
+/// 3.3494 while zoomed far out.
+fn dim_mark_size(radius: f32, frac: f32, min_on_screen: f32, floor: f32) -> f32 {
+    let min_on_screen = if min_on_screen.is_finite() { min_on_screen.max(0.0) } else { 0.0 };
+    let radius = if radius.is_finite() { radius.max(0.0) } else { 0.0 };
+    let ceiling = radius.max(floor).max(min_on_screen);
+    (radius * frac).max(min_on_screen).min(ceiling)
+}
+
 fn draw_sketch(
     mut gizmos: Gizmos,
     mut overlay: Gizmos<OverlayGizmos>,
@@ -21633,7 +21651,7 @@ fn draw_sketch(
                         dir = Vec2::new(0.707, 0.707);
                     }
                     let rim = cu + dir * r;
-                    let arrow = (r * 0.16).clamp(ms * 0.06, r.max(0.2));
+                    let arrow = dim_mark_size(r, 0.16, ms * 0.06, 0.2);
                     // The measured line: across the full circle for a diameter, centre-out
                     // for a radius. It runs on to the text wherever that was dragged.
                     let start = if *diameter { cu - dir * r } else { cu };
@@ -21642,7 +21660,7 @@ fn draw_sketch(
                     // Shoulder: a short horizontal landing the text sits on, like the linear
                     // dimension line under its own text.
                     let side = if tip.x >= cu.x { 1.0 } else { -1.0 };
-                    let shoulder = (r * 0.45).clamp(ms * 0.15, r.max(0.3));
+                    let shoulder = dim_mark_size(r, 0.45, ms * 0.15, 0.3);
                     gizmos.line(ap.to_world(tip), ap.to_world(tip + Vec2::new(side * shoulder, 0.0)), dim_col);
                     // Arrowheads biting the rim, pointing in along the line. A diameter gets
                     // one at each end; a radius only at the rim it measures.
@@ -25617,6 +25635,36 @@ mod tests {
             "taper ratio {:.4}, expected {want_ratio:.4}",
             front / back
         );
+    }
+
+    /// The crash in run.log: a radius dimension on a 3.25 mm circle, zoomed far enough out that
+    /// the screen-relative minimum arrowhead grew past the radius. `clamp(3.3494, 3.25)` panics,
+    /// and a Rust panic unwinds cleanly - so the window just vanished with no Windows error and
+    /// no dialog. Sizing must survive every combination it can be handed.
+    #[test]
+    fn a_radius_dimension_never_inverts_its_own_bounds() {
+        // The exact numbers off the panic line, both candidate call sites.
+        assert!(dim_mark_size(3.25, 0.16, 3.3494217, 0.2).is_finite());
+        assert!(dim_mark_size(3.25, 0.45, 3.3494217, 0.3).is_finite());
+
+        // A wide sweep: tiny to huge circles, at every zoom the camera allows. `ms` runs
+        // 0.03..400 (its own clamp), and the two call sites scale it by 0.06 and 0.15.
+        for r in [0.0_f32, 1e-6, 0.05, 0.2, 1.0, 3.25, 50.0, 5_000.0] {
+            for ms in [0.03_f32, 1.0, 12.0, 22.33, 55.82, 400.0] {
+                for (frac, k, floor) in [(0.16_f32, 0.06_f32, 0.2_f32), (0.45, 0.15, 0.3)] {
+                    let v = dim_mark_size(r, frac, ms * k, floor);
+                    assert!(v.is_finite() && v >= 0.0, "r={r} ms={ms}: got {v}");
+                    // Still at least as big as the screen minimum - that is the whole point of
+                    // having one, and silently dropping below it would undo the zoomed-out fix.
+                    assert!(v >= ms * k - 1e-6, "r={r} ms={ms}: {v} fell under the screen minimum {}", ms * k);
+                }
+            }
+        }
+
+        // Junk in must not propagate: a NaN radius from a malformed dimension is not a crash.
+        assert!(dim_mark_size(f32::NAN, 0.16, 1.0, 0.2).is_finite());
+        assert!(dim_mark_size(1.0, 0.16, f32::NAN, 0.2).is_finite());
+        assert!(dim_mark_size(f32::INFINITY, 0.45, f32::INFINITY, 0.3).is_finite());
     }
 
     /// Dump every gear type's triangles so they can be rendered and LOOKED at - measurements
