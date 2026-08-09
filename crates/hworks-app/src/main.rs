@@ -3032,6 +3032,14 @@ struct SketchSession {
     dim_edit: Option<usize>,
     dim_buf: f64,
     dim_edit_focus: bool,
+    /// Bumped every time the Modify box is opened, and mixed into its widget id.
+    ///
+    /// egui keeps a DragValue's half-typed TEXT keyed by widget id, and that text wins over the
+    /// value we pass in. Keying the box on the constraint index alone was not enough: indices
+    /// are reused as constraints come and go, so a new dimension landing on an old index
+    /// inherited whatever had last been typed there and showed that instead of the measurement.
+    /// A fresh id each opening has no stored text, so the box always opens on the real value.
+    dim_edit_epoch: u64,
     /// If the open Modify box dimensions a single line (entity index), clicking a
     /// second line converts it into an angle dimension between the two lines.
     dim_line: Option<usize>,
@@ -3572,7 +3580,60 @@ fn open_cli_file(
         }
         return;
     }
+    // Double-clicked assembly. The installer registers .hasm and hands us the path, but this
+    // only ever handled parts and drawings — so a double-clicked assembly opened an empty part
+    // with no message at all. Loads exactly like File > Open, refreshing each component from its
+    // source file where that file is still present.
+    if ext == "hasm" {
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| ron::from_str::<Assembly>(&t).map_err(|e| e.to_string())) {
+            Ok(mut loaded) => {
+                let dir = path.parent().map(|d| d.to_path_buf());
+                for c in &mut loaded.components {
+                    if c.source.is_empty() {
+                        continue;
+                    }
+                    let sp = std::path::PathBuf::from(&c.source);
+                    let full = if sp.is_absolute() { sp } else { dir.clone().map(|d| d.join(&sp)).unwrap_or(sp) };
+                    match std::fs::read_to_string(&full) {
+                        Ok(t) => {
+                            if let Ok(d) = ron::from_str::<Document>(&t) {
+                                c.cached = d;
+                            }
+                        }
+                        // Say so rather than silently showing a stale part.
+                        Err(_) => ui_state.toasts.push((format!("{}: source missing — using the embedded copy", c.name), 4.0)),
+                    }
+                }
+                *mode = DocMode::Assembly;
+                asm.0 = loaded;
+                asm_render.cache.clear();
+                asm_render.sec_cache.clear();
+                asm_render.dirty = true;
+                // Park an empty part document behind the assembly, as the Open path does.
+                doc.0 = Document::with_default_planes();
+                for f in &mut doc.0.features {
+                    f.hidden = true;
+                }
+                ui_state.current_file = Some(path.clone());
+                ui_state.regen = true;
+                ui_state.home_view_request = Some(HOME_VIEW_WAIT);
+                info!("Opened assembly {} (command line)", path.display());
+            }
+            Err(e) => {
+                warn!("Could not parse {}: {e}", path.display());
+                ui_state.last_error = Some(format!("Couldn't open {} — it isn't a valid HCAD assembly.", path.display()));
+            }
+        }
+        return;
+    }
     if ext != "hcad" && ext != "ron" {
+        // Registered for .hcad/.hasm/.hdrw, but a stray argument (or a renamed file) would
+        // otherwise open a blank part and look like a crash-on-open.
+        warn!("Ignoring {} — not an HCAD document.", path.display());
+        ui_state.last_error = Some(format!(
+            "Couldn't open {} — HCAD opens .hcad parts, .hasm assemblies and .hdrw drawings.",
+            path.display()
+        ));
         return;
     }
     match std::fs::read_to_string(&path) {
@@ -9270,7 +9331,7 @@ fn ui_system(
             // constraint. With a constant id egui reused the previous dimension's typed
             // buffer, so clicking a new sketch item showed the LAST item's value instead
             // of the current one until you re-clicked the field.
-            egui::Area::new(egui::Id::new(("dim_modify", ci)))
+            egui::Area::new(egui::Id::new(("dim_modify", ci, session.dim_edit_epoch)))
                 .fixed_pos(pos)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
@@ -12064,6 +12125,7 @@ fn sketch_interaction(
                 };
                 if let Some(ci2) = new_ci {
                     session.dim_edit = Some(ci2);
+                    session.dim_edit_epoch = session.dim_edit_epoch.wrapping_add(1);
                     session.dim_line = None;
                     session.dim_slot = None;
                     session.dim_buf = match session.sketch.constraints.get(ci2) {
@@ -13543,6 +13605,7 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
     };
     session.dim_edit = Some(ci);
     session.dim_buf = buf;
+    session.dim_edit_epoch = session.dim_edit_epoch.wrapping_add(1);
     session.dim_edit_focus = true;
     session.dim_line = line;
 }
@@ -25457,6 +25520,58 @@ mod tests {
             .zip(s.sketch.points.iter())
             .map(|(b, a)| b.distance(Vec2::new(a.x as f32, a.y as f32)))
             .fold(0.0_f32, f32::max)
+    }
+
+    /// The Modify box must open on what the geometry actually measures, never on the last
+    /// number typed. egui keeps a DragValue's half-typed TEXT keyed by widget id and that text
+    /// wins over the value passed in — and constraint indices get reused as constraints come
+    /// and go, so a new dimension landing on an old index inherited whatever had been typed
+    /// there. A fresh id each opening has no stored text.
+    #[test]
+    fn the_modify_box_opens_on_the_current_measurement() {
+        let mut s = SketchSession::default();
+        s.snap_dist = SNAP;
+        // Two lines of deliberately different lengths.
+        let a0 = s.sketch.add_point(0.0, 0.0);
+        let a1 = s.sketch.add_point(7.0, 0.0);
+        let b0 = s.sketch.add_point(0.0, 5.0);
+        let b1 = s.sketch.add_point(23.5, 5.0);
+        s.sketch.add_line(a0, a1, false);
+        s.sketch.add_line(b0, b1, false);
+
+        // A new dimension carries the measured length...
+        let ci = add_distance_dim(&mut s.sketch, a0, a1).expect("no dimension");
+        match s.sketch.constraints.get(ci) {
+            Some(Constraint::Distance { value, .. }) => assert!((value - 7.0).abs() < 1e-9, "measured {value}, expected 7"),
+            other => panic!("not a distance dimension: {other:?}"),
+        }
+        open_dim_edit(&mut s, ci, None);
+        assert!((s.dim_buf - 7.0).abs() < 1e-9, "the box opened on {}, not the 7 mm it measures", s.dim_buf);
+        let first_epoch = s.dim_edit_epoch;
+
+        // ...and typing a value into it must not follow you to the next dimension.
+        s.dim_buf = 999.0;
+        let ci2 = add_distance_dim(&mut s.sketch, b0, b1).expect("no second dimension");
+        open_dim_edit(&mut s, ci2, None);
+        assert!((s.dim_buf - 23.5).abs() < 1e-9, "the box opened on {}, not the 23.5 mm it measures", s.dim_buf);
+        assert_ne!(s.dim_edit_epoch, first_epoch, "the widget id did not change, so egui would reuse the old typed text");
+
+        // Reopening the FIRST dimension shows its own value again, on a fresh id.
+        let second_epoch = s.dim_edit_epoch;
+        open_dim_edit(&mut s, ci, None);
+        assert!((s.dim_buf - 7.0).abs() < 1e-9, "reopening the first dimension showed {}", s.dim_buf);
+        assert_ne!(s.dim_edit_epoch, second_epoch, "reopening reused the previous widget id");
+
+        // A diameter dimension reports the diameter, not the radius, since that is what the box
+        // shows and what the user types into it.
+        let c = s.sketch.add_point(50.0, 0.0);
+        s.sketch.add_circle(c, 4.0);
+        let cr = add_radius_dim(&mut s.sketch, c, 4.0).expect("no radius dimension");
+        if let Some(Constraint::Radius { diameter, .. }) = s.sketch.constraints.get_mut(cr) {
+            *diameter = true;
+        }
+        open_dim_edit(&mut s, cr, None);
+        assert!((s.dim_buf - 8.0).abs() < 1e-9, "a diameter dimension opened on {}, expected 8", s.dim_buf);
     }
 
     /// A polygon's second click sets its size AND its rotation, so without an angular latch a
