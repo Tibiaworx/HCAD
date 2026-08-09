@@ -2012,7 +2012,28 @@ enum TreeAction {
     ExtrudeCut(usize),
     Delete(usize),
     EditImage(usize),
+    /// Swing the view square-on to this feature's plane, SolidWorks "Normal To".
+    NormalTo(usize),
 }
+
+/// Is a projected point inside the 3D viewport, rather than behind a panel?
+///
+/// Anything drawn from a world position — plane names, dimension values, inference badges —
+/// goes on egui's foreground layer, which sits ABOVE the toolbar and the feature tree. A label
+/// whose geometry is off the top of the view would otherwise be painted straight over the
+/// toolbar, which is what "Front" was doing. `ctx.available_rect()` is the region the panels
+/// have left, i.e. exactly the 3D view.
+fn in_viewport(rect: egui::Rect, p: egui::Pos2) -> bool {
+    rect.contains(p)
+}
+
+/// How long to wait for a freshly opened document's geometry before framing whatever is there.
+/// Generous enough for a heavy part's background rebuild, short enough that a sketch-only file
+/// (which never produces a body) does not leave the camera moving at a surprising moment.
+const HOME_VIEW_WAIT: f32 = 4.0;
+
+/// The standard isometric pose: the yaw/pitch the Iso button and the view cube both use.
+const ISO_VIEW: (f32, f32) = (0.8, -0.55);
 
 /// A camera action chosen from the right-click context menu.
 #[derive(Clone, Copy)]
@@ -2114,6 +2135,18 @@ struct PlaneSpec {
 #[derive(Resource, Default)]
 struct UiState {
     pending: Option<PendingOp>,
+    /// Seconds left to wait for a freshly opened document's geometry before framing it.
+    ///
+    /// `Some` from the moment a file is read until the body exists (then it fits and turns
+    /// isometric) or the wait runs out. A countdown rather than a plain flag because `regen`
+    /// is NOT the right signal: it is cleared when the rebuild *starts*, and the mesh path
+    /// then finishes on a background thread — so waiting on it framed an empty part, which is
+    /// what left an opened file looking zoomed in.
+    home_view_request: Option<f32>,
+    /// Set when an extrude has just been started from a sketch: the view swings to iso so
+    /// the depth arrow and the preview are visible, instead of staying edge-on to the
+    /// sketch plane where an extrusion is a line.
+    iso_view_request: bool,
     /// egui style applied once.
     themed: bool,
     /// "New Part" was clicked; consumed by `handle_new_part`.
@@ -3548,6 +3581,7 @@ fn open_cli_file(
                 doc.0 = loaded;
                 ui_state.current_file = Some(path.clone());
                 ui_state.regen = true;
+                ui_state.home_view_request = Some(HOME_VIEW_WAIT);
                 info!("Opened {} (command line)", path.display());
             }
             Err(e) => {
@@ -3568,6 +3602,50 @@ fn camera_transform(cam: &OrbitCamera) -> Transform {
     Transform { translation, rotation, ..default() }
 }
 
+/// The camera radius that actually FITS a bounding box of the given diagonal.
+///
+/// Both projections show a vertical extent of `2 * radius * tan(VFOV/2)` — the orthographic one
+/// sets its viewport height to exactly that, so the same number serves both. Spun to an
+/// arbitrary angle a box can present up to its full diagonal, so that is what has to fit.
+///
+/// The old numbers were guesses (`diagonal * 0.9`, and `* 0.75` for assemblies) which put the
+/// visible height at about three quarters of the diagonal — the part overflowed the view by
+/// half again, which is why an opened file looked zoomed in.
+fn frame_radius(diagonal: f32) -> f32 {
+    const VFOV: f32 = std::f32::consts::PI / 4.0; // matches update_projection
+    const MARGIN: f32 = 1.18; // a little air around the part, and room for the overlaid panels
+    ((diagonal * 0.5) * MARGIN / (VFOV * 0.5).tan()).max(4.0)
+}
+
+/// Focus point + camera radius that frame everything on screen, in either mode.
+///
+/// The assembly branch has to walk the placed components: `fit_view` only knows about the part
+/// body, which in assembly mode is the empty parked document.
+fn fit_scene(part: &Part, asm: &Assembly, render: &AsmRender, in_asm: bool) -> (Vec3, f32) {
+    if !in_asm {
+        return fit_view(part);
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+    for comp in &asm.components {
+        if comp.hidden {
+            continue;
+        }
+        if let Some(geom) = render.cache.get(&asm_geom_key(comp)) {
+            let tf = comp_transform(comp);
+            for q in &geom.tri.positions {
+                let w = tf.transform_point(Vec3::from_array(*q));
+                lo = lo.min(w);
+                hi = hi.max(w);
+            }
+        }
+    }
+    if lo.x.is_finite() {
+        ((lo + hi) * 0.5, frame_radius((hi - lo).length()))
+    } else {
+        (Vec3::ZERO, 30.0)
+    }
+}
+
 /// Focus point + camera radius that frame the current body — or the reference
 /// planes when there's no body yet. Used by Zoom-to-Fit so it works at any scale.
 fn fit_view(part: &Part) -> (Vec3, f32) {
@@ -3580,8 +3658,7 @@ fn fit_view(part: &Part) -> (Vec3, f32) {
                 hi = hi.max(v);
             }
             let center = (lo + hi) * 0.5;
-            let radius = ((hi - lo).length() * 0.9).max(4.0);
-            return (center, radius);
+            return (center, frame_radius((hi - lo).length()));
         }
     }
     (Vec3::ZERO, 14.0)
@@ -3590,11 +3667,69 @@ fn fit_view(part: &Part) -> (Vec3, f32) {
 /// Aim the orbit camera straight down a plane/face normal (a "Normal To" view),
 /// keeping the current radius. Setting yaw/pitch (not the transform directly)
 /// means the user can keep orbiting smoothly afterwards.
+/// The plane a feature was built on, as (origin, normal) — what "Normal To" needs.
+///
+/// Anything that carries a `PlaneRef` qualifies, which is every sketch-based feature plus a
+/// gear. Fillets, shells and the rest have no plane of their own, so they get no menu entry
+/// rather than a dead one.
+fn feature_plane(kind: &FeatureKind) -> Option<(Vec3, Vec3)> {
+    let pr = match kind {
+        FeatureKind::Sketch { plane, .. }
+        | FeatureKind::Extrude { plane, .. }
+        | FeatureKind::Cut { plane, .. }
+        | FeatureKind::Revolve { plane, .. }
+        | FeatureKind::Gear { plane, .. } => plane.clone(),
+        FeatureKind::Plane(p) => {
+            let ap = ActivePlane::from_doc(p);
+            return Some((ap.origin, ap.n));
+        }
+        _ => return None,
+    };
+    let ap = ActivePlane::from_ref(&pr);
+    Some((ap.origin, ap.n))
+}
+
+/// Which face of a plane the camera is already on.
+///
+/// "Normal To" should turn to the near side. Taking the stored normal blindly swings the view
+/// through the model to look at the back of the sketch about half the time, which reads as the
+/// command going the wrong way.
+fn facing_normal(cam: &OrbitCamera, n: Vec3) -> Vec3 {
+    let view = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0) * Vec3::Z;
+    if view.dot(n) < 0.0 {
+        -n
+    } else {
+        n
+    }
+}
+
 fn look_along(cam: &mut OrbitCamera, focus: Vec3, normal: Vec3) {
+    look_along_aligned(cam, focus, normal, None)
+}
+
+/// Point the camera down `normal`, optionally choosing which world direction ends up along
+/// screen-right.
+///
+/// The pitch is set EXACTLY square-on. It used to be clamped to ±1.54 rad, a whisker short of
+/// the ±1.5708 that is straight down an axis, leaving a top or bottom face 1.8° out — and since
+/// a sketch is lifted a hair toward the camera to stop it z-fighting with the face beneath it,
+/// that tilt showed as the sketch sitting visibly offset from its own face.
+///
+/// Straight up or down the view direction no longer constrains yaw (every value gives the same
+/// direction and only rolls the picture), which is what the clamp was dodging. `right_hint`
+/// settles it there: pass the sketch plane's u axis and the sketch lands the right way up
+/// instead of at whatever roll was left over.
+fn look_along_aligned(cam: &mut OrbitCamera, focus: Vec3, normal: Vec3, right_hint: Option<Vec3>) {
     let n = normal.normalize_or_zero();
     if n != Vec3::ZERO {
-        cam.yaw = n.x.atan2(n.z);
-        cam.pitch = (-n.y).asin().clamp(-1.54, 1.54);
+        cam.pitch = (-n.y).clamp(-1.0, 1.0).asin();
+        let horiz = n.x.hypot(n.z);
+        if horiz > 1e-4 {
+            cam.yaw = n.x.atan2(n.z);
+        } else if let Some(r) = right_hint.map(|r| r.normalize_or_zero()).filter(|r| *r != Vec3::ZERO) {
+            // At the pole screen-right is (cos yaw, 0, -sin yaw); solve that for `r`.
+            cam.yaw = (-r.z).atan2(r.x);
+        }
     }
     cam.focus = focus;
 }
@@ -4028,39 +4163,20 @@ fn ui_system(
                 ui.separator();
                 if ui.button("Fit").on_hover_text("Zoom to fit the part").clicked() {
                     if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
-                        // Assembly mode fits the union of all placed components instead.
-                        let (focus, radius) = if in_asm {
-                            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-                            for comp in &asm.0.components {
-                                if comp.hidden {
-                                    continue;
-                                }
-                                if let Some(geom) = asm_render.cache.get(&asm_geom_key(comp)) {
-                                    let tf = comp_transform(comp);
-                                    for p in &geom.tri.positions {
-                                        let w = tf.transform_point(Vec3::from_array(*p));
-                                        lo = lo.min(w);
-                                        hi = hi.max(w);
-                                    }
-                                }
-                            }
-                            if lo.x.is_finite() {
-                                ((lo + hi) * 0.5, ((hi - lo).length() * 0.75).max(5.0))
-                            } else {
-                                (Vec3::ZERO, 30.0)
-                            }
-                        } else {
-                            fit_view(&part)
-                        };
+                        let (focus, radius) = fit_scene(&part, &asm.0, asm_render, in_asm);
                         let (yaw, pitch) = (orbit.yaw, orbit.pitch);
                         orbit.animate_to(focus, radius, yaw, pitch);
                     }
                 }
+                // Standard views. Front/Top/Right are EXACTLY square-on; the top view used to be
+                // a degree short of vertical to dodge the yaw singularity, which is now handled
+                // properly in look_along_aligned.
+                const HALF_PI: f32 = std::f32::consts::FRAC_PI_2;
                 for (name, yaw, pitch) in [
-                    ("Iso", 0.8_f32, -0.55_f32),
-                    ("Right", 1.5708, 0.0),
-                    ("Top", 0.0, -1.553),
-                    ("Front", 0.0, 0.0),
+                    ("Iso", ISO_VIEW.0, ISO_VIEW.1),
+                    ("Right", HALF_PI, 0.0_f32),
+                    ("Top", 0.0_f32, -HALF_PI),
+                    ("Front", 0.0_f32, 0.0_f32),
                 ] {
                     if ui.button(name).on_hover_text(format!("{name} view")).clicked() {
                         if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
@@ -4472,6 +4588,11 @@ fn ui_system(
                         if let Some(i) = selected_sketch.filter(|_| !in_sketch) {
                             ui_state.edit_sketch_request = Some(i);
                         }
+                        // Extruding is the moment the work stops being flat. Looking straight
+                        // down the sketch plane, the boss grows directly away from the camera
+                        // and its depth arrow points at your eye - so turn to iso and let it be
+                        // seen. (Revolves already sweep across the view, so they stay put.)
+                        ui_state.iso_view_request = matches!(kind, OpKind::Boss | OpKind::Cut);
                         ui_state.pending = Some(PendingOp { kind, depth, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
                     };
                     // Add material.
@@ -6888,6 +7009,25 @@ fn ui_system(
                             ui.separator();
                         }
                     }
+                    // Size AND angle, with the angle called out when it has latched — otherwise
+                    // the snap is invisible and reads as the cursor being ignored.
+                    Tool::Polygon => {
+                        if let Some(rim) = poly_rim(&session) {
+                            let d = rim - start;
+                            let deg = d.y.atan2(d.x).to_degrees().rem_euclid(360.0);
+                            let raw = session.cursor_raw_uv.map(|c| (c - start).y.atan2((c - start).x).to_degrees());
+                            let latched = raw.is_some_and(|r| {
+                                ((deg - r.rem_euclid(360.0) + 180.0).rem_euclid(360.0) - 180.0).abs() > 1e-3
+                            });
+                            let txt = format!("Polygon {} sides — R {:.1} mm @ {deg:.0}°", session.polygon_sides.max(3), d.length());
+                            let rt = egui::RichText::new(txt).strong();
+                            ui.label(if latched { rt.color(egui::Color32::from_rgb(245, 210, 70)) } else { rt });
+                            if latched {
+                                ui.label(egui::RichText::new(format!("snapped to {POLY_ANGLE_STEP:.0}°")).weak().small());
+                            }
+                            ui.separator();
+                        }
+                    }
                     _ => {}
                 }
                 session.request_live_focus = focus_now;
@@ -7645,6 +7785,14 @@ fn ui_system(
                             ui_state.sketch_plane_request = Some(order);
                             ui.close();
                         }
+                        // Datum planes are the other natural "Normal To" target - looking square
+                        // on to Front/Top/Right, or to an offset plane, before sketching on it.
+                        if let Some(fi) = feat_idx {
+                            if ui.button("Normal to").on_hover_text("Turn the view square-on to this plane").clicked() {
+                                action = Some(TreeAction::NormalTo(fi));
+                                ui.close();
+                            }
+                        }
                         // Only user-created offset planes carry construction info to edit.
                         if let (Some(off), Some(fi)) = (&offset, feat_idx) {
                             if ui.button("Edit plane").clicked() {
@@ -7704,6 +7852,10 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit gear").clicked() {
                                     action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -7850,6 +8002,10 @@ fn ui_system(
                                     action = Some(TreeAction::Select(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -7885,6 +8041,10 @@ fn ui_system(
                                     action = Some(TreeAction::Select(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -7904,6 +8064,10 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit fillet").clicked() {
                                     action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -7926,6 +8090,10 @@ fn ui_system(
                                     action = Some(TreeAction::EditPm(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -7944,6 +8112,10 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit mirror").clicked() {
                                     action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -7967,6 +8139,10 @@ fn ui_system(
                                     action = Some(TreeAction::EditPm(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -7986,6 +8162,10 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit shell").clicked() {
                                     action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -8015,6 +8195,10 @@ fn ui_system(
                                     action = Some(TreeAction::EditPm(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -8042,6 +8226,10 @@ fn ui_system(
                                     action = Some(TreeAction::EditPm(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -8061,6 +8249,10 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit thread").clicked() {
                                     action = Some(TreeAction::EditPm(i));
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -8091,6 +8283,10 @@ fn ui_system(
                                     action = Some(TreeAction::EditImage(i));
                                     ui.close();
                                 }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
+                                    ui.close();
+                                }
                                 if ui.button("Delete feature").clicked() {
                                     action = Some(TreeAction::Delete(i));
                                     ui.close();
@@ -8116,6 +8312,10 @@ fn ui_system(
                             resp.context_menu(|ui| {
                                 if ui.button("Edit mesh (scale/position)").clicked() {
                                     ui_state.mesh_edit = Some(i);
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -8147,6 +8347,10 @@ fn ui_system(
                                 }
                                 if ui.button(if f.hidden { "Show scan" } else { "Hide scan" }).clicked() {
                                     toggle_hidden = Some(i);
+                                    ui.close();
+                                }
+                                if feature_plane(&f.kind).is_some() && ui.button("Normal to").on_hover_text("Turn the view square-on to this feature's plane").clicked() {
+                                    action = Some(TreeAction::NormalTo(i));
                                     ui.close();
                                 }
                                 if ui.button("Delete feature").clicked() {
@@ -8222,6 +8426,22 @@ fn ui_system(
                             ui_state.pending = Some(PendingOp { kind, depth, reverse, dir2: back > 0.0, depth2: back.max(0.1), thin: thin > 0.0, thin_mm: if thin > 0.0 { thin as f32 } else { 2.0 }, thin_side });
                         } else {
                             ui_state.selected = Some(i);
+                        }
+                    }
+                    TreeAction::NormalTo(i) => {
+                        if let Some((origin, n)) = doc.0.features.get(i).and_then(|f| feature_plane(&f.kind)) {
+                            if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
+                                // Same dance the viewport's "Normal to sketch" uses: derive the
+                                // target pose with look_along, put the current pose back, then
+                                // glide to it so the turn animates instead of snapping.
+                                let cur = (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius);
+                                let n = facing_normal(&orbit, n);
+                                look_along(&mut orbit, origin, n);
+                                recenter_for_panel(&mut orbit, ctx.content_rect().height(), ui_state.view_center_offset);
+                                let tgt = (orbit.focus, orbit.radius, orbit.yaw, orbit.pitch);
+                                (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius) = cur;
+                                orbit.animate_to(tgt.0, tgt.1, tgt.2, tgt.3);
+                            }
                         }
                     }
                     TreeAction::Edit(i) => ui_state.edit_sketch_request = Some(i),
@@ -8377,10 +8597,12 @@ fn ui_system(
                     }
                     TreeAction::ExtrudeBoss(i) => {
                         ui_state.edit_sketch_request = Some(i);
+                        ui_state.iso_view_request = true;
                         ui_state.pending = Some(PendingOp { kind: OpKind::Boss, depth: EXTRUDE_DISTANCE as f32, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
                     }
                     TreeAction::ExtrudeCut(i) => {
                         ui_state.edit_sketch_request = Some(i);
+                        ui_state.iso_view_request = true;
                         ui_state.pending = Some(PendingOp { kind: OpKind::Cut, depth: EXTRUDE_DISTANCE as f32, reverse: false, dir2: false, depth2: 10.0 , thin: false, thin_mm: 2.0, thin_side: 0 });
                     }
                     TreeAction::Delete(i) => {
@@ -8569,7 +8791,7 @@ fn ui_system(
                         // Reuse look_along/recenter to derive the target pose, then restore the
                         // current pose and glide to it (so the transition animates).
                         let cur = (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius);
-                        look_along(&mut orbit, ap.origin, ap.n);
+                        look_along_aligned(&mut orbit, ap.origin, ap.n, Some(ap.u));
                         recenter_for_panel(&mut orbit, ctx.content_rect().height(), ui_state.view_center_offset);
                         let tgt = (orbit.focus, orbit.radius, orbit.yaw, orbit.pitch);
                         (orbit.yaw, orbit.pitch, orbit.focus, orbit.radius) = cur;
@@ -8610,11 +8832,91 @@ fn ui_system(
         }
     }
 
+    // A document was just opened: frame it isometrically, once there is something to frame.
+    //
+    // The wait is on GEOMETRY, not on the `regen` flag — that clears when the rebuild starts,
+    // and the mesh path finishes on a background thread, so framing on it caught an empty part
+    // and left the camera at its default distance. The countdown is the escape hatch for a file
+    // that never produces a body (a part holding only sketches).
+    if let Some(left) = ui_state.home_view_request {
+        let has_geometry = if in_asm {
+            !asm_render.cache.is_empty()
+        } else {
+            part.mesh.as_ref().is_some_and(|m| !m.positions.is_empty())
+        };
+        let settled = has_geometry && !ui_state.regen && !ui_state.rebuilding && ui_state.regen_debounce.is_none();
+        let left = left - time.delta_secs();
+        if settled || left <= 0.0 {
+            ui_state.home_view_request = None;
+            if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
+                let (focus, radius) = fit_scene(&part, &asm.0, asm_render, in_asm);
+                orbit.animate_to(focus, radius, ISO_VIEW.0, ISO_VIEW.1);
+            }
+        } else {
+            ui_state.home_view_request = Some(left);
+        }
+    }
+
+    // An extrude just started: glide to isometric. The focus and zoom are left alone, so the
+    // view turns around what you were already looking at rather than jumping to the origin.
+    if std::mem::take(&mut ui_state.iso_view_request) {
+        if let Ok((_tf, mut orbit)) = cam_q.single_mut() {
+            orbit.animate_view(ISO_VIEW.0, ISO_VIEW.1);
+        }
+    }
+
+    // Name every datum plane that is on screen, at its top-left corner. Three translucent
+    // squares tell you nothing about which is which, and "click a plane to start" is the first
+    // thing anyone does with a new part. The selected one is called out in its own colour.
+    if let Ok((camera, cam_gt)) = cam_read.single() {
+        let sketching = session.plane.is_some();
+        let show_all = show_all_ref_planes(&part, &doc.0, ui_state.selected_plane);
+        let half = ref_plane_display_size(&part, ui_state.plane_size) * 0.5;
+        let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("plane_labels")));
+        // Clip to the 3D view: the foreground layer is above the panels, so an unclipped label
+        // is painted over the toolbar.
+        let viewport = ctx.available_rect();
+        painter.set_clip_rect(viewport);
+        for (i, (_, plane, hidden)) in doc.0.planes_vis().enumerate() {
+            if !ref_plane_shown(i, hidden, sketching, ui_state.selected_plane, show_all) {
+                continue;
+            }
+            let ap = ActivePlane::from_doc(plane);
+            // Tucked just inside the top-left corner, in the plane's OWN axes, so the label
+            // rides the quad however the view is spun.
+            let anchor = ap.origin - ap.u * (half * 0.86) + ap.v * (half * 0.86);
+            let Ok(sp) = camera.world_to_viewport(cam_gt, anchor) else { continue };
+            if !in_viewport(viewport, egui::pos2(sp.x, sp.y)) {
+                continue;
+            }
+            let selected = ui_state.selected_plane == Some(i);
+            // The same red/green/blue the quads are tinted with, at full strength so the text
+            // reads against both the plane and the background.
+            let col = match i {
+                0 => egui::Color32::from_rgb(235, 110, 110),
+                1 => egui::Color32::from_rgb(110, 210, 130),
+                2 => egui::Color32::from_rgb(120, 160, 245),
+                _ => egui::Color32::from_rgb(235, 200, 110),
+            };
+            let pos = egui::pos2(sp.x, sp.y);
+            let font = egui::FontId::proportional(if selected { 15.0 } else { 13.0 });
+            // A dark plate behind it: over a pale plane edge-on to the light, bare text vanishes.
+            let galley = painter.layout_no_wrap(plane.name.clone(), font.clone(), col);
+            let rect = egui::Rect::from_min_size(pos, galley.size()).expand(3.0);
+            painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(150));
+            if selected {
+                painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, col), egui::StrokeKind::Inside);
+            }
+            painter.galley(pos, galley, col);
+        }
+    }
+
     // Sketch inference badges: small yellow relation chips beside the cursor (SolidWorks-style).
     if !session.infer_badges.is_empty() {
         if let (Some(ap), Some(cur), Ok((camera, cam_gt))) = (session.plane.clone(), session.cursor_uv, cam_read.single()) {
             if let Ok(sp) = camera.world_to_viewport(cam_gt, ap.to_world(cur)) {
-                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("infer_badges")));
+                let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("infer_badges")));
+                painter.set_clip_rect(ctx.available_rect());
                 let mut x = sp.x + 14.0;
                 let y = sp.y - 22.0;
                 for b in &session.infer_badges {
@@ -8636,7 +8938,11 @@ fn ui_system(
         // response so the caller can act on the click.
         let sel_dim = session.selected_dim;
         let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String, selected: bool| -> Option<egui::Response> {
-            camera.world_to_viewport(cam_gt, world).ok().map(|screen| {
+            // An egui Area cannot be clipped by its caller, so a dimension whose geometry has
+            // scrolled off the view is dropped rather than drawn over a panel. Clamping it to
+            // the edge instead would leave the number pointing at the wrong geometry.
+            let vp = ctx.available_rect();
+            camera.world_to_viewport(cam_gt, world).ok().filter(|s| in_viewport(vp, egui::pos2(s.x, s.y))).map(|screen| {
                 let col = if selected {
                     egui::Color32::from_rgb(255, 205, 90)
                 } else {
@@ -8765,7 +9071,12 @@ fn ui_system(
                 let mut half = |end: usize, ep: Vec2| {
                     let len = (ep - pm).length();
                     let labpos = (pm + ep) * 0.5;
-                    if let Ok(screen) = camera.world_to_viewport(cam_gt, ap.to_world(labpos)) {
+                    if let Ok(screen) = camera
+                        .world_to_viewport(cam_gt, ap.to_world(labpos))
+                        .ok()
+                        .filter(|s| in_viewport(ctx.available_rect(), egui::pos2(s.x, s.y)))
+                        .ok_or(())
+                    {
                         egui::Area::new(egui::Id::new(("cllabel", end)))
                             .fixed_pos(egui::pos2(screen.x, screen.y))
                             .order(egui::Order::Foreground)
@@ -9187,7 +9498,8 @@ fn ui_system(
         if let Some(axis) = nav_target {
             if let Ok((_, mut orbit)) = cam_q.single_mut() {
                 let n = axis.normalize();
-                let (ty, tp) = (n.x.atan2(n.z), (-n.y).asin().clamp(-1.54, 1.54));
+                // Square-on, like look_along: the old clamp left the top/bottom axis 1.8 degrees out.
+                let (ty, tp) = (n.x.atan2(n.z), (-n.y).clamp(-1.0, 1.0).asin());
                 orbit.animate_view(ty, tp);
             }
         }
@@ -11844,11 +12156,16 @@ fn sketch_interaction(
         }
         if just_pressed {
             let mut best: Option<(f32, ActivePlane, String)> = None;
-            // Hidden planes are invisible, so they must not be clickable either.
-            for (_id, p, _) in doc.0.planes_vis().filter(|(_, _, h)| !h) {
+            // A plane you cannot SEE must not be clickable — ask exactly the question the
+            // renderer asks. Filtering only user-hidden planes left the datums catching clicks
+            // after they had stepped aside for the first sketch, and since they now scale to
+            // span the part, an invisible plane sat right in front of the geometry and swallowed
+            // every attempt to sketch on a face.
+            let pickable = visible_ref_planes(&doc.0, &part, session.plane.is_some(), ui_state.selected_plane);
+            for (_id, p) in doc.0.planes().enumerate().filter(|(i, _)| pickable.contains(i)).map(|(_, q)| q) {
                 let ap = ActivePlane::from_doc(p);
                 if let Some((t, uv)) = ray_plane(&ap, &ray) {
-                    let half = ui_state.plane_size.max(1.0) * 0.5;
+                    let half = ref_plane_display_size(&part, ui_state.plane_size) * 0.5;
                     if uv.x.abs() <= half && uv.y.abs() <= half && best.as_ref().is_none_or(|(bt, _, _)| t < *bt) {
                         best = Some((t, ap, p.name.clone()));
                     }
@@ -11899,12 +12216,15 @@ fn sketch_interaction(
             let mut best: Option<(f32, ActivePlane)> = None;
             // Reference planes — only while starting the part (they're hidden once
             // a body exists, so you sketch on faces from then on).
-            if part.solid.is_none() {
-                // Hidden planes are invisible, so they must not be clickable either.
-                for (_id, p, _) in doc.0.planes_vis().filter(|(_, _, h)| !h) {
+            {
+                // Same rule as the renderer: only a plane that is actually on screen can be
+                // picked. (This used to be gated on "no body yet", which missed the case of a
+                // sketch-only part where the planes have already stepped aside.)
+                let pickable = visible_ref_planes(&doc.0, &part, session.plane.is_some(), ui_state.selected_plane);
+                for (_id, p) in doc.0.planes().enumerate().filter(|(i, _)| pickable.contains(i)).map(|(_, q)| q) {
                     let ap = ActivePlane::from_doc(p);
                     if let Some((t, uv)) = ray_plane(&ap, &ray) {
-                        let half = ui_state.plane_size.max(1.0) * 0.5;
+                        let half = ref_plane_display_size(&part, ui_state.plane_size) * 0.5;
                         if uv.x.abs() <= half && uv.y.abs() <= half
                             && best.as_ref().is_none_or(|(bt, _)| t < *bt) {
                                 best = Some((t, ap));
@@ -11934,7 +12254,7 @@ fn sketch_interaction(
                 // Snap face-on, but via the orbit state so the user can keep orbiting.
                 edge_sel.clear();
                 orbit.radius = orbit.radius.max(6.0);
-                look_along(&mut orbit, ap.origin, ap.n);
+                look_along_aligned(&mut orbit, ap.origin, ap.n, Some(ap.u));
                 recenter_for_panel(&mut orbit, window.height(), ui_state.view_center_offset);
                 *cam_tf = camera_transform(&orbit);
                 session.sketch.clear();
@@ -11952,8 +12272,13 @@ fn sketch_interaction(
                 info!("Sketching on the {} plane.", ap.name);
                 session.plane = Some(ap);
             } else {
-                // Clicked empty space (no edge, no face) → deselect.
+                // Clicked empty space (no edge, no face) → deselect EVERYTHING that draws in the
+                // viewport. Clearing only the edge selection left a feature picked in the tree
+                // outlined in orange with no way to put it down, so the last thing you looked at
+                // stayed lit over the model.
                 edge_sel.clear();
+                ui_state.selected = None;
+                ui_state.selected_plane = None;
             }
         }
         return;
@@ -14734,6 +15059,41 @@ fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>,
     session.dirty = true;
 }
 
+/// Angular steps a polygon's orientation latches to, in degrees. 15° covers the useful
+/// orientations (0/30/45/60/90…) for every side count anyone draws.
+const POLY_ANGLE_STEP: f32 = 15.0;
+/// How close, in degrees, the cursor has to be before it latches.
+///
+/// Deliberately narrow. The window applies either side of every step, so it eats twice its own
+/// width out of each 15° gap: at 6° that left a 3° free band and the snap fired four times in
+/// five, which reads as the cursor being ignored rather than as help. At 3° a round angle is
+/// still easy to hit and 9° of every 15 stays free for a deliberately odd one.
+const POLY_ANGLE_TOL: f32 = 3.0;
+
+/// Latch a polygon's orientation to the nearest angular step, keeping its size.
+///
+/// The second click sets both the size and the rotation, so without this a square is almost
+/// never square to anything: it lands a degree or two off and every face built on it inherits
+/// the tilt. Only the ANGLE moves — the radius is whatever the cursor says, so the polygon
+/// still sizes freely.
+///
+/// Returns the rim unchanged when the cursor is between steps, so any angle is still drawable.
+fn snap_polygon_angle(center: Vec2, rim: Vec2) -> Vec2 {
+    let d = rim - center;
+    let r = d.length();
+    if r < 1e-6 {
+        return rim;
+    }
+    let deg = d.y.atan2(d.x).to_degrees();
+    let nearest = (deg / POLY_ANGLE_STEP).round() * POLY_ANGLE_STEP;
+    // Shortest way round, so 359° latches onto 0° rather than being judged 359° away.
+    let off = (deg - nearest + 180.0).rem_euclid(360.0) - 180.0;
+    if off.abs() > POLY_ANGLE_TOL {
+        return rim;
+    }
+    center + Vec2::from_angle(nearest.to_radians()) * r
+}
+
 /// The polygon's rim/vertex point while dragging: the raw (unsnapped) cursor, snapped
 /// only to a genuine sketch point within tolerance. This keeps the size tracking the
 /// mouse — the broad rim/quadrant/reference snap cloud (whose tolerance grows with zoom)
@@ -14759,7 +15119,12 @@ fn poly_rim(session: &SketchSession) -> Option<Vec2> {
     if let Some((p, _)) = near {
         return Some(p);
     }
-    Some(raw)
+    // Nothing exact under the cursor, so latch the ORIENTATION to a round angle. A real point
+    // or body feature always wins over this — those are deliberate targets.
+    match session.pending {
+        Some(center) => Some(snap_polygon_angle(center, raw)),
+        None => Some(raw),
+    }
 }
 
 /// Regular polygon inscribed in (circumscribed by) a construction circle: `center` is the
@@ -14931,11 +15296,16 @@ fn handle_keys(
         && session.tool == Tool::Spline && session.spline_pts.len() >= 2 {
             commit_spline(&mut session, false);
         }
+    // E / D apply the extrude straight away rather than opening the PropertyManager, but the
+    // camera problem is the same: you were looking flat at the sketch, and the new solid grows
+    // directly away from you. Turn to iso so the result is visible.
     if keys.just_pressed(KeyCode::KeyE) {
         session.op_request = Some(SolidOp::Boss(EXTRUDE_DISTANCE, 0.0, 0.0, 0));
+        ui_state.iso_view_request = true;
     }
     if keys.just_pressed(KeyCode::KeyD) {
         session.op_request = Some(SolidOp::Cut(EXTRUDE_DISTANCE, 0.0, 0.0, 0));
+        ui_state.iso_view_request = true;
     }
     // Delete (or Backspace) removes a selected dimension first, else selected entities.
     if keys.just_pressed(KeyCode::Delete) || keys.just_pressed(KeyCode::Backspace) {
@@ -15554,6 +15924,9 @@ fn handle_file_io(
                         ui_state.asm_selected = None;
                         ui_state.current_file = Some(path.clone());
                         ui_state.regen = true;
+                        // Frame the assembly isometrically once it has rebuilt: opening a file
+                        // used to leave the camera wherever it happened to be.
+                        ui_state.home_view_request = Some(HOME_VIEW_WAIT);
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("assembly").to_string();
                         ui_state.toasts.push((format!("Opened {name}"), 2.5));
                         info!("Opened assembly {}", path.display());
@@ -15580,6 +15953,9 @@ fn handle_file_io(
                         ui_state.selected = None;
                         ui_state.current_file = Some(path.clone());
                         ui_state.regen = true;
+                        // Frame the part isometrically once it has rebuilt: opening a file
+                        // used to leave the camera wherever it happened to be.
+                        ui_state.home_view_request = Some(HOME_VIEW_WAIT);
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
                         ui_state.toasts.push((format!("Opened {name}"), 2.5));
                         info!("Opened {}", path.display());
@@ -15905,7 +16281,7 @@ fn handle_edit_sketch(
         if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
             let (center, radius) = fit_view(&part);
             orbit.radius = (radius * 2.1).max(6.0);
-            look_along(&mut orbit, center, ap.n);
+            look_along_aligned(&mut orbit, center, ap.n, Some(ap.u));
             recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
             *tf = camera_transform(&orbit);
         }
@@ -15941,7 +16317,7 @@ fn handle_edit_sketch(
                 // a profile beside it).
                 let (center, radius) = fit_view(&part);
                 orbit.radius = (radius * 2.1).max(6.0);
-                look_along(&mut orbit, center, ap.n);
+                look_along_aligned(&mut orbit, center, ap.n, Some(ap.u));
                 recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
                 *tf = camera_transform(&orbit);
             }
@@ -15991,34 +16367,35 @@ fn handle_edit_sketch(
     // silently dropped out and points had nothing exact to catch, which is what left the
     // small ledges. Datum planes are fixed in space and `reproject_plane_on_mesh` leaves them
     // alone, so a centre-plane sketch can't be dragged onto a face.
-    let plane = match part.mesh.as_ref() {
-        Some(mesh) if !plane.datum => {
-            // Regeneration runs this same geometry inside `catch_unwind`; this call sits on
-            // the UI thread, where a panic would take the whole app down. Keep the stored
-            // plane if it throws — a stale plane is a far better outcome than losing the
-            // session.
-            let stored = plane.clone();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let regions = sketch.regions();
-                let samples = sketch_footprint_samples(&stored, &regions);
-                reproject_plane_on_mesh(&stored, mesh, &samples)
-            }))
-            .unwrap_or_else(|_| {
-                warn!("Sketch edit: reprojecting the plane onto the body panicked — using the stored plane.");
-                plane.clone()
-            })
-        }
-        _ => plane,
-    };
+    //
+    // Against the UPSTREAM body specifically — the one regeneration builds this feature on.
+    // Landing it on the displayed body instead was the bug: that body contains this feature,
+    // so a boss's own top face sits exactly where its stale plane already is and the
+    // reprojection agreed with the wrong height. On extrusionerror.hcad that opened the sketch
+    // a full 2 mm above the face it was drawn on.
+    let plane = replane_on_upstream_body(&doc.0, i, &plane, &sketch);
     let ap = active_plane_from_ref(&plane, "Face");
+    // Reopening a BOSS or CUT extrude comes back with its PropertyManager, so the job in hand is
+    // the depth, not the profile — and square-on to the sketch plane is the one angle where a
+    // depth is invisible, because the boss grows straight away from the camera. Those go to
+    // isometric; editing the sketch itself still lands square-on, which is what drawing wants.
+    // (A revolve sweeps across the view either way, so it keeps the square-on view too.)
+    let editing_depth = matches!(ui_state.pending.as_ref().map(|p| p.kind), Some(OpKind::Boss) | Some(OpKind::Cut));
     if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
-        // Centre the body (not the plane origin) in the viewport, looking down the sketch normal,
-        // with a little padding (1.4×) so the whole part fits with room to draw.
+        // Centre the body (not the plane origin) in the viewport, with a little padding (2.1×)
+        // so the whole part fits with room to draw.
         let (center, radius) = fit_view(&part);
         orbit.radius = (radius * 2.1).max(6.0);
-        look_along(&mut orbit, center, ap.n);
-        recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
-        *tf = camera_transform(&orbit);
+        if editing_depth {
+            // Glide rather than snap: the part is already on screen and this is a change of
+            // viewpoint, not a jump to somewhere new.
+            let r = orbit.radius;
+            orbit.animate_to(center, r, ISO_VIEW.0, ISO_VIEW.1);
+        } else {
+            look_along_aligned(&mut orbit, center, ap.n, Some(ap.u));
+            recenter_for_panel(&mut orbit, win_h, ui_state.view_center_offset);
+            *tf = camera_transform(&orbit);
+        }
     }
     session.sketch = sketch;
     session.plane = Some(ap);
@@ -16112,12 +16489,28 @@ fn handle_exit_sketch(
             history.snapshot(&doc.0);
             let new_sketch = session.sketch.clone();
             let contours = session.selected_contours.clone();
+            // Persist the plane the sketch was actually edited on.
+            //
+            // Opening it re-landed the plane on the body the feature is built on; without
+            // writing that back, the document keeps the stale one for ever and regeneration
+            // silently re-derives the right answer on every rebuild. The stale value then leaks
+            // into everything that reads the plane raw — the sketch editor, the depth arrow, the
+            // preview — which is what made an extrude look like the wrong distance.
+            let edited_plane = session.plane.as_ref().map(plane_ref);
             match &mut doc.0.features[i].kind {
-                FeatureKind::Sketch { sketch, .. } => *sketch = new_sketch,
-                FeatureKind::Extrude { sketch, regions: r, region_pts: rp, .. }
-                | FeatureKind::Cut { sketch, regions: r, region_pts: rp, .. }
-                | FeatureKind::Revolve { sketch, regions: r, region_pts: rp, .. } => {
+                FeatureKind::Sketch { sketch, plane } => {
                     *sketch = new_sketch;
+                    if let Some(pl) = edited_plane {
+                        *plane = pl;
+                    }
+                }
+                FeatureKind::Extrude { sketch, regions: r, region_pts: rp, plane, .. }
+                | FeatureKind::Cut { sketch, regions: r, region_pts: rp, plane, .. }
+                | FeatureKind::Revolve { sketch, regions: r, region_pts: rp, plane, .. } => {
+                    *sketch = new_sketch;
+                    if let Some(pl) = edited_plane {
+                        *plane = pl;
+                    }
                     // Re-sample the picked contours from the EDITED sketch (indices and
                     // sample points both refresh together).
                     let all = sketch.regions();
@@ -16652,6 +17045,45 @@ fn gear_layers(gear_type: GearType, thickness: f64, helix_deg: f64, cone_deg: f6
             vec![Layer { w: 0.0, rot: 0.0, scale: 1.0 }, Layer { w: face * cos_g, rot: 0.0, scale }]
         }
     }
+}
+
+/// The body a feature is built ON: everything before it in the timeline, and nothing after.
+///
+/// This is the geometry regeneration hands the feature, and therefore the only body its sketch
+/// plane may be re-landed against. Using the *displayed* body instead is a trap — that includes
+/// the feature itself, so a boss's own top face sits exactly where its stale plane already is,
+/// and the reprojection "confirms" the wrong height rather than correcting it.
+fn body_before_feature(doc: &Document, i: usize) -> Option<TriMesh> {
+    let mut upstream = doc.clone();
+    upstream.rollback = i.min(upstream.features.len());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&upstream)))
+        .ok()
+        .flatten()
+        .map(|(m, _)| m)
+        .filter(|m| !m.positions.is_empty())
+}
+
+/// Re-land a stored sketch plane on the body the feature is built on.
+///
+/// Returns the plane unchanged for a datum (those are fixed in space) or when there is nothing
+/// upstream to land on.
+fn replane_on_upstream_body(doc: &Document, i: usize, plane: &PlaneRef, sketch: &Sketch) -> PlaneRef {
+    if plane.datum {
+        return plane.clone();
+    }
+    let Some(mesh) = body_before_feature(doc, i) else { return plane.clone() };
+    let stored = plane.clone();
+    // Regeneration runs this same geometry inside `catch_unwind`; this call sits on the UI
+    // thread, where a panic would take the whole app down. A stale plane beats losing the session.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let regions = sketch.regions();
+        let samples = sketch_footprint_samples(&stored, &regions);
+        reproject_plane_on_mesh(&stored, &mesh, &samples)
+    }))
+    .unwrap_or_else(|_| {
+        warn!("Sketch edit: reprojecting the plane onto the upstream body panicked — using the stored plane.");
+        plane.clone()
+    })
 }
 
 /// Rebuild the mesh-kernel body, plus the selectable feature edges emitted by the *last*
@@ -20591,7 +21023,7 @@ fn handle_new_part(
     mut history: ResMut<History>,
     mut edge_sel: ResMut<EdgeSelection>,
     existing: Query<Entity, With<SolidPart>>,
-    mut cam_q: Query<(&mut Transform, &OrbitCamera)>,
+    mut cam_q: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
     if !ui_state.new_part {
         return;
@@ -20628,8 +21060,15 @@ fn handle_new_part(
     ui_state.pending = None;
     ui_state.selected = None;
     ui_state.current_file = None; // a fresh part isn't bound to the old file
-    if let Ok((mut tf, orbit)) = cam_q.single_mut() {
-        *tf = camera_transform(orbit);
+    // Frame the datum planes isometrically. Without this, starting a new part after a big one
+    // left the camera at that part's distance and the planes were a speck at the origin.
+    if let Ok((mut tf, mut orbit)) = cam_q.single_mut() {
+        orbit.focus = Vec3::ZERO;
+        orbit.radius = frame_radius(ui_state.plane_size.max(1.0) * std::f32::consts::SQRT_2);
+        orbit.yaw = ISO_VIEW.0;
+        orbit.pitch = ISO_VIEW.1;
+        orbit.anim = None; // this is a hard reset, not a glide from wherever we were
+        *tf = camera_transform(&orbit);
     }
     info!("New part — model cleared.");
 }
@@ -20812,21 +21251,58 @@ fn orbit_camera(
 ///     even with a body present — needed for e.g. a revolve cut through the centre);
 ///   * no body yet and nothing selected → show all three (so the first sketch is easy to start);
 ///   * otherwise (a body exists, nothing selected) → all hidden, to avoid clutter.
+/// Are the datum planes still the main thing to click?
+///
+/// True only on a part with nothing built yet: no body, no features of any kind, and nothing
+/// picked. Once the first sketch exists the planes have done their job and get out of the way —
+/// they used to come back the moment you left that sketch, because a sketch alone makes no body,
+/// and three translucent squares over your work is clutter. Picking one in the tree still shows
+/// it, which is how you sketch on a different plane later.
+fn show_all_ref_planes(part: &Part, doc: &Document, selected_plane: Option<usize>) -> bool {
+    part.solid.is_none()
+        && selected_plane.is_none()
+        && !doc.features.iter().any(|f| !matches!(f.kind, FeatureKind::Plane(_)))
+}
+
+/// The datum planes on screen right now — and therefore exactly the ones that can be clicked.
+///
+/// Picking and rendering MUST agree here. When they drifted apart, planes that had stepped
+/// aside after the first sketch stayed clickable, and since they scale to span the part an
+/// invisible plane sat in front of the geometry and swallowed every attempt to sketch on a face.
+fn visible_ref_planes(doc: &Document, part: &Part, sketching: bool, selected: Option<usize>) -> Vec<usize> {
+    let show_all = show_all_ref_planes(part, doc, selected);
+    doc.planes_vis()
+        .enumerate()
+        .filter(|(i, (_, _, hidden))| ref_plane_shown(*i, *hidden, sketching, selected, show_all))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether datum plane `idx` is on screen right now.
+fn ref_plane_shown(idx: usize, user_hidden: bool, sketching: bool, selected_plane: Option<usize>, show_all: bool) -> bool {
+    !user_hidden && !sketching && (selected_plane == Some(idx) || show_all)
+}
+
 fn update_plane_visibility(
     part: Res<Part>,
     session: Res<SketchSession>,
-    ui_state: Res<UiState>,
+    mut ui_state: ResMut<UiState>,
     doc: Res<DocRes>,
     mut planes: Query<(&mut Visibility, &RefPlaneIdx)>,
 ) {
+    // Selecting a plane and selecting a feature are the same act of "what am I looking at", so
+    // they cannot both hold. Clicking a plane already clears the feature selection; this is the
+    // other half - without it a plane picked in the tree stayed on screen while you carried on
+    // clicking features and sketches, which is not what "selected" means to anyone.
+    if ui_state.selected.is_some() && ui_state.selected_plane.is_some() {
+        ui_state.selected_plane = None;
+    }
     let sketching = session.plane.is_some();
-    let show_all = part.solid.is_none() && ui_state.selected_plane.is_none();
+    let show_all = show_all_ref_planes(&part, &doc.0, ui_state.selected_plane);
     let hidden_by_user: Vec<bool> = doc.0.planes_vis().map(|(_, _, h)| h).collect();
     for (mut vis, idx) in &mut planes {
         let user_hidden = hidden_by_user.get(idx.0).copied().unwrap_or(false);
-        let want = if user_hidden || sketching {
-            Visibility::Hidden
-        } else if ui_state.selected_plane == Some(idx.0) || show_all {
+        let want = if ref_plane_shown(idx.0, user_hidden, sketching, ui_state.selected_plane, show_all) {
             Visibility::Visible
         } else {
             Visibility::Hidden
@@ -20900,10 +21376,36 @@ fn update_window_title(ui_state: Res<UiState>, mut windows: Query<&mut Window>) 
     }
 }
 
-/// Scale the reference-plane quads to the user's chosen display size (they're spawned at the base
-/// `PLANE_SIZE`), so planes can be enlarged to suit a big part without rebuilding the mesh.
-fn scale_ref_planes(ui_state: Res<UiState>, mut q: Query<&mut Transform, With<RefPlane>>) {
-    let s = (ui_state.plane_size.max(1.0) / PLANE_SIZE).max(0.01);
+/// How wide the reference planes should be drawn, in mm.
+///
+/// The user's setting is a FLOOR, not the answer: an 8 mm default plane against a 200 mm part is
+/// a postage stamp floating at the origin, useless for picking and useless for judging where the
+/// plane cuts. Once there is a body, the planes grow to span it.
+///
+/// Measured as the reach from the world origin (where the datum planes are centred) out to the
+/// furthest corner of the body's bounding box, so the quad covers the part however far off-origin
+/// it was modelled — a diagonal alone would fall short of a part built out to one side.
+fn ref_plane_display_size(part: &Part, user_size: f32) -> f32 {
+    let floor = user_size.max(1.0);
+    let Some(mesh) = part.mesh.as_ref().filter(|m| !m.positions.is_empty()) else { return floor };
+    let (lo, hi) = mesh_bbox(mesh);
+    let mut reach: f32 = 0.0;
+    for k in 0..8 {
+        let c = Vec3::new(
+            if k & 1 == 0 { lo.x } else { hi.x },
+            if k & 2 == 0 { lo.y } else { hi.y },
+            if k & 4 == 0 { lo.z } else { hi.z },
+        );
+        reach = reach.max(c.length());
+    }
+    // A little past the part, so its silhouette sits inside the plane rather than on its edge.
+    floor.max(reach * 2.3)
+}
+
+/// Scale the reference-plane quads to the display size (they're spawned at the base `PLANE_SIZE`),
+/// so planes suit a big part without rebuilding the mesh.
+fn scale_ref_planes(ui_state: Res<UiState>, part: Res<Part>, mut q: Query<&mut Transform, With<RefPlane>>) {
+    let s = (ref_plane_display_size(&part, ui_state.plane_size) / PLANE_SIZE).max(0.01);
     for mut t in &mut q {
         if (t.scale.x - s).abs() > 1.0e-4 {
             t.scale = Vec3::splat(s);
@@ -21184,11 +21686,12 @@ fn draw_selected_plane(
     ui_state: Res<UiState>,
     session: Res<SketchSession>,
     doc: Res<DocRes>,
+    part: Res<Part>,
 ) {
     if session.plane.is_some() {
         return;
     }
-    let h = ui_state.plane_size.max(1.0) * 0.5;
+    let h = ref_plane_display_size(&part, ui_state.plane_size) * 0.5;
     // Outline a plane (centre + in-plane axes u,v) as a rectangle with diagonals.
     let outline = |gizmos: &mut Gizmos, center: Vec3, u: Vec3, v: Vec3, col: Color, faint: Color| {
         let c = [center - u * h - v * h, center + u * h - v * h, center + u * h + v * h, center - u * h + v * h];
@@ -24452,6 +24955,294 @@ mod tests {
         (lens, angs)
     }
 
+    /// The framing must actually FIT. This projects the part's own corners through the camera
+    /// and checks they land inside the view, rather than trusting a magic multiplier — the old
+    /// `diagonal * 0.9` put the visible height at three quarters of the diagonal, so an opened
+    /// file overflowed the view by half again and looked zoomed in.
+    #[test]
+    fn a_fitted_part_actually_fits_on_screen() {
+        const VFOV: f32 = std::f32::consts::PI / 4.0;
+        let (block, _, _) = block_and_span();
+        let mut part = Part::default();
+        part.mesh = Some(block.clone());
+        let (focus, radius) = fit_view(&part);
+
+        // What the camera can see vertically at this distance (identical for both projections:
+        // the orthographic viewport height is set to exactly this).
+        let half_h = radius * (VFOV * 0.5).tan();
+
+        // Worst case is the isometric pose the open-a-file view uses.
+        let rot = Quat::from_euler(EulerRot::YXZ, ISO_VIEW.0, ISO_VIEW.1, 0.0);
+        let (right, up) = (rot * Vec3::X, rot * Vec3::Y);
+        let (lo, hi) = mesh_bbox(&block);
+        let (mut worst_x, mut worst_y) = (0.0_f32, 0.0_f32);
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { lo.x } else { hi.x },
+                if k & 2 == 0 { lo.y } else { hi.y },
+                if k & 4 == 0 { lo.z } else { hi.z },
+            ) - focus;
+            worst_x = worst_x.max(c.dot(right).abs());
+            worst_y = worst_y.max(c.dot(up).abs());
+        }
+        assert!(worst_y <= half_h, "the part is {worst_y} tall on screen but only {half_h} is visible");
+        // The narrowest sane window is about 4:3, and the left panel eats into it, so check the
+        // part clears a conservative width too.
+        let half_w = half_h * 4.0 / 3.0 * 0.75;
+        assert!(worst_x <= half_w, "the part is {worst_x} wide on screen but only {half_w} is usable");
+        // ...and it should not be lost in the distance either.
+        assert!(worst_y > half_h * 0.4, "the part fills only {} of the view height", worst_y / half_h);
+    }
+
+    /// Opening a file frames it: the Fit button and the open-a-document view must agree on
+    /// what "everything" is, in BOTH modes. In assembly mode `fit_view` alone sees only the
+    /// parked empty part document, so it would frame nothing.
+    #[test]
+    fn opening_a_document_frames_the_whole_scene() {
+        let (block, _, _) = block_and_span();
+        let mut part = Part::default();
+        part.mesh = Some(block.clone());
+        let empty_asm = Assembly::default();
+        let render = AsmRender::default();
+
+        // Part mode: centred on the block, close enough to fill the view.
+        let (focus, radius) = fit_scene(&part, &empty_asm, &render, false);
+        let (lo, hi) = mesh_bbox(&block);
+        assert!(focus.distance((lo + hi) * 0.5) < 1e-3, "the part was not centred: {focus:?}");
+        let span = (hi - lo).length();
+        assert!(radius > span * 0.3 && radius < span * 2.0, "radius {radius} does not frame a {span} part");
+
+        // Assembly mode with nothing placed: a sane home rather than an infinite bbox.
+        let (f2, r2) = fit_scene(&part, &empty_asm, &render, true);
+        assert!(f2.is_finite() && r2.is_finite() && r2 > 0.0, "an empty assembly gave a broken view ({f2:?}, {r2})");
+        assert!(f2.distance(Vec3::ZERO) < 1e-6, "an empty assembly did not fall back to the origin");
+    }
+
+    /// With a part on screen the planes have to span it. An 8 mm default quad against a 200 mm
+    /// part is a postage stamp at the origin — useless to pick and useless for judging where the
+    /// plane cuts. The user's setting stays a floor, never a ceiling.
+    #[test]
+    fn the_planes_grow_to_span_the_part() {
+        let empty = Part::default();
+        assert!((ref_plane_display_size(&empty, PLANE_SIZE) - PLANE_SIZE).abs() < 1e-6, "an empty part changed the plane size");
+        // A bigger user setting still wins on an empty part.
+        assert!((ref_plane_display_size(&empty, 50.0) - 50.0).abs() < 1e-6, "the user's size was ignored");
+
+        // A 20 x 20 x 10 block at the origin: the quad must cover its furthest corner.
+        let (block, _, _) = block_and_span();
+        let mut part = Part::default();
+        part.mesh = Some(block.clone());
+        let size = ref_plane_display_size(&part, PLANE_SIZE);
+        let (lo, hi) = mesh_bbox(&block);
+        let reach = [lo, hi, Vec3::new(lo.x, hi.y, hi.z), Vec3::new(hi.x, lo.y, hi.z)]
+            .iter()
+            .map(|c| c.length())
+            .fold(0.0_f32, f32::max);
+        assert!(size > 2.0 * reach, "the plane ({size}) does not reach the part's far corner ({reach})");
+        assert!(size > PLANE_SIZE * 4.0, "the plane stayed near its default size next to a part");
+
+        // A part built out to one side, not centred on the origin: a bbox DIAGONAL would fall
+        // short here, which is why the reach is measured from the origin.
+        let far = translate_mesh(&block, [200.0, 0.0, 0.0]);
+        let mut off = Part::default();
+        off.mesh = Some(far);
+        assert!(ref_plane_display_size(&off, PLANE_SIZE) > 400.0, "an off-origin part left the planes behind");
+
+        // And an explicit user size still wins when it is the larger of the two.
+        assert!((ref_plane_display_size(&part, 10_000.0) - 10_000.0).abs() < 1e-3, "a large user setting was overridden");
+    }
+
+    /// The datum planes are scaffolding: they should be up while there is nothing else to
+    /// click, and gone once the part has started. They used to come back the moment you left
+    /// your first sketch, because a sketch alone makes no body — three translucent squares over
+    /// your work.
+    #[test]
+    fn the_datum_planes_step_aside_once_the_part_has_started() {
+        let empty = Part::default();
+        let mut doc = Document::with_default_planes();
+        assert!(show_all_ref_planes(&empty, &doc, None), "a brand new part did not offer its planes");
+
+        // Picking one narrows the view to that plane alone.
+        assert!(!show_all_ref_planes(&empty, &doc, Some(1)), "picking a plane still showed all three");
+
+        // The first sketch is the part starting - even though it builds no body.
+        doc.add_feature(FeatureKind::Sketch { sketch: rect_sketch(10.0, 10.0), plane: xy() });
+        assert!(!show_all_ref_planes(&empty, &doc, None), "the planes came back after the first sketch");
+    }
+
+    /// An invisible plane must not be clickable. The datum planes step aside after the first
+    /// sketch AND scale to span the part — so a stale pick filter left a huge invisible plane
+    /// sitting in front of the body, swallowing every click meant for a face.
+    #[test]
+    fn a_plane_you_cannot_see_cannot_be_clicked() {
+        let mut doc = Document::with_default_planes();
+        let empty = Part::default();
+
+        // A brand new part: all three, ready to be picked.
+        assert_eq!(visible_ref_planes(&doc, &empty, false, None).len(), 3, "a new part offered no planes to click");
+
+        // Once the part has started they are gone from the screen — and from picking.
+        doc.add_feature(FeatureKind::Sketch { sketch: rect_sketch(10.0, 10.0), plane: xy() });
+        assert!(
+            visible_ref_planes(&doc, &empty, false, None).is_empty(),
+            "planes stayed clickable after the first sketch — they would block picking a face"
+        );
+
+        // With a body, likewise.
+        let (block, _, _) = block_and_span();
+        let mut solid = Part::default();
+        solid.mesh = Some(block);
+        assert!(visible_ref_planes(&doc, &solid, false, None).is_empty(), "planes stayed clickable next to a body");
+
+        // Picking one in the tree brings back exactly that one, so you can still sketch on it.
+        assert_eq!(visible_ref_planes(&doc, &solid, false, Some(1)), vec![1], "a plane picked in the tree was not clickable");
+
+        // And nothing is clickable mid-sketch.
+        assert!(visible_ref_planes(&doc, &empty, true, Some(1)).is_empty(), "a plane was clickable while sketching");
+    }
+
+    /// A label must never be painted on a plane that is not on screen, or names would float in
+    /// empty space. Both the quads and the labels ask the same function.
+    #[test]
+    fn a_plane_label_only_shows_when_its_plane_does() {
+        // While sketching, nothing shows - the sketch grid stands in for the plane.
+        for selected in [None, Some(0)] {
+            assert!(!ref_plane_shown(0, false, true, selected, true), "a plane showed while sketching");
+        }
+        // A plane the user hid stays hidden even when it is the selected one.
+        assert!(!ref_plane_shown(0, true, false, Some(0), true), "a hidden plane was shown because it was selected");
+        // Selected shows only itself.
+        assert!(ref_plane_shown(1, false, false, Some(1), false), "the selected plane was not shown");
+        assert!(!ref_plane_shown(0, false, false, Some(1), false), "an unselected plane showed alongside the selected one");
+        // Nothing picked, nothing built: all three.
+        for i in 0..3 {
+            assert!(ref_plane_shown(i, false, false, None, true), "plane {i} was missing from a new part");
+        }
+    }
+
+    /// The isometric pose the extrude turn uses must be the SAME one the Iso button and the
+    /// view cube use, or starting an extrude would land somewhere subtly different from every
+    /// other route to "isometric".
+    #[test]
+    fn the_extrude_turn_uses_the_standard_isometric_pose() {
+        let mut cam = OrbitCamera::default();
+        cam.focus = Vec3::new(3.0, 4.0, -5.0);
+        cam.radius = 42.0;
+        cam.animate_view(ISO_VIEW.0, ISO_VIEW.1);
+        let CamTarget { focus, radius, yaw, pitch } = cam.anim.expect("no animation was queued");
+        assert!((yaw - ISO_VIEW.0).abs() < 1e-6 && (pitch - ISO_VIEW.1).abs() < 1e-6, "not the standard iso pose");
+        // Turning around what you were looking at: the focus and zoom must be untouched, or
+        // starting an extrude would also fling the view back to the origin.
+        assert!(focus.distance(Vec3::new(3.0, 4.0, -5.0)) < 1e-6, "the extrude turn moved the focus to {focus:?}");
+        assert!((radius - 42.0).abs() < 1e-6, "the extrude turn changed the zoom");
+
+        // And it really is a three-quarter view: every axis visibly foreshortened, none edge-on.
+        let dir = Quat::from_euler(EulerRot::YXZ, ISO_VIEW.0, ISO_VIEW.1, 0.0) * Vec3::Z;
+        for (name, axis) in [("x", Vec3::X), ("y", Vec3::Y), ("z", Vec3::Z)] {
+            let d = dir.dot(axis).abs();
+            assert!(d > 0.2 && d < 0.95, "the {name} axis is {d} on to the camera - that is not isometric");
+        }
+    }
+
+    /// "Normal To" has to leave the camera looking straight down the plane's normal, whichever
+    /// way the plane faces. The yaw/pitch the camera stores are not the normal — they run
+    /// through a YXZ euler — so this checks the round trip rather than the numbers.
+    #[test]
+    fn normal_to_leaves_the_camera_square_on() {
+        let mut cam = OrbitCamera::default();
+        // Every axis, both signs, plus a few skew planes a face sketch could produce.
+        let dirs = [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(1.0, 1.0, 1.0).normalize(),
+            Vec3::new(-2.0, 0.5, 3.0).normalize(),
+            Vec3::new(0.3, -0.9, 0.15).normalize(),
+        ];
+        for n in dirs {
+            look_along(&mut cam, Vec3::new(4.0, -2.0, 7.0), n);
+            let offset = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0) * Vec3::Z;
+            // Straight down the normal is a dot product of 1. The pitch clamp (+-1.54 rad)
+            // keeps a dead-on top view a hair off vertical, which is deliberate — a camera
+            // exactly on the pole has no defined yaw.
+            assert!(offset.dot(n) > 0.999, "camera looks {offset:?} for a plane facing {n:?}");
+            assert!(cam.focus.distance(Vec3::new(4.0, -2.0, 7.0)) < 1e-6, "the focus did not move to the plane");
+        }
+    }
+
+    /// Sketching on a top or bottom face must land EXACTLY square-on. The old +-1.54 rad clamp
+    /// stopped 1.8 degrees short of vertical, and because a sketch is lifted a hair toward the
+    /// camera to stop it z-fighting with the face beneath it, that tilt showed up as the sketch
+    /// sitting visibly offset from its own face.
+    #[test]
+    fn a_sketch_on_a_flat_face_is_exactly_square_on() {
+        let mut cam = OrbitCamera::default();
+        // The two poles, where the old clamp bit, plus a couple of ordinary faces.
+        for (n, u) in [
+            (Vec3::Y, Vec3::X),
+            (Vec3::NEG_Y, Vec3::X),
+            (Vec3::Z, Vec3::X),
+            (Vec3::NEG_X, Vec3::Z),
+            (Vec3::new(0.0, 0.9998, 0.02).normalize(), Vec3::X),
+        ] {
+            look_along_aligned(&mut cam, Vec3::ZERO, n, Some(u));
+            let dir = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0) * Vec3::Z;
+            let off = dir.angle_between(n).to_degrees();
+            // A hundredth of a degree: at that angle the sketch's lift is invisible.
+            assert!(off < 0.01, "a face facing {n:?} is {off} degrees off square");
+        }
+    }
+
+    /// At the poles the view direction no longer pins the yaw — every value looks the same way
+    /// and only rolls the picture. The plane's own u axis has to settle it, or the sketch lands
+    /// at whatever roll the previous view happened to leave behind.
+    #[test]
+    fn a_top_face_sketch_lands_the_right_way_up() {
+        let mut cam = OrbitCamera::default();
+        for u in [Vec3::X, Vec3::Z, Vec3::NEG_X, Vec3::new(1.0, 0.0, 1.0).normalize()] {
+            // Start from a deliberately unhelpful roll.
+            cam.yaw = 2.3;
+            look_along_aligned(&mut cam, Vec3::ZERO, Vec3::Y, Some(u));
+            let right = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0) * Vec3::X;
+            assert!(right.dot(u) > 0.999, "the plane's u axis {u:?} came out along {right:?}, not screen-right");
+        }
+    }
+
+    /// It must turn to the side the camera is already on. Taking the stored normal blindly
+    /// swings the view through the model to stare at the back of the sketch about half the
+    /// time, which reads as the command going the wrong way.
+    #[test]
+    fn normal_to_turns_to_the_near_face_not_through_the_model() {
+        let mut cam = OrbitCamera::default();
+        for n in [Vec3::Z, Vec3::X, Vec3::new(1.0, 2.0, -0.5).normalize()] {
+            // Park the camera on the +n side, then ask for the plane: it must stay on that side.
+            look_along(&mut cam, Vec3::ZERO, n);
+            assert!(facing_normal(&cam, n).dot(n) > 0.0, "flipped away from the side it was already on");
+            assert!(facing_normal(&cam, -n).dot(n) > 0.0, "did not flip a back-facing normal toward the camera");
+            // ...and from the far side it comes out the other way.
+            look_along(&mut cam, Vec3::ZERO, -n);
+            assert!(facing_normal(&cam, n).dot(n) < 0.0, "swung through the model instead of using the near face");
+        }
+    }
+
+    /// Only features that actually sit on a plane offer the menu entry — a dead item on a
+    /// fillet would be worse than none.
+    #[test]
+    fn only_planar_features_offer_normal_to() {
+        let sketch_kind = FeatureKind::Sketch { sketch: rect_sketch(10.0, 10.0), plane: xy() };
+        let extrude = FeatureKind::Extrude { sketch: rect_sketch(10.0, 10.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 5.0, back: 0.0, thin: 0.0, thin_side: 0 };
+        let gear = FeatureKind::Gear { teeth: 20, module: 2.0, pressure_angle: 20.0, bore: 6.0, backlash: 0.0, thickness: 8.0, gear_type: GearType::Spur, helix_deg: 0.0, cone_deg: 0.0, plane: xy() };
+        for (name, k) in [("sketch", &sketch_kind), ("extrude", &extrude), ("gear", &gear)] {
+            let (_, n) = feature_plane(k).unwrap_or_else(|| panic!("{name} offered no plane"));
+            assert!((n.length() - 1.0).abs() < 1e-5, "{name} gave a non-unit normal: {n:?}");
+        }
+        assert!(feature_plane(&FeatureKind::Fillet { radius: 1.0, edges: vec![] }).is_none(), "a fillet offered a plane");
+        assert!(feature_plane(&FeatureKind::Shell { thickness: 1.0, open: vec![] }).is_none(), "a shell offered a plane");
+    }
+
     /// The box from the screenshots: drawn on a face with its bottom edge sitting on a body
     /// edge, so both bottom corners carry a PointOnLine onto that edge.
     #[cfg(test)]
@@ -24666,6 +25457,44 @@ mod tests {
             .zip(s.sketch.points.iter())
             .map(|(b, a)| b.distance(Vec2::new(a.x as f32, a.y as f32)))
             .fold(0.0_f32, f32::max)
+    }
+
+    /// A polygon's second click sets its size AND its rotation, so without an angular latch a
+    /// square is almost never square to anything — it lands a degree or two off, and every face
+    /// built on it inherits the tilt.
+    #[test]
+    fn a_polygon_latches_onto_round_angles() {
+        let c = Vec2::new(3.0, -7.0);
+        let at = |deg: f32, r: f32| c + Vec2::from_angle(deg.to_radians()) * r;
+        let angle_of = |p: Vec2| (p - c).y.atan2((p - c).x).to_degrees().rem_euclid(360.0);
+
+        // Just off a step: latches, and keeps the radius exactly.
+        for (aim, want) in [(2.0_f32, 0.0_f32), (88.0, 90.0), (271.5, 270.0), (44.0, 45.0), (-2.5, 0.0), (-88.0, 272.0_f32 - 2.0)] {
+            let snapped = snap_polygon_angle(c, at(aim, 12.0));
+            let got = angle_of(snapped);
+            let want = want.rem_euclid(360.0);
+            let off = ((got - want + 180.0).rem_euclid(360.0) - 180.0).abs();
+            assert!(off < 1e-3, "aiming at {aim} deg landed on {got}, expected {want}");
+            assert!(((snapped - c).length() - 12.0).abs() < 1e-4, "the latch changed the size");
+        }
+
+        // Between steps: left exactly where the cursor put it, so odd angles are still drawable.
+        for aim in [7.5_f32, 22.5, 100.0, 187.5] {
+            let snapped = snap_polygon_angle(c, at(aim, 5.0));
+            assert!(
+                (angle_of(snapped) - aim.rem_euclid(360.0)).abs() < 1e-3,
+                "aiming at {aim} deg was dragged to {} — an odd angle must stay reachable",
+                angle_of(snapped)
+            );
+        }
+
+        // The wrap-around: 359.5 deg must latch onto 0, not be judged 359 degrees from it.
+        let snapped = snap_polygon_angle(c, at(359.5, 4.0));
+        assert!(angle_of(snapped) < 1e-3 || (angle_of(snapped) - 360.0).abs() < 1e-3, "359.5 deg did not latch onto 0");
+
+        // A degenerate rim (cursor on the centre) must not produce NaN.
+        let z = snap_polygon_angle(c, c);
+        assert!(z.is_finite(), "a zero-radius rim produced {z:?}");
     }
 
     /// A slot butted up against existing geometry must LOCK its end centres to the body
@@ -25171,6 +26000,37 @@ mod tests {
                 for (hi, h) in r.holes.iter().enumerate() {
                     report(&format!("region{ri} hole{hi}"), h);
                 }
+            }
+        }
+    }
+
+    /// Bounding box after each feature, so a wrong extrude height shows up as a number.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_feature_extents -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_feature_extents() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let full: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for end in 1..=full.features.len() {
+            let mut doc = full.clone();
+            doc.rollback = end;
+            let kind = format!("{:?}", doc.features[end - 1].kind);
+            let name: String = kind.chars().take_while(|c| c.is_alphanumeric()).collect();
+            match regenerate_mesh(&doc) {
+                Some((m, _)) => {
+                    let (lo, hi) = mesh_bbox(&m);
+                    eprintln!(
+                        "[{end}] {name:<10} x {:.3}..{:.3}  y {:.3}..{:.3}  z {:.3}..{:.3}   (h={:.3})",
+                        lo.x, hi.x, lo.y, hi.y, lo.z, hi.z, hi.y - lo.y
+                    );
+                }
+                None => eprintln!("[{end}] {name:<10} no body"),
+            }
+        }
+        // What each feature ASKED for.
+        for (i, f) in full.features.iter().enumerate() {
+            if let FeatureKind::Extrude { plane, distance, back, .. } | FeatureKind::Cut { plane, distance, back, .. } = &f.kind {
+                eprintln!("  feature[{i}] plane y={:.4} normal={:?} distance={distance} back={back}", plane.origin[1], plane.normal);
             }
         }
     }
@@ -26454,6 +27314,63 @@ mod tests {
                 max_r - min_r
             );
         }
+    }
+
+    /// Reopening a face-built sketch must land it on the face it was drawn on, not on the
+    /// feature's own result.
+    ///
+    /// extrusionerror.hcad: a 2 mm disc with a 2 mm boss on top. The boss's stored plane had
+    /// gone stale at y=4 (an upstream depth was edited under it). Regeneration corrected that
+    /// to y=2 and built the part correctly, but reopening the sketch re-landed the plane on the
+    /// DISPLAYED body — which contains the boss — so the nearest +Y face under the footprint
+    /// was the boss's own top at y=4. The reprojection agreed with the stale value and the
+    /// sketch opened floating 2 mm above the face it belonged to.
+    #[test]
+    fn reopening_a_sketch_lands_it_on_the_face_it_was_drawn_on() {
+        // Rebuild the file's shape rather than depending on the file: a 2 mm disc, then a 2 mm
+        // boss whose stored plane is a stale 2 mm too high.
+        let mut doc = Document::with_default_planes();
+        let disc = {
+            let mut sk = hworks_sketch::Sketch::default();
+            let c = sk.add_point(0.0, 0.0);
+            sk.add_circle(c, 5.59);
+            sk
+        };
+        let xz = PlaneRef { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: true };
+        doc.add_feature(FeatureKind::Extrude { sketch: disc, regions: vec![], region_pts: vec![], plane: xz.clone(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+
+        let boss = {
+            let mut sk = hworks_sketch::Sketch::default();
+            let c = sk.add_point(0.0, 0.0);
+            sk.add_circle(c, 3.0);
+            sk
+        };
+        // Face-built (datum: false) and STALE: y = 4 where the face is at y = 2.
+        let stale = PlaneRef { origin: [0.0, 4.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 0.0, -1.0], normal: [0.0, 1.0, 0.0], datum: false };
+        doc.add_feature(FeatureKind::Extrude { sketch: boss.clone(), regions: vec![], region_pts: vec![], plane: stale.clone(), distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let boss_i = doc.features.len() - 1;
+
+        // The upstream body is the disc alone: 2 mm tall.
+        let upstream = body_before_feature(&doc, boss_i).expect("no upstream body");
+        let (ulo, uhi) = mesh_bbox(&upstream);
+        assert!((uhi.y - 2.0).abs() < 1e-3 && ulo.y.abs() < 1e-3, "upstream body is {}..{}, expected 0..2", ulo.y, uhi.y);
+
+        // Reopening lands the sketch on that face.
+        let landed = replane_on_upstream_body(&doc, boss_i, &stale, &boss);
+        assert!((landed.origin[1] - 2.0).abs() < 1e-3, "the sketch opened at y={}, not on the face at y=2", landed.origin[1]);
+
+        // The old behaviour, for contrast: re-landing on the DISPLAYED body (which contains the
+        // boss) confirms the stale height instead of correcting it.
+        let (displayed, _) = regenerate_mesh(&doc).expect("full body");
+        let regions = boss.regions();
+        let samples = sketch_footprint_samples(&stale, &regions);
+        let wrong = reproject_plane_on_mesh(&stale, &displayed, &samples);
+        assert!((wrong.origin[1] - 4.0).abs() < 1e-3, "the test's premise failed: the displayed body gave y={}", wrong.origin[1]);
+
+        // A datum plane is fixed in space and must never be dragged onto a face.
+        let held = replane_on_upstream_body(&doc, boss_i, &xz, &boss);
+        assert!(held.origin[1].abs() < 1e-9, "a datum plane was moved to y={}", held.origin[1]);
     }
 
     /// A gear feature has to come out the size its numbers say, and with a real bore. This is
