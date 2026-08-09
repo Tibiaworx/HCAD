@@ -314,6 +314,16 @@ struct AsmGeom {
 struct AsmRender {
     cache: std::collections::HashMap<String, AsmGeom>,
     dirty: bool,
+    /// Section-cut copies, keyed by component id. Unlike `cache` these CANNOT be shared
+    /// between instances of the same part: two instances sit at different places, so a single
+    /// world section plane meets each of them differently.
+    sec_cache: std::collections::HashMap<u64, Handle<Mesh>>,
+    /// The section the `sec_cache` was built for, so a moved plane rebuilds and an unchanged
+    /// one does not.
+    sec_shown: Option<SectionSpec>,
+    /// Explode distance the cuts were built at. Exploding moves parts through the plane, so
+    /// the cuts have to follow.
+    sec_explode: f32,
 }
 
 /// An in-progress component move drag: which world axis, the last cursor parameter along
@@ -1121,6 +1131,35 @@ fn component_tessellation(doc: &Document) -> Option<Tessellation> {
 
 /// Rebuild the assembly scene when flagged dirty: regenerate distinct parts into the cache
 /// (each once), then spawn one entity per visible component instance sharing the cached mesh.
+/// Cut one component's mesh with the assembly's section plane.
+///
+/// The plane is defined in WORLD space but each component's mesh lives in its own local
+/// frame, so the plane is carried into that frame rather than the mesh into the world: a
+/// rotation takes the normal, and the offset loses the component's own distance along it.
+/// Cutting in local space keeps the entity's transform doing its normal job, and keeps the
+/// shared per-part mesh cache intact for the uncut case.
+fn section_cut_component(tri: &TriMesh, tf: &Transform, spec: &SectionSpec) -> Option<TriMesh> {
+    let (u, v, n) = section_axes(spec);
+    let inv = tf.rotation.inverse();
+    let (lu, lv, ln) = (inv * u, inv * v, inv * n);
+    // Distance from the component's own origin to the plane, along the plane normal.
+    let local_offset = spec.offset - tf.translation.dot(n);
+    let (lo, hi) = mesh_bbox(tri);
+    let l = (((hi - lo).length()) as f64 * 1.5).max(10.0);
+    let d3 = |w: Vec3| [w.x as f64, w.y as f64, w.z as f64];
+    let pr = PlaneRef { origin: [0.0; 3], u: d3(lu), v: d3(lv), normal: d3(ln), datum: true };
+    let basis = basis_from_ref(&pr);
+    let sq = [[-l, -l], [l, -l], [l, l], [-l, l]];
+    // The tool fills the DISCARDED half-space: past the plane along +normal, or before it
+    // when flipped - the same convention the part-mode section uses.
+    let (start, len) = if spec.flip { (local_offset as f64 - 2.0 * l, 2.0 * l) } else { (local_offset as f64, 2.0 * l) };
+    let tool = extrude_tool_mesh(&sq, &[], &basis, start, len)?;
+    let cut = mesh_difference(tri, &tool);
+    // A display-only cut must never raise the torn-surface banner.
+    let _ = take_fallback_count();
+    (!cut.positions.is_empty()).then_some(cut)
+}
+
 fn asm_regenerate(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1131,6 +1170,14 @@ fn asm_regenerate(
     mut render: ResMut<AsmRender>,
     existing: Query<Entity, With<AsmComp>>,
 ) {
+    // A moved or toggled section plane needs the cut meshes rebuilt, exactly like a changed
+    // component would.
+    if render.sec_shown != ui_state.section || (render.sec_explode - ui_state.explode).abs() > 1e-4 {
+        render.sec_shown = ui_state.section;
+        render.sec_explode = ui_state.explode;
+        render.sec_cache.clear();
+        render.dirty = true;
+    }
     if !render.dirty {
         return;
     }
@@ -1143,12 +1190,14 @@ fn asm_regenerate(
         // return to assembly mode reuse it.
         if ui_state.editing_component.is_none() {
             render.cache.clear();
+            render.sec_cache.clear();
         }
         return;
     }
     // Drop cache entries whose part is gone (deleted last instance), keep shared ones.
     let live: std::collections::HashSet<String> = asm.0.components.iter().map(asm_geom_key).collect();
     render.cache.retain(|k, _| live.contains(k));
+    // Pass 1: the shared per-part geometry.
     for comp in &asm.0.components {
         if comp.hidden {
             continue;
@@ -1164,7 +1213,42 @@ fn asm_regenerate(
             let mesh = meshes.add(trimesh_to_bevy(tess.mesh));
             render.cache.insert(key.clone(), AsmGeom { mesh, tri, edges });
         }
-        let Some(geom) = render.cache.get(&key) else { continue };
+    }
+    // The explode offsets are measured against the whole scene, so the extent can only be
+    // taken once every component's geometry is in the cache - and the section has to cut at
+    // the exploded position, or the plane would appear to travel with each part.
+    let (centre, diag) = asm_scene_extent(&asm.0, &render);
+    // Pass 2: one entity per instance, section-cut where a plane is active.
+    let mut sectioned_away = 0usize;
+    for comp in &asm.0.components {
+        if comp.hidden {
+            continue;
+        }
+        let key = asm_geom_key(comp);
+        let (base_mesh, display, tri) = {
+            let Some(geom) = render.cache.get(&key) else { continue };
+            let display = comp_display_transform(comp, geom, centre, diag, ui_state.explode);
+            (geom.mesh.clone(), display, ui_state.section.map(|_| geom.tri.clone()))
+        };
+        let mesh_handle = match (ui_state.section, tri) {
+            (Some(spec), Some(tri)) => match render.sec_cache.get(&comp.id) {
+                Some(h) => h.clone(),
+                None => match section_cut_component(&tri, &display, &spec) {
+                    Some(cut) => {
+                        let h = meshes.add(trimesh_to_bevy(cut));
+                        render.sec_cache.insert(comp.id, h.clone());
+                        h
+                    }
+                    // Entirely on the discarded side. Drawing it uncut would read as the
+                    // section not working on that part, so leave it out and say how many.
+                    None => {
+                        sectioned_away += 1;
+                        continue;
+                    }
+                },
+            },
+            _ => base_mesh,
+        };
         // Each instance gets its own material so the selection tint can single it out.
         let material = materials.add(StandardMaterial {
             base_color: Color::srgb(0.62, 0.66, 0.74),
@@ -1175,12 +1259,15 @@ fn asm_regenerate(
             ..default()
         });
         commands.spawn((
-            Mesh3d(geom.mesh.clone()),
+            Mesh3d(mesh_handle),
             MeshMaterial3d(material),
             comp_transform(comp),
             AsmComp(comp.id),
             Name::new(comp.name.clone()),
         ));
+    }
+    if sectioned_away > 0 {
+        info!("Section: {sectioned_away} component(s) lie entirely past the plane and are hidden.");
     }
 }
 
@@ -1240,6 +1327,16 @@ fn draw_asm_edges(
         for e in &geom.edges {
             let a = tf.transform_point(Vec3::from_array(e[0]));
             let b = tf.transform_point(Vec3::from_array(e[1]));
+            // Edges come from the UNCUT part, so a section has to drop the ones it removed -
+            // otherwise they hang in the air past the plane and the cut looks broken. Judged
+            // on the midpoint: an edge crossing the plane belongs to the half being kept.
+            if let Some(spec) = ui_state.section {
+                let (_, _, n) = section_axes(&spec);
+                let d = ((a + b) * 0.5).dot(n) - spec.offset;
+                if if spec.flip { d < 0.0 } else { d > 0.0 } {
+                    continue;
+                }
+            }
             gizmos.line(nudge(a), nudge(b), col);
         }
     }
@@ -8905,7 +9002,24 @@ fn ui_system(
                                 }
                                 match angle_ref {
                                     Some(fixed) => session.sketch.solve_with_fixed(&fixed),
-                                    None => session.sketch.solve(),
+                                    None => {
+                                        // A distance holds one end so the shape grows rather
+                                        // than sliding; anything else solves normally.
+                                        if let Some((want, got)) = solve_distance_dim(&mut session.sketch, ci) {
+                                            // A dimension the sketch cannot reach - both ends
+                                            // locked to the body, or fighting another relation -
+                                            // used to be accepted in silence and simply not
+                                            // happen, which reads as the app ignoring you.
+                                            if (want - got).abs() > (want.abs() * 1e-3).max(1e-4) {
+                                                ui_state.toasts.push((
+                                                    format!(
+                                                        "Dimension not applied: asked for {want:.3} mm, the sketch can only reach {got:.3} mm. Something else is holding it \u{2014} usually both ends locked onto the body, or a conflicting relation."
+                                                    ),
+                                                    6.0,
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             // Per-kind toggle controls (Ø/R, or aligned/H/V).
@@ -9492,6 +9606,31 @@ fn ref_only_points(sketch: &Sketch) -> std::collections::HashSet<usize> {
     }
     in_ref.retain(|p| !in_real.contains(p));
     in_ref
+}
+
+/// Does `uv` sit on a body-projected reference snap point (a corner, edge midpoint or hole
+/// centre)?
+///
+/// A quarter of the snap radius, the same tolerance `get_or_add_point_ref` pins at: tight
+/// enough to mean "the user aimed at this feature", not "something was vaguely nearby". The
+/// full snap radius grows with zoom, and using it here is what used to yank a polygon vertex
+/// across the screen toward a far target.
+fn on_reference_point(session: &SketchSession, uv: Vec2) -> bool {
+    let tol = (session.snap_dist * 0.25).max(1e-3);
+    session.reference_points.iter().any(|r| r.distance(uv) <= tol)
+}
+
+/// Add a point, locked in place if it landed on a body reference feature.
+///
+/// The lock is what stops the ledges: an unpinned point keeps a degree of freedom, so a later
+/// solve is free to slide it a fraction off the body edge it was snapped to. Extrude that and
+/// the wall misses the one below it by a few microns.
+fn add_point_pinned_to_body(session: &mut SketchSession, uv: Vec2) -> usize {
+    if on_reference_point(session, uv) {
+        session.sketch.add_fixed_point(uv.x as f64, uv.y as f64)
+    } else {
+        session.sketch.add_point(uv.x as f64, uv.y as f64)
+    }
 }
 
 /// Like `get_or_add_point`, but if the position coincides with a body-projected
@@ -12264,6 +12403,10 @@ fn sketch_interaction(
                         None
                     };
                     if let Some(ci) = created {
+                        // Dimensioning one side of a box carries the opposite side with it.
+                        if let Some(l) = line_ctx {
+                            tie_opposite_side(&mut session.sketch, l);
+                        }
                         open_dim_edit(&mut session, ci, line_ctx);
                         session.dim_slot = slot_ctx;
                     }
@@ -12404,6 +12547,80 @@ fn has_radius(sketch: &Sketch, center: usize) -> bool {
 /// Add a distance dimension between two points at their current distance (or return
 /// the existing one for that pair). Returns the constraint index so the caller can
 /// open the Modify box on it. `None` only for a degenerate same-point pick.
+/// The side directly opposite `line` in a closed four-sided loop, if there is one.
+///
+/// Found by walking the loop rather than by geometry: from the dimensioned side's two ends,
+/// follow one line off each, and see whether a fourth line closes the far ends together.
+fn opposite_side(sketch: &Sketch, line: usize) -> Option<(usize, usize, usize)> {
+    let ends = |i: usize| match sketch.entities.get(i) {
+        Some(SketchEntity::Line { a, b, construction: false, reference: false }) => Some((*a, *b)),
+        _ => None,
+    };
+    let (a, b) = ends(line)?;
+    let others: Vec<(usize, usize, usize)> = (0..sketch.entities.len())
+        .filter(|i| *i != line)
+        .filter_map(|i| ends(i).map(|(c, d)| (i, c, d)))
+        .collect();
+    // The far end of the side hanging off `p`, for each such side.
+    let hanging = |p: usize| -> Vec<(usize, usize)> {
+        others
+            .iter()
+            .filter_map(|(i, c, d)| {
+                if *c == p {
+                    Some((*i, *d))
+                } else if *d == p {
+                    Some((*i, *c))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    for (i1, far_a) in hanging(a) {
+        for (i2, far_b) in hanging(b) {
+            if i1 == i2 || far_a == far_b {
+                continue;
+            }
+            // A fourth line joining the two far ends closes the quad; that is the opposite side.
+            if let Some((i, c, d)) = others
+                .iter()
+                .find(|(i, c, d)| *i != i1 && *i != i2 && ((*c == far_a && *d == far_b) || (*c == far_b && *d == far_a)))
+            {
+                return Some((*i, *c, *d));
+            }
+        }
+    }
+    None
+}
+
+/// Dimensioning one side of a box should carry the opposite side with it, so the box keeps its
+/// shape instead of turning into a trapezoid — but WITHOUT a second dimension on that side, so
+/// it stays driven rather than doubly defined. An `Equal` relation is exactly that: the far
+/// side reads as undefined, and always matches.
+///
+/// Skipped when the opposite side already has a dimension or an equality of its own, since
+/// adding another would over-define the sketch rather than help it.
+fn tie_opposite_side(sketch: &mut Sketch, line: usize) {
+    let Some((_, c, d)) = opposite_side(sketch, line) else { return };
+    let Some((a, b)) = (match sketch.entities.get(line) {
+        Some(SketchEntity::Line { a, b, .. }) => Some((*a, *b)),
+        _ => None,
+    }) else {
+        return;
+    };
+    let already = sketch.constraints.iter().any(|k| match k {
+        Constraint::Distance { a: x, b: y, .. } => (*x == c && *y == d) || (*x == d && *y == c),
+        Constraint::Equal(x, y, z, w) => {
+            let pair = |p: usize, q: usize, r: usize, t: usize| (p == r && q == t) || (p == t && q == r);
+            pair(*x, *y, c, d) || pair(*z, *w, c, d) || pair(*x, *y, a, b) || pair(*z, *w, a, b)
+        }
+        _ => false,
+    });
+    if !already {
+        sketch.constraints.push(Constraint::Equal(a, b, c, d));
+    }
+}
+
 fn add_distance_dim(sketch: &mut Sketch, a: usize, b: usize) -> Option<usize> {
     if a == b {
         return None;
@@ -12928,6 +13145,61 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
 /// Open the Modify box on dimension `ci`, seeding the edit buffer in the units the box
 /// shows (diameter ×2, angle in degrees). `line` carries a single-line context so a
 /// length dim can still morph into an angle if a second line is then clicked.
+/// Re-solve after a distance dimension changed, holding ONE end still.
+///
+/// A plain `solve()` spreads the correction over both endpoints, so setting a 20 mm side to
+/// 30 moves one end to -5 and the other to 25: the shape stays the right size and shape, but
+/// slides sideways under the rest of the sketch. Holding the first-picked end makes it grow
+/// away from where you started, which is what SolidWorks does and what the angle dimension
+/// here already did.
+///
+/// An end that is already locked (pinned to body geometry, or the origin anchor) is the
+/// natural anchor, so in that case the ordinary solve is right — pinning the other end as
+/// well would leave the dimension with nowhere to go.
+///
+/// Returns `(wanted, achieved)` so the caller can tell whether the dimension actually took.
+fn solve_distance_dim(sketch: &mut Sketch, ci: usize) -> Option<(f64, f64)> {
+    let (a, b, want, axis) = match sketch.constraints.get(ci) {
+        Some(Constraint::Distance { a, b, value, axis, .. }) => (*a, *b, *value, *axis),
+        _ => {
+            sketch.solve();
+            return None;
+        }
+    };
+    // Which end is tied to the body? A point welded to a body corner is `fixed`; one snapped
+    // onto a body EDGE carries a PointOnLine/Arc/Circle instead and is still free to slide
+    // along it. Both count: that end is the one that must not move, or dimensioning a side
+    // drags the sketch off the geometry it was drawn against - which is exactly what pushed
+    // the bottom-left corner of the box below its edge.
+    let attached = |i: usize| {
+        sketch.points.get(i).is_some_and(|q| q.fixed)
+            || sketch.constraints.iter().any(|c| match c {
+                Constraint::PointOnLine { p: q, .. } | Constraint::PointOnArc { p: q, .. } | Constraint::PointOnCircle { p: q, .. } => *q == i,
+                _ => false,
+            })
+    };
+    match (attached(a), attached(b)) {
+        // Both ends held by the body: nothing here can give, so let the ordinary solve run and
+        // let the caller report that the dimension did not take.
+        (true, true) => sketch.solve(),
+        (true, false) => sketch.solve_with_fixed(&[a]),
+        (false, true) => sketch.solve_with_fixed(&[b]),
+        // Neither is tied to anything: hold the end the dimension started from, so the shape
+        // grows away from where you clicked rather than sliding both ways.
+        (false, false) => sketch.solve_with_fixed(&[a]),
+    }
+    let (pa, pb) = (*sketch.points.get(a)?, *sketch.points.get(b)?);
+    let (dx, dy) = (pb.x - pa.x, pb.y - pa.y);
+    // Match the residual the constraint itself uses, or an axis dimension would read as
+    // unsatisfied whenever the line is not along that axis.
+    let got = match axis {
+        DimAxis::Horizontal => dx.abs(),
+        DimAxis::Vertical => dy.abs(),
+        _ => dx.hypot(dy),
+    };
+    Some((want, got))
+}
+
 fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
     let buf = match session.sketch.constraints.get(ci) {
         Some(Constraint::Distance { value, .. }) => *value,
@@ -14445,9 +14717,13 @@ fn text_handles(sketch: &Sketch, idx: usize) -> Option<(Vec2, Vec2, Vec2)> {
 /// Build a slot entity from end centres `a`,`b`, optional arc bend `mid`, and half-width `r`.
 fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>, r: f32) {
     let snap = session.snap_dist;
-    let pa = get_or_add_point(&mut session.sketch, a, snap);
-    let pb = get_or_add_point(&mut session.sketch, b, snap);
-    let pmid = mid.map(|m| get_or_add_point(&mut session.sketch, m, snap));
+    // `_ref` rather than plain `get_or_add_point`: a slot butting up against existing geometry
+    // needs its end centres LOCKED to the body features they were snapped to, exactly like a
+    // line's endpoints. Without the lock the ends keep a degree of freedom and a later solve
+    // slides them a fraction off, which is where the small ledges come from.
+    let pa = get_or_add_point_ref(session, a, snap);
+    let pb = get_or_add_point_ref(session, b, snap);
+    let pmid = mid.map(|m| get_or_add_point_ref(session, m, snap));
     session.sketch.entities.push(SketchEntity::Slot {
         a: pa,
         b: pb,
@@ -14470,6 +14746,19 @@ fn poly_rim(session: &SketchSession) -> Option<Vec2> {
             return Some(Vec2::new(p.x as f32, p.y as f32));
         }
     }
+    // Body reference features (corners, edge midpoints, hole centres) at the TIGHT tolerance,
+    // so a polygon can be sized off existing geometry. The full snap radius is what used to
+    // yank the vertex to a far target when zoomed out; a quarter of it takes a deliberate aim.
+    let tol = (session.snap_dist * 0.25).max(1e-3);
+    let near = session
+        .reference_points
+        .iter()
+        .map(|r| (*r, r.distance(raw)))
+        .filter(|(_, d)| *d <= tol)
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((p, _)) = near {
+        return Some(p);
+    }
     Some(raw)
 }
 
@@ -14485,13 +14774,19 @@ fn commit_polygon(session: &mut SketchSession, center: Vec2, rim: Vec2) {
     // finding the circle on its centre point, so concentric polygons MUST NOT share one
     // centre point — else every vertex would read the first (largest) circle's radius and
     // collapse onto it. Each polygon gets its own centre + its own construction circle.
-    let cp = session.sketch.add_point(center.x as f64, center.y as f64);
+    // Pinned when it landed on a body feature (a hole centre, a face centre), so a polygon
+    // placed concentric with existing geometry stays concentric through later solves.
+    let cp = add_point_pinned_to_body(session, center);
     session.sketch.add_construction_circle(cp, r as f64);
     let mut verts = Vec::with_capacity(n);
     for k in 0..n {
         let ang = theta0 + std::f32::consts::TAU * k as f32 / n as f32;
         let p = center + Vec2::new(ang.cos(), ang.sin()) * r;
-        verts.push(session.sketch.add_point(p.x as f64, p.y as f64));
+        // Any vertex that lands on a body corner is pinned there too. In practice that is the
+        // one the user clicked (plus its mirror on a symmetric placement) - a regular polygon
+        // cannot put many vertices on body features by accident, so this cannot over-constrain
+        // the shape in normal use.
+        verts.push(add_point_pinned_to_body(session, p));
     }
     // The polygon edges are the profile, so they're always solid — only the circumscribed
     // circle is construction. (Don't inherit the sticky Line-tool construction toggle, or
@@ -24035,6 +24330,437 @@ mod tests {
         assert!(s.constraints.iter().any(|c| matches!(c, Constraint::Vertical(x, y) if (*x == a && *y == b) || (*x == b && *y == a))));
         assert!(s.constraints.iter().any(|c| matches!(c, Constraint::PointOnCircle { p, .. } if *p == b)));
         assert!(!s.constraints.iter().any(|c| matches!(c, Constraint::PointOnArc { .. } | Constraint::Horizontal(..))));
+    }
+
+    /// A 20x20x10 block, and its extent along X.
+    #[cfg(test)]
+    fn block_and_span() -> (TriMesh, f32, f32) {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("block");
+        let (lo, hi) = mesh_bbox(&m);
+        (m, lo.x, hi.x)
+    }
+
+    /// A section plane whose normal runs along +X (the Right datum), at `offset`.
+    #[cfg(test)]
+    fn x_section(offset: f32, flip: bool) -> SectionSpec {
+        SectionSpec { which: 2, offset, flip, rot_u: 0.0, rot_v: 0.0 }
+    }
+
+    /// Sectioning an assembly has to cut every component against ONE world plane. Two copies
+    /// of the same part sit at different places, so the shared per-part mesh cannot be reused -
+    /// each instance needs its own cut, or the second copy comes out cut in the wrong place
+    /// and any fit you read off it is a lie.
+    #[test]
+    fn an_assembly_section_cuts_each_instance_where_it_actually_sits() {
+        let (block, x0, x1) = block_and_span();
+        let (_, _, n) = section_axes(&x_section(0.0, false));
+        assert!((n - Vec3::X).length() < 1e-6, "the test's premise failed: plane 2's normal is {n:?}, not +X");
+
+        let mid = (x0 + x1) * 0.5;
+        let spec = x_section(mid, false);
+        let at = |x: f32| Transform::from_translation(Vec3::new(x, 0.0, 0.0));
+        let width = x1 - x0;
+
+        // Straddling the plane: keeps the half below it, in the instance's own coordinates.
+        let near = section_cut_component(&block, &at(0.0), &spec).expect("the straddling instance produced nothing");
+        let (lo, hi) = mesh_bbox(&near);
+        assert!(hi.x <= mid + 1e-3, "material survived past the plane: {} > {mid}", hi.x);
+        assert!(hi.x > mid - width * 0.05, "the straddling instance was cut too far back: {}", hi.x);
+        assert!((lo.x - x0).abs() < 1e-3, "the kept side lost material it should have had");
+
+        // Shifted a long way along +X it is entirely past the plane, so nothing is left.
+        assert!(
+            section_cut_component(&block, &at(width * 3.0), &spec).is_none(),
+            "an instance wholly past the plane still produced geometry - the cut ignored where it sits"
+        );
+
+        // Shifted the other way it is untouched.
+        let behind = section_cut_component(&block, &at(-width * 3.0), &spec).expect("an instance before the plane vanished");
+        let full = hworks_geometry::signed_mesh_volume(&block).abs();
+        assert!(
+            (hworks_geometry::signed_mesh_volume(&behind).abs() - full).abs() < full * 1e-3,
+            "an instance entirely on the kept side lost material"
+        );
+    }
+
+    /// Flipping keeps the other half, and the two halves add back up to the whole part - the
+    /// same convention part mode uses.
+    #[test]
+    fn flipping_an_assembly_section_keeps_the_other_half() {
+        let (block, x0, x1) = block_and_span();
+        let mid = (x0 + x1) * 0.5;
+        let tf = Transform::from_translation(Vec3::ZERO);
+        let low = section_cut_component(&block, &tf, &x_section(mid, false)).expect("unflipped");
+        let high = section_cut_component(&block, &tf, &x_section(mid, true)).expect("flipped");
+        let (llo, lhi) = mesh_bbox(&low);
+        let (hlo, hhi) = mesh_bbox(&high);
+        assert!(lhi.x <= mid + 1e-3, "unflipped kept material past the plane");
+        assert!(hlo.x >= mid - 1e-3, "flipped kept material before the plane");
+        assert!((llo.x - x0).abs() < 1e-3 && (hhi.x - x1).abs() < 1e-3, "the two halves do not span the block");
+        let full = hworks_geometry::signed_mesh_volume(&block).abs();
+        let halves = hworks_geometry::signed_mesh_volume(&low).abs() + hworks_geometry::signed_mesh_volume(&high).abs();
+        assert!((halves - full).abs() < full * 1e-3, "the halves do not add up to the whole: {halves} vs {full}");
+    }
+
+    /// A square drawn as four lines, optionally rotated, optionally with its first side
+    /// sitting on body reference points (so those ends get locked).
+    #[cfg(test)]
+    fn square_session(deg: f32, first_side_on_body: bool) -> SketchSession {
+        let mut s = SketchSession::default();
+        s.snap_dist = SNAP;
+        s.tool = Tool::Line;
+        let c = [(0.0_f32, 0.0_f32), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
+        let rot = |q: (f32, f32)| {
+            let (sn, cs) = deg.to_radians().sin_cos();
+            Vec2::new(q.0 * cs - q.1 * sn, q.0 * sn + q.1 * cs)
+        };
+        if first_side_on_body {
+            s.reference_points = vec![rot(c[0]), rot(c[1])];
+        }
+        for k in 0..4 {
+            place_point(&mut s, rot(c[k]));
+            place_point(&mut s, rot(c[(k + 1) % 4]));
+        }
+        s
+    }
+
+    /// The four side lengths and the four corner angles, in order.
+    #[cfg(test)]
+    fn square_shape(s: &SketchSession) -> (Vec<f32>, Vec<f32>) {
+        let lens = s
+            .sketch
+            .entities
+            .iter()
+            .filter_map(|e| match e {
+                SketchEntity::Line { a, b, .. } => {
+                    let (pa, pb) = (s.sketch.points[*a], s.sketch.points[*b]);
+                    Some((((pb.x - pa.x).powi(2) + (pb.y - pa.y).powi(2)).sqrt()) as f32)
+                }
+                _ => None,
+            })
+            .collect();
+        let pts: Vec<Vec2> = s.sketch.points.iter().map(|q| Vec2::new(q.x as f32, q.y as f32)).collect();
+        let angs = (0..4)
+            .map(|k| {
+                let (u, v) = (pts[(k + 3) % 4] - pts[k], pts[(k + 1) % 4] - pts[k]);
+                u.angle_to(v).to_degrees().abs()
+            })
+            .collect();
+        (lens, angs)
+    }
+
+    /// The box from the screenshots: drawn on a face with its bottom edge sitting on a body
+    /// edge, so both bottom corners carry a PointOnLine onto that edge.
+    #[cfg(test)]
+    fn box_sitting_on_a_body_edge() -> (SketchSession, usize, usize, usize, usize) {
+        let mut s = SketchSession::default();
+        s.snap_dist = SNAP;
+        // Corners: bottom-left, bottom-right, top-right, top-left of a 20 x 8 box.
+        let bl = s.sketch.add_point(0.0, 0.0);
+        let br = s.sketch.add_point(20.0, 0.0);
+        let tr = s.sketch.add_point(20.0, 8.0);
+        let tl = s.sketch.add_point(0.0, 8.0);
+        s.sketch.add_line(bl, br, false);
+        s.sketch.add_line(br, tr, false);
+        s.sketch.add_line(tr, tl, false);
+        s.sketch.add_line(tl, bl, false);
+        s.sketch.constraints.push(Constraint::Horizontal(bl, br));
+        s.sketch.constraints.push(Constraint::Horizontal(tl, tr));
+        s.sketch.constraints.push(Constraint::Vertical(bl, tl));
+        s.sketch.constraints.push(Constraint::Vertical(br, tr));
+        // The body edge the box was drawn against: the two bottom corners ride it.
+        let e0 = s.sketch.add_fixed_point(-40.0, 0.0);
+        let e1 = s.sketch.add_fixed_point(60.0, 0.0);
+        s.sketch.constraints.push(Constraint::PointOnLine { p: bl, a: e0, b: e1 });
+        s.sketch.constraints.push(Constraint::PointOnLine { p: br, a: e0, b: e1 });
+        (s, bl, br, tr, tl)
+    }
+
+    /// Dimensioning the LEFT side of a box that sits on a body edge must move its TOP, not
+    /// push its bottom corner off the edge. In the screenshots the bottom-left corner dropped
+    /// below the edge and the box sheared into a trapezoid: the solve had been anchoring on
+    /// whichever end the line happened to be drawn from, with no regard for which end the body
+    /// was holding.
+    #[test]
+    fn dimensioning_a_side_keeps_the_box_on_the_edge_it_sits_on() {
+        let (mut s, bl, _br, _tr, tl) = box_sitting_on_a_body_edge();
+        // Dimension the left side (bottom-left -> top-left) to 2 mm. `a` is the BOTTOM here,
+        // but the rule must not depend on that: the body-attached end wins either way.
+        s.sketch.constraints.push(Constraint::Distance { a: tl, b: bl, value: 2.0, offset: 0.0, axis: Default::default() });
+        let ci = s.sketch.constraints.len() - 1;
+        let (want, got) = solve_distance_dim(&mut s.sketch, ci).expect("not a distance dimension");
+        assert!((want - got).abs() < 1e-4, "the dimension did not take: asked {want}, got {got}");
+
+        // The corner on the body edge must not have moved at all.
+        let p = s.sketch.points[bl];
+        assert!(p.y.abs() < 1e-6, "the bottom-left corner was pushed off the body edge to y={}", p.y);
+        // ...and the side shortened upwards.
+        assert!((s.sketch.points[tl].y - 2.0).abs() < 1e-4, "the top-left corner did not come down to 2 mm: {}", s.sketch.points[tl].y);
+    }
+
+    /// Dimensioning one side must carry the opposite side with it, so the box keeps its shape
+    /// rather than shearing - and WITHOUT putting a second dimension on that side, which would
+    /// over-define the sketch. An Equal relation gives "undefined, but always the same".
+    #[test]
+    fn dimensioning_one_side_ties_the_opposite_side_to_it() {
+        let (mut s, bl, br, tr, tl) = box_sitting_on_a_body_edge();
+        // Side 3 of the entity list is the left side (tl -> bl).
+        let left = s
+            .sketch
+            .entities
+            .iter()
+            .position(|e| matches!(e, SketchEntity::Line { a, b, .. } if (*a == tl && *b == bl) || (*a == bl && *b == tl)))
+            .expect("no left side");
+        tie_opposite_side(&mut s.sketch, left);
+        let tied = s.sketch.constraints.iter().any(|c| match c {
+            Constraint::Equal(x, y, z, w) => {
+                let pair = |p: usize, q: usize, r: usize, t: usize| (p == r && q == t) || (p == t && q == r);
+                (pair(*x, *y, tl, bl) && pair(*z, *w, br, tr)) || (pair(*x, *y, br, tr) && pair(*z, *w, tl, bl))
+            }
+            _ => false,
+        });
+        assert!(tied, "the right side was not tied to the left one");
+
+        // Now the dimension: both sides must end up 2 mm, and the right side carries no
+        // dimension of its own.
+        s.sketch.constraints.push(Constraint::Distance { a: tl, b: bl, value: 2.0, offset: 0.0, axis: Default::default() });
+        let ci = s.sketch.constraints.len() - 1;
+        solve_distance_dim(&mut s.sketch, ci);
+        let len = |a: usize, b: usize| {
+            let (pa, pb) = (s.sketch.points[a], s.sketch.points[b]);
+            ((pb.x - pa.x).powi(2) + (pb.y - pa.y).powi(2)).sqrt()
+        };
+        assert!((len(tl, bl) - 2.0).abs() < 1e-4, "the dimensioned side is {}", len(tl, bl));
+        assert!((len(br, tr) - 2.0).abs() < 1e-4, "the opposite side did not follow: {}", len(br, tr));
+        let dims = s.sketch.constraints.iter().filter(|c| matches!(c, Constraint::Distance { .. })).count();
+        assert_eq!(dims, 1, "the opposite side was given a dimension of its own instead of an equality");
+    }
+
+    /// Tying must not fire twice, or a second dimension on the same box would over-define it.
+    #[test]
+    fn tying_the_opposite_side_is_not_repeated() {
+        let (mut s, bl, _br, _tr, tl) = box_sitting_on_a_body_edge();
+        let left = s
+            .sketch
+            .entities
+            .iter()
+            .position(|e| matches!(e, SketchEntity::Line { a, b, .. } if (*a == tl && *b == bl) || (*a == bl && *b == tl)))
+            .unwrap();
+        tie_opposite_side(&mut s.sketch, left);
+        let after_one = s.sketch.constraints.len();
+        tie_opposite_side(&mut s.sketch, left);
+        assert_eq!(s.sketch.constraints.len(), after_one, "tying the same side twice added a duplicate relation");
+        // And tying the far side back is a no-op too - they are already equal.
+        let right = opposite_side(&s.sketch, left).expect("no opposite side").0;
+        tie_opposite_side(&mut s.sketch, right);
+        assert_eq!(s.sketch.constraints.len(), after_one, "tying the opposite side back added a second equality");
+    }
+
+    /// Dimensioning one side of a square must GROW it from one end, not expand it both ways
+    /// about its middle. The old plain solve spread the correction over both endpoints, so a
+    /// 20 mm side set to 30 put one end at -5 and the other at 25 — the square kept its shape
+    /// but slid sideways under the rest of the sketch, which is what read as "leaning".
+    #[test]
+    fn dimensioning_a_side_grows_the_square_instead_of_sliding_it() {
+        let mut s = square_session(0.0, false);
+        let (a, b) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Line { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("no lines");
+        let held = Vec2::new(s.sketch.points[a].x as f32, s.sketch.points[a].y as f32);
+
+        s.sketch.constraints.push(Constraint::Distance { a, b, value: 30.0, offset: 0.0, axis: Default::default() });
+        let ci = s.sketch.constraints.len() - 1;
+        let (want, got) = solve_distance_dim(&mut s.sketch, ci).expect("not a distance dimension");
+        assert!((want - got).abs() < 1e-6, "the dimension did not take: asked {want}, got {got}");
+
+        // The end the dimension started from must not have budged.
+        let now = Vec2::new(s.sketch.points[a].x as f32, s.sketch.points[a].y as f32);
+        assert!(now.distance(held) < 1e-6, "the anchored end moved from {held:?} to {now:?} — the square slid");
+
+        // And the shape is still a square-cornered rectangle, with the opposite side following.
+        let (lens, angs) = square_shape(&s);
+        assert!((lens[0] - 30.0).abs() < 1e-4 && (lens[2] - 30.0).abs() < 1e-4, "the opposite side did not follow: {lens:?}");
+        assert!((lens[1] - 20.0).abs() < 1e-4 && (lens[3] - 20.0).abs() < 1e-4, "the other pair changed length: {lens:?}");
+        for (k, a) in angs.iter().enumerate() {
+            assert!((a - 90.0).abs() < 0.01, "corner {k} leaned to {a} degrees");
+        }
+    }
+
+    /// The same must hold for a square that is not on the axes — there the shape is held by
+    /// perpendicular relations rather than horizontal/vertical ones.
+    #[test]
+    fn a_rotated_square_also_grows_from_its_anchor() {
+        let mut s = square_session(30.0, false);
+        let (a, b) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Line { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .unwrap();
+        let held = Vec2::new(s.sketch.points[a].x as f32, s.sketch.points[a].y as f32);
+        s.sketch.constraints.push(Constraint::Distance { a, b, value: 30.0, offset: 0.0, axis: Default::default() });
+        let ci = s.sketch.constraints.len() - 1;
+        solve_distance_dim(&mut s.sketch, ci);
+        let now = Vec2::new(s.sketch.points[a].x as f32, s.sketch.points[a].y as f32);
+        assert!(now.distance(held) < 1e-6, "the anchored end of a rotated square moved");
+        let (lens, angs) = square_shape(&s);
+        assert!((lens[0] - 30.0).abs() < 1e-4 && (lens[2] - 30.0).abs() < 1e-4, "opposite side did not follow: {lens:?}");
+        for a in &angs {
+            assert!((a - 90.0).abs() < 0.01, "a rotated square leaned to {a} degrees");
+        }
+    }
+
+    /// A side with BOTH ends locked onto the body cannot take a dimension. It must say so —
+    /// this used to be accepted in silence and simply not happen, which reads as the app
+    /// ignoring you. `solve_distance_dim` reports what was asked against what was reachable so
+    /// the caller can warn.
+    #[test]
+    fn a_dimension_the_sketch_cannot_reach_is_reported() {
+        let mut s = square_session(0.0, true);
+        let (a, b) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Line { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(s.sketch.points[a].fixed && s.sketch.points[b].fixed, "the test's premise failed: that side is not locked");
+        s.sketch.constraints.push(Constraint::Distance { a, b, value: 30.0, offset: 0.0, axis: Default::default() });
+        let ci = s.sketch.constraints.len() - 1;
+        let (want, got) = solve_distance_dim(&mut s.sketch, ci).expect("not a distance dimension");
+        assert!((want - got).abs() > 1.0, "a locked side reported success ({want} vs {got}) — the warning would never fire");
+        assert!((got - 20.0).abs() < 1e-4, "the locked side moved anyway: {got}");
+    }
+
+    /// A session sketching on a face whose corners are in the reference-snap pool.
+    #[cfg(test)]
+    fn session_on_a_face(corners: &[Vec2]) -> SketchSession {
+        let mut s = SketchSession::default();
+        s.snap_dist = SNAP;
+        s.reference_points = corners.to_vec();
+        s
+    }
+
+    /// How far the solver moved each point. A point locked onto a body feature must not move
+    /// at all - any drift is the ledge, measured directly.
+    #[cfg(test)]
+    fn drift_after_solve(s: &mut SketchSession) -> f32 {
+        let before: Vec<Vec2> = s.sketch.points.iter().map(|p| Vec2::new(p.x as f32, p.y as f32)).collect();
+        s.sketch.solve();
+        before
+            .iter()
+            .zip(s.sketch.points.iter())
+            .map(|(b, a)| b.distance(Vec2::new(a.x as f32, a.y as f32)))
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// A slot butted up against existing geometry must LOCK its end centres to the body
+    /// features they were snapped to. Unpinned they keep a degree of freedom, and a later
+    /// solve slides them a fraction off the edge - which is where the small ledges come from.
+    #[test]
+    fn a_slot_locks_its_ends_onto_body_features() {
+        let corner = Vec2::new(20.0, 0.0);
+        let mut s = session_on_a_face(&[corner, Vec2::new(0.0, 0.0)]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        // Both ends on body corners, then a third click for the width.
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, corner);
+        place_point(&mut s, Vec2::new(10.0, 3.0));
+
+        let slot = s.sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+            _ => None,
+        });
+        let (a, b) = slot.expect("no slot was created");
+        assert!(s.sketch.points[a].fixed, "the slot's start was not locked to the body corner");
+        assert!(s.sketch.points[b].fixed, "the slot's end was not locked to the body corner");
+        assert!(drift_after_solve(&mut s) < 1e-6, "a locked slot end drifted off its body feature");
+    }
+
+    /// A slot placed in open space must NOT be pinned - locking a point the user never aimed
+    /// at a feature would quietly make the sketch un-draggable.
+    #[test]
+    fn a_slot_in_open_space_stays_free() {
+        let mut s = session_on_a_face(&[Vec2::new(20.0, 0.0)]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(2.0, 5.0));
+        place_point(&mut s, Vec2::new(9.0, 5.0));
+        place_point(&mut s, Vec2::new(6.0, 7.0));
+        let (a, b) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("no slot");
+        assert!(!s.sketch.points[a].fixed && !s.sketch.points[b].fixed, "a slot drawn in open space was pinned");
+    }
+
+    /// A polygon placed concentric with a hole must stay concentric, and a vertex aimed at a
+    /// body corner must stay on it.
+    #[test]
+    fn a_polygon_locks_onto_body_features() {
+        let (hole, corner) = (Vec2::new(10.0, 10.0), Vec2::new(18.0, 10.0));
+        let mut s = session_on_a_face(&[hole, corner]);
+        s.tool = Tool::Polygon;
+        s.polygon_sides = 6;
+        // Centre on the hole, vertex on the corner. `poly_rim` reads the raw cursor, so set it.
+        place_point(&mut s, hole);
+        s.cursor_raw_uv = Some(corner);
+        place_point(&mut s, corner);
+
+        let centre = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Circle { center, construction: true, .. } => Some(*center),
+                _ => None,
+            })
+            .expect("no construction circle - the polygon was not created");
+        assert!(s.sketch.points[centre].fixed, "the polygon's centre was not locked to the hole centre");
+
+        let on_corner = s
+            .sketch
+            .points
+            .iter()
+            .any(|p| Vec2::new(p.x as f32, p.y as f32).distance(corner) < 1e-4 && p.fixed);
+        assert!(on_corner, "the polygon vertex aimed at the body corner was not locked to it");
+        assert!(drift_after_solve(&mut s) < 1e-6, "a locked polygon point drifted off its body feature");
+    }
+
+    /// The tolerance for locking has to be TIGHT. The full snap radius grows with zoom, and
+    /// using it here is what used to yank a polygon vertex across the screen to a far target -
+    /// so a point merely in the neighbourhood must stay free.
+    #[test]
+    fn only_a_deliberate_aim_locks_onto_the_body() {
+        let corner = Vec2::new(20.0, 0.0);
+        let s = session_on_a_face(&[corner]);
+        let tol = SNAP * 0.25;
+        assert!(on_reference_point(&s, corner), "landing exactly on a corner did not count");
+        assert!(on_reference_point(&s, corner + Vec2::new(tol * 0.5, 0.0)), "a deliberate aim did not count");
+        assert!(
+            !on_reference_point(&s, corner + Vec2::new(SNAP * 0.9, 0.0)),
+            "a point merely inside the broad snap radius was treated as a deliberate aim"
+        );
     }
 
     /// Drawing a second circle concentric-ish with the first (a "circle inside a circle") must
