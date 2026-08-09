@@ -6,6 +6,7 @@
 
 **A SolidWorks-style parametric CAD modeler, written in Rust.**
 
+[![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-informational)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
@@ -13,6 +14,11 @@
 </div>
 
 ---
+
+> ⚠️ **Alpha software.** HCAD is under active development and moves fast — expect rough
+> edges, bugs, and breaking changes between releases. Releases are marked *pre-release*
+> for this reason. Great for tinkering and feedback; **not** ready for production work.
+> Save often, and keep backups of anything important.
 
 HCAD is a desktop CAD application for **feature-based parametric solid modeling** — the
 same workflow you'd recognize from SolidWorks, Fusion 360, or FreeCAD: sketch in 2D, turn
