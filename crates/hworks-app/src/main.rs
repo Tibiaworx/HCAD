@@ -17110,6 +17110,42 @@ fn gear_layers(gear_type: GearType, thickness: f64, helix_deg: f64, cone_deg: f6
     }
 }
 
+/// Count edges with only one face, after welding vertices at the tolerance the edge tools use.
+///
+/// Zero means the surface is closed. This is deliberately the SAME measure the diagnostics use,
+/// so a cleanup can be checked against the thing that would report it as a defect — the mesh
+/// kernel's own `is_manifold` answers a subtly different question and passed a mesh this counts
+/// as open.
+fn welded_boundary_edges(m: &TriMesh) -> usize {
+    if m.positions.is_empty() {
+        return 0;
+    }
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for q in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(q[k]);
+            hi[k] = hi[k].max(q[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let sc = 1.0 / (diag * 2.0e-4).max(1e-6);
+    let mut canon: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+    let mut vid = vec![0usize; m.positions.len()];
+    for (i, q) in m.positions.iter().enumerate() {
+        let key = ((q[0] * sc).round() as i64, (q[1] * sc).round() as i64, (q[2] * sc).round() as i64);
+        let n = canon.len();
+        vid[i] = *canon.entry(key).or_insert(n);
+    }
+    let mut edges: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+        for (i, j) in [(a, b), (b, c), (c, a)] {
+            *edges.entry(if i < j { (i, j) } else { (j, i) }).or_insert(0) += 1;
+        }
+    }
+    edges.values().filter(|v| **v == 1).count()
+}
+
 /// The body a feature is built ON: everything before it in the timeline, and nothing after.
 ///
 /// This is the geometry regeneration hands the feature, and therefore the only body its sketch
@@ -17376,24 +17412,36 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     None => plane.clone(),
                 };
                 let basis = basis_from_ref(&resolved);
-                for r in &regs {
-                    if let Some(tool) = revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle) {
-                        body = Some(match body.take() {
-                            // Boss unions the swept solid; cut subtracts it (no-op if no body yet).
-                            Some(b) => {
-                                let joined = if *cut { mesh_difference(&b, &tool) } else { mesh_union(&b, &tool) };
-                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), *cut)).0.push(tool);
-                                joined
+                let tools: Vec<TriMesh> = regs
+                    .iter()
+                    .filter_map(|r| revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle))
+                    .collect();
+                // ONE boolean for the whole feature, not one per region.
+                //
+                // Subtracting the regions one after another leaves coincident surfaces in each
+                // intermediate body for the next subtraction to trip over: on strange loft.hcad
+                // the fourth cut turned a perfectly good body non-manifold, with 713 edges
+                // carrying up to ten faces spread over the whole part. Merging the tools first
+                // gives an identical shape — the volume agrees to three decimals — and a clean
+                // result. (Reversing the order also happened to avoid it, which is the giveaway
+                // that the shape was never the problem.)
+                let merged_tool = tools.iter().skip(1).fold(tools.first().cloned(), |acc, t| acc.map(|a| mesh_union(&a, t)));
+                if let Some(tool) = merged_tool {
+                    body = Some(match body.take() {
+                        // Boss unions the swept solid; cut subtracts it (no-op if no body yet).
+                        Some(b) => {
+                            let joined = if *cut { mesh_difference(&b, &tool) } else { mesh_union(&b, &tool) };
+                            feat_tools.entry(fi).or_insert_with(|| (Vec::new(), *cut)).0.push(tool);
+                            joined
+                        }
+                        None => {
+                            if *cut {
+                                continue;
                             }
-                            None => {
-                                if *cut {
-                                    continue;
-                                }
-                                feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(tool.clone());
-                                tool
-                            }
-                        });
-                    }
+                            feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(tool.clone());
+                            tool
+                        }
+                    });
                 }
             }
             FeatureKind::Loft { profiles, cut } => {
@@ -17539,7 +17587,40 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
             }
         }
     }
-    body.map(|m| (m, bevel_edges))
+    // Strip the zero-area triangles the bevel and thread builders leave behind: they cover no
+    // surface, carry no usable normal, bloat STL and STEP exports, and give the boolean kernel
+    // edges to trip over.
+    //
+    // But only when the result is still a closed solid. A collinear triangle can be the only
+    // face on one of its edges' far sides, and removing it then leaves that edge unmatched — a
+    // hole. Two of the saved models do exactly that. So the cleanup is attempted and CHECKED,
+    // and a mesh that would come out open is kept as it was: a few wasted triangles are a much
+    // smaller problem than a body with a hole in it.
+    body.map(|m| {
+        let mut cleaned = m.clone();
+        let dropped = hworks_geometry::drop_degenerate_triangles(&mut cleaned);
+        // Checked against the measure that would call it a defect. `is_manifold` alone was not
+        // enough — it passed meshes this counts as open, and two saved models lost their seal.
+        let stays_closed = welded_boundary_edges(&cleaned) <= welded_boundary_edges(&m);
+        let take_cleaned = dropped > 0 && stays_closed && hworks_geometry::is_manifold(&cleaned);
+        let out = if take_cleaned {
+            debug!("Regen: dropped {dropped} zero-area triangle(s).");
+            cleaned
+        } else {
+            if dropped > 0 {
+                debug!("Regen: kept {dropped} zero-area triangle(s) — removing them would open the surface.");
+            }
+            m
+        };
+        // A body that has gone non-manifold is a real problem the user has to know about: it
+        // exports as invalid STL/STEP and makes every later boolean unreliable. It used to
+        // happen in complete silence — the model looks fine on screen, because a pinch is
+        // invisible until something downstream chokes on it.
+        if !hworks_geometry::is_manifold(&out) {
+            NONMANIFOLD_BODIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        (out, bevel_edges)
+    })
 }
 
 /// Bounding box of a TriMesh in f64 (the f32 [`mesh_bbox`] loses range on large parts).
@@ -17630,6 +17711,9 @@ fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
 /// on the path (its own centroid rides the path points).
 /// Sweeps that fell back to a different profile region because the recorded one was gone.
 static SWEEP_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Rebuilds that left the body non-manifold — pinched, or with a surface touching itself.
+static NONMANIFOLD_BODIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Gears whose numbers don't describe a buildable gear.
 static GEAR_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// How finely each involute flank is sampled.
@@ -17647,6 +17731,10 @@ fn take_cut_direction_guesses() -> u32 {
 
 fn take_gear_failures() -> u32 {
     GEAR_FAILURES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn take_nonmanifold_bodies() -> u32 {
+    NONMANIFOLD_BODIES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Which way is material, decided across the whole cut footprint rather than one point.
@@ -17990,7 +18078,14 @@ fn finish_regen_job(
             let sweep_regions = take_sweep_region_fallbacks();
             let cut_guesses = take_cut_direction_guesses();
             let gear_fails = take_gear_failures();
-            ui_state.last_error = if gear_fails > 0 {
+            let pinched = take_nonmanifold_bodies();
+            ui_state.last_error = if pinched > 0 {
+                warn!("The rebuilt body is not a closed 2-manifold solid.");
+                Some(
+                    "\u{26a0} The body is PINCHED: somewhere its surface touches itself along an edge instead of enclosing solid material. It looks right on screen, but it will export as an invalid STL/STEP and later cuts and fillets on it may misbehave. Usually a cut that severs the part exactly, or two features meeting on a knife edge \u{2014} move one of them a fraction so they overlap properly."
+                        .to_string(),
+                )
+            } else if gear_fails > 0 {
                 warn!("{gear_fails} gear(s) could not be built from their numbers.");
                 Some(format!(
                     "\u{26a0} {gear_fails} gear(s) BUILT NOTHING: those numbers don't describe a real gear. Usually the bore is wider than the root circle, or there are too few teeth for the pressure angle \u{2014} raise the tooth count or shrink the bore."
@@ -25522,6 +25617,128 @@ mod tests {
             .fold(0.0_f32, f32::max)
     }
 
+    /// A multi-region revolve must be ONE boolean, not one per region.
+    ///
+    /// Subtracting the regions one after another leaves coincident surfaces in each intermediate
+    /// body for the next subtraction to trip over. On strange loft.hcad the fourth cut turned a
+    /// perfectly good body non-manifold — 713 edges carrying up to ten faces, spread over the
+    /// whole part. The shape was never wrong: cutting the same regions in the reverse order gave
+    /// a manifold body of the same volume, which is what proved it was the sequence and not the
+    /// geometry.
+    #[test]
+    fn a_multi_region_revolve_cut_stays_manifold() {
+        let _guard = counter_lock();
+        // A block, then a revolve cut with several concentric ring profiles around one axis —
+        // the arrangement that produced the failure.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(40.0, 40.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 30.0, back: 0.0, thin: 0.0, thin_side: 0 });
+
+        let mut sk = hworks_sketch::Sketch::default();
+        for (cx, cy) in [(12.0, 5.0), (12.0, 12.0), (12.0, 19.0), (16.0, 26.0)] {
+            let c = sk.add_point(cx, cy);
+            sk.add_circle(c, 2.5);
+        }
+        let xy_plane = xy();
+        doc.add_feature(FeatureKind::Revolve {
+            sketch: sk,
+            regions: vec![0, 1, 2, 3],
+            region_pts: vec![],
+            plane: xy_plane,
+            axis_pt: [0.0, 0.0],
+            axis_dir: [0.0, 30.0],
+            angle: std::f64::consts::TAU,
+            cut: true,
+        });
+        doc.rollback = doc.features.len();
+
+        let _ = take_nonmanifold_bodies();
+        let (m, _) = regenerate_mesh(&doc).expect("no body");
+        assert!(hworks_geometry::is_manifold(&m), "a multi-region revolve cut left the body non-manifold");
+        assert_eq!(take_nonmanifold_bodies(), 0, "the pinch warning fired on a sound body");
+        assert_eq!(welded_boundary_edges(&m), 0, "the revolve cut opened the surface");
+
+        // The grooves really were cut — the block lost material.
+        let plain = {
+            let mut d = Document::with_default_planes();
+            d.add_feature(FeatureKind::Extrude { sketch: rect_sketch(40.0, 40.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 30.0, back: 0.0, thin: 0.0, thin_side: 0 });
+            d.rollback = d.features.len();
+            regenerate_mesh(&d).expect("block").0
+        };
+        let (cut_v, full_v) = (hworks_geometry::signed_mesh_volume(&m).abs(), hworks_geometry::signed_mesh_volume(&plain).abs());
+        assert!(cut_v < full_v * 0.999, "nothing was cut: {cut_v} vs {full_v}");
+    }
+
+    /// A body that has gone non-manifold must be REPORTED. It exports as invalid STL/STEP and
+    /// makes every later boolean unreliable, but a pinch is invisible on screen — the model
+    /// looks perfectly fine until something downstream chokes on it.
+    ///
+    /// The positive case is verified against a real model (`strange loft.hcad`, whose revolve
+    /// cut leaves the body pinched) rather than synthetically: a hand-built edge-with-four-faces
+    /// is NOT reported by the kernel's `is_manifold`, so a synthetic shape would test my
+    /// assumption about that function rather than the behaviour that matters. What is pinned
+    /// here is the half that can go wrong silently in the other direction — false positives,
+    /// which would turn the warning into noise and get it ignored.
+    #[test]
+    fn an_ordinary_body_is_never_reported_as_pinched() {
+        let _guard = counter_lock();
+        let _ = take_nonmanifold_bodies();
+
+        // A plain block, a block with a cut, and a bevelled block: none may trip the warning.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        regenerate_mesh(&doc).expect("block");
+        assert_eq!(take_nonmanifold_bodies(), 0, "a plain block was reported as pinched");
+
+        doc.add_feature(FeatureKind::Cut { sketch: rect_sketch(6.0, 6.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        regenerate_mesh(&doc).expect("cut block");
+        assert_eq!(take_nonmanifold_bodies(), 0, "a cut block was reported as pinched");
+
+        doc.add_feature(FeatureKind::Fillet { radius: 1.5, edges: vec![] });
+        doc.rollback = doc.features.len();
+        regenerate_mesh(&doc).expect("filleted block");
+        assert_eq!(take_nonmanifold_bodies(), 0, "a filleted block was reported as pinched");
+    }
+
+    /// The bevel and thread builders emit zero-area triangles where their patches meet. They
+    /// cover no surface, so stripping them cannot change the shape — but left in they carry no
+    /// usable normal, bloat STL and STEP exports, and give the boolean kernel edges to trip over.
+    ///
+    /// The safety of removing them is checked, not argued: same volume, still manifold, and no
+    /// boundary edge opened.
+    #[test]
+    fn a_bevelled_body_carries_no_zero_area_triangles() {
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Fillet { radius: 2.0, edges: vec![] });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("no body");
+
+        let zero_area = |mesh: &TriMesh| {
+            mesh.indices
+                .chunks_exact(3)
+                .filter(|t| {
+                    let q = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
+                    (q(t[1]) - q(t[0])).cross(q(t[2]) - q(t[0])).length() < 1e-12
+                })
+                .count()
+        };
+        assert_eq!(zero_area(&m), 0, "the finished body still carries zero-area triangles");
+        assert!(hworks_geometry::is_manifold(&m), "the cleanup left a non-manifold body");
+        let (b, _, _) = surface_tears(&m);
+        assert_eq!(b, 0, "the cleanup opened {b} boundary edge(s)");
+
+        // And it really is a no-op on shape: strip a clean mesh and nothing moves.
+        let mut copy = m.clone();
+        let dropped = hworks_geometry::drop_degenerate_triangles(&mut copy);
+        assert_eq!(dropped, 0, "a cleaned mesh still had {dropped} degenerate triangles");
+        assert!(
+            (hworks_geometry::signed_mesh_volume(&copy) - hworks_geometry::signed_mesh_volume(&m)).abs() < 1e-9,
+            "the cleanup changed the volume"
+        );
+    }
+
     /// The Modify box must open on what the geometry actually measures, never on the last
     /// number typed. egui keeps a DragValue's half-typed TEXT keyed by widget id and that text
     /// wins over the value passed in — and constraint indices get reused as constraints come
@@ -26150,6 +26367,422 @@ mod tests {
         }
     }
 
+    /// Does the ORDER of a multi-region revolve's cuts matter, and does merging the tools into
+    /// one before cutting avoid the damage?
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_pinch_order -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_pinch_order() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let full: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (i, f) in full.features.iter().enumerate() {
+            let FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut } = &f.kind else { continue };
+            if !*cut {
+                continue;
+            }
+            let basis = basis_from_ref(plane);
+            let all = sketch.regions();
+            let merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
+            let mut before = full.clone();
+            before.rollback = i;
+            let Some((body, _)) = regenerate_mesh(&before) else { continue };
+            let tools: Vec<TriMesh> = merged
+                .iter()
+                .filter_map(|r| revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle))
+                .collect();
+            let report = |tag: &str, m: &TriMesh| {
+                eprintln!(
+                    "  {tag:<28} manifold={:<5} boundary={:<5} vol={:.4}",
+                    hworks_geometry::is_manifold(m),
+                    welded_boundary_edges(m),
+                    hworks_geometry::signed_mesh_volume(m)
+                );
+            };
+            // As shipped: cut them one after another, in order.
+            let mut seq = body.clone();
+            for t in &tools {
+                seq = mesh_difference(&seq, t);
+            }
+            report("one at a time (as shipped)", &seq);
+
+            // Reversed, to see whether the order is what matters.
+            let mut rev = body.clone();
+            for t in tools.iter().rev() {
+                rev = mesh_difference(&rev, t);
+            }
+            report("one at a time, reversed", &rev);
+
+            // Merged into a single tool first, then ONE difference.
+            if let Some((first, rest)) = tools.split_first() {
+                let mut all_tools = first.clone();
+                for t in rest {
+                    all_tools = mesh_union(&all_tools, t);
+                }
+                report("tools unioned first", &all_tools);
+                let once = mesh_difference(&body, &all_tools);
+                report("...then one difference", &once);
+            }
+            let _ = take_fallback_count();
+        }
+    }
+
+    /// WHERE is the pinch? Locates the edges carrying more than two faces and describes them in
+    /// the revolve's own terms (radius from the axis, height along it), and dumps the profile
+    /// that produced the offending tool.
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_pinch_location -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_pinch_location() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let full: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (i, f) in full.features.iter().enumerate() {
+            let FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut } = &f.kind else { continue };
+            let basis = basis_from_ref(plane);
+            let all = sketch.regions();
+            let merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
+
+            // Describe every profile: point count, area, and its shortest edge.
+            for (ri, r) in merged.iter().enumerate() {
+                let o = &r.outer;
+                let n = o.len();
+                let area = {
+                    let mut a = 0.0;
+                    for k in 0..n {
+                        let (p, q) = (o[k], o[(k + 1) % n]);
+                        a += p[0] * q[1] - q[0] * p[1];
+                    }
+                    (a * 0.5).abs()
+                };
+                let shortest = (0..n)
+                    .map(|k| {
+                        let (p, q) = (o[k], o[(k + 1) % n]);
+                        (q[0] - p[0]).hypot(q[1] - p[1])
+                    })
+                    .fold(f64::MAX, f64::min);
+                eprintln!("region{ri}: {n} pts area={area:.4} shortest_edge={shortest:.4}");
+                if n <= 6 {
+                    for q in o {
+                        eprintln!("     ({:.4}, {:.4})", q[0], q[1]);
+                    }
+                }
+            }
+
+            // Build up to the cut that breaks it, then locate the bad edges.
+            let mut before = full.clone();
+            before.rollback = i;
+            let Some((body, _)) = regenerate_mesh(&before) else { continue };
+            let mut acc = body;
+            for (ri, r) in merged.iter().enumerate() {
+                let Some(tool) = revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle) else { continue };
+                let next = if *cut { mesh_difference(&acc, &tool) } else { mesh_union(&acc, &tool) };
+                if !hworks_geometry::is_manifold(&next) && hworks_geometry::is_manifold(&acc) {
+                    eprintln!("--- region{ri} is the one that pinches it ---");
+                    // Weld, then find edges with more than two faces.
+                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    for q in &next.positions {
+                        for k in 0..3 {
+                            lo[k] = lo[k].min(q[k]);
+                            hi[k] = hi[k].max(q[k]);
+                        }
+                    }
+                    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+                    let sc = 1.0 / (diag * 2.0e-4).max(1e-6);
+                    let mut canon: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+                    let mut cpos: Vec<Vec3> = Vec::new();
+                    let mut vid = vec![0usize; next.positions.len()];
+                    for (k, q) in next.positions.iter().enumerate() {
+                        let key = ((q[0] * sc).round() as i64, (q[1] * sc).round() as i64, (q[2] * sc).round() as i64);
+                        vid[k] = *canon.entry(key).or_insert_with(|| {
+                            cpos.push(Vec3::from_array(*q));
+                            cpos.len() - 1
+                        });
+                    }
+                    let mut edges: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+                    for t in next.indices.chunks_exact(3) {
+                        let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+                        for (x, y) in [(a, b), (b, c), (c, a)] {
+                            *edges.entry(if x < y { (x, y) } else { (y, x) }).or_insert(0) += 1;
+                        }
+                    }
+                    let ao = Vec3::new(basis.origin[0] as f32, basis.origin[1] as f32, basis.origin[2] as f32);
+                    let k_ax = Vec3::new(axis_dir[0] as f32, axis_dir[1] as f32, 0.0).normalize_or_zero();
+                    let k_ax = if k_ax == Vec3::ZERO { Vec3::Y } else { k_ax };
+                    let (mut rmin, mut rmax, mut hmin, mut hmax, mut cnt) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN, 0);
+                    let mut fanned = std::collections::HashMap::new();
+                    for ((x, y), c) in &edges {
+                        if *c <= 2 {
+                            continue;
+                        }
+                        cnt += 1;
+                        *fanned.entry(*c).or_insert(0u32) += 1;
+                        for v in [*x, *y] {
+                            let d = cpos[v] - ao;
+                            let h = d.dot(k_ax);
+                            let r = (d - k_ax * h).length();
+                            rmin = rmin.min(r);
+                            rmax = rmax.max(r);
+                            hmin = hmin.min(h);
+                            hmax = hmax.max(h);
+                        }
+                    }
+                    let mut counts: Vec<_> = fanned.into_iter().collect();
+                    counts.sort();
+                    eprintln!("  {cnt} edges with >2 faces | radius {rmin:.4}..{rmax:.4} | height {hmin:.4}..{hmax:.4}");
+                    eprintln!("  faces-per-bad-edge histogram: {counts:?}");
+                    let (tlo, thi) = mesh_bbox(&tool);
+                    eprintln!("  tool bbox: {tlo:?} .. {thi:?}");
+                    break;
+                }
+                acc = next;
+            }
+        }
+    }
+
+    /// Is a revolve's TOOL non-manifold, or does the boolean make it so?
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_revolve_tools -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_revolve_tools() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let full: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (i, f) in full.features.iter().enumerate() {
+            let FeatureKind::Revolve { sketch, regions, region_pts, plane, axis_pt, axis_dir, angle, cut } = &f.kind else { continue };
+            let mut before = full.clone();
+            before.rollback = i;
+            let body = regenerate_mesh(&before).map(|(m, _)| m);
+            if let Some(b) = &body {
+                eprintln!("body before: manifold={} boundary={}", hworks_geometry::is_manifold(b), welded_boundary_edges(b));
+            }
+            let basis = basis_from_ref(plane);
+            let all = sketch.regions();
+            let merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
+            let mut acc = body;
+            for (ri, r) in merged.iter().enumerate() {
+                let tool = revolve_tool_mesh(&r.outer, &r.holes, &basis, *axis_pt, *axis_dir, *angle);
+                match &tool {
+                    Some(t) => eprintln!(
+                        "  tool[{ri}]: tris={} manifold={} boundary={} vol={:.3}",
+                        t.indices.len() / 3,
+                        hworks_geometry::is_manifold(t),
+                        welded_boundary_edges(t),
+                        hworks_geometry::signed_mesh_volume(t)
+                    ),
+                    None => eprintln!("  tool[{ri}]: NONE"),
+                }
+                if let (Some(a), Some(t)) = (acc.as_ref(), tool.as_ref()) {
+                    let next = if *cut { mesh_difference(a, t) } else { mesh_union(a, t) };
+                    eprintln!(
+                        "    after {}[{ri}]: manifold={} boundary={}",
+                        if *cut { "cut" } else { "union" },
+                        hworks_geometry::is_manifold(&next),
+                        welded_boundary_edges(&next)
+                    );
+                    // Tangency test: nudge the tool a hair along the axis. If a pinch is the
+                    // cause, breaking the exact contact makes the result manifold again; if the
+                    // boolean itself is at fault, the nudge changes nothing.
+                    if !hworks_geometry::is_manifold(&next) {
+                        let (rep, report) = repair_mesh(&next);
+                        eprintln!("      repair report: {report:?}");
+                        eprintln!(
+                            "      repair_mesh: manifold={} boundary={} vol {:.4} -> {:.4} (tris {} -> {})",
+                            hworks_geometry::is_manifold(&rep),
+                            welded_boundary_edges(&rep),
+                            hworks_geometry::signed_mesh_volume(&next),
+                            hworks_geometry::signed_mesh_volume(&rep),
+                            next.indices.len() / 3,
+                            rep.indices.len() / 3
+                        );
+                    }
+                    acc = Some(next);
+                }
+            }
+        }
+    }
+
+    /// Where does a revolve's profile sit relative to its axis? A loop that touches the axis
+    /// sweeps to a single point; one that CROSSES it sweeps through itself.
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_revolve_profile -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_revolve_profile() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (i, f) in doc.features.iter().enumerate() {
+            let FeatureKind::Revolve { sketch, regions, region_pts, axis_pt, axis_dir, angle, cut, .. } = &f.kind else { continue };
+            let all = sketch.regions();
+            let merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
+            eprintln!(
+                "feature[{i}] revolve cut={cut} angle={:.1} deg  axis_pt={axis_pt:?} axis_dir={axis_dir:?}  regions {} -> {} merged",
+                angle.to_degrees(),
+                all.len(),
+                merged.len()
+            );
+            // Signed distance from the axis LINE, in the sketch plane.
+            let (ax, ay) = (axis_pt[0], axis_pt[1]);
+            let (dx, dy) = (axis_dir[0], axis_dir[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+            let side = |q: &[f64; 2]| ((q[0] - ax) * dy - (q[1] - ay) * dx) / len;
+            for (ri, r) in merged.iter().enumerate() {
+                for (tag, loop_) in std::iter::once(("outer", &r.outer)).chain(r.holes.iter().enumerate().map(|(h, l)| ("hole", l)).map(|(t, l)| (t, l))) {
+                    let ds: Vec<f64> = loop_.iter().map(side).collect();
+                    let lo = ds.iter().cloned().fold(f64::MAX, f64::min);
+                    let hi = ds.iter().cloned().fold(f64::MIN, f64::max);
+                    let on_axis = ds.iter().filter(|d| d.abs() < 1e-6).count();
+                    let crosses = lo < -1e-6 && hi > 1e-6;
+                    eprintln!(
+                        "   region{ri} {tag}: {} pts  distance from axis {lo:.4}..{hi:.4}  on-axis={on_axis}{}",
+                        loop_.len(),
+                        if crosses { "  *** CROSSES THE AXIS ***" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    /// Is dropping the zero-area triangles safe, or does it open the surface?
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_drop_degenerates -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_drop_degenerates() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let Some((m, _)) = regenerate_mesh(&doc) else { return };
+        let keep: Vec<u32> = m
+            .indices
+            .chunks_exact(3)
+            .filter(|t| {
+                let q = |i: u32| Vec3::from_array(m.positions[i as usize]);
+                (q(t[1]) - q(t[0])).cross(q(t[2]) - q(t[0])).length() >= 1e-12
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let dropped = m.indices.len() / 3 - keep.len() / 3;
+        let mut trimmed = m.clone();
+        trimmed.indices = keep;
+        let (b0, nm0, _) = surface_tears(&m);
+        let (b1, nm1, _) = surface_tears(&trimmed);
+        eprintln!(
+            "dropped {dropped} zero-area tris | before: manifold={} boundary={b0} nm={nm0} vol={:.6} | after: manifold={} boundary={b1} nm={nm1} vol={:.6}",
+            hworks_geometry::is_manifold(&m),
+            hworks_geometry::signed_mesh_volume(&m),
+            hworks_geometry::is_manifold(&trimmed),
+            hworks_geometry::signed_mesh_volume(&trimmed)
+        );
+    }
+
+    /// Rebuild EVERY document in a directory and report anything wrong with the result: a
+    /// document that will not parse, one that builds nothing, a torn surface, a boolean that
+    /// fell back to the lossy path, or an anomaly counter that fired.
+    ///
+    /// This is the cheapest bug net available — the saved files are real models that hit real
+    /// paths, and a regression usually shows up here before anyone notices it by hand.
+    ///   HCAD_DIR="...\saved files" cargo test -p hworks-app diag_sweep_documents -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_sweep_documents() {
+        let _guard = counter_lock();
+        let dir = std::env::var("HCAD_DIR").expect("set HCAD_DIR");
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad")))
+            .collect();
+        entries.sort();
+        let (mut clean, mut problems) = (0usize, Vec::new());
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                problems.push(format!("{name}: unreadable"));
+                continue;
+            };
+            let doc: Document = match ron::from_str(&text) {
+                Ok(d) => d,
+                Err(e) => {
+                    problems.push(format!("{name}: will not parse — {e}"));
+                    continue;
+                }
+            };
+            let _ = take_fallback_count();
+            let _ = take_gear_failures();
+            let _ = take_cut_direction_guesses();
+            let _ = hworks_geometry::take_loft_hole_mismatch_count();
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc)));
+            let fb = take_fallback_count();
+            let gears = take_gear_failures();
+            let guesses = take_cut_direction_guesses();
+            let lofts = hworks_geometry::take_loft_hole_mismatch_count();
+            let mut notes = Vec::new();
+            match built {
+                Err(_) => notes.push("PANICKED during rebuild".to_string()),
+                Ok(None) => {
+                    // Only a complaint if the document actually asks for solid geometry.
+                    // Only the ACTIVE part of the timeline counts: a document deliberately
+                    // rolled back before its first solid feature is supposed to build nothing.
+                    let end = doc.rollback.min(doc.features.len());
+                    let wants_solid = doc.features[..end].iter().any(|f| {
+                        matches!(f.kind, FeatureKind::Extrude { .. } | FeatureKind::Revolve { .. } | FeatureKind::Gear { .. } | FeatureKind::ImportMesh { .. })
+                    });
+                    if wants_solid {
+                        notes.push("built NO BODY".to_string());
+                    }
+                }
+                Ok(Some((m, _))) => {
+                    // Two independent verdicts, because the welded-edge count alone is a poor
+                    // judge: it welds at 2e-4 of the diagonal, so legitimately small triangles
+                    // collapse and read as defects. `is_manifold` is the mesh kernel's own
+                    // answer, and a raw zero-area count needs no tolerance at all.
+                    let (b, nm, d) = surface_tears(&m);
+                    let zero_area = m
+                        .indices
+                        .chunks_exact(3)
+                        .filter(|t| {
+                            let q = |i: u32| Vec3::from_array(m.positions[i as usize]);
+                            let (a, bb, c) = (q(t[0]), q(t[1]), q(t[2]));
+                            (bb - a).cross(c - a).length() < 1e-12
+                        })
+                        .count();
+                    if !hworks_geometry::is_manifold(&m) {
+                        notes.push("NOT MANIFOLD (kernel verdict)".to_string());
+                    }
+                    if zero_area > 0 {
+                        notes.push(format!("{zero_area} zero-area triangle(s)"));
+                    }
+                    if b > 0 {
+                        notes.push(format!("{b} boundary edge(s) — open surface"));
+                    }
+                    if nm + d > 0 && hworks_geometry::is_manifold(&m) && zero_area == 0 && b == 0 {
+                        notes.push(format!("(welded-proxy only: nm={nm} deg={d} — sub-tolerance detail, not a defect)"));
+                    }
+                    if hworks_geometry::signed_mesh_volume(&m) <= 0.0 {
+                        notes.push("inside-out (non-positive volume)".to_string());
+                    }
+                }
+            }
+            if fb > 0 {
+                notes.push(format!("{fb} lossy BSP fallback(s)"));
+            }
+            if gears > 0 {
+                notes.push(format!("{gears} gear failure(s)"));
+            }
+            if guesses > 0 {
+                notes.push(format!("{guesses} cut direction guess(es)"));
+            }
+            if lofts > 0 {
+                notes.push(format!("{lofts} loft(s) dropped holes"));
+            }
+            if notes.is_empty() {
+                clean += 1;
+            } else {
+                problems.push(format!("{name}: {}", notes.join("; ")));
+            }
+        }
+        eprintln!("\n=== {clean} clean, {} with problems ===", problems.len());
+        for p in &problems {
+            eprintln!("  {p}");
+        }
+    }
+
     /// Walks a .hcad one feature at a time, reporting after each whether the body is still a
     /// closed 2-manifold and how many booleans fell back to the lossy BSP path. Names the
     /// exact feature that tears the surface instead of guessing from the final mesh.
@@ -26201,10 +26834,18 @@ mod tests {
                     }
                     let boundary = emap.values().filter(|v| **v == 1).count();
                     let nonman = emap.values().filter(|v| **v > 2).count();
+                    let zero_area = m
+                        .indices
+                        .chunks_exact(3)
+                        .filter(|t| {
+                            let q = |i: u32| Vec3::from_array(m.positions[i as usize]);
+                            (q(t[1]) - q(t[0])).cross(q(t[2]) - q(t[0])).length() < 1e-12
+                        })
+                        .count();
                     eprintln!(
-                        "[{end}] {name:<12} tris={:<7} verts={:<6} boundary={boundary:<6} nonmanifold={nonman:<6} degenerate={degen:<5} bsp_fallbacks={fb}",
+                        "[{end}] {name:<12} tris={:<7} zero_area={zero_area:<5} manifold={:<5} boundary={boundary:<6} nonmanifold={nonman:<6} bsp={fb}",
                         m.indices.len() / 3,
-                        canon.len()
+                        hworks_geometry::is_manifold(&m)
                     );
                 }
                 None => eprintln!("[{end}] {name:<12} NO BODY  bsp_fallbacks={fb}"),
