@@ -20728,34 +20728,69 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
     if !edges.iter().any(|&(a, b)| cancels(a, b)) {
         return regions.iter().map(|r| (*r).clone()).collect();
     }
-    let mut next: HashMap<usize, usize> = HashMap::new();
-    for &(a, b) in &edges {
-        if !cancels(a, b) {
-            next.insert(a, b);
-        }
-    }
-    if next.is_empty() {
+    // Trace the surviving edges into loops.
+    //
+    // The old version kept ONE successor per vertex (`HashMap<vertex, vertex>`), which assumes
+    // every boundary vertex has degree 2. Overlapping circles break that: where several selected
+    // faces meet, a vertex has two edges in and two out, and `insert` silently overwrote one — so
+    // boundary edges were dropped and the outlines came out open and self-crossing. No
+    // triangulator can turn those into a clean prism, which is where circtorttest's tearing came
+    // from.
+    //
+    // The rule below is the standard one for walking a planar subdivision: keep every edge, and
+    // at each vertex take the first outgoing edge met sweeping CLOCKWISE from the direction you
+    // came in on. That keeps the interior on the left the whole way round, so it traces the
+    // correct face whatever the vertex degree.
+    let mut kept: Vec<(usize, usize)> = edges.iter().copied().filter(|&(a, b)| !cancels(a, b)).collect();
+    kept.sort_unstable();
+    kept.dedup();
+    if kept.is_empty() {
         return regions.iter().map(|r| (*r).clone()).collect();
     }
-    // Trace the boundary edges into loops (assumes degree-2 boundary vertices).
+    // Outgoing edges per vertex. Built from the sorted edge list, so the walk is reproducible —
+    // hash iteration order used to decide where loops got split, and the same sketch merged into
+    // a different number of profiles on every rebuild.
+    let mut out_edges: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, &(a, _)) in kept.iter().enumerate() {
+        out_edges.entry(a).or_default().push(i);
+    }
+    let dir_angle = |from: usize, to: usize| {
+        let (p, q) = (pos[from], pos[to]);
+        (q[1] - p[1]).atan2(q[0] - p[0])
+    };
+    let tau = std::f64::consts::TAU;
+    let mut used = vec![false; kept.len()];
     let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
-    let mut used: HashSet<usize> = HashSet::new();
-    let starts: Vec<usize> = next.keys().copied().collect();
-    for s in starts {
-        if used.contains(&s) {
+    for first in 0..kept.len() {
+        if used[first] {
             continue;
         }
-        let mut loop_pts = Vec::new();
-        let mut cur = s;
-        loop {
-            used.insert(cur);
-            loop_pts.push(pos[cur]);
-            match next.get(&cur) {
-                Some(&nx) if nx != s && !used.contains(&nx) => cur = nx,
-                _ => break,
+        let mut loop_pts: Vec<[f64; 2]> = Vec::new();
+        let mut e = first;
+        for _ in 0..=kept.len() {
+            used[e] = true;
+            let (a, b) = kept[e];
+            loop_pts.push(pos[a]);
+            // Sweep clockwise from the way we came in; the first unused edge wins.
+            let back = dir_angle(b, a);
+            let mut best: Option<(f64, usize)> = None;
+            if let Some(cands) = out_edges.get(&b) {
+                for &ni in cands {
+                    if used[ni] && ni != first {
+                        continue;
+                    }
+                    let turn = (back - dir_angle(kept[ni].0, kept[ni].1)).rem_euclid(tau);
+                    // Turning a full circle means doubling straight back along the edge we
+                    // arrived on — a dead end, taken only when there is nothing else.
+                    let turn = if turn <= 1.0e-12 { tau } else { turn };
+                    if best.is_none_or(|(bt, _)| turn < bt) {
+                        best = Some((turn, ni));
+                    }
+                }
             }
-            if loop_pts.len() > pos.len() + 1 {
-                break;
+            match best {
+                Some((_, ni)) if ni != first => e = ni,
+                _ => break, // closed the loop, or ran out of boundary
             }
         }
         if loop_pts.len() >= 3 {
@@ -20763,6 +20798,29 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
         }
     }
     if loops.is_empty() {
+        return regions.iter().map(|r| (*r).clone()).collect();
+    }
+    // Sanity check: merging adjacent faces must not change how much area there is. A trace that
+    // goes wrong tends to go wrong LARGE — excut.hcad once had a bad re-trace grow a 355 mm²
+    // profile to 966 mm² and eat the part's rim. Cheap to check, and falling back to the
+    // unmerged inputs is always safe (they build as separate prisms).
+    let area_of = |poly: &[[f64; 2]]| {
+        let m = poly.len();
+        let mut a = 0.0;
+        for i in 0..m {
+            let (p, q) = (poly[i], poly[(i + 1) % m]);
+            a += p[0] * q[1] - q[0] * p[1];
+        }
+        a * 0.5
+    };
+    let want: f64 = regions
+        .iter()
+        .map(|r| area_of(&r.outer).abs() - r.holes.iter().map(|h| area_of(h).abs()).sum::<f64>())
+        .sum();
+    // Signed areas: outer loops come out positive, holes negative, so the sum is the net area.
+    let got: f64 = loops.iter().map(|l| area_of(l)).sum::<f64>().abs();
+    if want > 1.0e-9 && (got - want).abs() > want * 0.02 {
+        warn!("Region merge: traced area {got:.3} vs {want:.3} expected — keeping the unmerged profiles.");
         return regions.iter().map(|r| (*r).clone()).collect();
     }
     nest_loops(loops)
@@ -25617,6 +25675,148 @@ mod tests {
             .fold(0.0_f32, f32::max)
     }
 
+    /// Merging adjacent faces must trace a clean outline even where several of them meet at one
+    /// vertex.
+    ///
+    /// The old trace kept ONE successor per vertex, which assumes every boundary vertex has
+    /// degree 2. Overlapping circles break that: at a junction a vertex has two edges in and two
+    /// out, and the extra ones were silently dropped — so the outline came out open and
+    /// self-crossing, and no triangulator can turn that into a clean prism. On circtorttest.hcad
+    /// the extrude came out with 2012 boundary edges, 1384 non-manifold edges and eight lossy
+    /// fallbacks.
+    #[test]
+    fn merging_traces_a_clean_outline_through_junctions() {
+        // The reported arrangement: seven overlapping circles, a spread of selected faces.
+        let mut sk = hworks_sketch::Sketch::default();
+        for (cx, cy, r) in [
+            (0.0, 0.0, 3.61),
+            (-2.00, 1.55, 0.69),
+            (0.99, -0.82, 2.00),
+            (-0.49, 2.10, 1.28),
+            (-1.61, 0.62, 1.41),
+            (1.54, 1.76, 1.04),
+            (0.0, -1.16, 1.54),
+        ] {
+            let c = sk.add_point(cx, cy);
+            sk.add_circle(c, r);
+        }
+        let all = sk.regions();
+        let chosen: Vec<usize> = (0..all.len()).step_by(2).collect();
+        let picked = chosen_regions_pts(&all, &chosen, &[]);
+        let merged = merge_regions(&picked);
+
+        // Every merged outline must be simple: a self-crossing loop cannot become a solid.
+        let crossings = |loop_: &[[f64; 2]]| {
+            let n = loop_.len();
+            let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+            let mut hits = 0;
+            for i in 0..n {
+                let (p1, p2) = (loop_[i], loop_[(i + 1) % n]);
+                for j in (i + 2)..n {
+                    if i == 0 && j == n - 1 {
+                        continue;
+                    }
+                    let (q1, q2) = (loop_[j], loop_[(j + 1) % n]);
+                    if cross(p1, p2, q1) * cross(p1, p2, q2) < 0.0 && cross(q1, q2, p1) * cross(q1, q2, p2) < 0.0 {
+                        hits += 1;
+                    }
+                }
+            }
+            hits
+        };
+        for (i, r) in merged.iter().enumerate() {
+            assert_eq!(crossings(&r.outer), 0, "merged outline {i} crosses itself");
+            for (h, hole) in r.holes.iter().enumerate() {
+                assert_eq!(crossings(hole), 0, "merged outline {i} hole {h} crosses itself");
+            }
+        }
+
+        // Merging adjacent faces must not invent or lose area.
+        let area = |poly: &[[f64; 2]]| {
+            let m = poly.len();
+            let mut a = 0.0;
+            for i in 0..m {
+                let (p, q) = (poly[i], poly[(i + 1) % m]);
+                a += p[0] * q[1] - q[0] * p[1];
+            }
+            (a * 0.5).abs()
+        };
+        let net = |rs: &[hworks_sketch::Region]| -> f64 {
+            rs.iter().map(|r| area(&r.outer) - r.holes.iter().map(|h| area(h)).sum::<f64>()).sum()
+        };
+        let before: f64 = picked.iter().map(|r| area(&r.outer) - r.holes.iter().map(|h| area(h)).sum::<f64>()).sum();
+        let after = net(&merged);
+        assert!((after - before).abs() < before * 0.02, "merging changed the area: {before:.4} -> {after:.4}");
+
+        // And the whole point: it extrudes into a closed solid.
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude {
+            sketch: sk,
+            regions: chosen,
+            region_pts: vec![],
+            plane: xy(),
+            distance: 2.0,
+            back: 0.0,
+            thin: 0.0,
+            thin_side: 0,
+        });
+        doc.rollback = doc.features.len();
+        let _ = take_fallback_count();
+        let (m, _) = regenerate_mesh(&doc).expect("no body");
+        assert_eq!(welded_boundary_edges(&m), 0, "the extrude came out with holes in it");
+        assert!(hworks_geometry::is_manifold(&m), "the extrude came out non-manifold");
+        assert_eq!(take_fallback_count(), 0, "the extrude needed the lossy BSP fallback");
+    }
+
+    /// The same sketch must merge into the same profiles every single time.
+    ///
+    /// `merge_regions` traced its boundary loops starting from `HashMap::keys()`, and Rust
+    /// randomises hash iteration order per process — so where the boundary got split changed on
+    /// every rebuild. circtorttest.hcad merged into 6, 7, 8 and 9 profiles across five runs of
+    /// ONE binary on ONE file, and the tearing came and went with it. A model that rebuilds to a
+    /// different solid each time cannot be debugged by anyone.
+    #[test]
+    fn merging_regions_is_deterministic() {
+        // Overlapping circles, the arrangement that exposed it: many sub-regions, many junction
+        // vertices where several boundaries meet.
+        let mut sk = hworks_sketch::Sketch::default();
+        for (cx, cy, r) in [
+            (0.0, 0.0, 3.61),
+            (-2.00, 1.55, 0.69),
+            (0.99, -0.82, 2.00),
+            (-0.49, 2.10, 1.28),
+            (-1.61, 0.62, 1.41),
+            (1.54, 1.76, 1.04),
+            (0.0, -1.16, 1.54),
+        ] {
+            let c = sk.add_point(cx, cy);
+            sk.add_circle(c, r);
+        }
+        let all = sk.regions();
+        assert!(all.len() > 8, "the test's premise failed: only {} sub-regions", all.len());
+        let chosen: Vec<usize> = (0..all.len()).step_by(2).collect();
+
+        // Same input, many times: identical output every time, point for point.
+        let fingerprint = |rs: &[hworks_sketch::Region]| -> String {
+            let mut out = String::new();
+            for r in rs {
+                out.push_str(&format!("|{}", r.outer.len()));
+                for q in &r.outer {
+                    out.push_str(&format!(",{:.6},{:.6}", q[0], q[1]));
+                }
+                for h in &r.holes {
+                    out.push_str(&format!(";{}", h.len()));
+                }
+            }
+            out
+        };
+        let first = fingerprint(&merge_regions(&chosen_regions_pts(&all, &chosen, &[])));
+        for run in 1..12 {
+            let again = fingerprint(&merge_regions(&chosen_regions_pts(&all, &chosen, &[])));
+            assert_eq!(first, again, "run {run} merged the same sketch differently");
+        }
+    }
+
     /// A multi-region revolve must be ONE boolean, not one per region.
     ///
     /// Subtracting the regions one after another leaves coincident surfaces in each intermediate
@@ -26284,7 +26484,15 @@ mod tests {
             };
             let all = sketch.regions();
             let merged = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
-            eprintln!("feature[{fi}]: {} raw regions -> {} merged", all.len(), merged.len());
+            let chosen = chosen_regions_pts(&all, regions, region_pts);
+            eprintln!(
+                "feature[{fi}]: {} raw regions | selection stores {} indices + {} sample pts | chosen {} -> {} merged",
+                all.len(),
+                regions.len(),
+                region_pts.len(),
+                chosen.len(),
+                merged.len()
+            );
             for (ri, r) in merged.iter().enumerate() {
                 let report = |tag: &str, loop_: &Vec<[f64; 2]>| {
                     let n = loop_.len();
