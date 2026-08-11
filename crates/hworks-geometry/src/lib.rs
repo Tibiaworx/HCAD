@@ -508,6 +508,37 @@ fn poly_area_2d(l: &[[f64; 2]]) -> f64 {
     (a * 0.5).abs()
 }
 
+/// Drop triangles that name the same vertex twice, returning how many went.
+///
+/// Always safe, by construction rather than by measurement: such a triangle's only two real
+/// edges are the SAME undirected edge traversed both ways *within itself*, so removing it takes
+/// both away together and can never leave a neighbour's edge unmatched. That is not true of a
+/// triangle with three distinct-but-collinear points — those carry edges shared with real
+/// neighbours, and removing one opens a hole.
+///
+/// This is the bulk of what the bevel builder leaves behind: it stitches sharp edges with
+/// one-segment strips, and wherever the two ends already agree, half the strip collapses to
+/// exactly this shape.
+pub fn drop_duplicate_vertex_triangles(mesh: &mut TriMesh) -> usize {
+    let before = mesh.indices.len() / 3;
+    let keep: Vec<u32> = mesh
+        .indices
+        .chunks_exact(3)
+        .filter(|t| {
+            let q = |i: u32| mesh.positions[i as usize];
+            let same = |a: [f32; 3], b: [f32; 3]| {
+                (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9 && (a[2] - b[2]).abs() < 1e-9
+            };
+            let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
+            !(t[0] == t[1] || t[1] == t[2] || t[0] == t[2] || same(a, b) || same(b, c) || same(a, c))
+        })
+        .flatten()
+        .copied()
+        .collect();
+    mesh.indices = keep;
+    before - mesh.indices.len() / 3
+}
+
 /// Drop triangles with exactly zero area, returning how many went.
 ///
 /// A zero-area triangle has three collinear vertices, so it covers no surface: it contributes

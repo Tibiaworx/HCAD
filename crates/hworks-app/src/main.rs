@@ -17140,6 +17140,12 @@ fn welded_boundary_edges(m: &TriMesh) -> usize {
     for t in m.indices.chunks_exact(3) {
         let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
         for (i, j) in [(a, b), (b, c), (c, a)] {
+            if i == j {
+                // A self-loop is a collapsed edge with no side, not a hole. Counting them as
+                // boundaries is what made a perfectly sound bevelled body look torn, and blocked
+                // the cleanup that removes the triangles producing them in the first place.
+                continue;
+            }
             *edges.entry(if i < j { (i, j) } else { (j, i) }).or_insert(0) += 1;
         }
     }
@@ -17596,7 +17602,14 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
     // hole. Two of the saved models do exactly that. So the cleanup is attempted and CHECKED,
     // and a mesh that would come out open is kept as it was: a few wasted triangles are a much
     // smaller problem than a body with a hole in it.
-    body.map(|m| {
+    body.map(|mut m| {
+        // The bevel and thread builders leave zero-area triangles where their patches meet.
+        //
+        // These once looked like they were masking cracks: stripping them turned edgetest5 from
+        // zero boundary edges to one. They were not. That "boundary" was a SELF-LOOP — an edge
+        // whose two ends weld to the same vertex at the edge tools' tolerance, which has no side
+        // and cannot be a hole. Counting the surviving triangles properly shows both files close
+        // perfectly with every degenerate removed: 0 real boundary edges, 107 and 78 taken.
         let mut cleaned = m.clone();
         let dropped = hworks_geometry::drop_degenerate_triangles(&mut cleaned);
         // Checked against the measure that would call it a defect. `is_manifold` alone was not
@@ -25901,6 +25914,94 @@ mod tests {
         assert_eq!(take_nonmanifold_bodies(), 0, "a filleted block was reported as pinched");
     }
 
+    /// A self-loop is not a hole.
+    ///
+    /// This one measurement bug cost two sessions. An edge whose two ends weld to the same
+    /// vertex has no side — it is a collapsed edge, not a boundary. Counting it as one made
+    /// sound bevelled bodies look torn (edgetest5 "gained" a boundary edge when its degenerate
+    /// triangles were removed), which blocked the cleanup AND led me to conclude the bevel
+    /// builder was leaving real cracks. It was not: strip every degenerate from those models and
+    /// they close perfectly.
+    #[test]
+    fn a_collapsed_edge_is_not_counted_as_a_hole() {
+        // A closed tetrahedron, plus a triangle whose first two corners sit on the same point.
+        let mut m = TriMesh::default();
+        let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            let base = m.positions.len() as u32;
+            m.positions.extend([a, b, c]);
+            m.normals.extend([[0.0, 0.0, 1.0]; 3]);
+            m.indices.extend([base, base + 1, base + 2]);
+        };
+        let (p0, p1, p2, p3) = ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        tri(p0, p2, p1);
+        tri(p0, p1, p3);
+        tri(p1, p2, p3);
+        tri(p2, p0, p3);
+        drop(tri);
+        assert_eq!(welded_boundary_edges(&m), 0, "the test's premise failed: the tetrahedron is not closed");
+
+        let base = m.positions.len() as u32;
+        m.positions.extend([p0, p0, p1]);
+        m.normals.extend([[0.0, 0.0, 1.0]; 3]);
+        m.indices.extend([base, base + 1, base + 2]);
+        assert_eq!(welded_boundary_edges(&m), 0, "a collapsed edge was counted as a hole");
+
+        // And taking that triangle away leaves it closed too — the state either way is sound,
+        // which is the whole point: the measure must not swing on geometry that has no area.
+        let mut cleaned = m.clone();
+        assert!(hworks_geometry::drop_degenerate_triangles(&mut cleaned) > 0);
+        assert_eq!(welded_boundary_edges(&cleaned), 0, "removing a collapsed edge opened the surface");
+    }
+
+    /// `drop_duplicate_vertex_triangles` must take only the triangles that name one vertex
+    /// twice, and leave flat-but-distinct ones alone.
+    ///
+    /// The two kinds behave completely differently. A repeated vertex means the triangle's only
+    /// two real edges are ONE undirected edge traversed both ways inside itself, so they leave
+    /// together and nothing is orphaned. Three distinct collinear points carry edges shared with
+    /// real neighbours, and removing one of those opens a hole.
+    ///
+    /// The bevel builder emits mostly the first kind — 106 of edgetest5's 107 — but they are
+    /// deliberately left in the shipped body: see the note in `regenerate_mesh`. They are
+    /// masking real cracks, and taking away the paper without mending the wall makes the holes
+    /// visible rather than gone.
+    #[test]
+    fn duplicate_vertex_triangles_are_told_apart_from_flat_ones() {
+        let mut m = TriMesh::default();
+        let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+            let base = m.positions.len() as u32;
+            m.positions.extend([a, b, c]);
+            m.normals.extend([[0.0, 0.0, 1.0]; 3]);
+            m.indices.extend([base, base + 1, base + 2]);
+        };
+        tri([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]); // a real triangle
+        tri([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]); // repeated vertex
+        tri([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]); // flat, three distinct points
+        tri([5.0, 5.0, 5.0], [5.0, 6.0, 5.0], [5.0, 5.0, 6.0]); // another real one
+        drop(tri);
+
+        let mut cleaned = m.clone();
+        let dropped = hworks_geometry::drop_duplicate_vertex_triangles(&mut cleaned);
+        assert_eq!(dropped, 1, "expected exactly the repeated-vertex triangle to go");
+        assert_eq!(cleaned.indices.len() / 3, 3, "wrong number of triangles left");
+
+        // The flat one survives...
+        let flat_left = cleaned
+            .indices
+            .chunks_exact(3)
+            .filter(|t| {
+                let q = |i: u32| Vec3::from_array(cleaned.positions[i as usize]);
+                let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
+                (b - a).cross(c - a).length() < 1e-12
+            })
+            .count();
+        assert_eq!(flat_left, 1, "the flat triangle was removed too — that opens holes");
+
+        // ...and the broader sweep takes both, which is why it needs a guard and this does not.
+        let mut both = m.clone();
+        assert_eq!(hworks_geometry::drop_degenerate_triangles(&mut both), 2, "the broad sweep should take both kinds");
+    }
+
     /// The bevel and thread builders emit zero-area triangles where their patches meet. They
     /// cover no surface, so stripping them cannot change the shape — but left in they carry no
     /// usable normal, bloat STL and STEP exports, and give the boolean kernel edges to trip over.
@@ -26844,6 +26945,138 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Locate the cracks the bevel's degenerate triangles are masking: strip the degenerates,
+    /// then report every edge left with one face, in coordinates, with what its count was before.
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_bevel_cracks -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_bevel_cracks() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let Some((m, _)) = regenerate_mesh(&doc) else { return };
+
+        // Weld at the tolerance the edge tools use.
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for q in &m.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(q[k]);
+                hi[k] = hi[k].max(q[k]);
+            }
+        }
+        let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+        let sc = 1.0 / (diag * 2.0e-4).max(1e-6);
+        let mut canon: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+        let mut cpos: Vec<Vec3> = Vec::new();
+        let mut vid = vec![0usize; m.positions.len()];
+        for (k, q) in m.positions.iter().enumerate() {
+            let key = ((q[0] * sc).round() as i64, (q[1] * sc).round() as i64, (q[2] * sc).round() as i64);
+            vid[k] = *canon.entry(key).or_insert_with(|| {
+                cpos.push(Vec3::from_array(*q));
+                cpos.len() - 1
+            });
+        }
+        let is_degen = |t: &[u32]| {
+            let q = |i: u32| Vec3::from_array(m.positions[i as usize]);
+            (q(t[1]) - q(t[0])).cross(q(t[2]) - q(t[0])).length() < 1e-12
+        };
+        // Counts with and without the degenerate triangles.
+        let mut with: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+        let mut without: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+        for t in m.indices.chunks_exact(3) {
+            let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+            let d = is_degen(t);
+            for (i, j) in [(a, b), (b, c), (c, a)] {
+                if i == j {
+                    continue;
+                }
+                let k = if i < j { (i, j) } else { (j, i) };
+                *with.entry(k).or_insert(0) += 1;
+                if !d {
+                    *without.entry(k).or_insert(0) += 1;
+                }
+            }
+        }
+        // The decisive check: run the REAL cleanup, then count edges the way a hole would show
+        // up — ignoring self-loops, which are collapsed edges with no side and not boundaries.
+        let mut real = m.clone();
+        let removed = hworks_geometry::drop_degenerate_triangles(&mut real);
+        let mut after_edges: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+        let mut self_loops = 0usize;
+        for t in real.indices.chunks_exact(3) {
+            let (a, b, c) = (vid[t[0] as usize], vid[t[1] as usize], vid[t[2] as usize]);
+            for (i, j) in [(a, b), (b, c), (c, a)] {
+                if i == j {
+                    self_loops += 1;
+                    continue;
+                }
+                *after_edges.entry(if i < j { (i, j) } else { (j, i) }).or_insert(0) += 1;
+            }
+        }
+        eprintln!(
+            "after removing {removed} raw-degenerate triangles: {} real boundary edge(s), {self_loops} self-loop(s) from triangles that only collapse once welded",
+            after_edges.values().filter(|v| **v == 1).count()
+        );
+        let mut cracks: Vec<((usize, usize), u32, u32)> = without
+            .iter()
+            .filter(|(_, c)| **c == 1)
+            .map(|(k, c)| (*k, *c, with.get(k).copied().unwrap_or(0)))
+            .collect();
+        cracks.sort();
+        eprintln!("{} crack(s) revealed once the degenerate triangles are stripped:", cracks.len());
+        for ((a, b), after, before) in cracks.iter().take(20) {
+            let (pa, pb) = (cpos[*a], cpos[*b]);
+            eprintln!(
+                "  ({:.4},{:.4},{:.4}) -> ({:.4},{:.4},{:.4})  len={:.5}  faces before={before} after={after}",
+                pa.x, pa.y, pa.z, pb.x, pb.y, pb.z, pa.distance(pb)
+            );
+        }
+        // How many triangles touch each crack endpoint — a corner shows up as a high count.
+        for ((a, b), _, _) in cracks.iter().take(4) {
+            for v in [*a, *b] {
+                let n = m.indices.chunks_exact(3).filter(|t| t.iter().any(|&i| vid[i as usize] == v)).count();
+                eprintln!("    vertex ({:.4},{:.4},{:.4}) is used by {n} triangles", cpos[v].x, cpos[v].y, cpos[v].z);
+            }
+        }
+    }
+
+    /// Classify the zero-area triangles: a repeated vertex is harmless plumbing (its two real
+    /// edges cancel inside the triangle), but three DISTINCT collinear points is a flat patch
+    /// whose edges are shared with neighbours — remove that and you open a hole.
+    ///   HCAD_FILE=... cargo test -p hworks-app diag_degenerate_kinds -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_degenerate_kinds() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let Some((m, _)) = regenerate_mesh(&doc) else { return };
+        let (mut dup, mut flat) = (0usize, 0usize);
+        let mut edge_len = Vec::new();
+        for t in m.indices.chunks_exact(3) {
+            let q = |i: u32| Vec3::from_array(m.positions[i as usize]);
+            let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
+            if (b - a).cross(c - a).length() >= 1e-12 {
+                continue;
+            }
+            let same = |x: Vec3, y: Vec3| (x - y).length() < 1e-9;
+            if same(a, b) || same(b, c) || same(a, c) {
+                dup += 1;
+            } else {
+                flat += 1;
+                edge_len.push((b - a).length().max((c - b).length()).max((a - c).length()));
+            }
+        }
+        edge_len.sort_by(f32::total_cmp);
+        eprintln!("zero-area triangles: {} with a repeated vertex (harmless), {flat} genuinely flat (load-bearing)", dup);
+        if !edge_len.is_empty() {
+            eprintln!(
+                "  flat-patch longest edge: min={:.6} median={:.6} max={:.6}",
+                edge_len[0],
+                edge_len[edge_len.len() / 2],
+                edge_len[edge_len.len() - 1]
+            );
         }
     }
 
@@ -28023,6 +28256,9 @@ mod tests {
                 degen += 1;
             }
             for (i, j) in [(a, b), (b, c), (c, a)] {
+                if i == j {
+                    continue; // collapsed edge, no side — not a boundary
+                }
                 *emap.entry(if i < j { (i, j) } else { (j, i) }).or_insert(0) += 1;
             }
         }
