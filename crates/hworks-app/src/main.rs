@@ -76,9 +76,16 @@ const MAX_SEL: usize = 32;
 /// How long (seconds) an edge's key points flash after it's selected.
 const FLASH_SECS: f32 = 1.2;
 /// Two adjacent edge segments merge into one chain while the turn between them
-/// stays under ~60° (dot ≥ this). Sharp model corners (~90°) break the chain, so a
+/// stays under ~57° (dot ≥ this). Sharp model corners (~90°) break the chain, so a
 /// box edge stays a single edge while a tessellated circle walks into a full loop.
-const EDGE_CONTINUE_COS: f32 = 0.5;
+///
+/// Deliberately NOT 0.5. That is cos(60°) exactly — a regular hexagon's corner angle — so on a
+/// hexagonal extrusion whether the walk turned each corner came down to floating-point noise, and
+/// which corners it happened to survive depended on how the hexagon was rotated. A hexagon drawn
+/// square to the axes chained the whole rim; the same hexagon a few degrees off chained half of
+/// it, or one edge. A 60° turn is a sharp corner either way, so this now says so decisively and
+/// the whole-rim selection comes from the loop snap, which is deterministic.
+const EDGE_CONTINUE_COS: f32 = 0.545;
 /// Screen-space pixel radius for picking a model edge under the cursor.
 const EDGE_PICK_PX: f32 = 9.0;
 
@@ -24823,43 +24830,94 @@ fn edge_loop(edges: &[[[f32; 3]; 2]], seed: usize) -> (Vec<Vec3>, bool) {
         adj[*b].push(si);
     }
     let (sa, sb) = seg[seed];
-    // BFS the shortest path sa→sb that avoids the seed segment — that path plus the seed is the
-    // smallest cycle through the clicked edge.
-    let mut prev = vec![usize::MAX; pos.len()];
-    let mut seen = vec![false; pos.len()];
-    let mut q = std::collections::VecDeque::new();
-    seen[sa] = true;
-    q.push_back(sa);
-    while let Some(v) = q.pop_front() {
-        if v == sb {
-            break;
-        }
-        for &sg in &adj[v] {
-            if sg == seed {
-                continue;
+    // The shortest path sa→sb avoiding the seed segment — that path plus the seed is the smallest
+    // cycle through the clicked edge, restricted to the segments `allow` accepts.
+    let smallest_cycle = |allow: &dyn Fn(usize) -> bool| -> Option<Vec<usize>> {
+        let mut prev = vec![usize::MAX; pos.len()];
+        let mut seen = vec![false; pos.len()];
+        let mut q = std::collections::VecDeque::new();
+        seen[sa] = true;
+        q.push_back(sa);
+        while let Some(v) = q.pop_front() {
+            if v == sb {
+                break;
             }
-            let (a, b) = seg[sg];
-            let w = if a == v { b } else { a };
-            if !seen[w] {
-                seen[w] = true;
-                prev[w] = v;
-                q.push_back(w);
+            for &sg in &adj[v] {
+                if sg == seed || !allow(sg) {
+                    continue;
+                }
+                let (a, b) = seg[sg];
+                let w = if a == v { b } else { a };
+                if !seen[w] {
+                    seen[w] = true;
+                    prev[w] = v;
+                    q.push_back(w);
+                }
+            }
+        }
+        if !seen[sb] {
+            return None;
+        }
+        let mut ids = vec![sb];
+        let mut v = sb;
+        while v != sa {
+            v = prev[v];
+            if v == usize::MAX {
+                return None;
+            }
+            ids.push(v);
+        }
+        Some(ids)
+    };
+    // Search one PLANE at a time, and keep the biggest loop found.
+    //
+    // Searching the whole body at once minimises hop COUNT, and on a prism the side face next to
+    // the clicked edge is a 4-edge quad — shorter than any cap with more than four sides. So
+    // clicking the rim of a pentagonal or hexagonal extrusion selected that side quad instead of
+    // the cap perimeter, and the fillet got a fragment of the rim. A face perimeter is coplanar by
+    // definition, so restricting the search to a single plane is exactly what separates the cap
+    // from the side face; taking the largest then prefers the whole cap over any sub-loop of it.
+    //
+    // The candidate planes are the ones spanned by the seed and each edge meeting it — at most a
+    // handful, and the face perimeters through the clicked edge are always among them.
+    let diag = {
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in &pos {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        (hi - lo).length()
+    };
+    let tol = (diag * 1.0e-3).max(1.0e-5);
+    let sdir = (pos[sb] - pos[sa]).normalize_or_zero();
+    let mut best: Option<Vec<usize>> = None;
+    let mut planes: Vec<Vec3> = Vec::new();
+    for &nb in adj[sa].iter().chain(adj[sb].iter()) {
+        if nb == seed {
+            continue;
+        }
+        let (na, nbb) = seg[nb];
+        let n = sdir.cross((pos[nbb] - pos[na]).normalize_or_zero()).normalize_or_zero();
+        // Collinear with the seed — no plane of its own, and the walk would have taken it anyway.
+        if n == Vec3::ZERO || planes.iter().any(|p| p.cross(n).length() < 1.0e-3) {
+            continue;
+        }
+        planes.push(n);
+        let off = n.dot(pos[sa]);
+        let allow = |si: usize| {
+            let (a, b) = seg[si];
+            (n.dot(pos[a]) - off).abs() <= tol && (n.dot(pos[b]) - off).abs() <= tol
+        };
+        if let Some(ids) = smallest_cycle(&allow) {
+            if best.as_ref().is_none_or(|b| ids.len() > b.len()) {
+                best = Some(ids);
             }
         }
     }
-    if !seen[sb] {
+    // Nothing coplanar closed — fall back to searching the whole body, as this always did.
+    let Some(loop_ids) = best.or_else(|| smallest_cycle(&|_| true)) else {
         return (chain, false); // no cycle → lone edge
-    }
-    // Reconstruct the loop vertices sa..sb.
-    let mut loop_ids = vec![sb];
-    let mut v = sb;
-    while v != sa {
-        v = prev[v];
-        if v == usize::MAX {
-            return (chain, false);
-        }
-        loop_ids.push(v);
-    }
+    };
     let pts: Vec<Vec3> = loop_ids.iter().map(|&i| pos[i]).collect();
     // Accept only a reasonably planar loop (so we grab a flat face perimeter, not a path that
     // wanders over the body). Newell normal, then max out-of-plane distance.
@@ -31256,6 +31314,100 @@ mod tests {
                 (false, true) => "solid?? (was air before)",
             };
             eprintln!("  {label:32} uv({:6.1},{:6.1}) -> {verdict}", uv[0], uv[1]);
+        }
+    }
+
+    /// Clicking one edge of a polygon extrusion's rim selects the WHOLE rim, whatever the polygon
+    /// and however it happens to be rotated.
+    ///
+    /// Two bugs met here. The tangent walk's threshold was cos(60°) exactly — a regular hexagon's
+    /// corner — so whether it turned each corner was floating-point noise, and a hexagon a few
+    /// degrees off axis chained half its rim. And when the walk stopped, the loop snap searched the
+    /// whole body for the cycle with the fewest EDGES, which on a prism is the 4-edge side face
+    /// next to the click, not the cap — so every polygon past a square selected the wrong loop and
+    /// the fillet got a fragment of the rim.
+    #[test]
+    fn clicking_a_polygon_rim_selects_the_whole_cap() {
+        // Rotations chosen to straddle the old threshold: square to the axes (where the hexagon
+        // used to chain correctly by luck) and off it (where it used to fall apart).
+        let mut chain_lens: std::collections::BTreeMap<usize, Vec<(f64, usize)>> = Default::default();
+        for (n, rot) in [(5usize, 0.0_f64), (6, 0.0), (6, -0.55), (6, 0.31), (8, 0.0), (8, 0.2)] {
+            let mut s = Sketch::default();
+            let r = 10.0_f64;
+            let ids: Vec<usize> = (0..n)
+                .map(|k| {
+                    let a = std::f64::consts::TAU * k as f64 / n as f64 + rot;
+                    s.add_point(r * a.cos(), r * a.sin())
+                })
+                .collect();
+            for k in 0..n {
+                s.add_line(ids[k], ids[(k + 1) % n], false);
+            }
+            let mut doc = Document::with_default_planes();
+            doc.add_feature(FeatureKind::Extrude {
+                sketch: s,
+                regions: vec![],
+                region_pts: vec![],
+                plane: xy(),
+                distance: 8.0,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            });
+            doc.rollback = doc.features.len();
+            let (mesh, _) = regenerate_mesh(&doc).expect("body");
+            let tess = hworks_geometry::mesh_tessellation(mesh);
+            // Every cap edge must give the same answer — the bug's signature was that the result
+            // depended on WHICH edge you happened to click.
+            let caps: Vec<usize> = (0..tess.edges.len())
+                .filter(|&i| tess.edges[i][0][2].abs() < 1e-3 && tess.edges[i][1][2].abs() < 1e-3)
+                .collect();
+            assert_eq!(caps.len(), n, "n={n} rot={rot}: expected {n} cap edges, found {}", caps.len());
+            // With loop snap OFF the tangent walk must be rotation-independent too. It is allowed
+            // to chain (an octagon's 45° corners are gentle enough) or not (a hexagon's 60° corner
+            // is sharp) — but the SAME polygon must not give a different answer just because it was
+            // drawn at a different angle, which is what a threshold sitting exactly on cos(60°) did.
+            chain_lens.entry(n).or_default().push((rot, edge_chain(&tess.edges, caps[0]).0.len()));
+            for seed in caps {
+                let (lp, closed) = edge_loop(&tess.edges, seed);
+                assert!(closed, "n={n} rot={rot}: clicking cap edge {seed} gave an open selection");
+                assert_eq!(lp.len(), n, "n={n} rot={rot}: cap edge {seed} selected {} of {n} edges", lp.len());
+                // ...and it is the CAP, not some other loop that happens to have n edges.
+                for p in &lp {
+                    assert!(p.z.abs() < 1e-3, "n={n} rot={rot}: the loop left the cap plane at {p:?}");
+                }
+            }
+        }
+        for (n, runs) in &chain_lens {
+            let first = runs[0].1;
+            assert!(
+                runs.iter().all(|(_, l)| *l == first),
+                "n={n}: the tangent walk gave different answers at different rotations: {runs:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_edge_loop_pick -- --ignored --nocapture
+    fn diag_edge_loop_pick() {
+        // What does clicking each feature edge actually select? Reports, per seed, what the
+        // tangent walk gives and what the loop snap gives, so a partial selection can be read
+        // off rather than guessed at.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        let tess = hworks_geometry::mesh_tessellation(mesh);
+        eprintln!("{} feature edges, {} tangent", tess.edges.len(), tess.tangent_edges.len());
+        for (i, e) in tess.edges.iter().enumerate() {
+            let (a, b) = (e[0], e[1]);
+            let len = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            let (chain, cl) = edge_chain(&tess.edges, i);
+            let (lp, lc) = edge_loop(&tess.edges, i);
+            eprintln!(
+                "{i:3}: ({:6.2},{:6.2},{:6.2})→({:6.2},{:6.2},{:6.2}) len {len:5.2} | chain {:2} closed={cl:5} | loop {:2} closed={lc}",
+                a[0], a[1], a[2], b[0], b[1], b[2], chain.len(), lp.len()
+            );
         }
     }
 
