@@ -3033,6 +3033,13 @@ struct SketchSession {
     pending_c: Option<Vec2>,
     /// First point picked by the Dimension tool (point index).
     dim_first: Option<usize>,
+    /// A distance dimension whose geometry is chosen but whose LINE has not been put anywhere
+    /// yet. It follows the cursor until a second click decides where it sits — SolidWorks-style
+    /// placement, instead of appearing at a computed offset you then have to drag.
+    ///
+    /// Holds the two points, the line entity it came from (if it was picked as a line, for the
+    /// angle follow-up), and the value the geometry measured at pick time.
+    dim_place: Option<(usize, usize, Option<usize>)>,
     /// A just-placed dimension awaiting a typed value (the Distance constraint index),
     /// its editing buffer, and a one-shot focus request for the Modify box.
     dim_edit: Option<usize>,
@@ -9016,17 +9023,32 @@ fn ui_system(
                 } else {
                     egui::Color32::from_rgb(150, 215, 255)
                 };
+                // The number sits ON the dimension line, drafting-style, over an opaque chip
+                // that masks the line behind it — so the line reads as broken around the value
+                // instead of striking through it.
+                //
+                // An Area is placed by its top-left corner by default, which hangs the value down
+                // and to the right of the point it belongs to — on a dimension line that looks
+                // like it labels the wrong thing. The pivot centres it on the point instead.
                 egui::Area::new(id)
                     .fixed_pos(egui::pos2(screen.x, screen.y))
+                    .pivot(egui::Align2::CENTER_CENTER)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        // Never wrap — keep the value on one line even near a screen edge
-                        // (otherwise "90.0°" stacks one character per row).
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(text).color(col).strong())
-                                .wrap_mode(egui::TextWrapMode::Extend)
-                                .sense(egui::Sense::click()),
-                        )
+                        egui::Frame::new()
+                            .fill(ui.visuals().window_fill.gamma_multiply(0.92))
+                            .corner_radius(3.0)
+                            .inner_margin(egui::Margin { left: 4, right: 4, top: 1, bottom: 1 })
+                            .show(ui, |ui| {
+                                // Never wrap — keep the value on one line even near a screen edge
+                                // (otherwise "90.0°" stacks one character per row).
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(text).color(col).strong())
+                                        .wrap_mode(egui::TextWrapMode::Extend)
+                                        .sense(egui::Sense::click()),
+                                )
+                            })
+                            .inner
                     })
                     .inner
             })
@@ -9043,6 +9065,25 @@ fn ui_system(
                 }
             }
         };
+        // The value of the dimension being placed, live under the cursor. Without it the
+        // preview is three orange lines with no number, which does not look like a dimension at
+        // all while it is still lying on the edge it measures.
+        if let Some((a, b, _)) = session.dim_place {
+            if let (Some(pa), Some(pb), Some(cur)) = (session.sketch.points.get(a), session.sketch.points.get(b), session.cursor_uv) {
+                let a2 = Vec2::new(pa.x as f32, pa.y as f32);
+                let b2 = Vec2::new(pb.x as f32, pb.y as f32);
+                let axis = dim_axis_from_drag(a2, b2, cur);
+                let (_, _, lab) = distance_dim_geometry(a2, b2, dim_offset_for(a2, b2, axis, cur) as f32, axis);
+                // What the CHOSEN axis reads, matching what the second click will store.
+                let (dx, dy) = (b2.x - a2.x, b2.y - a2.y);
+                let v = match axis {
+                    DimAxis::Horizontal => dx.abs(),
+                    DimAxis::Vertical => dy.abs(),
+                    _ => dx.hypot(dy),
+                };
+                label_at(ctx, egui::Id::new("dimlabel_placing"), ap.to_world(lab), fmt_len_bare(v, unit), true);
+            }
+        }
         // Centres that carry a driving radius/diameter dimension (so the generic Ø
         // callout below can defer to the explicit dimension and avoid double labels).
         let mut dimensioned_centers: Vec<usize> = Vec::new();
@@ -12358,6 +12399,7 @@ fn sketch_interaction(
     // a dimension with the Select tool reopens it).
     if session.tool != Tool::Dimension {
         session.dim_first = None;
+        session.dim_place = None;
         session.dim_line = None;
         session.dim_slot = None;
         session.dim_ref_circle = None;
@@ -12737,6 +12779,42 @@ fn sketch_interaction(
         }
         Tool::Dimension if just_pressed => {
             if let Some(uv) = active_uv {
+                // A dimension waiting to be placed takes this click before anything else can
+                // claim it: the click means "put the line here", not "pick something".
+                if let Some((a, b, line)) = session.dim_place.take() {
+                    if let Some(ci) = add_distance_dim(&mut session.sketch, a, b) {
+                        let pt = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+                        if let (Some(pa), Some(pb)) = (pt(a), pt(b)) {
+                            // Where the line sits, AND what it measures — pull square off the
+                            // line for its true length, below it for the horizontal span, out to
+                            // the side for the vertical one.
+                            let axis = dim_axis_from_drag(pa, pb, uv);
+                            let dim_ms = if session.snap_dist > 1e-6 { (session.snap_dist / SNAP).clamp(0.03, 400.0) } else { 1.0 };
+                            let off = dim_standoff(dim_offset_for(pa, pb, axis, uv), dim_ms);
+                            if let Some(Constraint::Distance { axis: ax, offset, value, .. }) = session.sketch.constraints.get_mut(ci) {
+                                *ax = axis;
+                                *offset = off;
+                                // The value must be what the CHOSEN axis reads, not the straight
+                                // line one, or a horizontal dimension on a sloped line would open
+                                // showing its true length and then jump when confirmed.
+                                let (dx, dy) = ((pb.x - pa.x) as f64, (pb.y - pa.y) as f64);
+                                *value = match axis {
+                                    DimAxis::Horizontal => dx.abs(),
+                                    DimAxis::Vertical => dy.abs(),
+                                    _ => dx.hypot(dy),
+                                }
+                                .max(1.0e-3);
+                            }
+                        }
+                        // Dimensioning a side of a box carries the opposite side with it (unless
+                        // the shape already says so) — the same tie the old pick-time path did.
+                        if let Some(l) = line {
+                            tie_opposite_side(&mut session.sketch, l);
+                        }
+                        open_dim_edit(&mut session, ci, line);
+                    }
+                    return;
+                }
                 // Clicking an existing dimension's label reopens it for editing.
                 if let Some(ci) = dim_at(&session.sketch, uv, snap * 3.5) {
                     session.dim_first = None;
@@ -12748,9 +12826,15 @@ fn sketch_interaction(
                     // opens the Modify box so the exact value can be typed straight away.
                     let mut line_ctx = None;
                     let mut slot_ctx = None;
+                    // A distance dimension is ARMED here rather than created — it lands on the
+                    // next click. Radius, diameter, angle and slot width still appear straight
+                    // away: there is nothing to choose about where those sit.
                     let created = if let Some(p) = nearest_point(&session.sketch, uv, snap * 1.5) {
                         match session.dim_first.take() {
-                            Some(first) if first != p => add_distance_dim(&mut session.sketch, first, p),
+                            Some(first) if first != p => {
+                                session.dim_place = Some((first, p, None));
+                                None
+                            }
                             _ => {
                                 session.dim_first = Some(p);
                                 None
@@ -12760,7 +12844,8 @@ fn sketch_interaction(
                         session.dim_first = None;
                         if let Some((a, b)) = entity_line(&session.sketch, e) {
                             line_ctx = Some(e);
-                            add_distance_dim(&mut session.sketch, a, b)
+                            session.dim_place = Some((a, b, Some(e)));
+                            None
                         } else if let Some((center, radius)) = entity_circle(&session.sketch, e) {
                             // A round body edge was picked first → edge-to-edge dimension
                             // that DRIVES this circle's size; otherwise the usual Ø dim.
@@ -13805,7 +13890,7 @@ fn dim_arrowhead(g: &mut Gizmos, ap: &ActivePlane, tip: Vec2, dir: Vec2, len: f3
         return;
     }
     let perp = Vec2::new(-d.y, d.x);
-    let half = len * 0.30; // slim, like a drafting arrow — not a fat cone
+    let half = len * 0.17; // ~3:1 long-to-wide, a drafting dart — 0.30 read as a fat cone
     let back = tip - d * len;
     let (l, r) = (back + perp * half, back - perp * half);
     g.line(ap.to_world(tip), ap.to_world(l), col);
@@ -13818,51 +13903,78 @@ fn dim_arrowhead(g: &mut Gizmos, ap: &ActivePlane, tip: Vec2, dir: Vec2, len: f3
     }
 }
 
-/// Where a linear dimension's text belongs: clear of its line, on the side away from the
-/// geometry, so it never sits on top of the line it labels.
+/// How big a linear dimension's arrowheads are, and whether they had to be turned outward.
 ///
-/// Shared by the drawing and the label so they cannot drift apart.
-fn linear_dim_text_pos(a: Vec2, b: Vec2, p0: Vec2, p1: Vec2, ms: f32) -> Vec2 {
-    let dir = (p1 - p0).normalize_or_zero();
-    let mid = (p0 + p1) * 0.5;
-    if dir == Vec2::ZERO {
-        return mid;
+/// Heads are a fixed size on screen (they scale with the zoom-aware marker size, not with the
+/// dimension), but they must not swallow the span they sit in — so on a short dimension they are
+/// capped, and past a point they stop fitting between the witness lines at all and are drawn
+/// outside pointing in, which is what a drawing does.
+fn linear_dim_arrow(len: f32, ms: f32) -> (f32, bool) {
+    // `ms` is about a twelfth of the camera radius, which works out near 50 px on screen — so
+    // this constant is "arrowhead length in twentieths of an ms", and 0.25 lands at roughly the
+    // 11 px SolidWorks draws. It was 2.2 (~110 px): heads so large they read as cones, and long
+    // enough to trip the outward-turning branch below on an ordinary box side, which then threw
+    // the dimension line way out past both corners.
+    //
+    // Deliberately NOT capped as a fraction of the span: a fixed screen size is the whole point,
+    // and short spans are handled by turning the heads outward rather than by shrinking them.
+    let arrow = 0.25 * ms;
+    (arrow, len < arrow * 3.2)
+}
+
+/// The witness (extension) line running from one end of the measured geometry back out to the
+/// dimension line — `None` when there is nothing to draw.
+///
+/// It leaves a small gap at the geometry so it never looks welded to it and overshoots the
+/// dimension line by a hair, both drafting convention. Both amounts are fixed on SCREEN, so they
+/// hold their proportions as the view zooms.
+///
+/// The gap used to be a flat `0.55 * ms` with a `1.0 * ms` overshoot, and the line was skipped
+/// altogether unless it was longer than the two combined — about 78 px. A dimension placed
+/// anywhere near the edge it measures (which is most of them) fell under that and drew no witness
+/// lines at all. The gap is now capped as a fraction of the length available, so a short witness
+/// line shrinks its gap rather than disappearing.
+fn witness_segment(from: Vec2, to: Vec2, ms: f32) -> Option<(Vec2, Vec2)> {
+    let v = to - from;
+    let full = v.length();
+    // Placed right on the edge there genuinely is no witness line, and normalising a zero vector
+    // would leave a stray tick at the corner.
+    if full < 0.02 * ms {
+        return None;
     }
-    let perp = Vec2::new(-dir.y, dir.x);
-    let away = if perp.dot(mid - (a + b) * 0.5) >= 0.0 { perp } else { -perp };
-    mid + away * (1.6 * ms)
+    let dir = v / full;
+    let gap = (0.08 * ms).min(full * 0.30);
+    let over = 0.12 * ms;
+    Some((from + dir * gap, to + dir * over))
 }
 
 /// Draw a linear dimension the way a drawing does it: witness lines that stand off the geometry
 /// and overshoot the dimension line, and arrowheads that turn outward when the span is too tight
 /// to hold them.
 ///
-/// Returns where the text should sit — just clear of the line, on the side away from the
-/// geometry, rather than sitting on top of the line it belongs to.
-fn draw_linear_dim(g: &mut Gizmos, ap: &ActivePlane, a: Vec2, b: Vec2, p0: Vec2, p1: Vec2, ms: f32, col: Color) -> Vec2 {
+/// The text is not drawn here — it is an egui label, painted on the dimension line's midpoint
+/// (which `distance_dim_geometry` already returns) over a background chip that masks the line
+/// behind it, so the line reads as broken around the number.
+fn draw_linear_dim(g: &mut Gizmos, ap: &ActivePlane, a: Vec2, b: Vec2, p0: Vec2, p1: Vec2, ms: f32, col: Color) {
     let span = p1 - p0;
     let len = span.length();
     let dir = span.normalize_or_zero();
-    let arrow = (2.2 * ms).min(len * 0.30).max(0.6 * ms);
+    let (arrow, tight) = linear_dim_arrow(len, ms);
 
-    // Witness lines: a small gap off the geometry so they never look welded to it, and a short
-    // overshoot past the dimension line, both standard drafting practice.
-    let gap = 0.55 * ms;
-    let over = 1.0 * ms;
+    // Witness lines: from each end of the measured geometry back out to the dimension line, with
+    // a small gap where they leave the geometry so they never look welded to it and a short
+    // overshoot past the dimension line. Both are standard drafting practice.
     for (from, to) in [(a, p0), (b, p1)] {
-        let w = (to - from).normalize_or_zero();
-        if w != Vec2::ZERO {
-            g.line(ap.to_world(from + w * gap), ap.to_world(to + w * over), col);
+        if let Some((s, e)) = witness_segment(from, to, ms) {
+            g.line(ap.to_world(s), ap.to_world(e), col);
         }
     }
 
     if dir == Vec2::ZERO {
-        return p0;
+        return;
     }
-    // Too tight for the heads to fit between the witness lines: put them outside pointing in,
-    // and stretch the line past each end so they have something to sit on.
-    let tight = len < arrow * 3.2;
     if tight {
+        // Stretch the line past each end so the outward heads have something to sit on.
         let ext = arrow * 2.2;
         g.line(ap.to_world(p0 - dir * ext), ap.to_world(p1 + dir * ext), col);
         dim_arrowhead(g, ap, p0, -dir, arrow, col);
@@ -13872,8 +13984,22 @@ fn draw_linear_dim(g: &mut Gizmos, ap: &ActivePlane, a: Vec2, b: Vec2, p0: Vec2,
         dim_arrowhead(g, ap, p0, dir, arrow, col);
         dim_arrowhead(g, ap, p1, -dir, arrow, col);
     }
+}
 
-    linear_dim_text_pos(a, b, p0, p1, ms)
+/// Keep a dimension line clear of the geometry it measures.
+///
+/// NOTHING is floored any more: a dimension lands exactly where it is put, right on the edge if
+/// that is where you clicked. This used to push it clear of the geometry, because at a small
+/// offset the dimension line lands ON the line it belongs to and vanishes into it — but the cure
+/// was worse than the disease. The real problem was that the dimension being PLACED was drawn in
+/// the same colour as a placed one, so while it hugged the edge there was nothing new to see and
+/// it looked like the tool had not responded; the preview now draws in the placement colour with
+/// its own end ticks and a live value, so it is legible sitting right on the line.
+///
+/// Kept as a function (rather than deleted) because it is the one place that decides this, and
+/// the tests below pin the "placed where you clicked" promise to it.
+fn dim_standoff(raw: f64, _ms: f32) -> f64 {
+    raw
 }
 
 /// Which kind of distance a drag is asking for, SolidWorks-style.
@@ -13889,12 +14015,25 @@ fn dim_axis_from_drag(a: Vec2, b: Vec2, cursor: Vec2) -> DimAxis {
     }
     let perp = Vec2::new(-d.y, d.x).normalize();
     if v.normalize().dot(perp).abs() > 0.9 {
-        DimAxis::Aligned // pulled square off the line ⇒ its true length
-    } else if v.x.abs() > v.y.abs() {
+        return DimAxis::Aligned; // pulled square off the line ⇒ its true length
+    }
+    let along = if v.x.abs() > v.y.abs() {
         DimAxis::Vertical // pulled out to the side ⇒ the vertical span
     } else {
         DimAxis::Horizontal
-    }
+    };
+    // ...but only if that span EXISTS. Hugging the line, the pull is nearly parallel to it, which
+    // lands here every time — and on a horizontal edge the answer above is "vertical", whose span
+    // is zero. That drew the dimension collapsed to a point (the two witness lines lying along the
+    // edge as one line) reading 0, and placing it made a zero-length constraint the solver
+    // reported as over-defined. A degenerate projection is never what was meant: fall back to the
+    // line's true length.
+    let span = match along {
+        DimAxis::Horizontal => d.x.abs(),
+        DimAxis::Vertical => d.y.abs(),
+        DimAxis::Aligned => d.length(),
+    };
+    if span < d.length() * 0.05 { DimAxis::Aligned } else { along }
 }
 
 /// How far off the geometry the cursor sits, in the sense the given axis measures — the number
@@ -15635,7 +15774,9 @@ fn handle_keys(
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        if !session.spline_pts.is_empty() {
+        // Drop a dimension that is waiting to be placed, staying in the tool for the next one.
+        if session.dim_place.take().is_some() {
+        } else if !session.spline_pts.is_empty() {
             // 0) Finish the in-progress spline at the current segment (open) rather than
             // discarding it — ≥2 points make a real spline whose endpoints stay snappable.
             if session.spline_pts.len() >= 2 {
@@ -22924,9 +23065,7 @@ fn draw_sketch(
             hworks_sketch::Constraint::Distance { a, b, offset, axis, .. } => {
                 if let (Some(a2), Some(b2)) = (pt(*a), pt(*b)) {
                     let (p0, p1, _) = distance_dim_geometry(a2, b2, *offset as f32, *axis);
-                    gizmos.line(ap.to_world(p0), ap.to_world(p1), dim_col);
-                    gizmos.line(ap.to_world(a2), ap.to_world(p0), dim_col);
-                    gizmos.line(ap.to_world(b2), ap.to_world(p1), dim_col);
+                    draw_linear_dim(&mut gizmos, ap, a2, b2, p0, p1, ms, dim_col);
                 }
             }
             // Radius/diameter: a proper dimension line with an arrow into the rim and a
@@ -23045,6 +23184,34 @@ fn draw_sketch(
             let cv = Vec2::new(c[0] as f32, c[1] as f32);
             gizmos.line(ap.to_world(cv - Vec2::X * m), ap.to_world(cv + Vec2::X * m), col);
             gizmos.line(ap.to_world(cv - Vec2::Y * m), ap.to_world(cv + Vec2::Y * m), col);
+        }
+    }
+
+    // The dimension being placed. Drawn in the PLACEMENT colour, not the placed-dimension blue:
+    // sitting right on the edge it measures (which is exactly where you want to be able to put
+    // it) a blue copy of a blue line is invisible, and the tool looked unresponsive until the
+    // cursor had been dragged well clear. Orange, plus end ticks that stand off the line and a
+    // leader out to the cursor, so it reads at any offset — including zero.
+    if let Some((a, b, _)) = session.dim_place {
+        if let (Some(pa), Some(pb), Some(cur)) = (
+            session.sketch.points.get(a).map(|q| Vec2::new(q.x as f32, q.y as f32)),
+            session.sketch.points.get(b).map(|q| Vec2::new(q.x as f32, q.y as f32)),
+            session.cursor_uv,
+        ) {
+            let col = Color::srgb(1.0, 0.78, 0.25);
+            let axis = dim_axis_from_drag(pa, pb, cur);
+            let off = dim_offset_for(pa, pb, axis, cur) as f32;
+            let (p0, p1, mid) = distance_dim_geometry(pa, pb, off, axis);
+            // Drawn exactly as it will look once placed, arrowheads and all, so the second click
+            // holds no surprises — only the colour says it is still being placed.
+            draw_linear_dim(&mut gizmos, ap, pa, pb, p0, p1, ms, col);
+            // A leader from the line to the cursor, so it is obvious the dimension is following
+            // the mouse and waiting for a second click rather than already placed.
+            if cur.distance(mid) > 0.2 * ms {
+                gizmos.line(ap.to_world(mid), ap.to_world(cur), col);
+            }
+            draw_marker(&mut gizmos, ap, pa, col, ms);
+            draw_marker(&mut gizmos, ap, pb, col, ms);
         }
     }
 
@@ -26282,18 +26449,197 @@ mod tests {
         assert_eq!(hworks_geometry::drop_degenerate_triangles(&mut both), 2, "the broad sweep should take both kinds");
     }
 
-    /// The bevel and thread builders emit zero-area triangles where their patches meet. They
-    /// cover no surface, so stripping them cannot change the shape — but left in they carry no
-    /// usable normal, bloat STL and STEP exports, and give the boolean kernel edges to trip over.
+    /// A dimension's arrowheads are a fixed size on SCREEN — they scale with the zoom, not with
+    /// the thing being measured — but they must never swallow the span they sit in, and on a span
+    /// too short to hold them they have to turn outward instead of overlapping into a blob.
+    #[test]
+    fn dimension_arrowheads_fit_the_span_they_sit_in() {
+        let ms = 1.0_f32;
+        // Comfortable spans: both heads fit inside, and together they leave line to see.
+        // A box side is a couple of ms across at a normal working zoom, so that is the case
+        // that matters — heads sized off the old constant turned outward even there.
+        for len in [2.0_f32, 10.0, 25.0, 200.0] {
+            let (arrow, tight) = linear_dim_arrow(len, ms);
+            assert!(!tight, "a {len} span should not need outward arrows");
+            assert!(arrow * 2.0 < len * 0.8, "arrows ate a {len} span (each {arrow})");
+        }
+        // Short spans turn the heads outward rather than letting them collide in the middle.
+        for len in [0.0_f32, 0.2, 0.5] {
+            assert!(linear_dim_arrow(len, ms).1, "a {len} span should have turned the arrows out");
+        }
+        // The size is drafting-plausible, not a cone: an arrowhead is a small fraction of the
+        // marker scale, which is itself about a twelfth of the camera radius.
+        assert!(linear_dim_arrow(50.0, ms).0 < 0.5 * ms, "the arrowhead is back to cone size");
+        // Fixed on screen: zoom out (larger marker scale) and the head grows with it, so it
+        // stays the same number of pixels rather than shrinking to nothing.
+        let (near, _) = linear_dim_arrow(200.0, 1.0);
+        let (far, _) = linear_dim_arrow(200.0, 4.0);
+        assert!(far > near * 3.0, "the arrowhead did not scale with the zoom ({near} → {far})");
+        // Never zero, whatever the span — an arrowhead of length 0 draws nothing at all.
+        for len in [0.0_f32, 1e-6, 1e6] {
+            assert!(linear_dim_arrow(len, ms).0 > 0.0, "a {len} span produced an invisible arrowhead");
+        }
+    }
+
+    /// Witness lines run from each end of the measured geometry back out to the dimension line,
+    /// standing off the geometry and overshooting the line by a hair.
     ///
-    /// The safety of removing them is checked, not argued: same volume, still manifold, and no
+    /// They used to be skipped entirely unless they were longer than gap + overshoot — about
+    /// 78 px — so a dimension placed anywhere near the edge it measures drew none at all, and the
+    /// dimension floated with nothing tying it to the geometry.
+    #[test]
+    fn witness_lines_reach_back_to_the_geometry_they_measure() {
+        let ms = 1.0_f32;
+        let corner = Vec2::new(3.0, 0.0);
+        // Every placement from hard against the edge out to a long way clear of it.
+        for d in [0.05_f32, 0.2, 0.5, 1.0, 4.0, 40.0] {
+            let end = corner + Vec2::new(0.0, d);
+            let (s, e) = witness_segment(corner, end, ms).unwrap_or_else(|| panic!("no witness line at {d} out"));
+            // Starts clear of the geometry, but never so far that it swallows the line.
+            let off = (s - corner).length();
+            assert!(off > 0.0, "the witness line was welded to the geometry at {d} out");
+            assert!(off < d * 0.5, "the gap ate the witness line at {d} out ({off})");
+            // ...and finishes past the dimension line, on the far side of it.
+            let past = (e - corner).length();
+            assert!(past > d, "the witness line stopped short of the dimension line at {d} out");
+            assert!(past < d + 0.4 * ms, "the overshoot ran away at {d} out ({past})");
+            // Collinear with the run it stands in for, not skewed off it.
+            assert!((e - s).normalize().dot(Vec2::Y) > 0.999, "the witness line was not square");
+        }
+        // Placed right on the edge there is nothing to draw — and no stray tick at the corner.
+        assert!(witness_segment(corner, corner, ms).is_none());
+        assert!(witness_segment(corner, corner + Vec2::new(0.0, 1e-6), ms).is_none());
+        // Fixed on screen: zoom out and the gap grows with everything else.
+        let near = witness_segment(corner, corner + Vec2::Y * 40.0, 1.0).unwrap();
+        let far = witness_segment(corner, corner + Vec2::Y * 40.0, 4.0).unwrap();
+        assert!((far.0 - corner).length() > (near.0 - corner).length() * 3.0, "the gap did not scale with zoom");
+    }
 
-    /// A dimension's text must sit clear of its own line, on the side away from the geometry —
-    /// and the label and the drawn arrows must agree about which side that is, or the number
+    /// Placing a dimension against the edge it measures must leave it HUGGING that edge. The
+    /// second click is the position, full stop — nothing is imposed on top of it.
+    #[test]
+    fn a_dimension_placed_on_the_edge_hugs_it() {
+        // A 9.6 mm edge at a zoom where the marker scale is ~1, matching the reported case.
+        let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(9.6, 0.0));
+        let ms = 1.0_f32;
+        let place = |cursor: Vec2| -> f64 {
+            let axis = dim_axis_from_drag(a, b, cursor);
+            dim_standoff(dim_offset_for(a, b, axis, cursor), ms).abs()
+        };
+        // Clicked right on the edge, and a hair off it: snug either way.
+        assert!(place(Vec2::new(4.8, 0.0)) < 1e-6, "a dimension placed ON the edge sat {} away", place(Vec2::new(4.8, 0.0)));
+        assert!(place(Vec2::new(4.8, 0.05)) < 0.06, "a dimension placed against the edge sat {} away", place(Vec2::new(4.8, 0.05)));
+        // Dragged out, it goes where it was put — no snapping back, no extra padding.
+        for want in [0.5_f32, 2.0, 8.0] {
+            let got = place(Vec2::new(4.8, want));
+            assert!((got - want as f64).abs() < 1e-4, "dragged to {want}, landed at {got}");
+        }
+    }
 
-    /// Where you pull decides what the dimension measures, SolidWorks-style: square off the
-    /// line for its true length, below it for the horizontal span, out to the side for the
-    /// vertical one. And the click position becomes the dimension line's offset, so it lands
+    /// A dimension goes exactly where the second click puts it — including right on the edge it
+    /// measures.
+    ///
+    /// This once floored the offset so the line could not land on the geometry and disappear into
+    /// it. That was the wrong cure: the invisibility was the PREVIEW being drawn in the same
+    /// colour as a placed dimension, and the floor meant every dimension stood off the edge by an
+    /// amount nobody asked for. The preview is now drawn in the placement colour with its own end
+    /// ticks, so zero clearance is legible and the floor is gone.
+    #[test]
+    fn a_dimension_lands_exactly_where_it_is_placed() {
+        let ms = 1.0_f32;
+        for raw in [0.0_f64, 0.01, -0.01, 5.0, -5.0, 50.0] {
+            assert!((dim_standoff(raw, ms) - raw).abs() < 1e-12, "an offset of {raw} was moved");
+        }
+        // Zoom must not introduce one either — the same click gives the same offset at any scale.
+        for ms in [0.05_f32, 1.0, 400.0] {
+            assert_eq!(dim_standoff(0.0, ms), 0.0, "a zero offset picked up padding at ms={ms}");
+        }
+        // End to end: cursor on the line ⇒ the dimension line is on the line.
+        let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        let cur = Vec2::new(5.0, 0.0);
+        let axis = dim_axis_from_drag(a, b, cur);
+        let off = dim_standoff(dim_offset_for(a, b, axis, cur), ms) as f32;
+        let (p0, p1, _) = distance_dim_geometry(a, b, off, axis);
+        let clear = ((p0 + p1) * 0.5 - (a + b) * 0.5).length();
+        assert!(clear < 1e-6, "a dimension clicked onto the edge sat {clear} off it");
+    }
+
+    /// Where you pull decides what the dimension measures: square off the line for its true
+    /// length, below it for the horizontal span, out to the side for the vertical one.
+    #[test]
+    fn the_drag_direction_chooses_what_a_dimension_measures() {
+        // A 3-4-5 line, so aligned/horizontal/vertical give three DIFFERENT answers (5, 3, 4)
+        // and a wrong axis cannot pass unnoticed.
+        let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(3.0, 4.0));
+        let mid = (a + b) * 0.5;
+        let perp = Vec2::new(-4.0, 3.0).normalize();
+
+        assert_eq!(dim_axis_from_drag(a, b, mid + perp * 3.0), DimAxis::Aligned, "square off the line should read its true length");
+        assert_eq!(dim_axis_from_drag(a, b, mid - perp * 3.0), DimAxis::Aligned, "and from the other side too");
+        assert_eq!(dim_axis_from_drag(a, b, mid + Vec2::new(0.0, -6.0)), DimAxis::Horizontal, "pulling below should read the horizontal span");
+        assert_eq!(dim_axis_from_drag(a, b, mid + Vec2::new(6.0, 0.0)), DimAxis::Vertical, "pulling to the side should read the vertical span");
+
+        // The dimension lands under the cursor, whichever axis was chosen.
+        for pull in [Vec2::new(0.0, -6.0), Vec2::new(6.0, 0.0), perp * 3.0] {
+            let cur = mid + pull;
+            let ax = dim_axis_from_drag(a, b, cur);
+            let off = dim_offset_for(a, b, ax, cur) as f32;
+            let (p0, p1, _) = distance_dim_geometry(a, b, off, ax);
+            let on_line = ((p0 + p1) * 0.5 - cur).dot(match ax {
+                DimAxis::Horizontal => Vec2::Y,
+                DimAxis::Vertical => Vec2::X,
+                _ => Vec2::new(-(b - a).y, (b - a).x).normalize(),
+            });
+            assert!(on_line.abs() < 1e-4, "the {ax:?} dimension did not land under the cursor ({on_line})");
+        }
+
+        // Degenerate picks fall back to the aligned reading rather than producing NaN.
+        assert_eq!(dim_axis_from_drag(a, b, mid), DimAxis::Aligned);
+        assert_eq!(dim_axis_from_drag(a, a, mid + Vec2::new(1.0, 1.0)), DimAxis::Aligned);
+    }
+
+    /// A dimension must never read zero, whatever the drag.
+    ///
+    /// Hugging the line the pull is nearly PARALLEL to it, so the axis rule reached its
+    /// "pulled out to the side" branch every time — and on a horizontal edge that asks for the
+    /// vertical span, which is zero. The preview drew as a single line reading 0, and clicking
+    /// there made a zero-length constraint the solver called over-defined.
+    #[test]
+    fn hugging_the_line_never_gives_a_zero_dimension() {
+        let reads = |a: Vec2, b: Vec2, cursor: Vec2| -> f32 {
+            let axis = dim_axis_from_drag(a, b, cursor);
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            match axis {
+                DimAxis::Horizontal => dx.abs(),
+                DimAxis::Vertical => dy.abs(),
+                DimAxis::Aligned => dx.hypot(dy),
+            }
+        };
+        // A horizontal edge, a vertical one, and a point pair sharing a coordinate — every case
+        // where one projection is degenerate. Sweep the cursor right along each, both sides and
+        // past both ends, at the hair-off-the-line distances the tool is actually used at.
+        for (a, b) in [
+            (Vec2::new(0.0, 0.0), Vec2::new(9.6, 0.0)),
+            (Vec2::new(0.0, 0.0), Vec2::new(0.0, 9.6)),
+            (Vec2::new(3.0, 4.0), Vec2::new(3.0, -4.0)),
+        ] {
+            let len = (b - a).length();
+            for t in [-0.4_f32, 0.0, 0.25, 0.5, 0.75, 1.0, 1.4] {
+                for off in [-0.30_f32, -0.02, 0.0, 0.02, 0.30] {
+                    let along = a + (b - a) * t;
+                    let n = Vec2::new(-(b - a).y, (b - a).x).normalize() * off;
+                    let got = reads(a, b, along + n);
+                    assert!(got > len * 0.5, "cursor at t={t} off={off} read {got} on a {len} edge");
+                }
+            }
+        }
+        // Pulled properly clear, the projections are still available on a SLOPED line — the
+        // guard must not have collapsed everything to the aligned reading.
+        let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(8.0, 6.0));
+        let mid = (a + b) * 0.5;
+        assert_eq!(dim_axis_from_drag(a, b, mid + Vec2::new(0.0, -9.0)), DimAxis::Horizontal);
+        assert_eq!(dim_axis_from_drag(a, b, mid + Vec2::new(9.0, 0.0)), DimAxis::Vertical);
+    }
 
     /// The Modify box must open on what the geometry actually measures, never on the last
     /// number typed. egui keeps a DragValue's half-typed TEXT keyed by widget id and that text
