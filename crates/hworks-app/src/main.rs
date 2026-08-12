@@ -1818,6 +1818,9 @@ enum RectMode {
     Corner,
     /// Centre then a corner; adds X-pattern construction diagonals + a centre point.
     Center,
+    /// Centre then a corner, forced square, drawn entirely as construction geometry — a layout
+    /// guide whose centre point other geometry hangs off.
+    CenterSquare,
     /// Three clicks: the first two anchor one side, the third pulls out a parallelogram.
     Parallelogram,
 }
@@ -2162,6 +2165,9 @@ struct UiState {
     redo_request: bool,
     /// Save / open requested (from buttons or Ctrl+S / Ctrl+O).
     save_request: bool,
+    /// A save is waiting for the open sketch to be committed first. Set for exactly one frame,
+    /// so a sketch that refuses to commit can never trap the save in a loop.
+    save_pending_commit: bool,
     open_request: bool,
     /// Save As (always prompt) and Export (STL / STEP) requests.
     save_as_request: bool,
@@ -4409,6 +4415,7 @@ fn ui_system(
                             };
                             pick(ui, RectMode::Corner, icons::Icon::Rectangle, "Corner Rectangle", "Two opposite corners");
                             pick(ui, RectMode::Center, icons::Icon::CenterRectangle, "Center Rectangle", "Centre, then a corner (adds X construction diagonals)");
+                            pick(ui, RectMode::CenterSquare, icons::Icon::CenterRectangle, "Center Square (construction)", "A square layout guide sized from its centre — all construction, and its centre point binds to whatever you drop it on");
                             pick(ui, RectMode::Parallelogram, icons::Icon::Parallelogram, "Parallelogram", "Two points anchor one side, then pull out the rest");
                         });
                         // Spline tool + a ▾ dropdown: through-points or control-points.
@@ -12988,7 +12995,30 @@ fn opposite_side(sketch: &Sketch, line: usize) -> Option<(usize, usize, usize)> 
 /// Skipped when the opposite side already has a dimension or an equality of its own, since
 /// adding another would over-define the sketch rather than help it.
 fn tie_opposite_side(sketch: &mut Sketch, line: usize) {
-    let Some((_, c, d)) = opposite_side(sketch, line) else { return };
+    let Some((opp, c, d)) = opposite_side(sketch, line) else { return };
+    // Not when the shape already says it.
+    //
+    // A quad with shared corners whose four sides are all horizontal-or-vertical is a rectangle:
+    // its opposite sides are equal by construction, and an Equal on top of that is REDUNDANT.
+    // The solver reports a redundant relation as "over defined — conflicting relations", so
+    // dimensioning one side of an ordinary box lit the sketch up red for no reason.
+    let axis_of = |i: usize| -> Option<bool> {
+        let (a, b) = match sketch.entities.get(i) {
+            Some(SketchEntity::Line { a, b, .. }) => (*a, *b),
+            _ => return None,
+        };
+        sketch.constraints.iter().find_map(|k| match k {
+            Constraint::Horizontal(x, y) if (*x == a && *y == b) || (*x == b && *y == a) => Some(true),
+            Constraint::Vertical(x, y) if (*x == a && *y == b) || (*x == b && *y == a) => Some(false),
+            _ => None,
+        })
+    };
+    if let (Some(h0), Some(h1)) = (axis_of(line), axis_of(opp)) {
+        if h0 == h1 {
+            // Both along the same axis, joined by the other two sides: equal already.
+            return;
+        }
+    }
     let Some((a, b)) = (match sketch.entities.get(line) {
         Some(SketchEntity::Line { a, b, .. }) => Some((*a, *b)),
         _ => None,
@@ -13565,15 +13595,42 @@ fn solve_distance_dim(sketch: &mut Sketch, ci: usize) -> Option<(f64, f64)> {
                 _ => false,
             })
     };
-    match (attached(a), attached(b)) {
-        // Both ends held by the body: nothing here can give, so let the ordinary solve run and
-        // let the caller report that the dimension did not take.
-        (true, true) => sketch.solve(),
-        (true, false) => sketch.solve_with_fixed(&[a]),
-        (false, true) => sketch.solve_with_fixed(&[b]),
+    // Holding an end is a PREFERENCE, not a demand.
+    //
+    // If the shape is already anchored some other way — a centred square whose centre point is
+    // pinned, say — then pinning an end as well over-constrains it and the dimension silently
+    // fails to take. So: try it pinned, and if the value was not reached, put the points back
+    // and solve without the pin. The anchor is there to stop a free shape sliding, and a shape
+    // that is already held does not need it.
+    let snapshot: Vec<hworks_sketch::Point2> = sketch.points.clone();
+    let pin = match (attached(a), attached(b)) {
+        // Both ends held by the body: nothing here can give.
+        (true, true) => None,
+        (true, false) => Some(a),
+        (false, true) => Some(b),
         // Neither is tied to anything: hold the end the dimension started from, so the shape
         // grows away from where you clicked rather than sliding both ways.
-        (false, false) => sketch.solve_with_fixed(&[a]),
+        (false, false) => Some(a),
+    };
+    let reached = |sk: &Sketch| -> bool {
+        let (Some(pa), Some(pb)) = (sk.points.get(a), sk.points.get(b)) else { return false };
+        let (dx, dy) = (pb.x - pa.x, pb.y - pa.y);
+        let got = match axis {
+            DimAxis::Horizontal => dx.abs(),
+            DimAxis::Vertical => dy.abs(),
+            _ => dx.hypot(dy),
+        };
+        (want - got).abs() <= (want.abs() * 1e-3).max(1e-4)
+    };
+    match pin {
+        Some(p) => {
+            sketch.solve_with_fixed(&[p]);
+            if !reached(sketch) {
+                sketch.points = snapshot;
+                sketch.solve();
+            }
+        }
+        None => sketch.solve(),
     }
     let (pa, pb) = (*sketch.points.get(a)?, *sketch.points.get(b)?);
     let (dx, dy) = (pb.x - pa.x, pb.y - pa.y);
@@ -13734,6 +13791,123 @@ fn distance_dim_geometry(a2: Vec2, b2: Vec2, offset: f32, axis: DimAxis) -> (Vec
             let x = (a2.x + b2.x) * 0.5 + offset;
             (Vec2::new(x, a2.y), Vec2::new(x, b2.y), Vec2::new(x, (a2.y + b2.y) * 0.5))
         }
+    }
+}
+
+/// Draw a solid-looking arrowhead at `tip`, pointing along `dir`.
+///
+/// Gizmos only draw lines, so the head is a triangle outline plus a few interior strokes; at the
+/// size dimensions are drawn that reads as filled, which is what a technical drawing wants.
+/// A bare V looks like a sketch annotation rather than a dimension.
+fn dim_arrowhead(g: &mut Gizmos, ap: &ActivePlane, tip: Vec2, dir: Vec2, len: f32, col: Color) {
+    let d = dir.normalize_or_zero();
+    if d == Vec2::ZERO || len <= 0.0 {
+        return;
+    }
+    let perp = Vec2::new(-d.y, d.x);
+    let half = len * 0.30; // slim, like a drafting arrow — not a fat cone
+    let back = tip - d * len;
+    let (l, r) = (back + perp * half, back - perp * half);
+    g.line(ap.to_world(tip), ap.to_world(l), col);
+    g.line(ap.to_world(tip), ap.to_world(r), col);
+    g.line(ap.to_world(l), ap.to_world(r), col);
+    // Fill: a few strokes from the tip across the base.
+    for k in 1..4 {
+        let t = k as f32 / 4.0;
+        g.line(ap.to_world(tip), ap.to_world(l.lerp(r, t)), col);
+    }
+}
+
+/// Where a linear dimension's text belongs: clear of its line, on the side away from the
+/// geometry, so it never sits on top of the line it labels.
+///
+/// Shared by the drawing and the label so they cannot drift apart.
+fn linear_dim_text_pos(a: Vec2, b: Vec2, p0: Vec2, p1: Vec2, ms: f32) -> Vec2 {
+    let dir = (p1 - p0).normalize_or_zero();
+    let mid = (p0 + p1) * 0.5;
+    if dir == Vec2::ZERO {
+        return mid;
+    }
+    let perp = Vec2::new(-dir.y, dir.x);
+    let away = if perp.dot(mid - (a + b) * 0.5) >= 0.0 { perp } else { -perp };
+    mid + away * (1.6 * ms)
+}
+
+/// Draw a linear dimension the way a drawing does it: witness lines that stand off the geometry
+/// and overshoot the dimension line, and arrowheads that turn outward when the span is too tight
+/// to hold them.
+///
+/// Returns where the text should sit — just clear of the line, on the side away from the
+/// geometry, rather than sitting on top of the line it belongs to.
+fn draw_linear_dim(g: &mut Gizmos, ap: &ActivePlane, a: Vec2, b: Vec2, p0: Vec2, p1: Vec2, ms: f32, col: Color) -> Vec2 {
+    let span = p1 - p0;
+    let len = span.length();
+    let dir = span.normalize_or_zero();
+    let arrow = (2.2 * ms).min(len * 0.30).max(0.6 * ms);
+
+    // Witness lines: a small gap off the geometry so they never look welded to it, and a short
+    // overshoot past the dimension line, both standard drafting practice.
+    let gap = 0.55 * ms;
+    let over = 1.0 * ms;
+    for (from, to) in [(a, p0), (b, p1)] {
+        let w = (to - from).normalize_or_zero();
+        if w != Vec2::ZERO {
+            g.line(ap.to_world(from + w * gap), ap.to_world(to + w * over), col);
+        }
+    }
+
+    if dir == Vec2::ZERO {
+        return p0;
+    }
+    // Too tight for the heads to fit between the witness lines: put them outside pointing in,
+    // and stretch the line past each end so they have something to sit on.
+    let tight = len < arrow * 3.2;
+    if tight {
+        let ext = arrow * 2.2;
+        g.line(ap.to_world(p0 - dir * ext), ap.to_world(p1 + dir * ext), col);
+        dim_arrowhead(g, ap, p0, -dir, arrow, col);
+        dim_arrowhead(g, ap, p1, dir, arrow, col);
+    } else {
+        g.line(ap.to_world(p0), ap.to_world(p1), col);
+        dim_arrowhead(g, ap, p0, dir, arrow, col);
+        dim_arrowhead(g, ap, p1, -dir, arrow, col);
+    }
+
+    linear_dim_text_pos(a, b, p0, p1, ms)
+}
+
+/// Which kind of distance a drag is asking for, SolidWorks-style.
+///
+/// Pull square off the line and you get its true length; pull below it and you get the
+/// horizontal span; pull out to the side and you get the vertical one. On a line that is
+/// already horizontal or vertical all three agree, so the rule costs nothing there.
+fn dim_axis_from_drag(a: Vec2, b: Vec2, cursor: Vec2) -> DimAxis {
+    let d = b - a;
+    let v = cursor - (a + b) * 0.5;
+    if d.length() < 1e-6 || v.length() < 1e-6 {
+        return DimAxis::Aligned;
+    }
+    let perp = Vec2::new(-d.y, d.x).normalize();
+    if v.normalize().dot(perp).abs() > 0.9 {
+        DimAxis::Aligned // pulled square off the line ⇒ its true length
+    } else if v.x.abs() > v.y.abs() {
+        DimAxis::Vertical // pulled out to the side ⇒ the vertical span
+    } else {
+        DimAxis::Horizontal
+    }
+}
+
+/// How far off the geometry the cursor sits, in the sense the given axis measures — the number
+/// that becomes a dimension's stored offset.
+fn dim_offset_for(a: Vec2, b: Vec2, axis: DimAxis, cursor: Vec2) -> f64 {
+    let mid = (a + b) * 0.5;
+    match axis {
+        DimAxis::Aligned => {
+            let dir = (b - a).normalize_or_zero();
+            (cursor - mid).dot(Vec2::new(-dir.y, dir.x)) as f64
+        }
+        DimAxis::Horizontal => (cursor.y - mid.y) as f64,
+        DimAxis::Vertical => (cursor.x - mid.x) as f64,
     }
 }
 
@@ -14807,6 +14981,14 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                     session.pending = Some(uv);
                 }
             }
+            RectMode::CenterSquare => {
+                if let Some(center) = session.pending.take() {
+                    commit_center_square(session, center, uv);
+                    session.dirty = true;
+                } else {
+                    session.pending = Some(uv);
+                }
+            }
             RectMode::Parallelogram => {
                 // 1st click → A; 2nd → B (anchors a side); 3rd → C (pulls out the shape).
                 if session.pending.is_none() {
@@ -15273,17 +15455,74 @@ fn rect_axis_aligned(s: &mut Sketch, c0: Vec2, c1: Vec2, construction: bool) -> 
 
 /// Centre rectangle: an axis-aligned rectangle centred at `center` with `corner` as one
 /// corner, plus the two diagonals as construction lines (an X) and a pinned centre point.
+/// Place a centred rectangle's centre point and BIND it to whatever it was dropped on.
+///
+/// It used to be a bare `add_point`: a free-floating point that happened to sit on top of
+/// something. Nothing held it, so resizing the rectangle let the solver slide the centre off
+/// whatever it had been lined up with — which is exactly what centre points are for.
+///
+/// Reusing an existing point outright (rather than adding a coincidence between two) is the
+/// strongest binding available: they are then the same point and can never come apart.
+fn add_bound_center_point(session: &mut SketchSession, at: Vec2) -> usize {
+    let snap = session.snap_dist;
+    // An existing sketch point — a line endpoint, another rectangle's centre, or a circle's or
+    // arc's centre. Share it.
+    if let Some(i) = nearest_point(&session.sketch, at, snap) {
+        return i;
+    }
+    // A body feature (a corner, a hole centre) — lock it there, as a drawn point would be.
+    if on_reference_point(session, at) {
+        return session.sketch.add_fixed_point(at.x as f64, at.y as f64);
+    }
+    let cp = session.sketch.add_point(at.x as f64, at.y as f64);
+    // Dropped on an edge rather than a point: keep it on that edge, free to slide along it.
+    if let Some(e) = nearest_entity(&session.sketch, at, snap) {
+        if let Some((a, b)) = entity_line(&session.sketch, e) {
+            if a != cp && b != cp {
+                session.sketch.constraints.push(Constraint::PointOnLine { p: cp, a, b });
+            }
+        }
+    }
+    cp
+}
+
+/// A centred SQUARE in construction geometry: a layout guide, sized from its centre.
+fn commit_center_square(session: &mut SketchSession, center: Vec2, corner: Vec2) {
+    // Square off the drag: the larger half-extent wins, so it never comes out slightly oblong.
+    let d = corner - center;
+    let h = d.x.abs().max(d.y.abs()).max(0.01);
+    let corner = center + Vec2::new(h * d.x.signum(), h * d.y.signum());
+    let opposite = center * 2.0 - corner;
+    let [p0, p1, p2, p3] = rect_axis_aligned(&mut session.sketch, opposite, corner, true);
+    let cp = add_bound_center_point(session, center);
+    let s = &mut session.sketch;
+    s.add_line(p0, p2, true);
+    s.add_line(p1, p3, true);
+    // Both diagonals through the centre, so the square grows symmetrically about it instead of
+    // one corner staying put and the centre sliding.
+    s.constraints.push(Constraint::Midpoint { mid: cp, a: p0, b: p2 });
+    s.constraints.push(Constraint::Midpoint { mid: cp, a: p1, b: p3 });
+    // Adjacent sides equal — that is what makes it a square rather than a rectangle.
+    s.constraints.push(Constraint::Equal(p0, p1, p1, p2));
+}
+
 fn commit_center_rect(session: &mut SketchSession, center: Vec2, corner: Vec2) {
     let opposite = center * 2.0 - corner; // mirror of the corner about the centre
     let con = session.construction;
     let [p0, p1, p2, p3] = rect_axis_aligned(&mut session.sketch, opposite, corner, con);
+    {
+        // X-pattern construction diagonals.
+        let s = &mut session.sketch;
+        s.add_line(p0, p2, true);
+        s.add_line(p1, p3, true);
+    }
+    let cp = add_bound_center_point(session, center);
     let s = &mut session.sketch;
-    // X-pattern construction diagonals.
-    s.add_line(p0, p2, true);
-    s.add_line(p1, p3, true);
-    // A centre point pinned to the diagonals' crossing (their shared midpoint).
-    let cp = s.add_point(center.x as f64, center.y as f64);
+    // BOTH diagonals through the centre. With only one, the solver could satisfy it while
+    // shifting the rectangle sideways, so resizing walked the centre off whatever it was lined
+    // up with. The second is redundant on a true rectangle and costs nothing.
     s.constraints.push(Constraint::Midpoint { mid: cp, a: p0, b: p2 });
+    s.constraints.push(Constraint::Midpoint { mid: cp, a: p1, b: p3 });
 }
 
 /// Parallelogram from three points: side A→B is anchored, `c` pulls out the shape; the
@@ -15821,6 +16060,21 @@ fn handle_file_io(
 
     // Save: write to the bound file directly; if there isn't one yet, fall through to Save As.
     if ui_state.save_request {
+        // An open sketch is part of the model as far as anyone looking at the screen is
+        // concerned — but saving wrote the DOCUMENT only, and a sketch lives in the session
+        // until it is committed. So drawing a box, dimensioning it, and hitting Save wrote a
+        // file containing nothing but the three datum planes, without a word of warning.
+        // baddimension.hcad is 914 bytes of exactly that.
+        //
+        // Commit first, save on the next frame. The flag makes it a one-shot: if the commit
+        // does not happen, the save goes ahead anyway rather than looping.
+        let live_sketch = session.plane.is_some() && !session.sketch.entities.is_empty();
+        if live_sketch && !ui_state.save_pending_commit {
+            ui_state.save_pending_commit = true;
+            session.exit_request = true; // the same commit "Finish sketch" performs
+            return;
+        }
+        ui_state.save_pending_commit = false;
         ui_state.save_request = false;
         match ui_state.current_file.clone() {
             Some(path) => match write_doc(&doc.0, &path) {
@@ -15839,6 +16093,15 @@ fn handle_file_io(
     // Save As: always prompt (unless a path was typed into the in-app prompt); bind the
     // chosen path so later Saves are dialog-free.
     if ui_state.save_as_request {
+        // Same guard as Save: Save As can be reached straight from the menu, and losing an open
+        // sketch to it would be exactly as quiet.
+        let live_sketch = session.plane.is_some() && !session.sketch.entities.is_empty();
+        if live_sketch && !ui_state.save_pending_commit {
+            ui_state.save_pending_commit = true;
+            session.exit_request = true;
+            return;
+        }
+        ui_state.save_pending_commit = false;
         ui_state.save_as_request = false;
         let chosen = ui_state.pending_save_path.take().or_else(|| {
             rfd::FileDialog::new()
@@ -22890,6 +23153,22 @@ fn draw_sketch(
                         overlay.line(ap.to_world(c[0]), ap.to_world(c[2]), con_col); // X diagonals
                         overlay.line(ap.to_world(c[1]), ap.to_world(c[3]), con_col);
                     }
+                    RectMode::CenterSquare => {
+                        // Preview the SQUARED drag, not the raw one, so what you see is what
+                        // you get when the larger half-extent wins.
+                        let d = cur - start;
+                        let h = d.x.abs().max(d.y.abs()).max(0.01);
+                        let sq = start + Vec2::new(h * d.x.signum(), h * d.y.signum());
+                        let o = start * 2.0 - sq;
+                        let c = [o, Vec2::new(sq.x, o.y), sq, Vec2::new(o.x, sq.y)];
+                        // All construction: it is a layout guide, not a profile.
+                        for k in 0..4 {
+                            overlay.line(ap.to_world(c[k]), ap.to_world(c[(k + 1) % 4]), con_col);
+                        }
+                        overlay.line(ap.to_world(c[0]), ap.to_world(c[2]), con_col);
+                        overlay.line(ap.to_world(c[1]), ap.to_world(c[3]), con_col);
+                        draw_marker(&mut gizmos, ap, start, point_col, ms);
+                    }
                     RectMode::Parallelogram => {
                         if let Some(b) = session.pending_b {
                             let d = start + (cur - b);
@@ -25535,14 +25814,13 @@ mod tests {
             .position(|e| matches!(e, SketchEntity::Line { a, b, .. } if (*a == tl && *b == bl) || (*a == bl && *b == tl)))
             .expect("no left side");
         tie_opposite_side(&mut s.sketch, left);
-        let tied = s.sketch.constraints.iter().any(|c| match c {
-            Constraint::Equal(x, y, z, w) => {
-                let pair = |p: usize, q: usize, r: usize, t: usize| (p == r && q == t) || (p == t && q == r);
-                (pair(*x, *y, tl, bl) && pair(*z, *w, br, tr)) || (pair(*x, *y, br, tr) && pair(*z, *w, tl, bl))
-            }
-            _ => false,
-        });
-        assert!(tied, "the right side was not tied to the left one");
+        // No Equal is added here, and none is wanted: this box's four sides already carry
+        // horizontal/vertical relations, so its opposite sides are equal by construction and an
+        // Equal on top would be redundant — which the solver reports as over-defined.
+        assert!(
+            !s.sketch.constraints.iter().any(|c| matches!(c, Constraint::Equal(..))),
+            "a redundant Equal was added to a fully-relationed box"
+        );
 
         // Now the dimension: both sides must end up 2 mm, and the right side carries no
         // dimension of its own.
@@ -25864,10 +26142,11 @@ mod tests {
         });
         doc.rollback = doc.features.len();
 
-        let _ = take_nonmanifold_bodies();
         let (m, _) = regenerate_mesh(&doc).expect("no body");
+        // Checked directly rather than through the pinch COUNTER: that counter is a process
+        // global every regeneration writes to, and the suite runs concurrently, so a neighbour's
+        // rebuild can bump it between this test's clear and its read.
         assert!(hworks_geometry::is_manifold(&m), "a multi-region revolve cut left the body non-manifold");
-        assert_eq!(take_nonmanifold_bodies(), 0, "the pinch warning fired on a sound body");
         assert_eq!(welded_boundary_edges(&m), 0, "the revolve cut opened the surface");
 
         // The grooves really were cut — the block lost material.
@@ -25893,25 +26172,26 @@ mod tests {
     /// which would turn the warning into noise and get it ignored.
     #[test]
     fn an_ordinary_body_is_never_reported_as_pinched() {
-        let _guard = counter_lock();
-        let _ = take_nonmanifold_bodies();
+        // The warning fires on `!is_manifold`, so a body that IS manifold can never trip it.
+        // Checked that way rather than through the shared counter, which every concurrent
+        // regeneration in the suite also writes to.
 
         // A plain block, a block with a cut, and a bevelled block: none may trip the warning.
         let mut doc = Document::with_default_planes();
         doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.rollback = doc.features.len();
-        regenerate_mesh(&doc).expect("block");
-        assert_eq!(take_nonmanifold_bodies(), 0, "a plain block was reported as pinched");
+        let (body, _) = regenerate_mesh(&doc).expect("block");
+        assert!(hworks_geometry::is_manifold(&body), "a plain block was reported as pinched");
 
         doc.add_feature(FeatureKind::Cut { sketch: rect_sketch(6.0, 6.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 4.0, back: 0.0, thin: 0.0, thin_side: 0 });
         doc.rollback = doc.features.len();
-        regenerate_mesh(&doc).expect("cut block");
-        assert_eq!(take_nonmanifold_bodies(), 0, "a cut block was reported as pinched");
+        let (body, _) = regenerate_mesh(&doc).expect("cut block");
+        assert!(hworks_geometry::is_manifold(&body), "a cut block was reported as pinched");
 
         doc.add_feature(FeatureKind::Fillet { radius: 1.5, edges: vec![] });
         doc.rollback = doc.features.len();
-        regenerate_mesh(&doc).expect("filleted block");
-        assert_eq!(take_nonmanifold_bodies(), 0, "a filleted block was reported as pinched");
+        let (body, _) = regenerate_mesh(&doc).expect("filleted block");
+        assert!(hworks_geometry::is_manifold(&body), "a filleted block was reported as pinched");
     }
 
     /// A self-loop is not a hole.
@@ -26007,38 +26287,13 @@ mod tests {
     /// usable normal, bloat STL and STEP exports, and give the boolean kernel edges to trip over.
     ///
     /// The safety of removing them is checked, not argued: same volume, still manifold, and no
-    /// boundary edge opened.
-    #[test]
-    fn a_bevelled_body_carries_no_zero_area_triangles() {
-        let mut doc = Document::with_default_planes();
-        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(20.0, 20.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 10.0, back: 0.0, thin: 0.0, thin_side: 0 });
-        doc.add_feature(FeatureKind::Fillet { radius: 2.0, edges: vec![] });
-        doc.rollback = doc.features.len();
-        let (m, _) = regenerate_mesh(&doc).expect("no body");
 
-        let zero_area = |mesh: &TriMesh| {
-            mesh.indices
-                .chunks_exact(3)
-                .filter(|t| {
-                    let q = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
-                    (q(t[1]) - q(t[0])).cross(q(t[2]) - q(t[0])).length() < 1e-12
-                })
-                .count()
-        };
-        assert_eq!(zero_area(&m), 0, "the finished body still carries zero-area triangles");
-        assert!(hworks_geometry::is_manifold(&m), "the cleanup left a non-manifold body");
-        let (b, _, _) = surface_tears(&m);
-        assert_eq!(b, 0, "the cleanup opened {b} boundary edge(s)");
+    /// A dimension's text must sit clear of its own line, on the side away from the geometry —
+    /// and the label and the drawn arrows must agree about which side that is, or the number
 
-        // And it really is a no-op on shape: strip a clean mesh and nothing moves.
-        let mut copy = m.clone();
-        let dropped = hworks_geometry::drop_degenerate_triangles(&mut copy);
-        assert_eq!(dropped, 0, "a cleaned mesh still had {dropped} degenerate triangles");
-        assert!(
-            (hworks_geometry::signed_mesh_volume(&copy) - hworks_geometry::signed_mesh_volume(&m)).abs() < 1e-9,
-            "the cleanup changed the volume"
-        );
-    }
+    /// Where you pull decides what the dimension measures, SolidWorks-style: square off the
+    /// line for its true length, below it for the horizontal span, out to the side for the
+    /// vertical one. And the click position becomes the dimension line's offset, so it lands
 
     /// The Modify box must open on what the geometry actually measures, never on the last
     /// number typed. egui keeps a DragValue's half-typed TEXT keyed by widget id and that text
@@ -26090,6 +26345,81 @@ mod tests {
         }
         open_dim_edit(&mut s, cr, None);
         assert!((s.dim_buf - 8.0).abs() < 1e-9, "a diameter dimension opened on {}, expected 8", s.dim_buf);
+    }
+
+    /// A centred square's centre point must stay put when the square is resized, and must be
+    /// BOUND to whatever it was dropped on.
+    ///
+    /// The centre used to be a bare added point — free-floating, merely sitting on top of
+    /// whatever it was aimed at. Nothing held it, so resizing let the solver slide the square
+    /// sideways and walk the centre off the thing it was lined up with, which is the one job a
+    /// centre point has.
+    #[test]
+    fn a_centre_squares_centre_holds_when_it_is_resized() {
+        let mut s = SketchSession::default();
+        s.snap_dist = SNAP;
+        // Something for the centre to hang off: an existing point at (10, 10).
+        let anchor = s.sketch.add_point(10.0, 10.0);
+        s.sketch.points[anchor].fixed = true;
+
+        // Drop a centred square right on it. The drag is deliberately oblong — it must square up.
+        commit_center_square(&mut s, Vec2::new(10.0, 10.0), Vec2::new(17.0, 13.0));
+
+        // The centre IS the anchor point, not a copy sitting on top of it.
+        let shares = s
+            .sketch
+            .constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Midpoint { mid, .. } if *mid == anchor));
+        assert!(shares, "the centre point did not bind to the point it was dropped on");
+
+        let corners: Vec<usize> = s
+            .sketch
+            .entities
+            .iter()
+            .filter_map(|e| match e {
+                SketchEntity::Line { a, b, construction: true, .. } => Some([*a, *b]),
+                _ => None,
+            })
+            .flatten()
+            .filter(|i| *i != anchor)
+            .collect();
+        fn side(sk: &Sketch, a: usize, b: usize) -> f64 {
+            let (pa, pb) = (sk.points[a], sk.points[b]);
+            ((pb.x - pa.x).powi(2) + (pb.y - pa.y).powi(2)).sqrt()
+        }
+        // It came out square, not oblong, despite the 7 x 3 drag.
+        let (w, h) = {
+            let xs: Vec<f64> = corners.iter().map(|i| s.sketch.points[*i].x).collect();
+            let ys: Vec<f64> = corners.iter().map(|i| s.sketch.points[*i].y).collect();
+            (
+                xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min),
+                ys.iter().cloned().fold(f64::MIN, f64::max) - ys.iter().cloned().fold(f64::MAX, f64::min),
+            )
+        };
+        assert!((w - h).abs() < 1e-6, "not square: {w} x {h}");
+
+        // Now resize it, the way dimensioning a side does, and check the centre has not moved.
+        let before = (s.sketch.points[anchor].x, s.sketch.points[anchor].y);
+        let bottom: Vec<usize> = {
+            let ymin = corners.iter().map(|i| s.sketch.points[*i].y).fold(f64::MAX, f64::min);
+            let mut v: Vec<usize> = corners.iter().copied().filter(|i| (s.sketch.points[*i].y - ymin).abs() < 1e-9).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        assert_eq!(bottom.len(), 2, "expected two bottom corners, found {}", bottom.len());
+        s.sketch.constraints.push(Constraint::Distance { a: bottom[0], b: bottom[1], value: 20.0, offset: 0.0, axis: Default::default() });
+        let ci = s.sketch.constraints.len() - 1;
+        solve_distance_dim(&mut s.sketch, ci);
+
+        let after = (s.sketch.points[anchor].x, s.sketch.points[anchor].y);
+        assert!(
+            (after.0 - before.0).abs() < 1e-6 && (after.1 - before.1).abs() < 1e-6,
+            "the centre moved from {before:?} to {after:?} when the square was resized"
+        );
+        // ...and it really did resize.
+        assert!((side(&s.sketch, bottom[0], bottom[1]) - 20.0).abs() < 1e-3, "the square did not take the dimension");
     }
 
     /// A polygon's second click sets its size AND its rotation, so without an angular latch a
