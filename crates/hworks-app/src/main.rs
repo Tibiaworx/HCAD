@@ -9100,19 +9100,30 @@ fn ui_system(
         // preview is three orange lines with no number, which does not look like a dimension at
         // all while it is still lying on the edge it measures.
         if let Some(PendingDim::Pair { l1, l2 }) = session.dim_place {
-            if let (Some(cur), Some((pp, ba, bb))) = (session.cursor_uv, line_pair_anchor(&session.sketch, l1, l2)) {
+            if let Some(cur) = session.cursor_uv {
                 let v = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
-                if let (Some(p3), Some(a2), Some(b2)) = (v(pp), v(ba), v(bb)) {
-                    let (foot, _) = point_line_geometry(p3, a2, b2);
-                    let (_, _, m2) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, cur));
-                    let text = if lines_parallel(&session.sketch, l1, l2) {
-                        fmt_len_bare((p3 - foot).length(), unit)
-                    } else {
-                        // Crossing lines measure an angle, not a gap.
-                        let ang = (b2 - a2).angle_to(p3 - foot).abs().to_degrees();
-                        format!("{ang:.1}°")
-                    };
-                    label_at(ctx, egui::Id::new("dimlabel_placing_pair"), ap.to_world(m2), text, true, true);
+                let shown = if lines_parallel(&session.sketch, l1, l2) {
+                    line_pair_anchor(&session.sketch, l1, l2).and_then(|(pp, ba, bb)| {
+                        let (p3, a2, b2) = (v(pp)?, v(ba)?, v(bb)?);
+                        let (foot, _) = point_line_geometry(p3, a2, b2);
+                        let (_, _, m2) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, cur));
+                        Some((m2, fmt_len_bare((p3 - foot).length(), unit)))
+                    })
+                } else {
+                    // Crossing lines measure the angle of the wedge the cursor is in. This used to
+                    // measure against the perpendicular from one line to the other, so every
+                    // crossing pair — whatever its actual angle — previewed as 90°.
+                    (|| {
+                        let (e1, e2) = (entity_line(&session.sketch, l1)?, entity_line(&session.sketch, l2)?);
+                        let (o1, o2, ang) = angle_wedge_for_cursor(&session.sketch, e1, e2, cur)?;
+                        let (a2, b2, c2, d2) = (v(o1.0)?, v(o1.1)?, v(o2.0)?, v(o2.1)?);
+                        let vertex = line_intersection(a2, b2, c2, d2)?;
+                        let parts = angle_dim_parts(a2, b2, c2, d2, (cur - vertex).length().max(0.5));
+                        Some((parts.label, format!("{:.1}°", ang.to_degrees())))
+                    })()
+                };
+                if let Some((at, text)) = shown {
+                    label_at(ctx, egui::Id::new("dimlabel_placing_pair"), ap.to_world(at), text, true, true);
                 }
             }
         }
@@ -9486,17 +9497,18 @@ fn ui_system(
                             }
                             if resp.changed() {
                                 let v = session.dim_buf.max(0.001);
-                                // For an angle, keep the *first* (reference) line fixed so
-                                // only the second line swings to the new angle — like SW.
+                                // For an angle, hold the MORE CONSTRAINED line so only the freer
+                                // one swings to the new value — see `angle_hold_line`.
+                                let hold = angle_hold_line(&session.sketch, ci);
                                 let mut angle_ref: Option<[usize; 2]> = None;
                                 match session.sketch.constraints.get_mut(ci) {
                                     Some(Constraint::Distance { value, .. }) => *value = v,
                                     Some(Constraint::Radius { value, diameter, .. }) => {
                                         *value = if *diameter { v * 0.5 } else { v };
                                     }
-                                    Some(Constraint::Angle { value, a, b, .. }) => {
+                                    Some(Constraint::Angle { value, .. }) => {
                                         *value = v.to_radians();
-                                        angle_ref = Some([*a, *b]);
+                                        angle_ref = hold;
                                     }
                                     Some(Constraint::PointLineDistance { value, .. }) => *value = v,
                                     Some(Constraint::SlotWidth { value, .. }) => *value = v,
@@ -12911,6 +12923,10 @@ fn sketch_interaction(
                             add_angle_dim(&mut session.sketch, l1, l2)
                         };
                         if let Some(ci) = made {
+                            // Two crossing lines make four angles. Which one was meant is said by
+                            // where the label was put, so re-point the rays at the cursor before
+                            // the dimension opens.
+                            aim_angle_at_cursor(&mut session.sketch, ci, uv);
                             set_dim_offset_from_cursor(&mut session, ci, uv);
                             open_dim_edit(&mut session, ci, None);
                         }
@@ -13732,7 +13748,7 @@ fn circle_gap_slide(sketch: &Sketch, a: usize, b: usize, mode: u8, uv: Vec2) -> 
 /// Add a rim-to-rim distance between two sketch circles. The mode (apart / enclosing / inside)
 /// and the opening value come from the circles as drawn.
 fn add_circle_distance(sketch: &mut Sketch, e1: usize, e2: usize) -> Option<usize> {
-    let (mut ca, ra) = entity_circle(sketch, e1)?;
+    let (ca, ra) = entity_circle(sketch, e1)?;
     let (mut cb, rb) = entity_circle(sketch, e2)?;
     if e1 == e2 {
         return None;
@@ -15142,21 +15158,180 @@ fn trim_spline(session: &mut SketchSession, ei: usize, uv: Vec2) -> bool {
 /// The vertex and label anchor of an angle dimension between lines (a→b) and (c→d).
 /// The label sits `offset` out along the bisector from the vertex, on the side *between*
 /// the two lines as they emanate from the vertex (so the arc spans the lines you picked).
-fn angle_dim_geometry(a2: Vec2, b2: Vec2, c2: Vec2, d2: Vec2, offset: f32) -> (Vec2, Vec2) {
+/// Everything an angle dimension needs to draw: its vertex, the two rays, the signed sweep from
+/// the first to the second, and the label anchor on the bisector.
+///
+/// The rays are the lines as STORED — `b−a` and `d−c` — which is exactly what the solver's
+/// residual measures. They used to be recomputed here as "whichever endpoint is further from the
+/// vertex", so the arc always drew the smaller wedge no matter which one the constraint was
+/// actually holding: the picture could contradict its own number, and there was no way to ask for
+/// any of the other three angles at the crossing.
+struct AngleParts {
+    vertex: Vec2,
+    r1: Vec2,
+    /// Signed, in (−π, π]. Negative sweeps the arc clockwise from `r1`.
+    sweep: f32,
+    label: Vec2,
+}
+
+fn angle_dim_parts(a2: Vec2, b2: Vec2, c2: Vec2, d2: Vec2, offset: f32) -> AngleParts {
     let vertex = line_intersection(a2, b2, c2, d2).unwrap_or((a2 + b2 + c2 + d2) * 0.25);
-    // Rays pointing away from the vertex along each line (toward the line's far endpoint),
-    // so the bisector lands in the wedge actually between the two drawn lines.
-    let ray = |p: Vec2, q: Vec2| {
-        let far = if (p - vertex).length() >= (q - vertex).length() { p } else { q };
-        (far - vertex).normalize_or_zero()
-    };
-    let dir1 = ray(a2, b2);
-    let dir2 = ray(c2, d2);
-    let mut bisect = (dir1 + dir2).normalize_or_zero();
-    if bisect == Vec2::ZERO {
-        bisect = Vec2::new(-dir1.y, dir1.x);
+    let mut r1 = (b2 - a2).normalize_or_zero();
+    let mut r2 = (d2 - c2).normalize_or_zero();
+    if r1 == Vec2::ZERO {
+        r1 = Vec2::X;
     }
-    (vertex, vertex + bisect * offset)
+    if r2 == Vec2::ZERO {
+        r2 = Vec2::Y;
+    }
+    let sweep = r1.angle_to(r2);
+    // Rotating r1 by half the sweep always lands INSIDE the wedge, whichever way it turns —
+    // unlike (r1 + r2), which points into the wrong one once the wedge passes a half turn.
+    let bisect = Vec2::from_angle(r1.to_angle() + sweep * 0.5);
+    AngleParts { vertex, r1, sweep, label: vertex + bisect * offset }
+}
+
+fn angle_dim_geometry(a2: Vec2, b2: Vec2, c2: Vec2, d2: Vec2, offset: f32) -> (Vec2, Vec2) {
+    let p = angle_dim_parts(a2, b2, c2, d2, offset);
+    (p.vertex, p.label)
+}
+
+/// Which of an angle dimension's two lines to HOLD while the other swings to a retyped value: the
+/// one that is more constrained already.
+///
+/// This used to hold the FIRST-picked line, on the reasoning that it is the "reference". But pick
+/// order has nothing to do with which line the sketch can afford to move, and the pair is now
+/// stored in whichever order makes the wedge read positive — so it was effectively arbitrary. In
+/// angleincircle.hcad the free line came first, so retyping the angle held it and swung the
+/// VERTICAL line off vertical, breaking a relation and over-defining the sketch.
+///
+/// Only the points the two lines do NOT share can tell them apart — an angle's lines usually meet
+/// at a shared vertex, and that point says nothing about either.
+fn angle_hold_line(sketch: &Sketch, ci: usize) -> Option<[usize; 2]> {
+    let Some(&Constraint::Angle { a, b, c, d, .. }) = sketch.constraints.get(ci) else { return None };
+    let shared = |p: usize| [a, b].contains(&p) && [c, d].contains(&p);
+    let weight = |pts: [usize; 2]| -> i32 {
+        pts.iter()
+            .filter(|p| !shared(**p))
+            .map(|&p| {
+                // A locked point cannot move at all, so its line is the one to hold.
+                if sketch.points.get(p).is_some_and(|q| q.fixed) {
+                    return 1000;
+                }
+                sketch
+                    .constraints
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, k)| *i != ci && constraint_points(k).contains(&p))
+                    .count() as i32
+            })
+            .sum()
+    };
+    // A tie keeps the first line, which is the old behaviour and is as good as any when the two
+    // are equally free.
+    Some(if weight([a, b]) >= weight([c, d]) { [a, b] } else { [c, d] })
+}
+
+/// Re-point an existing angle dimension's rays at the cursor, so it holds the wedge the label was
+/// dropped in rather than whichever one the pick order happened to produce.
+fn aim_angle_at_cursor(sketch: &mut Sketch, ci: usize, uv: Vec2) {
+    let Some(&Constraint::Angle { a, b, c, d, .. }) = sketch.constraints.get(ci) else { return };
+    let Some((o1, o2, v)) = angle_wedge_for_cursor(sketch, (a, b), (c, d), uv) else { return };
+    if let Some(Constraint::Angle { a, b, c, d, value, .. }) = sketch.constraints.get_mut(ci) {
+        (*a, *b) = o1;
+        (*c, *d) = o2;
+        *value = v;
+    }
+}
+
+/// Draw an angle dimension the way a drawing does it: an arc across the wedge, arrowheads at both
+/// ends of the arc turned along it, and extension lines carrying each ray out to the arc when the
+/// arc is drawn beyond where the lines themselves reach.
+fn draw_angle_dim(
+    g: &mut Gizmos,
+    ap: &ActivePlane,
+    a2: Vec2,
+    b2: Vec2,
+    c2: Vec2,
+    d2: Vec2,
+    offset: f32,
+    ms: f32,
+    col: Color,
+) {
+    let p = angle_dim_parts(a2, b2, c2, d2, offset);
+    let r = offset.max(0.1 * ms);
+    let start = p.r1.to_angle();
+    let at = |t: f32| p.vertex + Vec2::from_angle(start + p.sweep * t) * r;
+
+    // Extension lines: each ray runs from wherever the geometry stops out to the arc, so the arc
+    // is visibly tied to the two lines rather than floating near them.
+    for (q1, q2) in [(a2, b2), (c2, d2)] {
+        let far = if (q1 - p.vertex).length() >= (q2 - p.vertex).length() { q1 } else { q2 };
+        let reach = (far - p.vertex).length();
+        if reach < r {
+            let dir = (far - p.vertex).normalize_or_zero();
+            if dir != Vec2::ZERO {
+                g.line(ap.to_world(far), ap.to_world(p.vertex + dir * (r + 0.6 * ms)), col);
+            }
+        }
+    }
+
+    // The arc itself, stepped finely enough that a wide wedge still reads as a curve.
+    let steps = ((p.sweep.abs() / 0.12).ceil() as usize).clamp(8, 96);
+    let mut prev = at(0.0);
+    for s in 1..=steps {
+        let cur = at(s as f32 / steps as f32);
+        g.line(ap.to_world(prev), ap.to_world(cur), col);
+        prev = cur;
+    }
+
+    // Arrowheads tangent to the arc at each end, pointing outward along it — and turned round to
+    // point inward when the wedge is too narrow to hold them, as the linear dimensions do.
+    let (arrow, tight) = linear_dim_arrow(p.sweep.abs() * r, ms);
+    let turn = if tight { -1.0 } else { 1.0 };
+    let sgn = p.sweep.signum();
+    // Tangent at the start points back along the arc (against the sweep); at the end, forward.
+    let t0 = Vec2::from_angle(start + std::f32::consts::FRAC_PI_2 * sgn);
+    let t1 = Vec2::from_angle(start + p.sweep + std::f32::consts::FRAC_PI_2 * sgn);
+    dim_arrowhead(g, ap, at(0.0), -t0 * turn, arrow, col);
+    dim_arrowhead(g, ap, at(1.0), t1 * turn, arrow, col);
+}
+
+/// Point an angle dimension's rays so the wedge between them is the one the CURSOR is in.
+///
+/// Two crossing lines make four angles — θ, 180−θ, and their opposites — and which one you meant
+/// is said by where you put the label, as it is in SolidWorks. Returns the two lines in stored
+/// order (first line, second line) and the positive wedge angle between them.
+fn angle_wedge_for_cursor(
+    sketch: &Sketch,
+    l1: (usize, usize),
+    l2: (usize, usize),
+    uv: Vec2,
+) -> Option<((usize, usize), (usize, usize), f64)> {
+    let p = |i: usize| sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+    let vertex = line_intersection(p(l1.0)?, p(l1.1)?, p(l2.0)?, p(l2.1)?)?;
+    let cur = (uv - vertex).normalize_or_zero();
+    if cur == Vec2::ZERO {
+        return None;
+    }
+    let mut best: Option<((usize, usize), (usize, usize), f32)> = None;
+    for o1 in [l1, (l1.1, l1.0)] {
+        for o2 in [l2, (l2.1, l2.0)] {
+            let r1 = (p(o1.1)? - p(o1.0)?).normalize_or_zero();
+            let r2 = (p(o2.1)? - p(o2.0)?).normalize_or_zero();
+            let s = r1.angle_to(r2);
+            let t = r1.angle_to(cur);
+            // In the wedge: the same way round from r1, and no further than r2.
+            let inside = s.abs() > 1.0e-6 && t.signum() == s.signum() && t.abs() <= s.abs() + 1.0e-4;
+            if inside && best.is_none_or(|(_, _, bs)| s.abs() < bs.abs()) {
+                best = Some((o1, o2, s));
+            }
+        }
+    }
+    let (o1, o2, s) = best?;
+    // Store it so the wedge reads POSITIVE — swapping which line comes first negates the signed
+    // angle and names the same wedge, and a dimension that opened showing −120° would be absurd.
+    if s < 0.0 { Some((o2, o1, -s as f64)) } else { Some((o1, o2, s as f64)) }
 }
 
 /// After a line `a→b` is committed, lock in the relation the user clearly intended so later
@@ -22872,6 +23047,16 @@ fn dim_mark_size(radius: f32, frac: f32, min_on_screen: f32, floor: f32) -> f32 
     (radius * frac).max(min_on_screen).min(ceiling)
 }
 
+/// The zoom-aware glyph scale: how big a screen-sized mark (arrowhead, tick, snap dot) should be
+/// in world units with the camera this far out.
+///
+/// Same expression the interaction system uses for its snap tolerance, but computed from the
+/// camera so a DRAW system never depends on another system having run first this frame.
+fn marker_scale(radius: f32) -> f32 {
+    let snap = (radius * (SNAP / 12.0)).clamp(5.0e-4, 200.0);
+    (snap / SNAP).clamp(0.03, 400.0)
+}
+
 fn draw_sketch(
     mut gizmos: Gizmos,
     mut overlay: Gizmos<OverlayGizmos>,
@@ -22940,11 +23125,15 @@ fn draw_sketch(
     let point_col = Color::srgb(1.0, 0.55, 0.15);
     let preview_col = Color::srgb(1.0, 0.95, 0.45); // opaque so the rubber-band reads over a picture
     let plane_rot = Quat::from_mat3(&Mat3::from_cols(ap.u, ap.v, ap.n));
-    // Marker/snap-glyph scale tied to the zoom so points stay a ~constant *screen* size. `snap_dist`
-    // already tracks the zoom (∝ camera radius), so `ms` ∝ radius keeps markers screen-constant. The
-    // clamp only guards the extremes — a floor of 0.5 kicked in at a moderate zoom-in and made the
-    // markers balloon on screen (very visible when picking a circular-pattern centre), so keep it low.
-    let ms = if session.snap_dist > 1e-6 { (session.snap_dist / SNAP).clamp(0.03, 400.0) } else { 1.0 };
+    // Marker/snap-glyph scale tied to the zoom so glyphs stay a ~constant *screen* size.
+    //
+    // Taken from the CAMERA, not from `session.snap_dist`. That field is written by the sketch
+    // INTERACTION system, which bails out early whenever a UI panel holds the pointer — which is
+    // precisely the state just after a dimension is placed, with its Modify box open. So the value
+    // could still be its initial zero, `ms` fell back to 1.0, and everything scaled by it (the
+    // arrowheads above all) shrank to nothing. It only appeared once the camera moved and the
+    // interaction system finally got a frame in which to fill the field.
+    let ms = marker_scale(radius);
 
     let uv_of = |i: usize| -> Vec2 {
         let p = &session.sketch.points[i];
@@ -23415,34 +23604,10 @@ fn draw_sketch(
                     }
                 }
             }
-            // Angle dimension: an arc between the two lines, around their vertex.
+            // Angle dimension: an arc across the wedge the constraint actually holds.
             hworks_sketch::Constraint::Angle { a, b, c, d, offset, .. } => {
                 if let (Some(a2), Some(b2), Some(c2), Some(d2)) = (pt(*a), pt(*b), pt(*c), pt(*d)) {
-                    let (vertex, _) = angle_dim_geometry(a2, b2, c2, d2, *offset as f32);
-                    let r = *offset as f32;
-                    // Rays away from the vertex along each line, so the arc spans the wedge
-                    // *between the two lines* — the short way, regardless of point order.
-                    let ray = |p: Vec2, q: Vec2| {
-                        let far = if (p - vertex).length() >= (q - vertex).length() { p } else { q };
-                        (far - vertex).normalize_or_zero()
-                    };
-                    let start = ray(a2, b2).to_angle();
-                    let mut sweep = ray(c2, d2).to_angle() - start;
-                    let tau = std::f32::consts::TAU;
-                    while sweep > std::f32::consts::PI {
-                        sweep -= tau;
-                    }
-                    while sweep <= -std::f32::consts::PI {
-                        sweep += tau;
-                    }
-                    let steps = 24;
-                    let mut prev = vertex + Vec2::from_angle(start) * r;
-                    for s in 1..=steps {
-                        let ang = start + sweep * (s as f32 / steps as f32);
-                        let cur = vertex + Vec2::from_angle(ang) * r;
-                        gizmos.line(ap.to_world(prev), ap.to_world(cur), dim_col);
-                        prev = cur;
-                    }
+                    draw_angle_dim(&mut gizmos, ap, a2, b2, c2, d2, *offset as f32, ms, dim_col);
                 }
             }
             // Line-to-line distance: drawn BETWEEN the two lines, arrows touching each.
@@ -23516,12 +23681,23 @@ fn draw_sketch(
                 }
             }
         }
-        if let (Some(cur), Some((pp, ba, bb))) = (session.cursor_uv, line_pair_anchor(&session.sketch, l1, l2)) {
+        if let Some(cur) = session.cursor_uv {
+            let v = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
             if lines_parallel(&session.sketch, l1, l2) {
-                let v = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
-                if let (Some(p3), Some(a2), Some(b2)) = (v(pp), v(ba), v(bb)) {
-                    let (q0, q1, _) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, cur));
-                    draw_linear_dim(&mut gizmos, ap, q0, q1, q0, q1, ms, col);
+                if let Some((pp, ba, bb)) = line_pair_anchor(&session.sketch, l1, l2) {
+                    if let (Some(p3), Some(a2), Some(b2)) = (v(pp), v(ba), v(bb)) {
+                        let (q0, q1, _) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, cur));
+                        draw_linear_dim(&mut gizmos, ap, q0, q1, q0, q1, ms, col);
+                    }
+                }
+            } else if let (Some(e1), Some(e2)) = (entity_line(&session.sketch, l1), entity_line(&session.sketch, l2)) {
+                // Crossing lines: the arc across whichever of the four wedges the cursor is in,
+                // drawn exactly as the placed dimension will be.
+                if let Some((o1, o2, _)) = angle_wedge_for_cursor(&session.sketch, e1, e2, cur) {
+                    if let (Some(a2), Some(b2), Some(c2), Some(d2)) = (v(o1.0), v(o1.1), v(o2.0), v(o2.1)) {
+                        let vertex = line_intersection(a2, b2, c2, d2).unwrap_or(cur);
+                        draw_angle_dim(&mut gizmos, ap, a2, b2, c2, d2, (cur - vertex).length().max(0.5), ms, col);
+                    }
                 }
             }
         }
@@ -31733,6 +31909,140 @@ mod tests {
         // The lines are still parallel — the solver satisfied the distance by translating, not by
         // swinging one line round to meet it.
         assert!(lines_parallel(&s, inner, outer), "the solver skewed the lines to satisfy the distance");
+    }
+
+    /// Two crossing lines make FOUR angles, and which one the dimension holds is said by where the
+    /// label is placed — as in SolidWorks. The arc drawn must be the wedge the constraint holds,
+    /// and the value must be the angle of that wedge.
+    ///
+    /// The drawing used to recompute its own rays as "whichever endpoint is further from the
+    /// vertex", ignoring the point order the solver's residual is written in — so the arc always
+    /// showed the smaller wedge whatever the constraint was actually holding, and there was no way
+    /// to ask for the other three angles at all.
+    #[test]
+    fn an_angle_dimension_holds_the_wedge_you_place_it_in() {
+        for want in [30.0_f32, 60.0, 120.0, 150.0] {
+            let mut s = Sketch::default();
+            let th = want.to_radians();
+            // Two lines crossing at the origin, each running BOTH ways out from it so all four
+            // wedges are real corners of the sketch.
+            let mk = |s: &mut Sketch, dir: Vec2| {
+                let p1 = s.add_point((-dir.x * 20.0) as f64, (-dir.y * 20.0) as f64);
+                let p2 = s.add_point((dir.x * 20.0) as f64, (dir.y * 20.0) as f64);
+                s.add_line(p1, p2, false);
+            };
+            mk(&mut s, Vec2::X);
+            mk(&mut s, Vec2::from_angle(th));
+            let ci = add_angle_dim(&mut s, 0, 1).expect("an angle dimension");
+
+            // A point inside each of the four wedges, and what that wedge measures.
+            let mid = |lo: f32, hi: f32| Vec2::from_angle((lo + hi) * 0.5) * 6.0;
+            let pi = std::f32::consts::PI;
+            let cases = [
+                (mid(0.0, th), want),
+                (mid(th, pi), 180.0 - want),
+                (mid(pi, pi + th), want),
+                (mid(pi + th, 2.0 * pi), 180.0 - want),
+            ];
+            for (at, expect) in cases {
+                aim_angle_at_cursor(&mut s, ci, at);
+                let Some(Constraint::Angle { a, b, c, d, value, .. }) = s.constraints.get(ci) else { panic!() };
+                let got = value.to_degrees() as f32;
+                assert!((got - expect).abs() < 0.5, "placed at {at:?} on a {want}° crossing: read {got}, wanted {expect}");
+                // The value must never come out negative — a dimension opening on −120° is absurd.
+                assert!(*value > 0.0, "the wedge angle came out negative: {value}");
+
+                // ...and the ARC drawn must span that same wedge, with the label inside it.
+                let p = |i: usize| Vec2::new(s.points[i].x as f32, s.points[i].y as f32);
+                let parts = angle_dim_parts(p(*a), p(*b), p(*c), p(*d), 6.0);
+                assert!(
+                    (parts.sweep.abs().to_degrees() - expect).abs() < 0.5,
+                    "the arc swept {} but the number said {expect}",
+                    parts.sweep.abs().to_degrees()
+                );
+                let to_label = (parts.label - parts.vertex).normalize();
+                let to_at = at.normalize();
+                assert!(to_label.dot(to_at) > 0.5, "the label sat outside the wedge it was placed in");
+            }
+        }
+    }
+
+    /// Dimension glyphs hold a constant SCREEN size at any zoom, and are never invisible.
+    ///
+    /// The scale used to be read from `session.snap_dist`, which the sketch INTERACTION system
+    /// writes — and that system bails out early whenever a UI panel holds the pointer, which is
+    /// exactly the state just after a dimension is placed with its Modify box open. So the field
+    /// could still be its initial zero, the scale fell back to 1.0, and the arrowheads shrank to
+    /// nothing until the camera was moved and the interaction system got a frame to fill it in.
+    #[test]
+    fn dimension_glyphs_hold_their_screen_size_at_any_zoom() {
+        // The camera shows 2·radius·tan(VFOV/2) of world height, VFOV = π/4.
+        let visible = |r: f32| 2.0 * r * (std::f32::consts::FRAC_PI_8).tan();
+        let mut fractions = Vec::new();
+        for radius in [0.5_f32, 2.0, 12.0, 30.0, 120.0, 800.0] {
+            let ms = marker_scale(radius);
+            assert!(ms > 0.0, "the glyph scale collapsed at radius {radius}");
+            let (arrow, _) = linear_dim_arrow(50.0, ms);
+            assert!(arrow > 0.0, "an invisible arrowhead at radius {radius}");
+            fractions.push(arrow / visible(radius));
+        }
+        // Constant on screen across four orders of magnitude of zoom (the clamps only bite at the
+        // extremes, so compare the middle of the range where the scale is linear).
+        let mid = &fractions[1..5];
+        let (lo, hi) = mid.iter().fold((f32::MAX, 0.0_f32), |(l, h), f| (l.min(*f), h.max(*f)));
+        assert!(hi / lo < 1.05, "the arrowhead changed apparent size with zoom: {mid:?}");
+        // And it is a sane fraction of the view — a couple of percent of the visible height, not
+        // a speck and not a cone.
+        assert!(mid[0] > 0.005 && mid[0] < 0.06, "the arrowhead is {} of the view height", mid[0]);
+    }
+
+    /// Retyping an angle swings the FREER line, not the one already pinned by relations.
+    ///
+    /// The angleincircle.hcad case: a circle with two lines out of its centre, one held Vertical
+    /// and both ends locked to the rim. The confirm path held whichever line came FIRST in the
+    /// constraint, which is set by wedge orientation and pick order, not by how constrained the
+    /// line is — so it held the free line, dragged the vertical one off vertical, and the sketch
+    /// went over-defined with the angle still not reached.
+    #[test]
+    fn an_angle_edit_swings_the_free_line_not_the_constrained_one() {
+        let mut s = Sketch::default();
+        let r = 6.5135133635837805;
+        let c = s.add_point(0.0, 0.0);
+        s.points[c].fixed = true;
+        s.add_circle(c, r);
+        // The constrained line: straight up, on the rim, and held Vertical.
+        let top = s.add_point(0.0, r);
+        s.add_line(top, c, false);
+        s.constraints.push(Constraint::PointOnCircle { p: top, center: c });
+        s.constraints.push(Constraint::Vertical(top, c));
+        // The free line: on the rim, nothing else holding it.
+        let start = 15.83_f64.to_radians();
+        let free = s.add_point(r * start.cos(), r * start.sin());
+        s.add_line(c, free, false);
+        s.constraints.push(Constraint::PointOnCircle { p: free, center: c });
+        // Stored with the FREE line first, exactly as the saved file has it.
+        let now = (std::f64::consts::FRAC_PI_2) - start;
+        s.constraints.push(Constraint::Angle { a: c, b: free, c, d: top, value: now, offset: 3.77 });
+        let ci = s.constraints.len() - 1;
+
+        // The line to hold is the vertical one, even though the free line is stored first.
+        assert_eq!(angle_hold_line(&s, ci), Some([c, top]), "held the wrong line");
+
+        // Retype 85° and solve the way the Modify box does.
+        let Some(Constraint::Angle { value, .. }) = s.constraints.get_mut(ci) else { panic!() };
+        *value = 85.0_f64.to_radians();
+        let hold = angle_hold_line(&s, ci).unwrap();
+        s.solve_with_fixed(&hold);
+
+        let p = |i: usize| Vec2::new(s.points[i].x as f32, s.points[i].y as f32);
+        // The vertical line stayed vertical and stayed on the rim...
+        assert!(p(top).x.abs() < 1e-3, "the vertical line was dragged off vertical to x={}", p(top).x);
+        assert!((p(top).length() - r as f32).abs() < 1e-2, "the held line left the rim");
+        // ...the free line moved to make up the difference, and is still on the rim...
+        assert!((p(free).length() - r as f32).abs() < 1e-2, "the swinging line left the rim");
+        // ...and the angle actually reached the value asked for.
+        let got = (p(free).angle_to(p(top))).abs().to_degrees();
+        assert!((got - 85.0).abs() < 0.5, "asked for 85°, the sketch settled at {got}°");
     }
 
     /// Clicking one circle then another dimensions the gap between their RIMS.
