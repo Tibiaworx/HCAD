@@ -2942,6 +2942,28 @@ struct RefImageEnt {
     id: FeatureId,
 }
 
+/// A dimension the Dimension tool has picked but not yet PLACED. It follows the cursor until a
+/// click decides where it sits — SolidWorks-style placement, instead of appearing at a computed
+/// offset you then have to drag off the geometry.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PendingDim {
+    /// The span between two points: a line's own length, or one point to another. `line` is the
+    /// entity it was picked from when it was picked as a line, so the opposite side of a box can
+    /// be tied to it and so a second line click can turn this into a [`PendingDim::Pair`].
+    Span { a: usize, b: usize, line: Option<usize> },
+    /// Two lines. Parallel, that means the perpendicular distance between them — the dimension
+    /// that holds one line a fixed distance off the other as either is resized. Not parallel, it
+    /// means the angle between them.
+    Pair { l1: usize, l2: usize },
+    /// A circle: its own radius/diameter, unless a second circle is clicked, in which case it
+    /// becomes a [`PendingDim::Gap`].
+    Round { center: usize, entity: usize },
+    /// Two circles: the RIM-TO-RIM distance between them. Not centre to centre — that reads zero
+    /// the moment the pair is concentric, which is the commonest case there is, and pins a
+    /// distance that cannot change.
+    Gap { e1: usize, e2: usize },
+}
+
 #[derive(Resource, Default)]
 struct SketchSession {
     plane: Option<ActivePlane>,
@@ -3040,13 +3062,8 @@ struct SketchSession {
     pending_c: Option<Vec2>,
     /// First point picked by the Dimension tool (point index).
     dim_first: Option<usize>,
-    /// A distance dimension whose geometry is chosen but whose LINE has not been put anywhere
-    /// yet. It follows the cursor until a second click decides where it sits — SolidWorks-style
-    /// placement, instead of appearing at a computed offset you then have to drag.
-    ///
-    /// Holds the two points, the line entity it came from (if it was picked as a line, for the
-    /// angle follow-up), and the value the geometry measured at pick time.
-    dim_place: Option<(usize, usize, Option<usize>)>,
+    /// A dimension whose geometry is chosen but which has not been PUT anywhere yet.
+    dim_place: Option<PendingDim>,
     /// A just-placed dimension awaiting a typed value (the Distance constraint index),
     /// its editing buffer, and a one-shot focus request for the Modify box.
     dim_edit: Option<usize>,
@@ -7169,6 +7186,7 @@ fn ui_system(
                             | Constraint::PointLineDistance { .. }
                             | Constraint::SlotWidth { .. }
                             | Constraint::RefCircleDistance { .. }
+                            | Constraint::CircleDistance { .. }
                     )
                     .then_some(i)
                 })
@@ -7202,7 +7220,8 @@ fn ui_system(
                                 Some(Constraint::Distance { value, .. })
                                 | Some(Constraint::PointLineDistance { value, .. })
                                 | Some(Constraint::SlotWidth { value, .. })
-                                | Some(Constraint::RefCircleDistance { value, .. }) => {
+                                | Some(Constraint::RefCircleDistance { value, .. })
+                                | Some(Constraint::CircleDistance { value, .. }) => {
                                     if ui.add(egui::DragValue::new(value).speed(0.05).range(0.01..=10_000.0).suffix(" mm")).changed() {
                                         changed = true;
                                     }
@@ -9019,7 +9038,11 @@ fn ui_system(
         // panel ✕ removes it), double-click opens its Modify box. Returns the label's
         // response so the caller can act on the click.
         let sel_dim = session.selected_dim;
-        let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String, selected: bool| -> Option<egui::Response> {
+        // `live` marks the read-out of a dimension still being PLACED. Those must not be
+        // interactable: the label tracks the cursor, so an interactive one sits under the pointer
+        // and eats the very click that would put the dimension down — you had to swing the mouse
+        // wide of it to land one at all.
+        let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String, selected: bool, live: bool| -> Option<egui::Response> {
             // An egui Area cannot be clipped by its caller, so a dimension whose geometry has
             // scrolled off the view is dropped rather than drawn over a panel. Clamping it to
             // the edge instead would leave the number pointing at the wrong geometry.
@@ -9041,6 +9064,7 @@ fn ui_system(
                     .fixed_pos(egui::pos2(screen.x, screen.y))
                     .pivot(egui::Align2::CENTER_CENTER)
                     .order(egui::Order::Foreground)
+                    .interactable(!live)
                     .show(ctx, |ui| {
                         egui::Frame::new()
                             .fill(ui.visuals().window_fill.gamma_multiply(0.92))
@@ -9052,7 +9076,7 @@ fn ui_system(
                                 ui.add(
                                     egui::Label::new(egui::RichText::new(text).color(col).strong())
                                         .wrap_mode(egui::TextWrapMode::Extend)
-                                        .sense(egui::Sense::click()),
+                                        .sense(if live { egui::Sense::empty() } else { egui::Sense::click() }),
                                 )
                             })
                             .inner
@@ -9075,7 +9099,48 @@ fn ui_system(
         // The value of the dimension being placed, live under the cursor. Without it the
         // preview is three orange lines with no number, which does not look like a dimension at
         // all while it is still lying on the edge it measures.
-        if let Some((a, b, _)) = session.dim_place {
+        if let Some(PendingDim::Pair { l1, l2 }) = session.dim_place {
+            if let (Some(cur), Some((pp, ba, bb))) = (session.cursor_uv, line_pair_anchor(&session.sketch, l1, l2)) {
+                let v = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+                if let (Some(p3), Some(a2), Some(b2)) = (v(pp), v(ba), v(bb)) {
+                    let (foot, _) = point_line_geometry(p3, a2, b2);
+                    let (_, _, m2) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, cur));
+                    let text = if lines_parallel(&session.sketch, l1, l2) {
+                        fmt_len_bare((p3 - foot).length(), unit)
+                    } else {
+                        // Crossing lines measure an angle, not a gap.
+                        let ang = (b2 - a2).angle_to(p3 - foot).abs().to_degrees();
+                        format!("{ang:.1}°")
+                    };
+                    label_at(ctx, egui::Id::new("dimlabel_placing_pair"), ap.to_world(m2), text, true, true);
+                }
+            }
+        }
+        if let Some(PendingDim::Gap { e1, e2 }) = session.dim_place {
+            if let (Some((a, _)), Some((b, _)), Some(cur)) =
+                (entity_circle(&session.sketch, e1), entity_circle(&session.sketch, e2), session.cursor_uv)
+            {
+                let mode = circle_gap_mode(&session.sketch, a, b).unwrap_or(0);
+                if let Some(off) = circle_gap_slide(&session.sketch, a, b, mode, cur) {
+                    if let Some((p1, p2, lab)) = circle_gap_of(&session.sketch, a, b, mode, off as f32) {
+                        let text = fmt_len_bare(p1.distance(p2), unit);
+                        label_at(ctx, egui::Id::new("dimlabel_placing_gap"), ap.to_world(lab), text, true, true);
+                    }
+                }
+            }
+        }
+        if let Some(PendingDim::Round { center, entity }) = session.dim_place {
+            if let (Some(cp), Some((_, r)), Some(cur)) =
+                (session.sketch.points.get(center), entity_circle(&session.sketch, entity), session.cursor_uv)
+            {
+                let cu = Vec2::new(cp.x as f32, cp.y as f32);
+                let d = (cur - cu).normalize_or_zero();
+                let at = if d == Vec2::ZERO { cu } else { cu + d * (r as f32) };
+                let text = format!("Ø{}", fmt_len_bare(r as f32 * 2.0, unit));
+                label_at(ctx, egui::Id::new("dimlabel_placing_round"), ap.to_world(at), text, true, true);
+            }
+        }
+        if let Some(PendingDim::Span { a, b, .. }) = session.dim_place {
             if let (Some(pa), Some(pb), Some(cur)) = (session.sketch.points.get(a), session.sketch.points.get(b), session.cursor_uv) {
                 let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                 let b2 = Vec2::new(pb.x as f32, pb.y as f32);
@@ -9088,7 +9153,7 @@ fn ui_system(
                     DimAxis::Vertical => dy.abs(),
                     _ => dx.hypot(dy),
                 };
-                label_at(ctx, egui::Id::new("dimlabel_placing"), ap.to_world(lab), fmt_len_bare(v, unit), true);
+                label_at(ctx, egui::Id::new("dimlabel_placing"), ap.to_world(lab), fmt_len_bare(v, unit), true, true);
             }
         }
         // Centres that carry a driving radius/diameter dimension (so the generic Ø
@@ -9102,7 +9167,7 @@ fn ui_system(
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, _, lab) = distance_dim_geometry(a2, b2, *offset as f32, *axis);
-                        act(label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("dimlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on, false), k, &mut dim_action);
                     }
                 }
                 Constraint::Radius { center, value, diameter, label } => {
@@ -9112,7 +9177,7 @@ fn ui_system(
                         let r = *value as f32;
                         let edge = radius_label_pos(cu, r, *label);
                         let text = if *diameter { format!("Ø{}", fmt_len_bare(*value as f32 * 2.0, unit)) } else { format!("R{}", fmt_len_bare(*value as f32, unit)) };
-                        act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on, false), k, &mut dim_action);
                     }
                 }
                 Constraint::Angle { a, b, c, d, value, offset } => {
@@ -9128,17 +9193,17 @@ fn ui_system(
                         let c2 = Vec2::new(pc.x as f32, pc.y as f32);
                         let d2 = Vec2::new(pd.x as f32, pd.y as f32);
                         let (_, lab) = angle_dim_geometry(a2, b2, c2, d2, *offset as f32);
-                        act(label_at(ctx, egui::Id::new(("anglabel", k)), ap.to_world(lab), format!("{:.1}°", value.to_degrees()), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("anglabel", k)), ap.to_world(lab), format!("{:.1}°", value.to_degrees()), on, false), k, &mut dim_action);
                     }
                 }
-                Constraint::PointLineDistance { p, a, b, value, .. } => {
+                Constraint::PointLineDistance { p, a, b, value, offset } => {
                     let pts = (session.sketch.points.get(*p), session.sketch.points.get(*a), session.sketch.points.get(*b));
                     if let (Some(pp), Some(pa), Some(pb)) = pts {
                         let p2 = Vec2::new(pp.x as f32, pp.y as f32);
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
-                        let (_, lab) = point_line_geometry(p2, a2, b2);
-                        act(label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
+                        let (_, _, lab) = line_gap_geometry(p2, a2, b2, *offset as f32);
+                        act(label_at(ctx, egui::Id::new(("pldlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on, false), k, &mut dim_action);
                     }
                 }
                 Constraint::SlotWidth { a, b, value, .. } => {
@@ -9146,14 +9211,19 @@ fn ui_system(
                         let a2 = Vec2::new(pa.x as f32, pa.y as f32);
                         let b2 = Vec2::new(pb.x as f32, pb.y as f32);
                         let (_, _, lab) = slot_width_geometry(a2, b2, (*value * 0.5) as f32);
-                        act(label_at(ctx, egui::Id::new(("slotlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("slotlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on, false), k, &mut dim_action);
                     }
                 }
                 Constraint::RefCircleDistance { center, cx, cy, radius, value, mode, .. } => {
                     if let (Some(pc), Some(rsk)) = (session.sketch.points.get(*center), circle_radius_of(&session.sketch, *center)) {
                         let csk = Vec2::new(pc.x as f32, pc.y as f32);
                         let (_, _, lab) = ref_circle_dim_geometry(Vec2::new(*cx as f32, *cy as f32), *radius as f32, csk, rsk, *mode);
-                        act(label_at(ctx, egui::Id::new(("rcdlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on), k, &mut dim_action);
+                        act(label_at(ctx, egui::Id::new(("rcdlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on, false), k, &mut dim_action);
+                    }
+                }
+                Constraint::CircleDistance { a, b, value, mode, offset } => {
+                    if let Some((_, _, lab)) = circle_gap_of(&session.sketch, *a, *b, *mode, *offset as f32) {
+                        act(label_at(ctx, egui::Id::new(("cdlabel", k)), ap.to_world(lab), fmt_len_bare(*value as f32, unit), on, false), k, &mut dim_action);
                     }
                 }
                 _ => {}
@@ -9169,7 +9239,7 @@ fn ui_system(
                 if let Some(c) = session.sketch.points.get(*center) {
                     let cu = Vec2::new(c.x as f32, c.y as f32);
                     let edge = cu + Vec2::new(*radius as f32 * 0.707, *radius as f32 * 0.707);
-                    let resp = label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{}", fmt_len_bare(*radius as f32 * 2.0, unit)), false);
+                    let resp = label_at(ctx, egui::Id::new(("dialabel", k)), ap.to_world(edge), format!("Ø{}", fmt_len_bare(*radius as f32 * 2.0, unit)), false, false);
                     if resp.is_some_and(|r| r.double_clicked()) {
                         dia_action = Some(*center);
                     }
@@ -9321,7 +9391,10 @@ fn ui_system(
             Some(Constraint::Radius { diameter, .. }) => Some(DimKind::Radius(*diameter)),
             Some(Constraint::Angle { .. }) => Some(DimKind::Angle),
             // Slot width edits like a plain mm distance (no axis/diameter toggle).
-            Some(Constraint::PointLineDistance { .. }) | Some(Constraint::SlotWidth { .. }) | Some(Constraint::RefCircleDistance { .. }) => Some(DimKind::PointLine),
+            Some(Constraint::PointLineDistance { .. })
+            | Some(Constraint::SlotWidth { .. })
+            | Some(Constraint::RefCircleDistance { .. })
+            | Some(Constraint::CircleDistance { .. }) => Some(DimKind::PointLine),
             _ => None,
         };
         // Label/box anchor in plane uv, computed from the constraint's points.
@@ -9355,6 +9428,9 @@ fn ui_system(
                     }
                     _ => None,
                 }
+            }
+            Some(Constraint::CircleDistance { a, b, mode, offset, .. }) => {
+                circle_gap_of(&session.sketch, *a, *b, *mode, *offset as f32).map(|(_, _, lab)| lab)
             }
             _ => None,
         };
@@ -9425,6 +9501,7 @@ fn ui_system(
                                     Some(Constraint::PointLineDistance { value, .. }) => *value = v,
                                     Some(Constraint::SlotWidth { value, .. }) => *value = v,
                                     Some(Constraint::RefCircleDistance { value, .. }) => *value = v,
+                                    Some(Constraint::CircleDistance { value, .. }) => *value = v,
                                     _ => {}
                                 }
                                 match angle_ref {
@@ -10566,14 +10643,35 @@ fn radius_label_pos(center: Vec2, radius: f32, label: [f64; 2]) -> Vec2 {
 
 /// The dimension line for a point-to-line distance, pushed `offset` along the perpendicular
 /// so the text can be dragged clear of the geometry.
-fn point_line_geometry_off(p: Vec2, a: Vec2, b: Vec2, offset: f32) -> (Vec2, Vec2) {
-    let (foot, mid) = point_line_geometry(p, a, b);
-    let mut n = (p - foot).normalize_or_zero();
-    if n == Vec2::ZERO {
-        let ab = (b - a).normalize_or_zero();
-        n = Vec2::new(-ab.y, ab.x);
+/// Where a line-to-line distance is DRAWN: a run straight across the gap, from the base line to
+/// the other one, slid along the pair to wherever it was placed. Returns the end on the base
+/// line, the end on the other line, and the label anchor between them.
+///
+/// This used to be a leader from one END of the other line, perpendicular to the base — so the
+/// dimension always sat at whichever endpoint happened to be stored, typically a far corner,
+/// instead of between the two lines where it was put.
+///
+/// `offset` is the slide ALONG the lines, measured from the foot of that endpoint. It is not a
+/// displacement away from them, as it is for every other dimension: pushing this one sideways out
+/// of the gap it measures would leave it spanning nothing.
+/// How far along the pair a cursor at `uv` puts a line-to-line distance — the `offset` that
+/// [`line_gap_geometry`] then draws from. Shared by the placement click, the drag, and the
+/// preview so all three agree.
+fn line_gap_slide(p: Vec2, a: Vec2, b: Vec2, uv: Vec2) -> f32 {
+    let (foot, _) = point_line_geometry(p, a, b);
+    let dir = (b - a).normalize_or_zero();
+    if dir == Vec2::ZERO { 0.0 } else { (uv - foot).dot(dir) }
+}
+
+fn line_gap_geometry(p: Vec2, a: Vec2, b: Vec2, offset: f32) -> (Vec2, Vec2, Vec2) {
+    let (foot, _) = point_line_geometry(p, a, b);
+    let mut dir = (b - a).normalize_or_zero();
+    if dir == Vec2::ZERO {
+        dir = Vec2::X;
     }
-    (foot, mid + n * offset)
+    let gap = p - foot; // straight across, base line → the other one
+    let base = foot + dir * offset;
+    (base, base + gap, base + gap * 0.5)
 }
 
 fn slot_width_geometry(a2: Vec2, b2: Vec2, half: f32) -> (Vec2, Vec2, Vec2) {
@@ -10642,6 +10740,7 @@ fn constraint_points(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnArc { p, .. } => vec![*p],
         Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
         Constraint::RefCircleDistance { center, .. } => vec![*center],
+        Constraint::CircleDistance { a, b, .. } => vec![*a, *b],
     }
 }
 
@@ -10676,6 +10775,7 @@ fn constraint_label(c: &Constraint) -> String {
         Constraint::PointOnArc { .. } => "On arc".into(),
         Constraint::SlotWidth { value, .. } => format!("Slot width  {value:.2}"),
         Constraint::RefCircleDistance { value, .. } => format!("Edge gap  {value:.2}"),
+        Constraint::CircleDistance { value, .. } => format!("Circle gap  {value:.2}"),
     }
 }
 
@@ -10718,6 +10818,7 @@ fn sketch_fingerprint(s: &Sketch) -> u64 {
             | Constraint::PointLineDistance { value, .. }
             | Constraint::Radius { value, .. }
             | Constraint::RefCircleDistance { value, .. }
+            | Constraint::CircleDistance { value, .. }
             | Constraint::Angle { value, .. } => *value,
             _ => 0.0,
         };
@@ -12104,29 +12205,7 @@ fn sketch_interaction(
             let mut second_line: Option<usize> = None;
             let mut second_slot: Option<usize> = None;
             if let Some(uv) = active_uv {
-                // Nearest sketch line (preferring a real line over a reference line).
-                let mut best: Option<(usize, bool, f32)> = None;
-                for (i, e) in session.sketch.entities.iter().enumerate() {
-                    if Some(i) == first_line {
-                        continue;
-                    }
-                    if let SketchEntity::Line { a, b, reference, .. } = e {
-                        if let (Some(pa), Some(pb)) = (session.sketch.points.get(*a), session.sketch.points.get(*b)) {
-                            let va = Vec2::new(pa.x as f32, pa.y as f32);
-                            let vb = Vec2::new(pb.x as f32, pb.y as f32);
-                            let d = closest_on_segment(uv, va, vb).distance(uv);
-                            if d <= snap * 2.0 {
-                                let better = best.is_none_or(|(_, bref, bd)| {
-                                    (*reference, d) < (bref, bd) || (*reference == bref && d < bd)
-                                });
-                                if better {
-                                    best = Some((i, *reference, d));
-                                }
-                            }
-                        }
-                    }
-                }
-                second_line = best.map(|(i, _, _)| i);
+                second_line = nearest_line_entity(&session.sketch, uv, snap * 2.0, first_line);
                 // A slot under the cursor (its centre line can be dimensioned to a line).
                 if let Some(e) = nearest_entity(&session.sketch, uv, snap * 2.0) {
                     if Some(e) != first_slot && entity_slot(&session.sketch, e).is_some() {
@@ -12187,6 +12266,7 @@ fn sketch_interaction(
                         Some(Constraint::Angle { value, .. }) => value.to_degrees(),
                         Some(Constraint::PointLineDistance { value, .. }) => *value,
                         Some(Constraint::RefCircleDistance { value, .. }) => *value,
+                        Some(Constraint::CircleDistance { value, .. }) => *value,
                         _ => 0.0,
                     };
                     session.dim_edit_focus = true;
@@ -12788,7 +12868,55 @@ fn sketch_interaction(
             if let Some(uv) = active_uv {
                 // A dimension waiting to be placed takes this click before anything else can
                 // claim it: the click means "put the line here", not "pick something".
-                if let Some((a, b, line)) = session.dim_place.take() {
+                if let Some(pending) = session.dim_place {
+                    // ...unless it lands on ANOTHER line, which means "and this one too". That is
+                    // how Smart Dimension reads a second pick, and it is the only way to say
+                    // "the distance between these two lines" — the click after this places it.
+                    if let PendingDim::Span { line: Some(l1), .. } = pending {
+                        if let Some(l2) = nearest_line_entity(&session.sketch, uv, snap * 2.0, Some(l1)) {
+                            session.dim_place = Some(PendingDim::Pair { l1, l2 });
+                            return;
+                        }
+                    }
+                    // Same for a circle: a click on ANOTHER circle asks for the distance between
+                    // the two rather than this one's own size.
+                    if let PendingDim::Round { entity, .. } = pending {
+                        if let Some((_, _, e2)) = nearest_circle_entity(&session.sketch, uv, snap * 2.0, Some(entity)) {
+                            session.dim_place = Some(PendingDim::Gap { e1: entity, e2 });
+                            return;
+                        }
+                    }
+                    session.dim_place = None;
+                    if let PendingDim::Gap { e1, e2 } = pending {
+                        if let Some(ci) = add_circle_distance(&mut session.sketch, e1, e2) {
+                            set_dim_offset_from_cursor(&mut session, ci, uv);
+                            open_dim_edit(&mut session, ci, None);
+                        }
+                        return;
+                    }
+                    if let PendingDim::Round { center, entity } = pending {
+                        if let Some((_, radius)) = entity_circle(&session.sketch, entity) {
+                            if let Some(ci) = add_radius_dim(&mut session.sketch, center, radius) {
+                                set_dim_offset_from_cursor(&mut session, ci, uv);
+                                open_dim_edit(&mut session, ci, None);
+                            }
+                        }
+                        return;
+                    }
+                    if let PendingDim::Pair { l1, l2 } = pending {
+                        // Parallel lines have a separation to hold; crossing lines have an angle.
+                        let made = if lines_parallel(&session.sketch, l1, l2) {
+                            add_point_line_distance(&mut session.sketch, l1, l2)
+                        } else {
+                            add_angle_dim(&mut session.sketch, l1, l2)
+                        };
+                        if let Some(ci) = made {
+                            set_dim_offset_from_cursor(&mut session, ci, uv);
+                            open_dim_edit(&mut session, ci, None);
+                        }
+                        return;
+                    }
+                    let PendingDim::Span { a, b, line } = pending else { return };
                     if let Some(ci) = add_distance_dim(&mut session.sketch, a, b) {
                         let pt = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
                         if let (Some(pa), Some(pb)) = (pt(a), pt(b)) {
@@ -12839,7 +12967,7 @@ fn sketch_interaction(
                     let created = if let Some(p) = nearest_point(&session.sketch, uv, snap * 1.5) {
                         match session.dim_first.take() {
                             Some(first) if first != p => {
-                                session.dim_place = Some((first, p, None));
+                                session.dim_place = Some(PendingDim::Span { a: first, b: p, line: None });
                                 None
                             }
                             _ => {
@@ -12851,14 +12979,19 @@ fn sketch_interaction(
                         session.dim_first = None;
                         if let Some((a, b)) = entity_line(&session.sketch, e) {
                             line_ctx = Some(e);
-                            session.dim_place = Some((a, b, Some(e)));
+                            session.dim_place = Some(PendingDim::Span { a, b, line: Some(e) });
                             None
                         } else if let Some((center, radius)) = entity_circle(&session.sketch, e) {
                             // A round body edge was picked first → edge-to-edge dimension
-                            // that DRIVES this circle's size; otherwise the usual Ø dim.
+                            // that DRIVES this circle's size; otherwise arm the Ø dim, which
+                            // lands on the next click — or becomes a centre-to-centre distance
+                            // if that click is on another circle.
                             match session.dim_ref_circle.take() {
                                 Some((rc, rr)) => add_ref_circle_dim(&mut session.sketch, center, radius, rc, rr),
-                                None => add_radius_dim(&mut session.sketch, center, radius),
+                                None => {
+                                    session.dim_place = Some(PendingDim::Round { center, entity: e });
+                                    None
+                                }
                             }
                         } else if entity_slot(&session.sketch, e).is_some() {
                             // A slot is one entity — clicking it dimensions its width; but
@@ -13532,6 +13665,116 @@ fn ref_circle_dim_geometry_off(cref: Vec2, rref: f32, csk: Vec2, rsk: f32, mode:
     (p1, p2, (p1 + p2) * 0.5 + dir * offset_along)
 }
 
+/// Display geometry of a [`Constraint::CircleDistance`]: the rim-to-rim segment between two
+/// sketch circles, plus the label anchor. Returns (end on a's rim, end on b's rim, label).
+///
+/// Where the two centres differ the gap is only meaningful along the centre line, so that is
+/// where it is drawn and `offset` slides the label along it. CONCENTRIC, there is no centre line
+/// and the gap is the same the whole way round, so `offset` is read as the ANGLE at which to draw
+/// it — which is what lets you put the dimension on whichever side of the ring you want.
+fn circle_gap_geometry(ca: Vec2, ra: f32, cb: Vec2, rb: f32, mode: u8, offset: f32) -> (Vec2, Vec2, Vec2) {
+    let v = cb - ca;
+    let d = v.length();
+    if d > 1.0e-6 {
+        let dir = v / d;
+        let (p1, p2) = match mode {
+            1 => (ca + dir * ra, cb + dir * rb), // a encloses b
+            2 => (ca - dir * ra, cb - dir * rb), // b encloses a
+            _ => (ca + dir * ra, cb - dir * rb), // apart: the facing rims
+        };
+        (p1, p2, (p1 + p2) * 0.5 + dir * offset)
+    } else {
+        let dir = Vec2::new(offset.cos(), offset.sin());
+        let (inner, outer) = if ra <= rb { (ra, rb) } else { (rb, ra) };
+        (ca + dir * inner, ca + dir * outer, ca + dir * (inner + outer) * 0.5)
+    }
+}
+
+/// Which configuration two sketch circles are in: 0 = apart, 1 = the circle at `a` encloses the
+/// one at `b`, 2 = the other way about. Shared by the preview and the constraint so the gap shown
+/// while placing is the gap that gets stored.
+fn circle_gap_mode(sketch: &Sketch, a: usize, b: usize) -> Option<u8> {
+    let p = |i: usize| sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+    let d = p(a)?.distance(p(b)?) as f64;
+    let (ra, rb) = (circle_radius_of(sketch, a)? as f64, circle_radius_of(sketch, b)? as f64);
+    // Exactly one configuration has a positive rim gap; overlapping picks the least bad. The
+    // enclosing cases go last so a dead tie resolves to "one inside the other", which is what a
+    // concentric pair is.
+    let cands = [(0u8, d - ra - rb), (2, rb - d - ra), (1, ra - d - rb)];
+    cands.into_iter().max_by(|x, y| x.1.partial_cmp(&y.1).unwrap()).map(|(m, _)| m)
+}
+
+/// Resolve a [`Constraint::CircleDistance`] against the sketch: its two centres and radii, then
+/// its drawn geometry at the stored offset. `None` if either circle has gone.
+fn circle_gap_of(sketch: &Sketch, a: usize, b: usize, mode: u8, offset: f32) -> Option<(Vec2, Vec2, Vec2)> {
+    let p = |i: usize| sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+    let (ca, cb) = (p(a)?, p(b)?);
+    let (ra, rb) = (circle_radius_of(sketch, a)?, circle_radius_of(sketch, b)?);
+    Some(circle_gap_geometry(ca, ra, cb, rb, mode, offset))
+}
+
+/// Where a cursor puts a circle-gap dimension: a slide along the centre line, or — concentric,
+/// where there is no centre line — the angle round the ring. See [`circle_gap_geometry`].
+fn circle_gap_slide(sketch: &Sketch, a: usize, b: usize, mode: u8, uv: Vec2) -> Option<f64> {
+    let p = |i: usize| sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+    let (ca, cb) = (p(a)?, p(b)?);
+    let (ra, rb) = (circle_radius_of(sketch, a)?, circle_radius_of(sketch, b)?);
+    let v = cb - ca;
+    if v.length() > 1.0e-6 {
+        let (p1, p2, _) = circle_gap_geometry(ca, ra, cb, rb, mode, 0.0);
+        Some((uv - (p1 + p2) * 0.5).dot(v.normalize()) as f64)
+    } else {
+        let d = uv - ca;
+        Some(if d.length() > 1.0e-6 { d.y.atan2(d.x) as f64 } else { 0.0 })
+    }
+}
+
+/// Add a rim-to-rim distance between two sketch circles. The mode (apart / enclosing / inside)
+/// and the opening value come from the circles as drawn.
+fn add_circle_distance(sketch: &mut Sketch, e1: usize, e2: usize) -> Option<usize> {
+    let (mut ca, ra) = entity_circle(sketch, e1)?;
+    let (mut cb, rb) = entity_circle(sketch, e2)?;
+    if e1 == e2 {
+        return None;
+    }
+    // Two circles drawn on the SAME centre point share one radius variable — the solver keys
+    // radii by centre point — so neither could be driven independently and the dimension would be
+    // unsatisfiable. Give the second circle its own centre, held on the first by a coincidence:
+    // the pair stays concentric and both radii become addressable.
+    if ca == cb {
+        let q = sketch.points[ca];
+        let fresh = sketch.add_point(q.x, q.y);
+        if let Some(SketchEntity::Circle { center, .. }) = sketch.entities.get_mut(e2) {
+            *center = fresh;
+        }
+        sketch.constraints.push(Constraint::Coincident(fresh, ca));
+        cb = fresh;
+    }
+    if ca == cb {
+        return None;
+    }
+    // One dimension per pair — clicking them again reopens it rather than stacking a conflict.
+    if let Some(i) = sketch.constraints.iter().position(|c| {
+        matches!(c, Constraint::CircleDistance { a, b, .. } if (*a == ca && *b == cb) || (*a == cb && *b == ca))
+    }) {
+        return Some(i);
+    }
+    let p = |i: usize| sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+    let d = p(ca)?.distance(p(cb)?) as f64;
+    // Exactly one configuration has a positive rim gap; overlapping picks the least bad. The
+    // enclosing cases go last so a dead tie resolves to "one inside the other", which is what a
+    // concentric pair is.
+    let mode = circle_gap_mode(sketch, ca, cb)?;
+    let cur = match mode {
+        1 => ra - d - rb,
+        2 => rb - d - ra,
+        _ => d - ra - rb,
+    };
+    // `mode` is phrased about this order of (a, b), so the pair is stored exactly as picked.
+    sketch.constraints.push(Constraint::CircleDistance { a: ca, b: cb, value: cur.max(0.05), mode, offset: 0.0 });
+    Some(sketch.constraints.len() - 1)
+}
+
 /// The sketch circle's current radius by its centre point (first matching circle entity).
 fn circle_radius_of(sketch: &Sketch, center: usize) -> Option<f32> {
     sketch.entities.iter().find_map(|e| match e {
@@ -13598,7 +13841,7 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
                 _ => None,
             },
             Constraint::PointLineDistance { p, a, b, offset, .. } => match (pt(*p), pt(*a), pt(*b)) {
-                (Some(pp), Some(a2), Some(b2)) => Some(point_line_geometry_off(pp, a2, b2, *offset as f32).1),
+                (Some(pp), Some(a2), Some(b2)) => Some(line_gap_geometry(pp, a2, b2, *offset as f32).2),
                 _ => None,
             },
             Constraint::SlotWidth { a, b, value, offset } => match (pt(*a), pt(*b)) {
@@ -13612,6 +13855,9 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
                 }
                 None => None,
             },
+            Constraint::CircleDistance { a, b, mode, offset, .. } => {
+                circle_gap_of(sketch, *a, *b, *mode, *offset as f32).map(|(_, _, lab)| lab)
+            }
             _ => None,
         };
         // The whole dimension line grabs, not just the text — a linear dimension's label is a
@@ -13630,8 +13876,8 @@ fn dim_at(sketch: &Sketch, uv: Vec2, tol: f32) -> Option<usize> {
             }),
             Constraint::PointLineDistance { p: pp, a, b, offset, .. } => match (pt(*pp), pt(*a), pt(*b)) {
                 (Some(p3), Some(a2), Some(b2)) => {
-                    let (foot, _) = point_line_geometry_off(p3, a2, b2, *offset as f32);
-                    Some((foot, p3))
+                    let (q0, q1, _) = line_gap_geometry(p3, a2, b2, *offset as f32);
+                    Some((q0, q1))
                 }
                 _ => None,
             },
@@ -13750,6 +13996,7 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
         Some(Constraint::PointLineDistance { value, .. }) => *value,
         Some(Constraint::SlotWidth { value, .. }) => *value,
         Some(Constraint::RefCircleDistance { value, .. }) => *value,
+        Some(Constraint::CircleDistance { value, .. }) => *value,
         _ => return,
     };
     session.dim_edit = Some(ci);
@@ -13764,14 +14011,63 @@ fn open_dim_edit(session: &mut SketchSession, ci: usize, line: Option<usize>) {
 /// Add a perpendicular distance dimension between two line entities (e.g. the two parallel
 /// sides of a slot, or a line and a body-edge reference line). A reference line is used as
 /// the base; an endpoint of the other line is the driven point. Returns the constraint idx.
-fn add_point_line_distance(sketch: &mut Sketch, l1: usize, l2: usize) -> Option<usize> {
-    let _ = entity_line(sketch, l1)?;
-    let _ = entity_line(sketch, l2)?;
+/// The nearest sketch LINE under `uv`, preferring a real line over a projected reference line and
+/// skipping `except`. Shared by the second-line pick and the Modify-box follow-up so they agree
+/// about what counts as "clicking another line".
+fn nearest_line_entity(sketch: &Sketch, uv: Vec2, tol: f32, except: Option<usize>) -> Option<usize> {
+    let mut best: Option<(usize, bool, f32)> = None;
+    for (i, e) in sketch.entities.iter().enumerate() {
+        if Some(i) == except {
+            continue;
+        }
+        let SketchEntity::Line { a, b, reference, .. } = e else { continue };
+        let (Some(pa), Some(pb)) = (sketch.points.get(*a), sketch.points.get(*b)) else { continue };
+        let va = Vec2::new(pa.x as f32, pa.y as f32);
+        let vb = Vec2::new(pb.x as f32, pb.y as f32);
+        let d = closest_on_segment(uv, va, vb).distance(uv);
+        if d <= tol && best.is_none_or(|(_, bref, bd)| (*reference, d) < (bref, bd)) {
+            best = Some((i, *reference, d));
+        }
+    }
+    best.map(|(i, _, _)| i)
+}
+
+/// The nearest sketch CIRCLE whose rim passes near `uv`, skipping `except`. Returns its centre
+/// point, its radius, and the entity index.
+fn nearest_circle_entity(sketch: &Sketch, uv: Vec2, tol: f32, except: Option<usize>) -> Option<(usize, f64, usize)> {
+    let mut best: Option<(usize, f64, usize, f32)> = None;
+    for i in 0..sketch.entities.len() {
+        if Some(i) == except {
+            continue;
+        }
+        let Some((c, r)) = entity_circle(sketch, i) else { continue };
+        let Some(cp) = sketch.points.get(c) else { continue };
+        let cu = Vec2::new(cp.x as f32, cp.y as f32);
+        // Distance to the RIM, which is what the eye picks — plus the centre itself, so a small
+        // circle can still be grabbed from the middle.
+        let d = (uv.distance(cu) - r as f32).abs().min(uv.distance(cu));
+        if d <= tol && best.is_none_or(|(_, _, _, bd)| d < bd) {
+            best = Some((c, r, i, d));
+        }
+    }
+    best.map(|(c, r, i, _)| (c, r, i))
+}
+
+/// Which point, and which line, a line-to-line distance is expressed as.
+///
+/// Shared by the constraint and its preview so the two cannot disagree about which of the pair is
+/// the base — the preview would otherwise measure off one line and the dimension off the other.
+fn line_pair_anchor(sketch: &Sketch, l1: usize, l2: usize) -> Option<(usize, usize, usize)> {
     let is_ref = |i: usize| matches!(sketch.entities.get(i), Some(SketchEntity::Line { reference: true, .. }));
     // Prefer a reference (body-edge) line as the fixed base.
     let (base, other) = if is_ref(l2) && !is_ref(l1) { (l2, l1) } else { (l1, l2) };
     let (ba, bb) = entity_line(sketch, base)?;
     let (pp, _) = entity_line(sketch, other)?;
+    Some((pp, ba, bb))
+}
+
+fn add_point_line_distance(sketch: &mut Sketch, l1: usize, l2: usize) -> Option<usize> {
+    let (pp, ba, bb) = line_pair_anchor(sketch, l1, l2)?;
     if let Some(i) = sketch.constraints.iter().position(|c| {
         matches!(c, Constraint::PointLineDistance { p, a, b, .. } if *p == pp && *a == ba && *b == bb)
     }) {
@@ -14083,16 +14379,13 @@ fn set_dim_offset_from_cursor(session: &mut SketchSession, ci: usize, uv: Vec2) 
             }
             _ => None,
         },
-        // Perpendicular distance from the line, signed so the label can sit on either side.
+        // A line-to-line distance slides ALONG the pair, not away from it — see
+        // [`line_gap_geometry`]. Dragging it sideways would take it out of the gap it measures.
         Some(Constraint::PointLineDistance { p, a, b, .. }) => match (pt(*p), pt(*a), pt(*b)) {
             (Some(pp), Some(a2), Some(b2)) => {
-                let (foot, mid) = point_line_geometry(pp, a2, b2);
-                let mut n = (pp - foot).normalize_or_zero();
-                if n == Vec2::ZERO {
-                    let ab = (b2 - a2).normalize_or_zero();
-                    n = Vec2::new(-ab.y, ab.x);
-                }
-                Some((uv - mid).dot(n) as f64)
+                let (foot, _) = point_line_geometry(pp, a2, b2);
+                let dir = (b2 - a2).normalize_or_zero();
+                Some(if dir == Vec2::ZERO { 0.0 } else { (uv - foot).dot(dir) as f64 })
             }
             _ => None,
         },
@@ -14116,6 +14409,8 @@ fn set_dim_offset_from_cursor(session: &mut SketchSession, ci: usize, uv: Vec2) 
             }
             None => None,
         },
+        // Slides along the centre line, or round the ring when the pair is concentric.
+        Some(Constraint::CircleDistance { a, b, mode, .. }) => circle_gap_slide(&session.sketch, *a, *b, *mode, uv),
         _ => None,
     };
     // Radius/diameter is placed in POLAR terms around the centre, so it carries an angle as
@@ -14136,6 +14431,7 @@ fn set_dim_offset_from_cursor(session: &mut SketchSession, ci: usize, uv: Vec2) 
         (Some(o), Some(Constraint::PointLineDistance { offset, .. })) => *offset = o,
         (Some(o), Some(Constraint::SlotWidth { offset, .. })) => *offset = o,
         (Some(o), Some(Constraint::RefCircleDistance { offset, .. })) => *offset = o,
+        (Some(o), Some(Constraint::CircleDistance { offset, .. })) => *offset = o,
         _ => {}
     }
 }
@@ -22988,6 +23284,14 @@ fn draw_sketch(
             }
         }
     }
+    // Circle-to-circle gaps: the rim-to-rim run, drawn like any other linear dimension.
+    for c in &session.sketch.constraints {
+        if let Constraint::CircleDistance { a, b, mode, offset, .. } = c {
+            if let Some((p1, p2, _)) = circle_gap_of(&session.sketch, *a, *b, *mode, *offset as f32) {
+                draw_linear_dim(&mut gizmos, ap, p1, p2, p1, p2, ms, rcd_col);
+            }
+        }
+    }
     // A body circle picked as the reference side of an edge-to-edge dimension glows until
     // the second click (on a sketch circle) completes it — the standard orange selection accent.
     if let Some((c, r)) = session.dim_ref_circle {
@@ -23141,11 +23445,11 @@ fn draw_sketch(
                     }
                 }
             }
-            // Point-to-line distance: a perpendicular leader from the point to the edge.
-            hworks_sketch::Constraint::PointLineDistance { p, a, b, .. } => {
+            // Line-to-line distance: drawn BETWEEN the two lines, arrows touching each.
+            hworks_sketch::Constraint::PointLineDistance { p, a, b, offset, .. } => {
                 if let (Some(p2), Some(a2), Some(b2)) = (pt(*p), pt(*a), pt(*b)) {
-                    let (foot, _) = point_line_geometry(p2, a2, b2);
-                    gizmos.line(ap.to_world(p2), ap.to_world(foot), dim_col);
+                    let (q0, q1, _) = line_gap_geometry(p2, a2, b2, *offset as f32);
+                    draw_linear_dim(&mut gizmos, ap, q0, q1, q0, q1, ms, dim_col);
                 }
             }
             // Slot width: a witness line straight across the slot (side to side).
@@ -23199,7 +23503,59 @@ fn draw_sketch(
     // it) a blue copy of a blue line is invisible, and the tool looked unresponsive until the
     // cursor had been dragged well clear. Orange, plus end ticks that stand off the line and a
     // leader out to the cursor, so it reads at any offset — including zero.
-    if let Some((a, b, _)) = session.dim_place {
+    // Two lines picked: the perpendicular distance between them (or, crossing, their angle),
+    // following the cursor until the click that places it. Both picked lines are drawn in the
+    // placement colour so it is clear WHICH pair is being measured.
+    if let Some(PendingDim::Pair { l1, l2 }) = session.dim_place {
+        let col = Color::srgb(1.0, 0.78, 0.25);
+        for li in [l1, l2] {
+            if let Some((a, b)) = entity_line(&session.sketch, li) {
+                if let (Some(pa), Some(pb)) = (session.sketch.points.get(a), session.sketch.points.get(b)) {
+                    let (va, vb) = (Vec2::new(pa.x as f32, pa.y as f32), Vec2::new(pb.x as f32, pb.y as f32));
+                    gizmos.line(ap.to_world(va), ap.to_world(vb), col);
+                }
+            }
+        }
+        if let (Some(cur), Some((pp, ba, bb))) = (session.cursor_uv, line_pair_anchor(&session.sketch, l1, l2)) {
+            if lines_parallel(&session.sketch, l1, l2) {
+                let v = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+                if let (Some(p3), Some(a2), Some(b2)) = (v(pp), v(ba), v(bb)) {
+                    let (q0, q1, _) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, cur));
+                    draw_linear_dim(&mut gizmos, ap, q0, q1, q0, q1, ms, col);
+                }
+            }
+        }
+    }
+    // A circle picked but not yet placed: its Ø leader follows the cursor round the rim.
+    if let Some(PendingDim::Round { center, entity }) = session.dim_place {
+        if let (Some(cp), Some((_, r)), Some(cur)) =
+            (session.sketch.points.get(center), entity_circle(&session.sketch, entity), session.cursor_uv)
+        {
+            let col = Color::srgb(1.0, 0.78, 0.25);
+            let cu = Vec2::new(cp.x as f32, cp.y as f32);
+            let d = (cur - cu).normalize_or_zero();
+            if d != Vec2::ZERO {
+                gizmos.line(ap.to_world(cu - d * r as f32), ap.to_world(cu + d * r as f32), col);
+            }
+            draw_marker(&mut gizmos, ap, cu, col, ms);
+        }
+    }
+    // Two circles picked: the rim-to-rim gap, sliding along the centre line — or, concentric,
+    // swinging round the ring — until the click that places it.
+    if let Some(PendingDim::Gap { e1, e2 }) = session.dim_place {
+        let col = Color::srgb(1.0, 0.78, 0.25);
+        if let (Some((a, _)), Some((b, _)), Some(cur)) =
+            (entity_circle(&session.sketch, e1), entity_circle(&session.sketch, e2), session.cursor_uv)
+        {
+            let mode = circle_gap_mode(&session.sketch, a, b).unwrap_or(0);
+            if let Some(off) = circle_gap_slide(&session.sketch, a, b, mode, cur) {
+                if let Some((p1, p2, _)) = circle_gap_of(&session.sketch, a, b, mode, off as f32) {
+                    draw_linear_dim(&mut gizmos, ap, p1, p2, p1, p2, ms, col);
+                }
+            }
+        }
+    }
+    if let Some(PendingDim::Span { a, b, .. }) = session.dim_place {
         if let (Some(pa), Some(pb), Some(cur)) = (
             session.sketch.points.get(a).map(|q| Vec2::new(q.x as f32, q.y as f32)),
             session.sketch.points.get(b).map(|q| Vec2::new(q.x as f32, q.y as f32)),
@@ -29482,13 +29838,14 @@ mod tests {
         se.sketch.constraints.push(Constraint::Radius { center: c, value: 4.0, diameter: true, label: [0.0, 0.0] });
         cases.push(("Diameter", se, 0, Vec2::new(2.0, 9.0), Vec2::new(-3.0, -4.0)));
 
-        // Point-to-line: offset field existed but was never applied.
+        // Line-to-line distance: this one slides ALONG the pair rather than away from it, so its
+        // drag targets stay on the midline of the gap (see `line_gap_geometry`).
         let mut se = SketchSession::default();
         let pp = se.sketch.add_point(0.0, 6.0);
         let la = se.sketch.add_point(-5.0, 0.0);
         let lb = se.sketch.add_point(5.0, 0.0);
         se.sketch.constraints.push(Constraint::PointLineDistance { p: pp, a: la, b: lb, value: 6.0, offset: 0.0 });
-        cases.push(("PointLineDistance", se, 0, Vec2::new(0.0, 11.0), Vec2::new(0.0, -3.0)));
+        cases.push(("PointLineDistance", se, 0, Vec2::new(0.0, 3.0), Vec2::new(4.0, 0.0)));
 
         // Slot width: slides along the slot axis.
         let mut se = SketchSession::default();
@@ -31315,6 +31672,124 @@ mod tests {
             };
             eprintln!("  {label:32} uv({:6.1},{:6.1}) -> {verdict}", uv[0], uv[1]);
         }
+    }
+
+    /// Dimensioning between two parallel sketch lines holds them a set distance apart: resize one
+    /// and the other keeps its gap. Click one line, click the other, click to place.
+    #[test]
+    fn a_dimension_between_two_lines_holds_them_apart() {
+        // The nested-rectangles case: two vertical sides, an inner and an outer.
+        let mut s = Sketch::default();
+        let (i0, i1) = (s.add_point(5.0, 0.0), s.add_point(5.0, 10.0));
+        let (o0, o1) = (s.add_point(14.31, 0.0), s.add_point(14.31, 10.0));
+        s.add_line(i0, i1, false);
+        s.add_line(o0, o1, false);
+        let (inner, outer) = (0usize, 1usize);
+        s.constraints.push(Constraint::Vertical(i0, i1));
+        s.constraints.push(Constraint::Vertical(o0, o1));
+
+        // Clicking near the outer line while the inner is armed must find the OUTER one.
+        assert_eq!(nearest_line_entity(&s, Vec2::new(14.2, 5.0), 1.0, Some(inner)), Some(outer));
+        // Two verticals are parallel, so this is a distance and not an angle.
+        assert!(lines_parallel(&s, inner, outer), "two vertical lines were not seen as parallel");
+
+        let ci = add_point_line_distance(&mut s, inner, outer).expect("a line-to-line distance");
+
+        // It must be drawn BETWEEN the two lines, at the height it was placed — not shot off to
+        // whichever endpoint happens to be stored, which is where the leader used to land.
+        let v = |s: &Sketch, i: usize| Vec2::new(s.points[i].x as f32, s.points[i].y as f32);
+        for place_y in [1.0_f32, 5.0, 9.0] {
+            let (p3, a2, b2) = (v(&s, o0), v(&s, i0), v(&s, i1));
+            let (q0, q1, lab) = line_gap_geometry(p3, a2, b2, line_gap_slide(p3, a2, b2, Vec2::new(9.0, place_y)));
+            // One end on each line...
+            assert!((q0.x - 5.0).abs() < 1e-3, "the near end left the inner line: {q0:?}");
+            assert!((q1.x - 14.31).abs() < 1e-3, "the far end left the outer line: {q1:?}");
+            // ...both at the height it was placed, with the label between them.
+            assert!((q0.y - place_y).abs() < 1e-3, "placed at y={place_y}, drawn at {q0:?}");
+            assert!((q1.y - place_y).abs() < 1e-3, "placed at y={place_y}, drawn at {q1:?}");
+            assert!(lab.x > 5.0 && lab.x < 14.31, "the label sat outside the gap it measures: {lab:?}");
+        }
+
+        let gap = |s: &Sketch| {
+            let v = |i: usize| Vec2::new(s.points[i].x as f32, s.points[i].y as f32);
+            let (foot, _) = point_line_geometry(v(o0), v(i0), v(i1));
+            (v(o0) - foot).length()
+        };
+        assert!((gap(&s) - 9.31).abs() < 1e-3, "picked up the wrong measurement: {}", gap(&s));
+
+        // Type a new value: the pair moves to it.
+        let Some(Constraint::PointLineDistance { value, .. }) = s.constraints.get_mut(ci) else { panic!() };
+        *value = 20.0;
+        s.solve();
+        assert!((gap(&s) - 20.0).abs() < 0.05, "the typed distance was not applied: {}", gap(&s));
+
+        // ...and now the point of the whole thing: move the INNER line, and the outer follows so
+        // the gap is preserved. Without a driving constraint the outer would just stay put.
+        for p in [i0, i1] {
+            s.points[p].x -= 4.0;
+        }
+        s.solve();
+        assert!((gap(&s) - 20.0).abs() < 0.05, "moving the inner line broke the gap: {}", gap(&s));
+        // The lines are still parallel — the solver satisfied the distance by translating, not by
+        // swinging one line round to meet it.
+        assert!(lines_parallel(&s, inner, outer), "the solver skewed the lines to satisfy the distance");
+    }
+
+    /// Clicking one circle then another dimensions the gap between their RIMS.
+    ///
+    /// Not centre to centre: two concentric circles — a bore and the wall round it, the commonest
+    /// pair there is — have zero centre distance, so that dimension read 0 and pinned a distance
+    /// that cannot change, which the solver reported as over-defined.
+    #[test]
+    fn a_dimension_between_two_circles_measures_the_rim_gap() {
+        // Concentric, sharing nothing but a position: r=10 outside r=3, so the wall is 7 thick.
+        let mut s = Sketch::default();
+        let c1 = s.add_point(0.0, 0.0);
+        s.add_circle(c1, 10.0);
+        let c2 = s.add_point(0.0, 0.0);
+        s.add_circle(c2, 3.0);
+
+        // Picked on the rim, which is what the eye aims at...
+        assert_eq!(nearest_circle_entity(&s, Vec2::new(3.0, 0.0), 0.5, Some(0)).map(|(_, _, e)| e), Some(1));
+        // ...and the circle already armed is skipped, or a click would pair it with itself.
+        assert_eq!(nearest_circle_entity(&s, Vec2::new(10.0, 0.0), 0.5, Some(0)), None);
+
+        let ci = add_circle_distance(&mut s, 0, 1).expect("a rim-to-rim distance");
+        let Some(Constraint::CircleDistance { value, mode, .. }) = s.constraints.get(ci) else { panic!() };
+        assert_eq!(*mode, 1, "the big circle should have been seen as enclosing the small one");
+        assert!((value - 7.0).abs() < 1e-6, "the wall measured {value}, not 7");
+
+        let gap = |s: &Sketch| {
+            let r = |e: usize| match s.entities.get(e) {
+                Some(SketchEntity::Circle { radius, .. }) => *radius,
+                _ => panic!(),
+            };
+            (r(0) - r(1)).abs()
+        };
+        // Retype it: the wall thickens, and the circles stay concentric rather than the solver
+        // shoving them apart to make up the difference.
+        let Some(Constraint::CircleDistance { value, .. }) = s.constraints.get_mut(ci) else { panic!() };
+        *value = 12.0;
+        s.solve();
+        assert!((gap(&s) - 12.0).abs() < 0.05, "the typed gap was not applied: {}", gap(&s));
+        let apart = Vec2::new((s.points[c2].x - s.points[c1].x) as f32, (s.points[c2].y - s.points[c1].y) as f32);
+        assert!(apart.length() < 0.05, "the solver moved the centres apart by {}", apart.length());
+
+        // And the same thing on two circles that are genuinely apart, where the gap is measured
+        // along the centre line between the facing rims.
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        s.add_circle(a, 2.0);
+        let b = s.add_point(20.0, 0.0);
+        s.add_circle(b, 3.0);
+        let ci = add_circle_distance(&mut s, 0, 1).expect("a rim-to-rim distance");
+        let Some(Constraint::CircleDistance { value, mode, .. }) = s.constraints.get(ci) else { panic!() };
+        assert_eq!(*mode, 0, "two separated circles should read as apart");
+        assert!((value - 15.0).abs() < 1e-6, "the gap measured {value}, not 15");
+        // Drawn between the facing rims, not centre to centre.
+        let (p1, p2, _) = circle_gap_of(&s, a, b, 0, 0.0).expect("geometry");
+        assert!((p1 - Vec2::new(2.0, 0.0)).length() < 1e-4, "near end at {p1:?}");
+        assert!((p2 - Vec2::new(17.0, 0.0)).length() < 1e-4, "far end at {p2:?}");
     }
 
     /// Clicking one edge of a polygon extrusion's rim selects the WHOLE rim, whatever the polygon

@@ -226,6 +226,24 @@ pub enum Constraint {
         #[serde(default)]
         offset: f64,
     },
+    /// Driving rim-to-rim distance between TWO SKETCH CIRCLES, centred at `a` and `b`. The
+    /// sibling of [`Constraint::RefCircleDistance`], for when both circles can move rather than
+    /// one being a baked body edge.
+    ///
+    /// This measures the gap between the RIMS, not between the centres — dimensioning two circles
+    /// centre-to-centre reads zero the moment they are concentric, which is the commonest case
+    /// there is (a bore and the wall around it) and pins a distance that cannot change.
+    ///
+    /// `mode` captures the configuration at creation, as `RefCircleDistance` does: 0 = apart (the
+    /// gap between them), 1 = the circle at `a` ENCLOSES the one at `b`, 2 = the other way about.
+    CircleDistance {
+        a: usize,
+        b: usize,
+        value: f64,
+        mode: u8,
+        #[serde(default)]
+        offset: f64,
+    },
 }
 
 /// Which span a [`Constraint::Distance`] measures: the true point-to-point distance
@@ -1328,6 +1346,7 @@ fn constraint_point_indices(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnArc { p, .. } => vec![*p],
         Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
         Constraint::RefCircleDistance { center, .. } => vec![*center],
+        Constraint::CircleDistance { a, b, .. } => vec![*a, *b],
     }
 }
 
@@ -1391,6 +1410,10 @@ fn remap_constraint(c: &mut Constraint, m: &[usize]) {
             *center = m[*center];
         }
         Constraint::Radius { center, .. } | Constraint::RefCircleDistance { center, .. } => *center = m[*center],
+        Constraint::CircleDistance { a, b, .. } => {
+            *a = m[*a];
+            *b = m[*b];
+        }
         Constraint::Angle { a, b, c, d, .. } => {
             *a = m[*a];
             *b = m[*b];
@@ -1828,7 +1851,7 @@ impl Sketch {
             // semantics; slot width isn't a solver variable.
             Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => 0,
             // Always one row (a no-op row when its circle is gone, keeping counts stable).
-            Constraint::RefCircleDistance { .. } => 1,
+            Constraint::RefCircleDistance { .. } | Constraint::CircleDistance { .. } => 1,
         }
     }
 
@@ -2107,6 +2130,43 @@ impl Sketch {
                             ]);
                         }
                         None => put_row(&mut r, jac, &mut k, 0.0, &[]),
+                    }
+                }
+                Constraint::CircleDistance { a, b, value, mode, .. } => {
+                    // Rim-to-rim between two sketch circles, both free to move and resize. Same
+                    // residuals as RefCircleDistance, but with the far circle's radius as a
+                    // variable too (D = centre gap, ra/rb the two radius variables):
+                    //   apart     → D − ra − rb − v
+                    //   a encloses b → ra − D − rb − v
+                    //   b encloses a → rb − D − ra − v
+                    let (ca, cb) = (*a, *b);
+                    let dx = px(ca) - px(cb);
+                    let dy = py(ca) - py(cb);
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    match (layout.radius_var(ca), layout.radius_var(cb)) {
+                        (Some(ra), Some(rb)) => {
+                            // Concentric: the centre gap is zero AND its direction is undefined,
+                            // so dx/dist is meaningless. The rim gap is then purely the radius
+                            // difference — leave the centres out of the row rather than divide by
+                            // almost nothing and let the solver shove the circles apart to
+                            // satisfy a derivative that is really noise.
+                            let (ux, uy) = if dist < 1.0e-6 { (0.0, 0.0) } else { (dx / dist, dy / dist) };
+                            let (res, sa, sb, csign) = match mode {
+                                1 => (x[ra] - dist - x[rb] - value, 1.0, -1.0, -1.0),
+                                2 => (x[rb] - dist - x[ra] - value, -1.0, 1.0, -1.0),
+                                _ => (dist - x[ra] - x[rb] - value, -1.0, -1.0, 1.0),
+                            };
+                            put_row(&mut r, jac, &mut k, res, &[
+                                (2 * ca, csign * ux),
+                                (2 * ca + 1, csign * uy),
+                                (2 * cb, -csign * ux),
+                                (2 * cb + 1, -csign * uy),
+                                (ra, sa),
+                                (rb, sb),
+                            ]);
+                        }
+                        // A circle is gone → no-op residual (keeps the row count stable).
+                        _ => put_row(&mut r, jac, &mut k, 0.0, &[]),
                     }
                 }
                 // Enforced after the solve: EqualRadius keeps its "a drives b"
