@@ -21574,6 +21574,39 @@ const COINCIDENT_TOL: f64 = 1.0e-4;
 const ROBUST_TOL: f64 = 0.05;
 const ROBUST_OVERLAP: f64 = 0.1;
 
+/// The tightest boolean tolerance an **exact-arc (NURBS) tool** may be handed to.
+///
+/// truck divides a face-face intersection curve by a depth-100 *binary* recursion
+/// (`truck-geotrait`'s `sub_parameter_division`). Each sample of that curve is itself a
+/// Newton double-projection, so when the asked tolerance is finer than the projection can
+/// converge to, the recursion never satisfies it and fans out to ~2^100 subdivisions: the
+/// boolean simply never returns. There is no panic to catch — the thread spins and
+/// allocates until it is killed, which froze the app outright on the *default* first rung
+/// of the cut/boss ladders (tol 1e-4).
+///
+/// Measured on a plain Ø22.5 disc cut into a 30x30x15 slab (debug build): tolerances of
+/// 0.005 and below never came back; 0.01 took 21 s; 0.02 took 14 s; 0.05 took 10 s. The
+/// floor sits an order of magnitude above the cliff, because the cliff is not a fixed
+/// number — it moves with how well the two surfaces project onto each other.
+///
+/// Rungs below this floor run the *faceted* tool instead: the same cut, with prism facets
+/// where the exact path would have given true cylinders.
+const ARC_BOOL_MIN_TOL: f64 = 0.05;
+
+/// The exact-arc annotations to hand a kernel boolean running at tolerance `tol`: the real
+/// spans where truck can cope, empty (⇒ a faceted tool) below [`ARC_BOOL_MIN_TOL`].
+fn arcs_safe_at<'a>(
+    tol: f64,
+    outer: &'a [hworks_geometry::ArcSpan],
+    holes: &'a [Vec<hworks_geometry::ArcSpan>],
+) -> (&'a [hworks_geometry::ArcSpan], &'a [Vec<hworks_geometry::ArcSpan>]) {
+    if tol >= ARC_BOOL_MIN_TOL {
+        (outer, holes)
+    } else {
+        (&[], &[])
+    }
+}
+
 /// Union a set of sketch regions in 2D into merged outline(s) by cancelling the
 /// edges shared between adjacent regions. Adjacent contours collapse into a single
 /// profile — so the extrude is one solid and never needs the fragile coincident-
@@ -21791,11 +21824,13 @@ fn boss_union(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, dist
         // Direction 2 (`back`) extends the prism the opposite way; it shares the same side
         // as the union overlap, so burying by at least `back` gives the both-directions boss.
         // A nudged (inflated) profile no longer lies on its source circles, so only the
-        // un-nudged strategies use the exact-arc annotations.
+        // un-nudged strategies use the exact-arc annotations — and only at a tolerance
+        // truck's boolean can actually complete (see `ARC_BOOL_MIN_TOL`).
         let boss = if nudge > 0.0 {
             extrude_solid_with_overlap(&inflate_loop(&r.outer, nudge), &r.holes, basis, distance, overlap.max(back))
         } else {
-            extrude_solid_with_overlap_arcs(&r.outer, &r.holes, &outer_arcs, &hole_arcs, basis, distance, overlap.max(back))
+            let (oa, ha) = arcs_safe_at(tol, &outer_arcs, &hole_arcs);
+            extrude_solid_with_overlap_arcs(&r.outer, &r.holes, oa, ha, basis, distance, overlap.max(back))
         };
         let Some(boss) = boss else {
             continue;
@@ -21851,11 +21886,13 @@ fn cut_op(body: &KSolid, r: &hworks_sketch::Region, basis: &PlaneBasis, distance
     let (outer_arcs, hole_arcs) = (kernel_spans(&r.outer_arcs), kernel_hole_spans(r));
     for (k, &(nudge, tol)) in strategies.iter().enumerate() {
         // As in `boss_union`: a nudged profile is off its source circles, so the
-        // exact-arc annotations only apply to the un-nudged strategies.
+        // exact-arc annotations only apply to the un-nudged strategies — and only at a
+        // tolerance truck can actually complete (see `ARC_BOOL_MIN_TOL`).
         let s = if nudge > 0.0 {
             cut_tol(body, &inflate_loop(&r.outer, nudge), &r.holes, basis, distance, back, tol)
         } else {
-            cut_tol_arcs(body, &r.outer, &r.holes, &outer_arcs, &hole_arcs, basis, distance, back, tol)
+            let (oa, ha) = arcs_safe_at(tol, &outer_arcs, &hole_arcs);
+            cut_tol_arcs(body, &r.outer, &r.holes, oa, ha, basis, distance, back, tol)
         };
         if let Some(s) = s {
             // The body may carry NURBS (exact-arc) faces, and a boolean against
@@ -32735,6 +32772,75 @@ mod tests {
         assert_eq!(add_distance_dim(&mut s, 9, 0), None);
     }
 
+    /// Run `f` on a worker thread and fail if it hasn't finished within `secs`.
+    ///
+    /// A runaway geometry kernel cannot be cancelled — truck's boolean spins inside native
+    /// code with no yield point — so the thread is ABANDONED rather than joined. It keeps
+    /// burning a core until the test process exits, which is the price of the suite
+    /// reporting a failure instead of hanging forever.
+    fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(v) => v,
+            Err(_) => panic!("{what} did not finish within {secs}s — the geometry kernel is running away"),
+        }
+    }
+
+    #[test]
+    fn a_circular_cut_never_hangs_the_exact_kernel() {
+        // Every circular cut used to wedge the app: `cut_op`'s first rung hands truck an
+        // exact-arc (NURBS) tool at tolerance 1e-4, and truck divides the resulting
+        // intersection curve with a depth-100 BINARY recursion — a tolerance its Newton
+        // projection can't reach fans out to ~2^100 subdivisions and never returns. No
+        // panic, no failure: the thread just spins (2400+ CPU-seconds and counting), and
+        // since `regenerate_reported` runs on the UI thread the whole app froze.
+        // `ARC_BOOL_MIN_TOL` keeps the exact-arc tool away from tolerances truck can't
+        // finish; the tight rungs run the faceted tool instead.
+        //
+        // A plain pocket in a plain slab — no snapped geometry, no hole to cross. That was
+        // enough to hang, so it is enough to guard.
+        let top = PlaneRef { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        let mut pocket = Sketch::default();
+        let c = pocket.add_point(15.0, 15.0);
+        pocket.add_circle(c, 5.0);
+        let mut doc = Document::with_default_planes();
+        doc.add_feature(FeatureKind::Extrude { sketch: rect_sketch(30.0, 30.0), regions: vec![], region_pts: vec![], plane: xy(), distance: 15.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.add_feature(FeatureKind::Cut { sketch: pocket, regions: vec![], region_pts: vec![], plane: top, distance: 2.5, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (solid, fails) = within(120, "exact rebuild of a circular pocket", move || regenerate_reported(&doc));
+        assert!(fails.is_empty(), "exact regen reported: {fails:?}");
+        let vol = tri_vol(&tessellate(&solid.expect("body"), 0.03).mesh);
+        let expect = 30.0 * 30.0 * 15.0 - std::f64::consts::PI * 25.0 * 2.5;
+        eprintln!("circular pocket volume {vol:.1} (expected {expect:.1})");
+        assert!((vol - expect).abs() < expect * 0.01, "pocket volume off: {vol:.1} vs {expect:.1}");
+    }
+
+    #[test]
+    fn exact_arc_tools_are_kept_away_from_tolerances_truck_cannot_finish() {
+        // The invariant behind `ARC_BOOL_MIN_TOL`, checked directly so a future edit to
+        // either boolean ladder can't quietly reintroduce the hang. Below the floor the
+        // annotations must come back EMPTY — that is what turns the NURBS tool into a
+        // faceted one; at or above it they must pass through untouched.
+        let spans = vec![hworks_geometry::ArcSpan { first_edge: 0, count: 64, center: [0.0, 0.0], radius: 5.0 }];
+        let holes = vec![spans.clone()];
+        for tol in [1.0e-4, 1.0e-3, 1.0e-2, 0.02, 0.049] {
+            let (o, h) = arcs_safe_at(tol, &spans, &holes);
+            assert!(o.is_empty() && h.is_empty(), "tol {tol} is below the floor — the tool must be faceted");
+        }
+        for tol in [ARC_BOOL_MIN_TOL, 0.1, 1.0] {
+            let (o, h) = arcs_safe_at(tol, &spans, &holes);
+            assert_eq!(o.len(), 1, "tol {tol} is safe — the exact arcs must survive");
+            assert_eq!(h.len(), 1, "tol {tol} is safe — the hole arcs must survive");
+        }
+        // Every rung of both ladders that uses the exact-arc tool must sit at or above the
+        // floor, or it is a hang waiting to happen.
+        assert!(ROBUST_TOL >= ARC_BOOL_MIN_TOL, "the ladders' loosest rung must still be able to use exact arcs");
+        assert!(COINCIDENT_TOL < ARC_BOOL_MIN_TOL, "the tight rung must run faceted");
+    }
+
     #[test]
     fn counterbore_snapped_to_hole_leaves_no_sliver_walls() {
         // The excut.hcad case: a slab with a through-hole (r=6), then a counterbore cut whose
@@ -32758,9 +32864,13 @@ mod tests {
         // The exact kernel may reject this cut outright (truck is fragile around a tool
         // crossing a hole) — the app then falls back to the mesh kernel, so the MESH result
         // is what must be clean. When the exact path does produce a body, hold it to the
-        // same standard.
-        let mut builds: Vec<(&str, TriMesh)> = vec![("mesh path", regenerate_mesh(&doc).expect("mesh body").0)];
-        if let (Some(solid), fails) = regenerate_reported(&doc) {
+        // same standard. Both rebuilds are time-bounded: this case once wedged truck's
+        // boolean forever (see `a_circular_cut_never_hangs_the_exact_kernel`), which took
+        // the whole suite down with it — a failure here must stay a failure, not a hang.
+        let (dm, de) = (doc.clone(), doc.clone());
+        let mut builds: Vec<(&str, TriMesh)> =
+            vec![("mesh path", within(180, "counterbore mesh rebuild", move || regenerate_mesh(&dm)).expect("mesh body").0)];
+        if let (Some(solid), fails) = within(180, "counterbore exact rebuild", move || regenerate_reported(&de)) {
             // A failing exact rebuild returns its PARTIAL body — the app discards it and
             // falls back to the mesh kernel, so only a CLEAN exact result gets judged here.
             if fails.is_empty() {
