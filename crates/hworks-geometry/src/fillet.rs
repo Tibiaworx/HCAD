@@ -1042,6 +1042,27 @@ fn is_piecewise_straight(chain: &[[f64; 3]]) -> bool {
     if n < 3 {
         return false;
     }
+    // An arc is SUSTAINED turning in one direction, not one big turn.
+    //
+    // This used to judge each vertex alone: a turn between ~5.7° and ~45° meant "arc". But a
+    // tessellated arc's per-facet turn shrinks as the tessellation gets finer — the junction rim
+    // in roundfilleterror.hcad turns only 2.8° per facet — so the test fell through and a smooth
+    // arc was declared piecewise straight. It was then split into a handful of long straight runs
+    // and filleted with one crisp cylinder each: faceted where it should curve, and the
+    // mismatched cylinders unioned into a non-manifold body.
+    //
+    // Accumulating same-sign turn is independent of how finely the arc is divided.
+    let mut nrm = [0.0; 3];
+    for i in 0..n {
+        let p = chain[i];
+        let q = chain[(i + 1) % n];
+        nrm[0] += (p[1] - q[1]) * (p[2] + q[2]);
+        nrm[1] += (p[2] - q[2]) * (p[0] + q[0]);
+        nrm[2] += (p[0] - q[0]) * (p[1] + q[1]);
+    }
+    let axis = if len(nrm) > 1e-9 { norm(nrm) } else { [0.0, 0.0, 1.0] };
+    const ARC_TOTAL: f64 = 0.26; // ~15° of accumulated bend is a curve, not tessellation noise
+    let (mut run, mut sign) = (0.0_f64, 0.0_f64);
     for i in 0..n {
         let a = chain[(i + n - 1) % n];
         let b = chain[i];
@@ -1049,9 +1070,26 @@ fn is_piecewise_straight(chain: &[[f64; 3]]) -> bool {
         if len(sub(b, a)) < 1e-9 || len(sub(c, b)) < 1e-9 {
             continue;
         }
-        let d = dot(norm(sub(b, a)), norm(sub(c, b)));
-        if d > 0.7 && d < 0.995 {
-            return false; // a gradual turn ⇒ an arc, not a corner
+        let (t_in, t_out) = (norm(sub(b, a)), norm(sub(c, b)));
+        let d = dot(t_in, t_out);
+        if d < 0.7 {
+            // A real corner: the bend so far belonged to the run that just ended.
+            run = 0.0;
+            sign = 0.0;
+            continue;
+        }
+        let ang = d.clamp(-1.0, 1.0).acos();
+        if ang < 1e-5 {
+            continue; // dead straight, and its turn direction is meaningless
+        }
+        let s = if dot(cross(t_in, t_out), axis) < 0.0 { -1.0 } else { 1.0 };
+        if s != sign {
+            run = 0.0;
+            sign = s;
+        }
+        run += ang;
+        if run > ARC_TOTAL {
+            return false; // sustained bend ⇒ an arc
         }
     }
     true
@@ -1875,5 +1913,60 @@ mod coil_tests {
     fn bore_cylinder_is_manifold() {
         let cyl = make_cylinder([0.0, 0.0, 20.2], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 2.5, 9.8, 48);
         assert!(crate::mesh_bool::is_manifold(&cyl), "bore cylinder mesh is not 2-manifold");
+    }
+
+    /// A curve must not read as "piecewise straight" just because it is finely tessellated.
+    ///
+    /// The test used to judge each vertex alone — a turn between ~5.7° and ~45° meant "arc" — so
+    /// an arc's per-facet turn fell below the window as soon as the tessellation got good. The
+    /// junction rim in roundfilleterror.hcad turns 2.8° per facet, was declared straight, and was
+    /// then filleted as a handful of long cylinders: faceted where it should curve, and
+    /// non-manifold where the mismatched cylinders met.
+    #[test]
+    fn a_finely_tessellated_arc_is_not_mistaken_for_a_straight_run() {
+        let arc = |r: f64, n: usize, sweep: f64| -> Vec<[f64; 3]> {
+            (0..n).map(|k| {
+                let t = sweep * k as f64 / (n - 1) as f64;
+                [r * t.cos(), r * t.sin(), 0.0]
+            }).collect()
+        };
+        // A full circle, at tessellations from coarse to very fine. Every one is a curve.
+        for n in [12usize, 24, 48, 96, 192] {
+            let ring: Vec<[f64; 3]> = arc(10.0, n + 1, std::f64::consts::TAU)[..n].to_vec();
+            assert!(!is_piecewise_straight(&ring), "a {n}-facet circle read as piecewise straight");
+        }
+        // A genuine polygon still does — that is what the classification is FOR. (Not an octagon:
+        // its 45° turn sits exactly on the "is this a corner" threshold, so it read as a curve
+        // before this change too. Left alone rather than quietly retuned here.)
+        for sides in [3usize, 4, 6] {
+            let poly: Vec<[f64; 3]> = (0..sides)
+                .map(|k| {
+                    let t = std::f64::consts::TAU * k as f64 / sides as f64;
+                    [10.0 * t.cos(), 10.0 * t.sin(), 0.0]
+                })
+                .collect();
+            assert!(is_piecewise_straight(&poly), "a {sides}-gon was not seen as piecewise straight");
+        }
+        // The case from the file: a closed rim of two arcs joined by two straight radial ends —
+        // an annular sector. It contains curves, so it is not piecewise straight.
+        let mut rim: Vec<[f64; 3]> = Vec::new();
+        let sweep = 2.0;
+        for p in arc(12.5, 60, sweep) {
+            rim.push(p);
+        }
+        for p in arc(9.5, 60, sweep).into_iter().rev() {
+            rim.push(p);
+        }
+        assert!(!is_piecewise_straight(&rim), "an annular-sector rim read as piecewise straight");
+        // ...and a rectangle of the same point count still does, however finely its SIDES are
+        // subdivided — subdivision alone must not change the answer either way.
+        let mut rect: Vec<[f64; 3]> = Vec::new();
+        for (a, b) in [([0.0, 0.0], [20.0, 0.0]), ([20.0, 0.0], [20.0, 8.0]), ([20.0, 8.0], [0.0, 8.0]), ([0.0, 8.0], [0.0, 0.0])] {
+            for k in 0..30 {
+                let t = k as f64 / 30.0;
+                rect.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, 0.0]);
+            }
+        }
+        assert!(is_piecewise_straight(&rect), "a finely subdivided rectangle stopped reading as straight");
     }
 }

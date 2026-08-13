@@ -25979,18 +25979,19 @@ mod tests {
         let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
         for (label, picked) in [("open (old doc, wrap-healed)", vec![open]), ("closed (new store)", vec![shut])] {
             let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
-            // A rim on a tessellated curved wall must DECLINE the mesh surgery (its per-facet
-            // strips crease into a striped/notched surface) and take the smooth CSG round instead.
-            assert!(beveled.is_none(), "{label}: curved-wall rim must decline surgery");
+            // The mesh surgery must TAKE this rim. It used to be refused on the grounds that a
+            // tessellated curved wall creases its per-facet strips into a striped, notched
+            // surface — which is measured right below, and does not happen.
+            let body = beveled.unwrap_or_else(|| panic!("{label}: the surgery declined a curved-wall rim"));
+            assert!(hworks_geometry::is_manifold(&body), "{label}: the filleted cylinder is not manifold");
             assert_eq!(fe.len(), 2 * n, "{label}: expected two complete {n}-segment seam rings, got {}", fe.len());
-            let body = round_mesh(&cyl, fr, &picked).expect("CSG round");
             let tess = mesh_tessellation(body);
-            // The CSG body must be SMOOTH: sharp edges ≈ the untouched bottom rim plus a few CSG
-            // tessellation creases (~2n). The failure mode this guards is the creased/striped
-            // surgery output, which shows up as ~20n sharp edges — an order of magnitude apart.
+            // SMOOTH: the only sharp edges left are the untouched bottom rim. The striped failure
+            // mode shows up here as ~20n sharp edges — more than an order of magnitude apart, so
+            // this is the assertion that would catch a regression to it.
             assert!(
-                tess.edges.len() <= n * 3,
-                "{label}: body should be smooth (~{n} bottom-rim edges), got {} sharp edges",
+                tess.edges.len() <= n + 4,
+                "{label}: the fillet band should add no sharp edges (~{n} bottom-rim only), got {}",
                 tess.edges.len()
             );
             let kept = clip_edges_to_mesh(&fe, &tess.mesh, 0.01);
@@ -32169,6 +32170,217 @@ mod tests {
                 runs.iter().all(|(_, l)| *l == first),
                 "n={n}: the tangent walk gave different answers at different rotations: {runs:?}"
             );
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_round -- --ignored --nocapture
+    fn diag_fillet_round() {
+        // Is a Fillet actually ROUND? Probe the surface across each picked edge and compare the
+        // profile against the circular arc it is supposed to be, and report which engine ran.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let text = std::fs::read_to_string(&path).expect("read file");
+        let doc: Document = ron::from_str(&text).expect("parse");
+        // The body just BEFORE the fillet, and the fillet's own parameters.
+        let fi = doc.features.iter().position(|f| matches!(f.kind, FeatureKind::Fillet { .. })).expect("a fillet");
+        let FeatureKind::Fillet { radius, edges } = &doc.features[fi].kind else { unreachable!() };
+        eprintln!("fillet r={radius}  picked edges={}", edges.len());
+        for (i, e) in edges.iter().enumerate() {
+            let n = e.len();
+            let len = if n >= 2 {
+                let (a, b) = (e[0], e[n - 1]);
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+            } else {
+                0.0
+            };
+            eprintln!("  edge {i}: {n} pts, span {len:.3}");
+        }
+        let mut before = doc.clone();
+        before.rollback = fi;
+        let (pre, _) = regenerate_mesh(&before).expect("body before the fillet");
+        eprintln!("before: {} tris, manifold={}", pre.indices.len() / 3, hworks_geometry::is_manifold(&pre));
+
+        let seg = ((radius * 6.0).round() as usize).clamp(3, 12);
+        let (surgery, _) = hworks_geometry::bevel_mesh_and_edges(&pre, *radius, seg, edges);
+        eprintln!("mesh-surgery bevel: {}", match &surgery {
+            Some(m) => format!("OK, {} tris, manifold={}", m.indices.len() / 3, hworks_geometry::is_manifold(m)),
+            None => "FAILED → falls back to the CSG round".into(),
+        });
+
+        let (after, _) = regenerate_mesh(&doc).expect("body after");
+        eprintln!("after:  {} tris, manifold={}", after.indices.len() / 3, hworks_geometry::is_manifold(&after));
+
+        // A fillet removes material, so the volume must DROP by roughly the amount the rounding
+        // takes off — a fillet that did nothing, or one that ate the part, both show up here.
+        let vol = |m: &hworks_geometry::TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let p = |i: u32| m.positions[i as usize].map(|x| x as f64);
+                let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                v += (a[0] * (b[1] * c[2] - c[1] * b[2]) - a[1] * (b[0] * c[2] - c[0] * b[2]) + a[2] * (b[0] * c[1] - c[0] * b[1])) / 6.0;
+            }
+            v.abs()
+        };
+        eprintln!("volume {:.3} → {:.3}  (removed {:.3})", vol(&pre), vol(&after), vol(&pre) - vol(&after));
+
+        // ROUND or CHAMFER? Sweep the boundary around the corner and measure its distance from
+        // where the fillet's axis should be. A true round sits at exactly r for every angle; a
+        // flat chamfer bulges out in the middle of the sweep. (A single diagonal probe cannot tell
+        // them apart — both cross the diagonal at r(√2−1) from the corner.)
+        {
+            let r = *radius as f32;
+            // The axis-aligned edge: x = 0, y = 12.217, z from −12.5 to −9.5. Air is −X/+Y.
+            let p0 = Vec3::new(0.0, 12.2171173, -11.0);
+            let centre = p0 + Vec3::new(-r, r, 0.0);
+            let mut hits = Vec::new();
+            for k in 0..=8 {
+                let th = (k as f32 / 8.0) * std::f32::consts::FRAC_PI_2;
+                let dir = Vec3::new(th.sin(), -th.cos(), 0.0);
+                let mut boundary = f32::NAN;
+                for j in 1..=400 {
+                    let t = j as f32 * (r * 2.0 / 400.0);
+                    if point_inside_mesh(&after, centre + dir * t) {
+                        boundary = t;
+                        break;
+                    }
+                }
+                hits.push(boundary);
+            }
+            eprintln!("  boundary radius around the corner (want {r:.2} at every angle):");
+            eprintln!("    {}", hits.iter().map(|h| format!("{h:.2}")).collect::<Vec<_>>().join("  "));
+            let good: Vec<f32> = hits.iter().copied().filter(|h| h.is_finite()).collect();
+            if let (Some(lo), Some(hi)) = (
+                good.iter().copied().reduce(f32::min),
+                good.iter().copied().reduce(f32::max),
+            ) {
+                eprintln!("    spread {:.3} (a flat chamfer would bulge ~{:.2} in the middle)", hi - lo, r * (2.0f32.sqrt() - 1.0));
+            }
+        }
+
+        // Probe the PROFILE across the corner. Walk out along the diagonal from a point on the
+        // picked edge into the air quadrant: the surface should cross at the fillet arc, so the
+        // last solid sample sits at distance r from the arc centre. A square corner shows as the
+        // material stopping right at the corner, whatever the radius.
+        for (i, e) in edges.iter().enumerate() {
+            if e.len() < 2 {
+                continue;
+            }
+            let n = e.len();
+            let mid = Vec3::new(
+                ((e[0][0] + e[n - 1][0]) * 0.5) as f32,
+                ((e[0][1] + e[n - 1][1]) * 0.5) as f32,
+                ((e[0][2] + e[n - 1][2]) * 0.5) as f32,
+            );
+            // The two face directions at this corner: up (+Y, off the ring top) and the two
+            // in-plane normals of the edge. Find which in-plane side is air above the top.
+            let dir = {
+                let a = Vec3::new(e[0][0] as f32, e[0][1] as f32, e[0][2] as f32);
+                let b = Vec3::new(e[n - 1][0] as f32, e[n - 1][1] as f32, e[n - 1][2] as f32);
+                (b - a).normalize_or_zero()
+            };
+            let side = dir.cross(Vec3::Y).normalize_or_zero();
+            for s in [side, -side] {
+                let probe = |t: f32| mid + (s + Vec3::Y).normalize() * t;
+                // Only the quadrant that was AIR before the fillet is interesting.
+                if point_inside_mesh(&pre, probe(0.35)) {
+                    continue;
+                }
+                let mut last_solid = 0.0f32;
+                let mut steps = 0;
+                for k in 1..=120 {
+                    let t = k as f32 * 0.1;
+                    if point_inside_mesh(&after, probe(t)) {
+                        last_solid = t;
+                        steps += 1;
+                    }
+                }
+                eprintln!(
+                    "  edge {i} side {:?}: material reaches {last_solid:.2} along the diagonal ({steps} solid samples) — a round r={radius:.2} fillet should reach {:.2}",
+                    (s.x.round(), s.z.round()),
+                    (*radius as f32) * (2.0f32.sqrt() - 1.0)
+                );
+            }
+        }
+
+        // What a plain click on the ARC part of the same junction would give. If that declines,
+        // then nothing the user can pick along the curved part of the rim ever produces a fillet,
+        // and the straight ends are the only thing that visibly rounds — which is exactly the
+        // "it fillets at 90° instead of round" report.
+        {
+            let t2 = hworks_geometry::mesh_tessellation(pre.clone());
+            let y = edges[0][0][1] as f32;
+            let arc_seed = (0..t2.edges.len()).find(|&i| {
+                let s = t2.edges[i];
+                let flat = (s[0][1] - y).abs() < 1e-3 && (s[1][1] - y).abs() < 1e-3;
+                let d = Vec3::from_array(s[0]).distance(Vec3::from_array(s[1]));
+                flat && d < 1.0 // a tessellation facet, not one of the long straight ends
+            });
+            match arc_seed {
+                Some(si) => {
+                    let (chain, closed) = edge_chain(&t2.edges, si);
+                    let pts: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+                    let (m, _) = hworks_geometry::bevel_mesh_and_edges(&pre, *radius, seg, std::slice::from_ref(&pts));
+                    let csg = hworks_geometry::round_mesh(&pre, *radius, std::slice::from_ref(&pts));
+                    let q = m.as_ref().map(|b| (vol(b) - vol(&pre), hworks_geometry::is_manifold(b), hworks_geometry::mesh_tessellation(b.clone()).edges.len()));
+                    let base = hworks_geometry::mesh_tessellation(pre.clone()).edges.len();
+                    eprintln!(
+                        "plain click on the ARC: {} pts closed={closed} → surgery {}, CSG {} | {:?} (baseline sharp {base}; concave should ADD volume)",
+                        chain.len(),
+                        if m.is_some() { "OK" } else { "declined" },
+                        if csg.is_some() { "OK" } else { "declined" },
+                        q
+                    );
+                }
+                None => eprintln!("plain click on the ARC: no arc facet found at y={y}"),
+            }
+        }
+
+        // What the WHOLE junction loop would give instead of the picked fragments — the answer to
+        // "should I have Ctrl+clicked?". Take the loop through the first picked edge and fillet it.
+        let tess = hworks_geometry::mesh_tessellation(pre.clone());
+        // Match on the picked segment's MIDPOINT, and break ties by coordinate so the seed is the
+        // same on every run — the tessellator's edge order is not stable, and a seed picked by
+        // `min_by` over ties silently jumped between loops from one run to the next.
+        let seed = (edges[0].len() >= 2).then(|| {
+            let e = &edges[0];
+            let m = |p: [f64; 3], q: [f64; 3]| Vec3::new(((p[0] + q[0]) * 0.5) as f32, ((p[1] + q[1]) * 0.5) as f32, ((p[2] + q[2]) * 0.5) as f32);
+            let want = m(e[0], e[e.len() - 1]);
+            let key = |k: usize| {
+                let s = tess.edges[k];
+                let mid = m([s[0][0] as f64, s[0][1] as f64, s[0][2] as f64], [s[1][0] as f64, s[1][1] as f64, s[1][2] as f64]);
+                (mid.distance(want), mid.x, mid.y, mid.z)
+            };
+            (0..tess.edges.len())
+                .min_by(|&i, &j| {
+                    let (a, b) = (key(i), key(j));
+                    a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.total_cmp(&b.2)).then(a.3.total_cmp(&b.3))
+                })
+                .unwrap()
+        });
+        if let Some(si) = seed {
+            let (loop_pts, closed) = edge_loop(&tess.edges, si);
+            eprintln!("whole-loop alternative: {} pts closed={closed}", loop_pts.len());
+            let chain: Vec<[f64; 3]> = loop_pts.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
+            let (surg, _) = hworks_geometry::bevel_mesh_and_edges(&pre, *radius, seg, std::slice::from_ref(&chain));
+            match surg {
+                Some(m) => {
+                    // Smoothness: a striped/notched band shows up as a mass of sharp edges. The
+                    // untouched rims of the part are the baseline.
+                    let base = hworks_geometry::mesh_tessellation(pre.clone()).edges.len();
+                    let now = hworks_geometry::mesh_tessellation(m.clone()).edges.len();
+                    eprintln!(
+                        "  surgery OK: {} tris, manifold={}, volume {:.3} (added {:.3}), sharp edges {base} → {now}",
+                        m.indices.len() / 3,
+                        hworks_geometry::is_manifold(&m),
+                        vol(&m),
+                        vol(&m) - vol(&pre)
+                    );
+                }
+                None => match hworks_geometry::round_mesh(&pre, *radius, std::slice::from_ref(&chain)) {
+                    Some(m) => eprintln!("  CSG round: {} tris, manifold={}, volume {:.3}", m.indices.len() / 3, hworks_geometry::is_manifold(&m), vol(&m)),
+                    None => eprintln!("  CSG round FAILED too"),
+                },
+            }
         }
     }
 
