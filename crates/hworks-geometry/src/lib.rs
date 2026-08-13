@@ -3216,6 +3216,71 @@ pub fn shell_tool(body: &TriMesh, thickness: f64, open: &[([f64; 3], [f64; 3])],
 mod tests {
     use super::*;
 
+    /// Diagnostic: where is the tolerance cliff below which truck's boolean runs away on an
+    /// exact-arc (NURBS) tool? This is how `hworks-app`'s `ARC_BOOL_MIN_TOL` was chosen —
+    /// re-run it after a truck upgrade to re-derive the floor. Run with:
+    ///   cargo test -p hworks-geometry diag_nurbs_boolean_runaway -- --ignored --nocapture
+    ///
+    /// Each case runs on its own thread: a runaway boolean cannot be cancelled, so the
+    /// thread is abandoned (it spins until the process exits) rather than joined.
+    #[test]
+    #[ignore]
+    fn diag_nurbs_boolean_runaway() {
+        let basis = PlaneBasis { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        // A 30x30 slab, all lines, as the base body.
+        let slab: Vec<[f64; 2]> = vec![[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]];
+        let base_basis = PlaneBasis { origin: [0.0, 0.0, 0.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        // A circle tessellated to `n` points, annotated as one full-circle arc span.
+        let circle = |cx: f64, cy: f64, r: f64, n: usize| -> (Vec<[f64; 2]>, Vec<ArcSpan>) {
+            let pts = (0..n)
+                .map(|k| {
+                    let a = std::f64::consts::TAU * k as f64 / n as f64;
+                    [cx + r * a.cos(), cy + r * a.sin()]
+                })
+                .collect();
+            (pts, vec![ArcSpan { first_edge: 0, count: n, center: [cx, cy], radius: r }])
+        };
+        let run = |label: String, f: Box<dyn FnOnce() -> String + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || { let _ = tx.send(f()); });
+            match rx.recv_timeout(std::time::Duration::from_secs(45)) {
+                Ok(m) => eprintln!("  OK      {label}: {m}"),
+                Err(_) => eprintln!("  RUNAWAY {label} (>45s)"),
+            }
+        };
+        // The sweep that located the cliff: everything at or below 0.005 ran away; 0.01 came
+        // back in 21 s, 0.02 in 14 s, 0.05 in 10 s (debug build).
+        for tol in [1.0e-4_f64, 2.0e-4, 5.0e-4, 1.0e-3, 2.0e-3, 5.0e-3, 1.0e-2, 0.02, 0.05] {
+            let base = extrude_solid_arcs(&slab, &[], &[], &[], &base_basis, 15.0).expect("slab");
+            let (pts, arcs) = circle(15.0, 15.0, 11.25, 64);
+            let b = basis.clone();
+            run(format!("cut NURBS disc tol={tol}"), Box::new(move || {
+                let t0 = std::time::Instant::now();
+                let r = cut_tol_arcs(&base, &pts, &[], &arcs, &[], &b, -2.5, 0.0, tol).is_some();
+                format!("some={r} in {:?}", t0.elapsed())
+            }));
+        }
+        // Same disc as a plain faceted tool (no arc annotations) — the control.
+        for tol in [1.0e-4_f64, 0.05] {
+            let base = extrude_solid_arcs(&slab, &[], &[], &[], &base_basis, 15.0).expect("slab");
+            let (pts, _) = circle(15.0, 15.0, 11.25, 128);
+            let b = basis.clone();
+            run(format!("cut FACETED disc n=128 tol={tol}"), Box::new(move || {
+                format!("some={}", cut_tol(&base, &pts, &[], &b, -2.5, 0.0, tol).is_some())
+            }));
+        }
+        // A NURBS boss union onto the slab.
+        for tol in [1.0e-4_f64, 0.02] {
+            let base = extrude_solid_arcs(&slab, &[], &[], &[], &base_basis, 15.0).expect("slab");
+            let (pts, arcs) = circle(15.0, 15.0, 5.0, 64);
+            let b = PlaneBasis { origin: [0.0, 0.0, 15.0], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+            run(format!("union NURBS boss tol={tol}"), Box::new(move || {
+                let boss = extrude_solid_arcs(&pts, &[], &arcs, &[], &b, 5.0).expect("boss");
+                format!("some={}", union_tol(&base, &boss, tol).is_some())
+            }));
+        }
+    }
+
     /// Diagnostic: load a real scan and report why it won't cut. Run with:
     ///   cargo test -p hworks-geometry diag_scan_topology -- --ignored --nocapture
     #[test]
