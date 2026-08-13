@@ -27532,7 +27532,7 @@ mod tests {
         let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], h]).collect();
         rim.push(rim[0]);
         let picked = vec![rim];
-        // Fillet the rim exactly like regen: surgery (declines on curved walls) → CSG round.
+        // Fillet the rim exactly like regen: surgery, with the CSG round as the fallback.
         let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, ((fr * 6.0) as usize).clamp(3, 12), &picked);
         let body = beveled.unwrap_or_else(|| round_mesh(&cyl, fr, &picked).expect("csg round"));
         // Slot cut straight through the top, like the user's Cut-Extrude2: a 4-wide rectangle

@@ -799,40 +799,6 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
 /// cylinder strip per selected edge, and a fanned patch per corner. `None` if the result isn't
 /// watertight (a partial-vertex T-junction the prototype can't split → caller falls back to CSG).
 fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64, seg: usize) -> Option<TriMesh> {
-    // Decline a CONCAVE edge that runs along a tessellated curved wall.
-    //
-    // This guard used to fire for any selected edge merely TOUCHING a near-tangent (facet-seam)
-    // edge — that is, any rim on or even adjacent to a curved wall — because the per-facet strips
-    // were said to crease into a striped, notched surface. On convex rims that is no longer true:
-    // measured on a 32-gon cylinder's top rim at radii from 0.2 to 3.5, the surgery holds the
-    // ideal torus to 0.12% of r, removes the exact Pappus volume to within 0.1%, and leaves the
-    // band with no sharp edges at all. Refusing those was costing every curved-wall fillet the good
-    // engine and pushing it onto a CSG path that cannot do a rim mixing arcs with corners.
-    //
-    // CONCAVE curved edges are a different matter and still go wrong: on roundfilleterror2.hcad's
-    // boss-base rim the surgery REMOVED 61 units of material where a concave fillet must add, and
-    // trebled the sharp-edge count — the striping the guard was written for. So the guard now
-    // asks the two questions that actually matter, rather than one that stands in for both:
-    // is this edge concave, and does it lie on a curved wall?
-    let cos_facet = 20.0_f64.to_radians().cos();
-    for (ei, e) in topo.edges.iter().enumerate() {
-        if !selected[ei] || edge_sign(topo, e) <= 0 {
-            continue; // unselected, or convex — the surgery is good on those
-        }
-        for &v in &[e.a, e.b] {
-            for &oi in &topo.vert_edges[v] {
-                if oi == ei || selected[oi] {
-                    continue;
-                }
-                let o = &topo.edges[oi];
-                if o.faces.len() == 2
-                    && dot(topo.faces[o.faces[0]].normal, topo.faces[o.faces[1]].normal) > cos_facet
-                {
-                    return None;
-                }
-            }
-        }
-    }
     let verts = &topo.verts;
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
     let mut b = Build::new();
@@ -1680,15 +1646,18 @@ mod tests {
         assert_eq!(long_count, 0, "no spurious long feature edges (longest {longest:.2})");
     }
 
-    /// The curved-wall guard asks two questions, not one: is the edge CONCAVE, and does it lie on
-    /// a tessellated curved wall? Only both together are refused.
+    /// A rim on a tessellated curved wall fillets the right way round whichever way it bends:
+    /// convex rims lose material, concave rims gain it, and both go through the surgery.
     ///
-    /// It used to refuse on the second alone, which cost every convex curved rim the good engine
-    /// (see `fillet_cylinder_top_rim` for how accurate that engine actually is). Dropping it
-    /// altogether is no good either: on a concave curved rim the surgery removes material where a
-    /// fillet must add it, and covers the band in creases.
+    /// This used to assert the concave half DECLINED — there was a guard in `run_surgery` that
+    /// refused exactly this shape. The guard began life refusing *any* rim on a curved wall, on the
+    /// belief that per-facet strips crease into a striped band; that was disproved for convex rims
+    /// (`fillet_cylinder_top_rim`) and the guard was narrowed to concave ones. It is now gone
+    /// altogether: the concave case is as accurate as the convex one — see
+    /// `a_concave_curved_rim_fills_the_corner`, which measures the volume, the surface and the
+    /// creasing.
     #[test]
-    fn a_concave_curved_rim_declines_but_a_convex_one_does_not() {
+    fn a_curved_rim_fillets_the_right_way_round_whichever_way_it_bends() {
         let n = 32;
         let circ = |cx: f64, cy: f64, r: f64| -> Vec<[f64; 2]> {
             (0..n)
@@ -1721,35 +1690,29 @@ mod tests {
             }
             v.abs()
         };
-        // Convex top rim (z = 10): taken, and it REMOVES material.
+        // Convex top rim (z = 12): taken, and it REMOVES material.
         let top = bevel_mesh_selected(&body, 0.7, 12, &ring(12.0)).expect("a convex curved rim must be filleted by the surgery");
         assert!(crate::mesh_bool::is_manifold(&top), "the convex rim fillet is not manifold");
         assert!(vol(&top) < vol(&body), "rounding a convex rim must remove material, not add it");
 
-        // Concave base rim (z = 4): declined, so the caller takes the CSG round. Accepting it is
-        // the regression this guards — the surgery gets the sign of the fillet wrong there.
-        assert!(
-            bevel_mesh_selected(&body, 0.7, 12, &ring(5.0)).is_none(),
-            "a concave curved rim must decline the surgery"
-        );
-        // Either way the feature edges are still emitted, so the rim stays selectable.
+        // Concave base rim (z = 5): also taken, and it ADDS material — the fillet fills the notch
+        // where the boss meets the plate instead of cutting into it.
+        let base = bevel_mesh_selected(&body, 0.7, 12, &ring(5.0)).expect("a concave curved rim must be filleted by the surgery");
+        assert!(crate::mesh_bool::is_manifold(&base), "the concave rim fillet is not manifold");
+        assert!(vol(&base) > vol(&body), "rounding a concave rim must add material, not remove it");
+        // Either way the feature edges are emitted, so the rim stays selectable.
         assert!(bevel_feature_edges(&body, 0.7, &ring(5.0)).len() > n, "the concave rim's seam edges must still be emitted");
     }
 
-    /// TARGET, not yet met: the surgery should fillet a CONCAVE rim on a curved wall.
+    /// The surgery fillets a CONCAVE rim on a curved wall: the circular junction where a raised
+    /// feature meets the part below it (the boss-base rim from roundfilleterror{,2,3}.hcad).
     ///
-    /// This is the boss-base rim from roundfilleterror{,2,3}.hcad, reduced. The surgery gets it
-    /// wrong today — on the real file it took 61 units of material OUT of a corner a fillet must
-    /// fill — so `run_surgery` declines it (see the guard there) and the CSG round cannot do a rim
-    /// that mixes arcs with corners either. That leaves no way to round the circular junction
-    /// where a raised feature meets the part below it.
-    ///
-    /// The numbers below are exact, so this test is the acceptance criterion: un-ignore it, drop
-    /// the concave half of the guard, and make it pass. Concave+STRAIGHT already works, and
-    /// convex+curved is verified by `fillet_cylinder_top_rim` — so the fault is in the corner
-    /// patches between consecutive concave facets along a curve.
+    /// `run_surgery` used to decline this shape outright, and the CSG round cannot do a rim mixing
+    /// arcs with corners either, so there was no way at all to round such a junction. The three
+    /// measurements below are the ones that would catch the failure it was declined for — a fillet
+    /// of the wrong sign (material taken OUT of the corner), a band that misses the true fillet
+    /// surface, and the creasing that a striped, per-facet band shows as.
     #[test]
-    #[ignore = "the surgery cannot do concave edges on a curved wall yet — this is the target"]
     fn a_concave_curved_rim_fills_the_corner() {
         let n = 32;
         let circ: Vec<[f64; 2]> = (0..n)
@@ -1788,6 +1751,104 @@ mod tests {
         let got = vol(&m) - vol(&body);
         assert!(got > 0.0, "a concave fillet must ADD material; this removed {:.3}", -got);
         assert!((got - want).abs() < want * 0.02, "added {got:.4}, the exact answer is {want:.4}");
+
+        // ...and the band it adds is the actual fillet surface, not just the right amount of
+        // material: every vertex inside the band's box lies on the ideal concave torus (axis circle
+        // radius 4+r at z=5+r, tube radius r). Measures 0.12% of r — the same fidelity the convex
+        // rim holds in `fillet_cylinder_top_rim`.
+        let mut worst = 0.0f64;
+        for q in &m.positions {
+            let (x, y, z) = (q[0] as f64 - 10.0, q[1] as f64 - 10.0, q[2] as f64);
+            let d = (x * x + y * y).sqrt();
+            if !(5.0 - 1e-6..=5.0 + r + 1e-6).contains(&z) || !(4.0 - 1e-6..=4.0 + r + 1e-6).contains(&d) {
+                continue; // outside the fillet band's box — plain wall or plate top
+            }
+            let (ax, ay) = ((4.0 + r) * x / d.max(1e-12), (4.0 + r) * y / d.max(1e-12));
+            worst = worst.max((((x - ax).powi(2) + (y - ay).powi(2) + (z - (5.0 + r)).powi(2)).sqrt() - r).abs());
+        }
+        assert!(worst < r * 0.02, "the concave band strays {worst:.4} from the ideal torus");
+
+        // No striping: a band creased into per-facet strips shows up as a mass of sharp display
+        // edges (the symptom this shape was declined for was the count trebling). A real fillet
+        // does the opposite — it REPLACES the rim's own sharp ring with a smooth band, so the
+        // count falls (76 → 44 here).
+        let before = crate::mesh_tessellation(body.clone()).edges.len();
+        let after = crate::mesh_tessellation(m.clone()).edges.len();
+        assert!(after <= before, "the fillet added sharp edges ({before} → {after}) — the band is striped");
+    }
+
+    /// roundfilleterror2.hcad's shape: a flat ring (annulus 5..8, z 0..2) with a quarter-annulus
+    /// sector standing on it (z 2..6.5), walls flush. The junction loop mixes two CONCAVE straight
+    /// radial edges with the ring top's two CONVEX 270° arcs.
+    fn ring_and_sector() -> (TriMesh, Vec<Vec<[f64; 3]>>) {
+        let n = 128;
+        let pt = |i: usize, rad: f64| -> [f64; 2] {
+            let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+            [rad * a.cos(), rad * a.sin()]
+        };
+        let ring_o: Vec<[f64; 2]> = (0..n).map(|i| pt(i, 8.0)).collect();
+        let ring_i: Vec<[f64; 2]> = (0..n).map(|i| pt(i, 5.0)).collect();
+        let ring = extrude_tool_mesh(&ring_o, &[ring_i.iter().rev().copied().collect()], &xy(), 0.0, 2.0).unwrap();
+        // Quarter sector, 0°..90°, on the same tessellation so its walls are flush with the ring's.
+        let q = n / 4;
+        let mut sect: Vec<[f64; 2]> = (0..=q).map(|i| pt(i, 8.0)).collect();
+        sect.extend((0..=q).rev().map(|i| pt(i, 5.0)));
+        let sector = extrude_tool_mesh(&sect, &[], &xy(), 2.0, 4.5).unwrap();
+        let body = crate::mesh_union(&ring, &sector);
+        // The junction loop at z=2: outer 270° arc, straight radial at 0°, inner 270° arc,
+        // straight radial at 90° — as four picked polylines.
+        let at = |i: usize, rad: f64| { let p = pt(i, rad); [p[0], p[1], 2.0] };
+        let picked = vec![
+            (q..=n).map(|i| at(i, 8.0)).collect::<Vec<_>>(),
+            (q..=n).map(|i| at(i, 5.0)).collect::<Vec<_>>(),
+            vec![at(0, 5.0), at(0, 8.0)],
+            vec![at(q, 5.0), at(q, 8.0)],
+        ];
+        (body, picked)
+    }
+
+    /// The junction loop of roundfilleterror2.hcad, which the curved-wall guard used to refuse:
+    /// two CONCAVE straight radial edges and two CONVEX 270° arcs picked as one selection. Each
+    /// piece must pull its own way — the arcs cutting material off the ring's rims, the straights
+    /// filling the notch under the sector — so the total is the signed Pappus sum of the four.
+    ///
+    /// (The whole loop was once read as evidence the surgery had the sign of a concave fillet
+    /// wrong, on a measurement of about −61 at r=2.2. It doesn't: the two convex arcs simply
+    /// outweigh the two short straights, and −57 is what this loop is supposed to give.)
+    #[test]
+    fn mixed_convex_and_concave_junction_loop_fillets() {
+        let (body, picked) = ring_and_sector();
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let pi = std::f64::consts::PI;
+        // Radii up to the ring's own 2.0 wall height. Past that the fillet is taller than the
+        // feature it stands on and the pieces run into each other — the volume stays right, but
+        // the band self-creases, which is the geometry being impossible rather than the surgery
+        // going wrong.
+        for &r in &[0.5f64, 1.0, 1.5, 1.9] {
+            let area = r * r * (1.0 - pi / 4.0);
+            let ubar = r * (5.0 / 6.0 - pi / 4.0) / (1.0 - pi / 4.0);
+            // Pappus per piece: the convex arcs remove, the concave straights add.
+            let outer = -1.5 * pi * (8.0 - ubar) * area;
+            let inner = -1.5 * pi * (5.0 + ubar) * area;
+            let straights = 2.0 * area * 3.0;
+            let want = outer + inner + straights;
+            let m = bevel_mesh_selected(&body, r, 12, &picked)
+                .unwrap_or_else(|| panic!("r={r}: the surgery declined the mixed junction loop"));
+            assert!(crate::mesh_bool::is_manifold(&m), "r={r}: the filleted junction is not manifold");
+            let got = vol(&m) - vol(&body);
+            assert!(
+                (got - want).abs() < want.abs() * 0.02,
+                "r={r}: the loop moved {got:+.4}, the signed sum of its four pieces is {want:+.4} \
+                 (outer arc {outer:+.3}, inner arc {inner:+.3}, straights {straights:+.3})"
+            );
+        }
     }
 
     #[test]
