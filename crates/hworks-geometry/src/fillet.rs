@@ -1,16 +1,24 @@
 //! Edge rounding (fillet) for triangle meshes.
 //!
-//! Two strategies:
+//! Three strategies, in the order [`round_mesh`] tries them:
 //!
 //!  * **Boolean rolling-ball** ([`fillet_boolean`]) for *picked* edges between flat faces:
 //!    a cylinder of radius `r` tangent to both faces replaces the sharp corner. We carve
 //!    `(corner-triangle prism − cylinder)` out of the body with Manifold, so the cylinder
-//!    arc becomes the new surface — an exact, crisp CAD-style fillet.
+//!    arc becomes the new surface — an exact, crisp CAD-style fillet. A circular rim gets
+//!    the same treatment from a torus.
 //!
-//!  * **SDF blur** ([`round_mesh`] fallback) when no edges are given (a global round) or
-//!    the boolean path can't handle an edge: sample the signed-distance field on a voxel
-//!    grid, Gaussian-blur it by the radius (flat faces stay put, edges round to ≈ r), and
-//!    re-extract the surface with surface nets.
+//!  * **Swept cross-section** ([`fillet_swept`]) for a curve: the same rolling-ball
+//!    cross-section swept along the rim, so it follows the curve instead of being faceted
+//!    into straight runs. Exact, and one boolean however long the pick. Takes closed rims
+//!    (a slot, a rounded rectangle) and open arcs — part of a rim — alike.
+//!
+//!  * **SDF blur** ([`sdf_round`], via [`local_round`]) when no edges are given (a global
+//!    round) or an edge fits none of the above — not planar, or mixing arcs with sharp
+//!    corners: sample the signed-distance field on a voxel grid, Gaussian-blur it by the
+//!    radius (flat faces stay put, edges round to ≈ r), and re-extract with surface nets.
+//!    This one is approximate and can fail badly; `round_mesh` weighs its answer against
+//!    what a fillet is worth and drops it if it has gouged the part.
 
 use crate::TriMesh;
 use std::collections::HashMap;
@@ -257,6 +265,19 @@ fn fill_normals(m: &mut TriMesh) {
         }
     }
     m.normals = normals;
+}
+
+/// Enclosed volume of a closed mesh (the divergence-theorem sum over its triangles).
+fn mesh_volume(m: &TriMesh) -> f64 {
+    let mut vol = 0.0;
+    for t in m.indices.chunks_exact(3) {
+        let p = |i: u32| {
+            let v = m.positions[i as usize];
+            [v[0] as f64, v[1] as f64, v[2] as f64]
+        };
+        vol += dot(p(t[0]), cross(p(t[1]), p(t[2])));
+    }
+    (vol / 6.0).abs()
 }
 
 /// Flip a mesh's triangle winding if its signed volume is negative, so the boolean tool is
@@ -1060,18 +1081,91 @@ fn edge_band_box(edges: &[Vec<[f64; 3]>], radius: f64) -> Option<TriMesh> {
     band
 }
 
+/// Ear-clip a simple 2D polygon into triangles (indices into `poly`), each wound to follow the
+/// polygon's own traversal order — so every boundary edge appears in the triangulation running
+/// the same way the polygon runs. Used to cap the two ends of a sweep along an OPEN chain.
+///
+/// A triangle fan would be cheaper but is not safe here: the fillet cross-section is not convex
+/// — the rolling circle bites a concave arc out of it — so a fan from the wrong vertex would lay
+/// triangles across the bite.
+fn triangulate_simple(poly: &[(f64, f64)]) -> Vec<[usize; 3]> {
+    let n = poly.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let area2 = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+    let signed: f64 = (0..n).map(|i| { let (a, b) = (poly[i], poly[(i + 1) % n]); a.0 * b.1 - b.0 * a.1 }).sum();
+    let cw = signed < 0.0;
+    let mut idx: Vec<usize> = (0..n).collect();
+    if cw {
+        idx.reverse(); // clip CCW, so an ear is a positively-signed triangle
+    }
+    let mut out = Vec::with_capacity(n.saturating_sub(2));
+    while idx.len() > 3 {
+        let m = idx.len();
+        let mut clipped = false;
+        for k in 0..m {
+            let (i0, i1, i2) = (idx[(k + m - 1) % m], idx[k], idx[(k + 1) % m]);
+            let (a, b, c) = (poly[i0], poly[i1], poly[i2]);
+            if area2(a, b, c) <= 1e-12 {
+                continue; // reflex or degenerate — not an ear
+            }
+            if idx.iter().any(|&j| {
+                j != i0
+                    && j != i1
+                    && j != i2
+                    && area2(a, b, poly[j]) >= 0.0
+                    && area2(b, c, poly[j]) >= 0.0
+                    && area2(c, a, poly[j]) >= 0.0
+            }) {
+                continue; // another vertex sits in the candidate ear
+            }
+            out.push([i0, i1, i2]);
+            idx.remove(k);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            return Vec::new(); // not a simple polygon — caller treats the cap as unbuildable
+        }
+    }
+    out.push([idx[0], idx[1], idx[2]]);
+    if cw {
+        for t in &mut out {
+            t.swap(0, 2); // back to the polygon's own traversal order
+        }
+    }
+    out
+}
+
 /// Sweep a closed 2D `profile` (points in `(w, z)` = horizontal-into-material, along-axis)
-/// along the closed loop `pts`, with the profile's `w` axis = the in-plane normal of the
-/// loop (`cross(tangent, axis)·w_sign`) and `z` axis = `axis`. A tube whose cross-section
-/// is constant but rotates to follow the rim — exact for straight runs and arcs alike.
-fn sweep_profile(profile: &[(f64, f64)], pts: &[V3], axis: V3, w_sign: f64) -> TriMesh {
+/// along `pts`, with the profile's `w` axis = the in-plane normal of the loop
+/// (`cross(tangent, axis)·w_sign`) and `z` axis = `axis`. A tube whose cross-section is
+/// constant but rotates to follow the rim — exact for straight runs and arcs alike.
+///
+/// `closed` sweeps `pts` as a loop; otherwise it is an OPEN chain (part of a rim — what a
+/// partial pick makes), swept between its ends and capped square to the tangent at each, so
+/// the tool takes the picked span and nothing beyond it.
+fn sweep_profile(profile: &[(f64, f64)], pts: &[V3], axis: V3, w_sign: f64, closed: bool) -> Option<TriMesh> {
     let n = pts.len();
     let np = profile.len();
+    if n < 2 || np < 3 {
+        return None;
+    }
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * np);
     for i in 0..n {
-        let prev = pts[(i + n - 1) % n];
-        let next = pts[(i + 1) % n];
-        let t = norm(sub(next, prev));
+        // The station's frame is the mitre plane through the point — the average direction in
+        // and out. An open chain's ends have no neighbour to average with, so they take the
+        // one-sided direction and the cap sits square to the last segment.
+        let t = if closed {
+            norm(sub(pts[(i + 1) % n], pts[(i + n - 1) % n]))
+        } else if i == 0 {
+            norm(sub(pts[1], pts[0]))
+        } else if i == n - 1 {
+            norm(sub(pts[n - 1], pts[n - 2]))
+        } else {
+            norm(sub(pts[i + 1], pts[i - 1]))
+        };
         let w = scale(norm(cross(t, axis)), w_sign);
         for &(wv, zv) in profile {
             let p = add(pts[i], add(scale(w, wv), scale(axis, zv)));
@@ -1079,7 +1173,7 @@ fn sweep_profile(profile: &[(f64, f64)], pts: &[V3], axis: V3, w_sign: f64) -> T
         }
     }
     let mut indices: Vec<u32> = Vec::new();
-    for i in 0..n {
+    for i in 0..if closed { n } else { n - 1 } {
         let i1 = (i + 1) % n;
         for j in 0..np {
             let j1 = (j + 1) % np;
@@ -1088,17 +1182,75 @@ fn sweep_profile(profile: &[(f64, f64)], pts: &[V3], axis: V3, w_sign: f64) -> T
             indices.extend_from_slice(&[a, b, c, a, c, d]);
         }
     }
+    if !closed {
+        // Cap both ends, wound to agree with the walls — a mesh that is closed but half-inverted
+        // is not a solid, and the boolean reads it as one anyway, which is how an 0.08-unit fillet
+        // came back having taken 4 units out of the part.
+        //
+        // Take the rule off the walls rather than off the frame. The quad `(a,b,c)/(a,c,d)` above
+        // leaves the strip's own boundary running j→j1 at its FAR station and j1→j at its near
+        // one, so the wall surface ends with j1→j at station 0 and j→j1 at station n−1. A cap
+        // closes a boundary by traversing it the opposite way, so station 0's cap follows the
+        // profile's order and station n−1's runs against it.
+        let cap = triangulate_simple(profile);
+        if cap.is_empty() {
+            return None;
+        }
+        for (station, with_profile) in [(0usize, true), (n - 1, false)] {
+            let base = (station * np) as u32;
+            for t in &cap {
+                let (a, b, c) = (base + t[0] as u32, base + t[1] as u32, base + t[2] as u32);
+                if with_profile {
+                    indices.extend_from_slice(&[a, b, c]);
+                } else {
+                    indices.extend_from_slice(&[a, c, b]);
+                }
+            }
+        }
+    }
     let mut m = TriMesh { positions, normals: Vec::new(), indices };
     orient_outward(&mut m);
     fill_normals(&mut m);
-    m
+    Some(m)
 }
 
-/// Exact swept rolling-ball fillet on a *planar convex* rim (a slot pocket, a rounded-
-/// rectangle rim, …): sweep the corner-sliver cross-section along the rim and subtract it.
-/// `None` if the rim isn't planar+convex (caller falls back to the SDF crop).
+/// Is `chain` a closed loop? Either the first point is repeated at the end (gap 0) or the
+/// ends are simply adjacent round the rim (gap ≈ one facet). A partial pick's ends are the
+/// chord across everything it did NOT pick, which is longer than that from three facets on.
+fn chain_is_closed(chain: &[V3]) -> bool {
+    let n = chain.len();
+    if n < 4 {
+        return false;
+    }
+    let longest = chain.windows(2).map(|w| len(sub(w[1], w[0]))).fold(0.0_f64, f64::max);
+    len(sub(chain[0], chain[n - 1])) <= longest * 1.5 + 1e-9
+}
+
+/// Exact swept rolling-ball fillet on a *planar* rim: sweep the rolling-ball cross-section
+/// along the rim — a corner sliver to subtract off a ridge, a quarter-round fill to union into
+/// a notch. Returns the tool and whether to union it. The rim may be a closed loop (a slot
+/// pocket, a rounded-rectangle rim, a whole cap edge) or an OPEN arc — part of a rim, which is
+/// what a partial pick makes; those are swept between the picked ends and capped there.
+///
+/// This is the accurate path for a curved pick, and it is one boolean whatever the pick's
+/// length. The alternatives it replaces both went wrong on an arc: splitting it into straight
+/// runs unions mismatched cylinders (non-manifold from six facets on), and the SDF crop removed
+/// sixty times a convex fillet's volume, or took 46.7 units out of a plate a concave one should
+/// have added 0.25 to — bands gouged right out of the part, either way.
+///
+/// `None` if the rim isn't planar, turns a corner, or doesn't sit on one (caller falls back).
 fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriMesh, bool)> {
-    if chain.len() < 6 {
+    let closed = chain_is_closed(chain);
+    // A repeated first point is a duplicate station, not a facet: it would sweep a zero-length
+    // segment and leave a degenerate quad ring in the tool.
+    let mut chain: Vec<V3> = chain.to_vec();
+    if closed && len(sub(chain[0], chain[chain.len() - 1])) < 1e-9 {
+        chain.pop();
+    }
+    let chain = &chain[..];
+    // A closed rim needs enough stations to be a rim at all; an open arc is meaningful from two
+    // facets (three points) — and below that `is_straight_edge` has already claimed it.
+    if chain.len() < if closed { 6 } else { 3 } {
         return None;
     }
     let tris: Vec<[V3; 3]> = mesh
@@ -1114,6 +1266,10 @@ fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriM
         .collect();
     let nn = chain.len();
     let center = scale(chain.iter().fold([0.0; 3], |a, p| add(a, *p)), 1.0 / nn as f64);
+    // Newell over the chain closed back on itself. For an open arc that is the sector it
+    // subtends, whose normal is the arc's plane normal just the same — only the magnitude
+    // differs, and a chain flat enough for the magnitude to vanish is a straight edge, which
+    // `is_straight_edge` has already claimed.
     let mut nrm = [0.0; 3];
     for i in 0..nn {
         let p = chain[i];
@@ -1132,8 +1288,13 @@ fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriM
     }
     // Smoothness: the sweep assumes a tangent-continuous rim (a slot, a rounded rect). A
     // sharp corner (a square pocket) makes the swept tool self-intersect, so bail and let
-    // the SDF crop handle it.
+    // the caller fall back. An open chain is only judged at its INTERIOR vertices — the
+    // wrap-around is the chord back across the unpicked part of the rim, not a turn in the
+    // pick, and reading it as a corner rejects every partial arc there is.
     for i in 0..nn {
+        if !closed && (i == 0 || i == nn - 1) {
+            continue;
+        }
         let a = chain[(i + nn - 1) % nn];
         let b = chain[i];
         let c = chain[(i + 1) % nn];
@@ -1147,51 +1308,84 @@ fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriM
         (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
     };
     let e = radius * 0.4;
-    let p0 = chain[0];
-    let t0 = norm(sub(chain[1], chain[nn - 1]));
-    // Orient the axis to the cap's outward (air) side.
-    let axis = if inside(add(p0, scale(axis0, e))) { scale(axis0, -1.0) } else { axis0 };
-    // The in-plane normal pointing into material (the +w of the cross-section).
-    let mut w0 = norm(cross(t0, axis));
-    if !inside(add(p0, add(scale(w0, e), scale(axis, -e)))) {
-        w0 = scale(w0, -1.0);
-    }
+    // Probe the middle of the pick, not its first point. Every station of a closed rim is as
+    // good as any other, but an open pick's ENDS are where it abuts whatever it stopped at —
+    // a boss wall, another face — and a probe there reads that neighbour's material instead
+    // of the corner being filleted.
+    let mid = nn / 2;
+    let p0 = chain[mid];
+    let t0 = norm(sub(chain[(mid + 1) % nn], chain[(mid + nn - 1) % nn]));
+    // Read the frame off the four quadrants around the rim, rather than orienting the axis by a
+    // single probe along it. That probe sits directly above or below the rim point depending on
+    // which way round the chain runs, and below it is ON the wall — a winding of about a half,
+    // decided by rounding. The quadrant probes are all clear of both faces, and their count is
+    // the convex/concave answer anyway, so one pass settles both.
+    let u0 = norm(cross(t0, axis0));
+    let quadrant: Vec<((f64, f64), bool)> = [-1.0_f64, 1.0]
+        .iter()
+        .flat_map(|&sc| [-1.0_f64, 1.0].map(move |sw| (sc, sw)))
+        .map(|(sc, sw)| ((sc, sw), inside(add(p0, add(scale(axis0, sc * e), scale(u0, sw * e))))))
+        .collect();
+    let solid = quadrant.iter().filter(|(_, s)| *s).count();
+    // A ridge has one solid quadrant, a notch has three. Two (a flat face) or none (a hair of
+    // material) is not a corner to round.
+    let concave = match solid {
+        1 => false,
+        3 => true,
+        _ => return None,
+    };
+    // The odd quadrant out — solid on a ridge, air in a notch.
+    let (sa, su) = quadrant.iter().find(|(_, s)| *s == !concave).map(|(q, _)| *q)?;
+    // Put the cross-section in the frame each profile below is written in. Convex: material at
+    // (+w, −z), so the lone SOLID quadrant becomes it. Concave: the notch at (−w, +z), so the
+    // lone AIR quadrant becomes that.
+    let (axis, w0) = if concave {
+        (scale(axis0, sa), scale(u0, -su))
+    } else {
+        (scale(axis0, -sa), scale(u0, su))
+    };
     let w_sign = if dot(w0, cross(t0, axis)) > 0.0 { 1.0 } else { -1.0 };
-    // Convex only (one solid quadrant); concave rims fall back.
-    let mut solid = 0;
-    for sc in [-1.0_f64, 1.0] {
-        for sw in [-1.0_f64, 1.0] {
-            if inside(add(p0, add(scale(axis, sc * e), scale(w0, sw * e)))) {
-                solid += 1;
-            }
-        }
-    }
-    if solid != 1 {
-        return None;
-    }
-    // Corner-sliver cross-section in (w, z): material at (+w, −z), rolling circle (r, −r).
-    // Outer edges run into air (w<0 / z>0) so the cut is transversal.
     let r = radius;
-    let pad = r;
     const ARC: usize = 14;
-    let mut profile: Vec<(f64, f64)> = vec![(r, 0.0)]; // cap contact
-    for k in 1..ARC {
-        let a = std::f64::consts::FRAC_PI_2 * (1.0 + k as f64 / ARC as f64); // 90°→180°
-        profile.push((r + r * a.cos(), -r + r * a.sin()));
-    }
-    profile.push((0.0, -r)); // wall contact
-    profile.push((-pad, -r)); // into the pocket (air)
-    profile.push((-pad, pad)); // air
-    profile.push((r, pad)); // above the cap (air)
-    let chain_v3: Vec<V3> = chain.to_vec();
-    let tool = sweep_profile(&profile, &chain_v3, axis, w_sign);
-    Some((tool, false))
+    let profile: Vec<(f64, f64)> = if concave {
+        // Quarter-round FILL for a notch: the corner, up the wall to its contact at (0, r), then
+        // the rolling circle (centred (−r, r)) back down to its contact on the floor at (−r, 0).
+        // No padding — unlike the convex tool this is added material, so it is exactly the
+        // fillet and nothing else. Its two flat faces lie in the two faces of the notch, and its
+        // ends are square to the pick: a partial pick's fillet stops where the pick stops.
+        let mut p = vec![(0.0, 0.0)];
+        for k in 0..=ARC {
+            let a = -std::f64::consts::FRAC_PI_2 * k as f64 / ARC as f64; // 0°→−90°
+            p.push((-r + r * a.cos(), r + r * a.sin()));
+        }
+        p
+    } else {
+        // Corner-sliver cross-section in (w, z): material at (+w, −z), rolling circle (r, −r).
+        // Outer edges run into air (w<0 / z>0) so the cut is transversal.
+        let pad = r;
+        let mut p: Vec<(f64, f64)> = vec![(r, 0.0)]; // cap contact
+        for k in 1..ARC {
+            let a = std::f64::consts::FRAC_PI_2 * (1.0 + k as f64 / ARC as f64); // 90°→180°
+            p.push((r + r * a.cos(), -r + r * a.sin()));
+        }
+        p.push((0.0, -r)); // wall contact
+        p.push((-pad, -r)); // into the pocket (air)
+        p.push((-pad, pad)); // air
+        p.push((r, pad)); // above the cap (air)
+        p
+    };
+    let tool = sweep_profile(&profile, chain, axis, w_sign, closed)?;
+    Some((tool, concave))
 }
 
-/// Round a curved/mixed edge (a slot rim, a freeform loop) while keeping the rest of the
-/// body sharp: SDF-round the whole body (which softens every edge), then splice back only
+/// Round an edge no exact tool fits — not planar, or mixing arcs with sharp corners so
+/// neither `fillet_swept` nor the straight-run split will take it — while keeping the rest of
+/// the body sharp: SDF-round the whole body (which softens every edge), then splice back only
 /// the change inside a box hugging the edge. Convex edges lose their shaved shell; concave
 /// edges gain their fill — both clipped to the edge band.
+///
+/// Approximate, and its failures are not small: the caller weighs the result against what a
+/// fillet is worth and drops it rather than ship a gouged part.
 fn local_round(body: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     let band = edge_band_box(edges, radius)?;
     // Round only the NEIGHBOURHOOD of the picked edge, not the whole part.
@@ -1372,10 +1566,85 @@ fn split_straight_runs(chain: &[[f64; 3]]) -> Vec<Vec<[f64; 3]>> {
     runs
 }
 
-/// Round the picked `edges`: a circular rim → torus, a straight edge → tangent cylinder
-/// (both exact booleans), and anything curved or mixed (a slot rim, a freeform loop) → the
-/// SDF round masked to that edge — which follows the whole outline smoothly instead of
-/// faceting it into starbursts. With no edges, rounds every edge (global SDF).
+/// What [`round_mesh`] will do with one picked chain. The decision is split out from the work
+/// so the cost can be counted before any of it is done — see [`round_mesh_booleans`]. Anything
+/// that reads the routing from a *copy* of these rules will drift from them; there is one copy.
+enum ChainPlan {
+    /// Handed to [`fillet_boolean`]: a circular rim (one torus) or straight sides (one tangent
+    /// cylinder per segment).
+    Boolean(Vec<Vec<[f64; 3]>>),
+    /// One swept tool, whatever the pick's length. Carries the tool because deciding this
+    /// *is* building it.
+    Swept(TriMesh, bool),
+    /// The SDF crop, carrying the chain's segment count — its cost turns on that.
+    Local(usize),
+}
+
+impl ChainPlan {
+    /// Mesh booleans this plan runs. The unit matters because each one re-meshes a body that
+    /// the last one grew, so the cost is superlinear in this count and barely related to how
+    /// many model edges the pick covers: a 270° rim arriving as one polyline is a single
+    /// boolean, the same rim picked facet by facet is one per facet.
+    ///
+    /// Slightly under-counts: `fillet_boolean` may blend a corner where three filleted faces
+    /// meet, at most one per chain endpoint that qualifies. Whatever those come to is already
+    /// inside the end-to-end timings this is calibrated against.
+    fn booleans(&self) -> usize {
+        match self {
+            // Mirrors `fillet_boolean`'s own loop: a circular rim is one revolved tool, anything
+            // else is one per segment — collinear points included, it does not merge them.
+            ChainPlan::Boolean(chains) => chains
+                .iter()
+                .map(|c| if fit_circle(c).is_some() { 1 } else { c.len().saturating_sub(1) })
+                .sum(),
+            ChainPlan::Swept(..) => 1,
+            // `local_round` builds its band and its work box by unioning one box per segment
+            // (twice), then splices with seven more booleans around the voxel pass.
+            ChainPlan::Local(segments) => 2 * segments.saturating_sub(1) + 7,
+        }
+    }
+}
+
+/// Which route one picked chain takes. See [`round_mesh`] for why the sweep is asked first.
+fn plan_chain(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> ChainPlan {
+    if fit_circle(chain).is_some() || is_straight_edge(chain) {
+        ChainPlan::Boolean(vec![chain.to_vec()])
+    } else if let Some((tool, is_union)) = fillet_swept(mesh, radius, chain) {
+        ChainPlan::Swept(tool, is_union)
+    } else if is_piecewise_straight(chain) {
+        // A rectangle / polygon rim → fillet each straight side with a crisp cylinder.
+        ChainPlan::Boolean(split_straight_runs(chain))
+    } else {
+        ChainPlan::Local(chain.len().saturating_sub(1))
+    }
+}
+
+/// How many mesh booleans [`round_mesh`] would run on this pick — the honest measure of what
+/// handing it over costs, and the one the bevel's fallback gate uses. Answered without doing
+/// any of the work (it builds swept tools, which is how sweepability is decided, but touches
+/// the body not at all).
+///
+/// `usize::MAX` for an empty pick: that means "round every edge", which is a voxel pass over
+/// the whole body and never something to hand over blind.
+pub(crate) fn round_mesh_booleans(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> usize {
+    if edges.is_empty() {
+        return usize::MAX;
+    }
+    edges.iter().map(|c| plan_chain(mesh, radius, c).booleans()).sum()
+}
+
+/// Round the picked `edges`: a circular rim → torus, a straight edge → tangent cylinder, a
+/// curve → the swept corner sliver (all three exact booleans), and only what none of those
+/// fit → the SDF round masked to that edge. With no edges, rounds every edge (global SDF).
+///
+/// The curve case decides itself, by whether `fillet_swept` can build a tool, rather than by
+/// `is_piecewise_straight`. That classifier answers a different question — "is this a polygon
+/// or a curve" — and its answer on a *tessellated* arc moves with how many facets are in the
+/// pick: below ~15° of accumulated bend an arc reads as a polygon, so a 6-facet pick of a
+/// 128-gon rim was filleted as separate straight runs (mismatched cylinders, non-manifold)
+/// and a 7-facet pick of the same rim fell through to the SDF (which took sixty times a
+/// fillet's volume out of the part). One boolean over the whole arc is right at either size,
+/// so the classifier now only sorts what the sweep has already declined.
 pub fn round_mesh(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     if radius <= 1e-6 || mesh.indices.len() < 3 {
         return None;
@@ -1384,15 +1653,16 @@ pub fn round_mesh(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
         return sdf_round(mesh, radius, &[]);
     }
     let mut boolean_edges: Vec<Vec<[f64; 3]>> = Vec::new();
+    let mut swept: Vec<(TriMesh, bool)> = Vec::new();
     let mut curved_edges: Vec<Vec<[f64; 3]>> = Vec::new();
     for chain in edges {
-        if fit_circle(chain).is_some() || is_straight_edge(chain) {
-            boolean_edges.push(chain.clone());
-        } else if is_piecewise_straight(chain) {
-            // A rectangle / polygon rim → fillet each straight side with a crisp cylinder.
-            boolean_edges.extend(split_straight_runs(chain));
-        } else {
-            curved_edges.push(chain.clone());
+        // Built against the ORIGINAL mesh, not the body as it is filleted. A swept tool only
+        // needs to know which side of the rim is air, and where two picked edges meet, an
+        // earlier chain's cut can have taken the material the probe would have read.
+        match plan_chain(mesh, radius, chain) {
+            ChainPlan::Boolean(chains) => boolean_edges.extend(chains),
+            ChainPlan::Swept(tool, is_union) => swept.push((tool, is_union)),
+            ChainPlan::Local(_) => curved_edges.push(chain.clone()),
         }
     }
     let mut body = mesh.clone();
@@ -1403,17 +1673,31 @@ pub fn round_mesh(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             any = true;
         }
     }
-    for chain in &curved_edges {
-        // Exact swept fillet for a planar convex rim (a slot); else crop the SDF round.
-        if let Some((tool, is_union)) = fillet_swept(&body, radius, chain) {
-            if tool.indices.len() >= 3 {
-                body = if is_union { crate::mesh_union(&body, &tool) } else { crate::mesh_difference(&body, &tool) };
-                any = true;
-            }
-        } else if let Some(m) = local_round(&body, radius, std::slice::from_ref(chain)) {
-            body = m;
+    for (tool, is_union) in &swept {
+        if tool.indices.len() >= 3 {
+            body = if *is_union { crate::mesh_union(&body, tool) } else { crate::mesh_difference(&body, tool) };
             any = true;
         }
+    }
+    for chain in &curved_edges {
+        // Last resort: an edge no exact tool fits — not planar, or mixing arcs with sharp corners
+        // so neither the sweep nor the straight-run split will take it.
+        //
+        // Weigh what it did before keeping it. This path rounds the whole neighbourhood of the
+        // edge and splices the change back, and when that goes wrong it does not go wrong by a
+        // little: on a 7-facet arc it removed 9.17 units where a fillet takes 0.148, on a concave
+        // one it took 46.7 out of a plate that should have GAINED 0.25. Both were bands gouged
+        // out of the part, and both shipped as a finished body. A fillet moves (1−π/4)·r²·L
+        // whichever way it goes; anything an order past that is not a fillet, and no fillet at
+        // all is the better answer.
+        let Some(m) = local_round(&body, radius, std::slice::from_ref(chain)) else { continue };
+        let arc: f64 = chain.windows(2).map(|w| len(sub(w[1], w[0]))).sum();
+        let bound = (1.0 - std::f64::consts::PI / 4.0) * radius * radius * arc * 10.0;
+        if (mesh_volume(&m) - mesh_volume(&body)).abs() > bound {
+            continue;
+        }
+        body = m;
+        any = true;
     }
     if any {
         Some(body)
@@ -2123,6 +2407,46 @@ fn ray_tri(o: V3, dir: V3, a: V3, b: V3, c: V3) -> Option<f64> {
 #[cfg(test)]
 mod cliff_tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn diag_swept_tool_shape() {
+        let n = 128usize;
+        let pt = |i: usize, rad: f64, z: f64| -> [f64; 3] {
+            let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+            [rad * a.cos(), rad * a.sin(), z]
+        };
+        // A plain annulus 5..8, z 0..2 — no sector, so nothing else can be involved.
+        let ring_o: Vec<[f64; 2]> = (0..n).map(|i| { let p = pt(i, 8.0, 0.0); [p[0], p[1]] }).collect();
+        let ring_i: Vec<[f64; 2]> = (0..n).map(|i| { let p = pt(i, 5.0, 0.0); [p[0], p[1]] }).collect();
+        let basis = crate::PlaneBasis { origin: [0.0; 3], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] };
+        let body = crate::extrude_tool_mesh(&ring_o, &[ring_i.iter().rev().copied().collect()], &basis, 0.0, 2.0).unwrap();
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v
+        };
+        for &k in &[4usize, 12] {
+            let chain: Vec<[f64; 3]> = (0..=k).map(|i| pt(i, 8.0, 2.0)).collect();
+            let (tool, is_union) = fillet_swept(&body, 0.5, &chain).expect("sweep must take a plain convex arc");
+            let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+            for p in &tool.positions {
+                for c in 0..3 { lo[c] = lo[c].min(p[c] as f64); hi[c] = hi[c].max(p[c] as f64); }
+            }
+            let (v, t, boundary, nonman) = crate::mesh_bool::weld_edge_stats(&tool);
+            let arc: f64 = chain.windows(2).map(|w| len(sub(w[1], w[0]))).sum();
+            eprintln!(
+                "k={k}: tool signed vol {:+.4} (a sliver of arc {arc:.3} is {:.4}), union={is_union}, \
+                 manifold={}, welded v={v} t={t} boundary={boundary} nonman={nonman}",
+                vol(&tool), (1.0 - std::f64::consts::PI / 4.0) * 0.25 * arc, crate::mesh_bool::is_manifold(&tool)
+            );
+            eprintln!("    tool bbox x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}]  chain ({:.2},{:.2})→({:.2},{:.2})",
+                lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], chain[0][0], chain[0][1], chain[k][0], chain[k][1]);
+        }
+    }
 
     /// Which BRANCH does `round_mesh` send a partial-arc pick down, as the pick grows? The cost
     /// wall between 6 and 7 segments is not a scaling curve, so it should be a change of route.

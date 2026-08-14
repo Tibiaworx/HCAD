@@ -940,21 +940,35 @@ fn inset_fold_area(topo: &Topo, fi: usize, cpt: &dyn Fn(usize, usize) -> V3) -> 
         .sum()
 }
 
-/// How many selected model edges the CSG round can still finish in an interactive budget.
+/// How much CSG-round work the fallback may take on before the surgery keeps its folded mesh
+/// instead — counted in **mesh booleans**, which `round_mesh_booleans` reports for a pick without
+/// doing any of them.
 ///
-/// Handing a folded bevel to `round_mesh` only helps if it comes back, and past a handful of
-/// segments it does not. Measured on the ring-and-sector body at r=0.5, with the per-segment tools
-/// already batched into one boolean apiece: 1 segment 27 ms, 2 segments 39 ms, 4 segments 77 ms,
-/// 5 segments 560 ms, 6 segments 706 ms, **7 segments 60 s**. So a lone terminal edge — the shape
-/// that folds in practice, a fillet running out onto a curved wall — is cheap to hand over, while
-/// a whole picked rim would wedge the UI, which regenerates on the main thread.
+/// This used to count selected model edges, and that number never described the cost. Each boolean
+/// re-meshes a body the last one grew, so the work tracks how a pick divides into chains, not how
+/// much of the model it covers: the whole junction loop of roundfilleterror2.hcad is 194 model
+/// edges but only four booleans — two 270° arcs swept whole and two radial straights — and it
+/// rounds in 60–72 ms in release, while 32 model edges picked one at a time are 32 booleans and
+/// 4.5 s. The old gate refused the first and would have accepted the second.
 ///
-/// The wall at 7 is NOT the cost of a growing body: batching the tools cut 4 segments nearly in
-/// half and left 7 untouched, so something else takes over there and is worth its own look. Until
-/// then the bound stays where the cost is still measured in tens of milliseconds. Past it the
-/// folded mesh is emitted as-is: a striped run-out is a bad look, but a far better one than a
-/// frozen application.
-const CSG_ROUND_MAX_EDGES: usize = 4;
+/// Measured in release on the ring-and-sector body by `diag_csg_round_cost_vs_booleans`:
+/// 1 → 5.2 ms, 2 → 11 ms, 4 → 28 ms, 6 → 49 ms, **8 → 238 ms**, 12 → 965 ms, 16 → 1.6 s,
+/// 32 → 3.9 s. On cost alone the bound would be 6, where the knee is.
+///
+/// **It is 3, and the reason is accuracy, not time.** Past a lone edge or two the surgery is the
+/// better engine where it can close at all: on the junction loop it holds the signed Pappus sum to
+/// 2% against the CSG round's ~12%, because it blends the four pieces into one another instead of
+/// applying them as four independent tools. So the handover is kept to what the surgery genuinely
+/// cannot do — a fillet whose run-out folds a face, which is one or two edges ending on a curved
+/// wall — rather than extended to every pick the round could merely afford. The junction loop is
+/// four booleans and stays on the surgery, fold and all.
+///
+/// Raising it to 6 is a live option and costs nothing in speed; it trades that 2% for a run-out
+/// that isn't striped. `mixed_convex_and_concave_junction_loop_fillets` records both numbers.
+///
+/// Past the bound the folded mesh is emitted as-is: a striped run-out is a bad look, but a far
+/// better one than a wronger body.
+const CSG_ROUND_MAX_BOOLEANS: usize = 3;
 
 /// Escape hatch for measuring the two engines against each other on the same document:
 /// `HCAD_BEVEL_NO_CSG_HANDOVER=1` keeps the folded surgery result instead of declining.
@@ -965,21 +979,29 @@ fn csg_handover_enabled() -> bool {
 /// The surgery half of a prepared bevel: flat faces inset to their corners, a convex/concave
 /// cylinder strip per selected edge, and a fanned patch per corner. `None` if the result isn't
 /// watertight (a partial-vertex T-junction the prototype can't split → caller falls back to CSG).
-fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64, seg: usize) -> Option<TriMesh> {
+/// `csg_booleans` reports what the CSG round would cost on this pick (`round_mesh_booleans`),
+/// for deciding whether a folded inset is worth handing over. Taken as a closure because most
+/// bevels don't fold and never ask: answering costs a pass over the body's triangles per chain,
+/// and building each swept tool, which is how sweepability gets decided.
+fn run_surgery(
+    topo: &Topo,
+    selected: &[bool],
+    corner: &HashMap<(usize, usize), V3>,
+    r: f64,
+    seg: usize,
+    csg_booleans: impl Fn() -> usize,
+) -> Option<TriMesh> {
     let verts = &topo.verts;
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
     // A face the inset turns inside-out can only be emitted as a self-overlapping sheet — see
     // `inset_fold_area`. Hand those to the CSG round, which does this shape properly (on the
     // boss-sector junction: volume to 0.7%, the face plane covered exactly once, nothing through
-    // the walls) — but only while the pick is small enough for it to finish, per
-    // `CSG_ROUND_MAX_EDGES`. The threshold is on fold AREA, not on any fold at all, so a sliver
-    // flipped by rounding noise doesn't push a good bevel onto the slower path; a real fold runs
-    // to whole multiples of r², a numerical one to a millionth of it.
+    // the walls) — but only while the round can still finish, per `CSG_ROUND_MAX_BOOLEANS`. The
+    // threshold is on fold AREA, not on any fold at all, so a sliver flipped by rounding noise
+    // doesn't push a good bevel onto the slower path; a real fold runs to whole multiples of r², a
+    // numerical one to a millionth of it.
     let folded: f64 = (0..topo.faces.len()).map(|fi| inset_fold_area(topo, fi, &cpt)).sum();
-    if folded > 0.01 * r * r
-        && selected.iter().filter(|&&s| s).count() <= CSG_ROUND_MAX_EDGES
-        && csg_handover_enabled()
-    {
+    if folded > 0.01 * r * r && csg_handover_enabled() && csg_booleans() <= CSG_ROUND_MAX_BOOLEANS {
         return None;
     }
     let mut b = Build::new();
@@ -1484,7 +1506,7 @@ pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> 
 /// a flat (chamfer) profile. `None` if a corner ring can't be resolved (caller → CSG).
 pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     let (topo, selected, corner) = bevel_prep(mesh, r, picked)?;
-    run_surgery(&topo, &selected, &corner, r, seg)
+    run_surgery(&topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked))
 }
 
 /// Both the surgery mesh and the selectable feature edges from a **single** topology pass — what
@@ -1496,8 +1518,8 @@ pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f
     match bevel_prep(mesh, r, picked) {
         Some((topo, selected, corner)) => {
             let edges = emit_feature_edges(&topo, &selected, &corner, r);
-            let mesh = run_surgery(&topo, &selected, &corner, r, seg);
-            (mesh, edges)
+            let out = run_surgery(&topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked));
+            (out, edges)
         }
         None => (None, Vec::new()),
     }
@@ -2010,8 +2032,8 @@ mod tests {
             }
             v.abs()
         };
-        // A lone terminal edge is one model edge — cheap for the CSG round to take (26 ms), well
-        // inside `CSG_ROUND_MAX_EDGES`.
+        // A lone terminal edge is one straight segment, so one boolean — the cheapest thing the
+        // CSG round can be handed, well inside `CSG_ROUND_MAX_BOOLEANS`.
         let (_, sel, _) = bevel_prep(&body, r, &edge).expect("prep");
         assert_eq!(sel.iter().filter(|&&s| s).count(), 1, "a lone radial edge should select one model edge");
         assert!(bevel_mesh_selected(&body, r, 12, &edge).is_none(), "the surgery must decline a fillet that folds its run-out");
@@ -2100,13 +2122,19 @@ mod tests {
     /// wrong, on a measurement of about −61 at r=2.2. It doesn't: the two convex arcs simply
     /// outweigh the two short straights, and −57 is what this loop is supposed to give.)
     ///
-    /// KNOWN LIMIT, deliberately not asserted away: the two straight edges still run out onto the
-    /// curved walls, so their four ends fold the ring-top face exactly as
-    /// `a_fillet_running_out_onto_a_curved_wall_hands_over_to_csg` describes. This pick is far too
-    /// big to hand to the CSG round — 194 model edges against a measured cliff at 8 — so the
-    /// folded mesh is emitted rather than freezing the app. What this test pins is the part that
-    /// IS right: each piece pulls its own way and the total is the signed sum. It cannot see the
-    /// fold, because volume never can.
+    /// KNOWN LIMIT, deliberately not asserted away: the two straight edges run out onto the curved
+    /// walls, so their four ends fold the ring-top face exactly as
+    /// `a_fillet_running_out_onto_a_curved_wall_hands_over_to_csg` describes. The folded mesh is
+    /// emitted rather than handed over, and that is now a CHOICE rather than a limitation — the
+    /// loop is four booleans, which the CSG round finishes in 60–72 ms release (manifold, see
+    /// `diag_csg_round_on_the_whole_junction_loop`), so `CSG_ROUND_MAX_BOOLEANS` could take it and
+    /// is set below it on purpose. What it would cost: the round applies the four pieces as
+    /// independent tools and holds the signed sum to ~12%, where the surgery blends them and holds
+    /// 2% — measured either way, this test pins the 2%.
+    ///
+    /// So the fold stays, and volume cannot see it (a face folded back adds and removes in equal
+    /// measure). What this test pins is the part that IS right: each piece pulls its own way and
+    /// the total is the signed sum.
     #[test]
     fn mixed_convex_and_concave_junction_loop_fillets() {
         let (body, picked) = ring_and_sector();
@@ -2119,6 +2147,14 @@ mod tests {
             v.abs()
         };
         let pi = std::f64::consts::PI;
+        // Four booleans — affordable, and still past `CSG_ROUND_MAX_BOOLEANS`, so the surgery
+        // keeps this pick. If that bound is ever raised, this test changes with it: the routing
+        // below goes to the CSG round, its tolerance widens to ~13%, and the fold goes away.
+        assert_eq!(
+            crate::fillet::round_mesh_booleans(&body, 1.0, &picked), 4,
+            "the junction loop should cost four booleans: two swept arcs and two straights"
+        );
+        assert!(4 > CSG_ROUND_MAX_BOOLEANS, "the gate is meant to refuse this pick — see the doc comment");
         // Radii up to the ring's own 2.0 wall height. Past that the fillet is taller than the
         // feature it stands on and the pieces run into each other — the volume stays right, but
         // the band self-creases, which is the geometry being impossible rather than the surgery
@@ -2275,9 +2311,13 @@ mod tests {
     /// produced a tool the difference then read inside-out. Every existing test either used a
     /// whole rim or measured something a gouge doesn't disturb.
     ///
-    /// The bound is deliberately loose. The tool overruns each edge end by half a radius so
-    /// neighbouring fillets meet, which on a short arc genuinely removes a couple of times the
-    /// ideal — but nothing legitimate removes ten times it, let alone seven hundred.
+    /// The pick size used to decide which of three routes the arc took, and two of them were
+    /// wrong. Below ~15° of accumulated bend `is_piecewise_straight` called the arc a polygon and
+    /// filleted it as separate straight runs — non-manifold from six facets on, the failure that
+    /// function's own comment predicts. Above it the arc fell to the SDF crop, which at seven
+    /// facets removed 9.17 units where a fillet takes 0.148: a band gouged out of the part, sixty
+    /// times over, and slower the bigger the pick (60 s at 24 facets). A swept tool along the arc
+    /// takes every size in one boolean, so the sweep is tried before the classifier now.
     #[test]
     fn an_arc_pick_removes_only_its_own_corner() {
         let (body, _) = ring_and_sector();
@@ -2295,20 +2335,240 @@ mod tests {
             v.abs()
         };
         let r = 0.5;
-        // Sizes that take the per-facet boolean route — 6 segments is where the gouge appeared.
-        for &k in &[1usize, 2, 4, 6] {
+        // Across all three routes: 1–2 facets read as a straight edge, and everything from 4 up
+        // used to split at 6/7 between the per-facet booleans and the SDF.
+        for &k in &[1usize, 2, 4, 6, 7, 8, 12, 24] {
             let chain: Vec<[f64; 3]> = (n / 4..=n / 4 + k).map(|i| pt(i, 8.0)).collect();
             let arc: f64 = chain.windows(2).map(|w| { let d = sub(w[1], w[0]); dot(d, d).sqrt() }).sum();
             let ideal = (1.0 - std::f64::consts::PI / 4.0) * r * r * arc;
             let m = crate::round_mesh(&body, r, std::slice::from_ref(&chain))
                 .unwrap_or_else(|| panic!("k={k}: the CSG round declined a plain convex arc"));
-            // NOT asserted, because it does not hold and never has: at 6 segments the result is
-            // non-manifold, the per-facet cylinders meeting along a curve failing to stitch — the
-            // exact failure `is_piecewise_straight` warns about in its own comment. Pre-existing
-            // (the convex path here is unchanged from before this work) and its own job to fix.
+            assert!(crate::mesh_bool::is_manifold(&m), "k={k}: the filleted arc is not manifold");
+            // Which way round the chain runs must not matter — see the concave test below.
+            let backwards: Vec<[f64; 3]> = chain.iter().rev().copied().collect();
+            let mb = crate::round_mesh(&body, r, std::slice::from_ref(&backwards))
+                .unwrap_or_else(|| panic!("k={k}: declined the same arc picked backwards"));
+            assert!(
+                (vol(&mb) - vol(&m)).abs() < ideal * 0.02,
+                "k={k}: the arc picked backwards removed {:.4}, forwards {:.4}",
+                vol(&body) - vol(&mb), vol(&body) - vol(&m)
+            );
             let removed = vol(&body) - vol(&m);
-            assert!(removed > ideal * 0.5, "k={k}: removed {removed:.4}, less than half the {ideal:.4} a fillet takes — it barely cut");
-            assert!(removed < ideal * 10.0, "k={k}: removed {removed:.4} where a fillet takes {ideal:.4} — it is gouging the part");
+            // A short pick still goes down the straight-edge route, whose tool overruns each end
+            // by half a radius so neighbouring fillets meet — on one or two facets that is most of
+            // what it removes. The swept arc takes the pick and nothing past it, so from four
+            // facets on the answer is the analytic one (a hair under, the sliver's centroid
+            // sitting inside r=8).
+            let (lo, hi) = if k <= 2 { (0.9, 3.0) } else { (0.99, 1.05) };
+            assert!(
+                removed > ideal * lo && removed < ideal * hi,
+                "k={k}: removed {removed:.4}, a fillet on this arc takes {ideal:.4}"
+            );
+            // ...and it removes it THERE. Volume alone cannot see a cut that reached past the pick
+            // and took the same total — the uncapped sweep this replaced reached 2.6 units, five
+            // radii, back into the sector — so ask each facet of the rim whether its corner is
+            // still there. The probe sits in the sliver a fillet takes and nowhere else: 0.15·r in
+            // from both the wall and the top, which is 1.2·r from the rolling circle's centre.
+            // By winding, not by matching vertices: the boolean keeps vertices it has cut past.
+            let corner_gone = |i: usize| -> bool {
+                let a = std::f64::consts::TAU * (i as f64 + 0.5) / n as f64;
+                let (rad, z) = (8.0 - 0.15 * r, 2.0 - 0.15 * r);
+                let p = [rad * a.cos(), rad * a.sin(), z];
+                let mut w = 0.0f64;
+                for t in m.indices.chunks_exact(3) {
+                    let g = |j: u32| { let q = m.positions[j as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                    let (u, v2, c) = (sub(g(t[0]), p), sub(g(t[1]), p), sub(g(t[2]), p));
+                    let nrm = |q: [f64; 3]| dot(q, q).sqrt();
+                    let (lu, lv, lc) = (nrm(u), nrm(v2), nrm(c));
+                    let den = lu * lv * lc + dot(u, v2) * lc + dot(v2, c) * lu + dot(c, u) * lv;
+                    w += 2.0 * dot(u, cross(v2, c)).atan2(den);
+                }
+                (w / (4.0 * std::f64::consts::PI)).abs() <= 0.5
+            };
+            let cut: Vec<usize> = (0..n).filter(|&i| corner_gone(i)).collect();
+            // The pick covers facets n/4 .. n/4+k. Below three facets it is read as a straight edge
+            // and its cylinder overruns each end by half a radius — 0.64 of a facet chord here —
+            // so allow a neighbour at either end, but no more.
+            let (first, last) = (*cut.first().unwrap_or(&0), *cut.last().unwrap_or(&0));
+            assert!(
+                cut.len() >= k && cut.len() <= k + 2 && first + 1 >= n / 4 && last <= n / 4 + k + 1,
+                "k={k}: the cut covers rim facets {first}..={last} ({} of them); the pick is {}..={}",
+                cut.len(), n / 4, n / 4 + k - 1
+            );
+        }
+    }
+
+    /// The same, on a CONCAVE arc: part of the base circle of a boss standing on a plate. The
+    /// fillet adds a quarter-round fill instead of shaving a sliver, and the sign is the whole
+    /// point — routed to the SDF this removed 46.7 units of the plate where 0.25 should have been
+    /// added, took 16 s doing it, and came back non-manifold. At 24 facets it took 36 s and
+    /// changed nothing at all while still reporting success.
+    ///
+    /// Also pins that the answer does not depend on which way round the chain runs. The frame
+    /// used to be oriented by a single probe along the loop normal, whose sign follows the chain
+    /// direction — and one of the two directions put that probe ON the wall, where the winding is
+    /// a half and rounding decides.
+    #[test]
+    fn a_concave_arc_pick_fills_only_its_own_notch() {
+        let n = 128usize;
+        let ang = |i: usize| std::f64::consts::TAU * i as f64 / n as f64;
+        let circ: Vec<[f64; 2]> = (0..n).map(|i| [8.0 * ang(i).cos(), 8.0 * ang(i).sin()]).collect();
+        let plate = extrude_tool_mesh(&[[-15.0, -15.0], [15.0, -15.0], [15.0, 15.0], [-15.0, 15.0]], &[], &xy(), 0.0, 3.0).unwrap();
+        let boss = extrude_tool_mesh(&circ, &[], &xy(), 3.0, 9.0).unwrap();
+        let body = crate::mesh_union(&plate, &boss);
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let r = 0.5;
+        for &k in &[4usize, 7, 12, 24] {
+            let chain: Vec<[f64; 3]> = (0..=k).map(|i| [8.0 * ang(i).cos(), 8.0 * ang(i).sin(), 3.0]).collect();
+            let arc: f64 = chain.windows(2).map(|w| { let d = sub(w[1], w[0]); dot(d, d).sqrt() }).sum();
+            let ideal = (1.0 - std::f64::consts::PI / 4.0) * r * r * arc;
+            let mut backwards = chain.clone();
+            backwards.reverse();
+            for (which, chain) in [("forwards", &chain), ("backwards", &backwards)] {
+                let m = crate::round_mesh(&body, r, std::slice::from_ref(chain))
+                    .unwrap_or_else(|| panic!("k={k} {which}: the CSG round declined a plain concave arc"));
+                assert!(crate::mesh_bool::is_manifold(&m), "k={k} {which}: the filleted notch is not manifold");
+                let added = vol(&m) - vol(&body);
+                // A hair over the analytic answer: the fill wraps the OUTSIDE of the boss, so by
+                // Pappus its centroid travels a little further than the rim it sits on.
+                assert!(
+                    added > ideal * 0.99 && added < ideal * 1.05,
+                    "k={k} {which}: the fillet moved {added:+.4}, a fill on this arc adds {ideal:.4}"
+                );
+            }
+        }
+    }
+
+    /// The bevel's fallback gate is a *prediction* of what the CSG round will cost, so it is only
+    /// worth anything if it tracks what the round actually does. It cannot drift by construction —
+    /// `round_mesh` and `round_mesh_booleans` route through the same `plan_chain` — so what is
+    /// pinned here is the discrimination the count exists to make, which counting model edges got
+    /// exactly backwards: the same span of rim is ONE boolean picked as a polyline and one per
+    /// facet picked singly, and those differ by three orders of magnitude in time (12.6 ms against
+    /// 3.9 s in release, `diag_csg_round_cost_vs_booleans`).
+    #[test]
+    fn the_gate_counts_booleans_not_model_edges() {
+        let (body, picked) = ring_and_sector();
+        let n = 128usize;
+        let pt = |i: usize| { let a = std::f64::consts::TAU * (i % n) as f64 / n as f64; [8.0 * a.cos(), 8.0 * a.sin(), 2.0] };
+        let count = |chains: &[Vec<[f64; 3]>]| crate::fillet::round_mesh_booleans(&body, 0.5, chains);
+
+        // A 96-facet arc as one polyline: 96 model edges, one swept tool.
+        let arc: Vec<Vec<[f64; 3]>> = vec![(n / 4..=n / 4 + 96).map(pt).collect()];
+        assert_eq!(count(&arc), 1, "a curve is one boolean however long the pick");
+        assert!(crate::round_mesh(&body, 0.5, &arc).is_some(), "...and that route has to work");
+        // The same 96 facets picked one at a time: one boolean each.
+        let singly: Vec<Vec<[f64; 3]>> = (n / 4..n / 4 + 96).map(|i| vec![pt(i), pt(i + 1)]).collect();
+        assert_eq!(count(&singly), 96, "separately picked facets cost one boolean apiece");
+
+        // A whole circular rim is a torus — one, not one per facet.
+        let rim: Vec<Vec<[f64; 3]>> = vec![(0..=n).map(pt).collect()];
+        assert_eq!(count(&rim), 1, "a circular rim is a single revolved tool");
+
+        // The junction loop: two arcs swept whole, two single-segment straights.
+        assert_eq!(count(&picked), 4, "the junction loop is four booleans, not its 194 model edges");
+
+        // An empty pick means "round every edge" — a voxel pass over the whole body, never
+        // something to hand over blind.
+        assert_eq!(count(&[]), usize::MAX, "a global round must never pass the gate");
+
+        // Where the bound falls, in the shapes it was chosen for. The run-outs that actually fold
+        // — one or both radial edges of the sector, ending on the curved walls — are 1 and 2
+        // booleans and hand over; the junction loop is 4 and stays on the surgery, which holds
+        // that pick to 2% where the round holds 12%. See `CSG_ROUND_MAX_BOOLEANS`.
+        let r = 2.35;
+        for (what, pick) in [
+            ("one radial edge", vec![picked[2].clone()]),
+            ("both radial edges", vec![picked[2].clone(), picked[3].clone()]),
+        ] {
+            let cost = crate::fillet::round_mesh_booleans(&body, r, &pick);
+            assert!(cost <= CSG_ROUND_MAX_BOOLEANS, "{what}: {cost} booleans, outside the bound");
+            assert!(
+                bevel_mesh_selected(&body, r, 12, &pick).is_none(),
+                "{what}: folds its run-out and costs {cost} booleans — the surgery should hand it over"
+            );
+        }
+        let loop_cost = crate::fillet::round_mesh_booleans(&body, r, &picked);
+        assert!(loop_cost > CSG_ROUND_MAX_BOOLEANS, "the junction loop is {loop_cost} booleans, inside the bound");
+        assert!(
+            bevel_mesh_selected(&body, r, 12, &picked).is_some(),
+            "the junction loop is past the bound — the surgery should keep it, fold and all"
+        );
+    }
+
+    /// What `CSG_ROUND_MAX_BOOLEANS` is calibrated on: time against the boolean count
+    /// `round_mesh_booleans` predicts, over both shapes the count has to tell apart.
+    ///
+    /// N facets picked as N separate one-segment chains is N booleans and scales; the same span
+    /// picked as ONE polyline is a single swept boolean however long it is. The old gate, counting
+    /// model edges, could not see the difference — run with `--release` for the numbers quoted on
+    /// the constant.
+    #[test]
+    #[ignore]
+    fn diag_csg_round_cost_vs_booleans() {
+        let (body, _) = ring_and_sector();
+        let n = 128usize;
+        let pt = |i: usize| { let a = std::f64::consts::TAU * (i % n) as f64 / n as f64; [8.0 * a.cos(), 8.0 * a.sin(), 2.0] };
+        let run = |what: &str, chains: &[Vec<[f64; 3]>]| {
+            let edges: usize = chains.iter().map(|c| c.len() - 1).sum();
+            let want = crate::fillet::round_mesh_booleans(&body, 0.5, chains);
+            let t0 = std::time::Instant::now();
+            let got = crate::round_mesh(&body, 0.5, chains);
+            eprintln!(
+                "{what:>28}: {edges:3} model edges → {want:3} booleans   {:>9.2?}  {}",
+                t0.elapsed(), if got.is_some() { "OK" } else { "declined" }
+            );
+        };
+        for &m in &[1usize, 2, 4, 6, 8, 12, 16, 32] {
+            let chains: Vec<Vec<[f64; 3]>> = (n / 4..n / 4 + m).map(|i| vec![pt(i), pt(i + 1)]).collect();
+            run(&format!("{m} facets picked singly"), &chains);
+        }
+        for &m in &[8usize, 32, 96] {
+            let chain: Vec<Vec<[f64; 3]>> = vec![(n / 4..=n / 4 + m).map(pt).collect()];
+            run(&format!("{m} facets as one arc"), &chain);
+        }
+    }
+
+    /// What the surgery hands over on a folded run-out: the whole junction loop of
+    /// roundfilleterror2.hcad — 194 model edges but only four booleans, two 270° arcs and two
+    /// short radial straights — timed and weighed against the signed Pappus sum of its four
+    /// pieces. `mixed_convex_and_concave_junction_loop_fillets` asserts the outcome; this reports
+    /// the cost the gate is deciding on.
+    #[test]
+    #[ignore]
+    fn diag_csg_round_on_the_whole_junction_loop() {
+        let (body, picked) = ring_and_sector();
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let pi = std::f64::consts::PI;
+        for &r in &[0.5f64, 1.0, 1.5, 1.9] {
+            let area = r * r * (1.0 - pi / 4.0);
+            let ubar = r * (5.0 / 6.0 - pi / 4.0) / (1.0 - pi / 4.0);
+            let want = -1.5 * pi * (8.0 - ubar) * area - 1.5 * pi * (5.0 + ubar) * area + 2.0 * area * 3.0;
+            let t0 = std::time::Instant::now();
+            let m = crate::round_mesh(&body, r, &picked);
+            let el = t0.elapsed();
+            match m {
+                Some(m) => eprintln!(
+                    "r={r}: {el:>8.2?}  moved {:+.4} (signed sum of the four pieces {want:+.4}, {:+.1}%)  manifold={}",
+                    vol(&m) - vol(&body), (vol(&m) - vol(&body) - want) / want.abs() * 100.0,
+                    crate::mesh_bool::is_manifold(&m)
+                ),
+                None => eprintln!("r={r}: {el:>8.2?}  declined"),
+            }
         }
     }
 
@@ -2736,3 +2996,4 @@ mod tests {
         assert!(is_watertight(&beveled));
     }
 }
+
