@@ -32478,6 +32478,30 @@ mod tests {
         let tess = mesh_tessellation(mesh.clone());
         let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
         eprintln!("seam lines: {} emitted, {} kept after clipping", bevel_edges.len(), kept.len());
+        // A seam END is only "dangling" if nothing meets it. The band's outline is closed by the
+        // MESH's own sharp edges (the trim curves on each wall), so measure against those too.
+        {
+            let mut worst = 0.0f32;
+            let mut unmet = 0;
+            for e in &kept {
+                for p in e {
+                    let pv = Vec3::from_array(*p);
+                    let d = tess
+                        .edges
+                        .iter()
+                        .flat_map(|s| s.iter())
+                        .map(|q| pv.distance(Vec3::from_array(*q)))
+                        .fold(f32::INFINITY, f32::min);
+                    if d > 1e-3 {
+                        unmet += 1;
+                        eprintln!("   UNMET end ({:.3},{:.3},{:.3}) r={:.3} — nearest drawn edge {d:.4} away",
+                            p[0], p[1], p[2], ((p[0] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt());
+                    }
+                    worst = worst.max(d.min(1e3));
+                }
+            }
+            eprintln!("seam ends meeting a drawn mesh edge: {}/{} (worst gap {worst:.4})", kept.len() * 2 - unmet, kept.len() * 2);
+        }
         for e in &kept {
             let rad = |p: [f32; 3]| ((p[0] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt();
             let over = rad(e[0]).max(rad(e[1])) - outer;

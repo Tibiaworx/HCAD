@@ -857,7 +857,7 @@ fn clip_seam_to_face(topo: &Topo, fi: usize, p: V3, q: V3) -> Vec<(V3, V3)> {
 /// face. Follows the rounded body and chains up for picking. Each segment carries the normal of
 /// the flat face it borders — the segment is only valid while the final surface UNDER it still
 /// faces that way (a later cut whose wall merely grazes the line must not keep it alive).
-fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>) -> Vec<([[f32; 3]; 2], [f32; 3])> {
+fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64) -> Vec<([[f32; 3]; 2], [f32; 3])> {
     let f32a = |p: V3| [p[0] as f32, p[1] as f32, p[2] as f32];
     let mut out = Vec::new();
     for fi in 0..topo.faces.len() {
@@ -869,9 +869,36 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
                 if topo.edge_between(a, b).is_some_and(|ei| selected[ei]) {
                     let pa = corner.get(&(a, fi)).copied().unwrap_or(topo.verts[a]);
                     let pb = corner.get(&(b, fi)).copied().unwrap_or(topo.verts[b]);
-                    // Only the part that stays on the face — a mitred corner can put the line's
-                    // end outside it where the edge runs out onto a curved wall.
-                    for (ca, cb) in clip_seam_to_face(topo, fi, pa, pb) {
+                    // Run the line LONG and cut it to the face, exactly as the fill itself is
+                    // swept long and cut to the footprint — the seam has to have the fillet's
+                    // extent, and the mitred corners are not it at either end. Short of the face
+                    // (the boundary curves away) the corner sits outside and the line is trimmed
+                    // back; past it (the boundary curves toward, as the bore does) the corner
+                    // stops short and the line is carried on to meet the wall. Bounded by r, the
+                    // same overrun the fill is swept with, so it can't wander onto a face the
+                    // fillet never reaches.
+                    // ...but ONLY at an end where the seam actually runs out. Where the next
+                    // boundary edge is selected too the seam continues into its neighbour, already
+                    // meeting it at their shared mitred corner; extending there just runs each
+                    // chord of a rounded rim past the next one (a boss's base rim grew 0.8-long
+                    // chords into 1.88-long overlapping ones).
+                    let dir = norm(sub(pb, pa));
+                    let prev_sel = topo.edge_between(lp[(k + m - 1) % m], a).is_some_and(|ei| selected[ei]);
+                    let next_sel = topo.edge_between(b, lp[(k + 2) % m]).is_some_and(|ei| selected[ei]);
+                    let ea = if prev_sel { pa } else { add(pa, scale(dir, -r)) };
+                    let eb = if next_sel { pb } else { add(pb, scale(dir, r)) };
+                    let mid = scale(add(pa, pb), 0.5);
+                    // Keep the run the original seam lies in; a long line can re-enter the face
+                    // elsewhere (across a hole, or the far side of a ring).
+                    let runs = clip_seam_to_face(topo, fi, ea, eb);
+                    let on_run = |a: V3, b: V3| {
+                        let ab = sub(b, a);
+                        let l2 = dot(ab, ab).max(1e-18);
+                        let t = (dot(sub(mid, a), ab) / l2).clamp(0.0, 1.0);
+                        let q = add(a, scale(ab, t));
+                        dot(sub(mid, q), sub(mid, q)) < 1e-8
+                    };
+                    for (ca, cb) in runs.into_iter().filter(|&(a, b)| on_run(a, b)) {
                         out.push(([f32a(ca), f32a(cb)], n));
                     }
                 }
@@ -915,13 +942,18 @@ fn inset_fold_area(topo: &Topo, fi: usize, cpt: &dyn Fn(usize, usize) -> V3) -> 
 
 /// How many selected model edges the CSG round can still finish in an interactive budget.
 ///
-/// Handing a folded bevel to `round_mesh` only helps if it comes back. It unions one fillet solid
-/// per picked segment, and the cost is not linear — measured on the ring-and-sector body at r=0.5:
-/// 1 segment 26 ms, 2 segments 55 ms, 4 segments 135 ms, **8 segments 61 s**. So a lone terminal
-/// edge (the shape that folds in practice — a fillet running out onto a curved wall) is cheap to
-/// hand over, while a whole picked rim would wedge the UI, which regenerates on the main thread.
-/// Past this bound the folded mesh is emitted as-is: a striped run-out is a bad look, but it is a
-/// far better one than a frozen application.
+/// Handing a folded bevel to `round_mesh` only helps if it comes back, and past a handful of
+/// segments it does not. Measured on the ring-and-sector body at r=0.5, with the per-segment tools
+/// already batched into one boolean apiece: 1 segment 27 ms, 2 segments 39 ms, 4 segments 77 ms,
+/// 5 segments 560 ms, 6 segments 706 ms, **7 segments 60 s**. So a lone terminal edge — the shape
+/// that folds in practice, a fillet running out onto a curved wall — is cheap to hand over, while
+/// a whole picked rim would wedge the UI, which regenerates on the main thread.
+///
+/// The wall at 7 is NOT the cost of a growing body: batching the tools cut 4 segments nearly in
+/// half and left 7 untouched, so something else takes over there and is worth its own look. Until
+/// then the bound stays where the cost is still measured in tens of milliseconds. Past it the
+/// folded mesh is emitted as-is: a striped run-out is a bad look, but a far better one than a
+/// frozen application.
 const CSG_ROUND_MAX_EDGES: usize = 4;
 
 /// Escape hatch for measuring the two engines against each other on the same document:
@@ -1442,7 +1474,7 @@ fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), 
 /// empty = every edge.
 pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Vec<[[f32; 3]; 2]> {
     match bevel_prep(mesh, r, picked) {
-        Some((topo, selected, corner)) => emit_feature_edges(&topo, &selected, &corner).into_iter().map(|(e, _)| e).collect(),
+        Some((topo, selected, corner)) => emit_feature_edges(&topo, &selected, &corner, r).into_iter().map(|(e, _)| e).collect(),
         None => Vec::new(),
     }
 }
@@ -1463,7 +1495,7 @@ pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f6
 pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> (Option<TriMesh>, Vec<([[f32; 3]; 2], [f32; 3])>) {
     match bevel_prep(mesh, r, picked) {
         Some((topo, selected, corner)) => {
-            let edges = emit_feature_edges(&topo, &selected, &corner);
+            let edges = emit_feature_edges(&topo, &selected, &corner, r);
             let mesh = run_surgery(&topo, &selected, &corner, r, seg);
             (mesh, edges)
         }
@@ -2039,16 +2071,23 @@ mod tests {
         for &r in &[1.0f64, 1.4, 2.35] {
             let seams = bevel_feature_edges(&body, r, &[picked[2].clone()]);
             assert!(!seams.is_empty(), "r={r}: the rim's seam edges must still be emitted");
-            let mut worst = 0.0f64;
+            let (mut worst, mut furthest, mut nearest) = (0.0f64, 0.0f64, f64::MAX);
             for e in &seams {
                 for p in e {
                     let d = ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt();
                     worst = worst.max(d - 8.0);
+                    furthest = furthest.max(d);
+                    nearest = nearest.min(d);
                 }
             }
             // The wall is a 128-gon, so its outline is INSIDE r=8 — a seam ending on it can never
             // exceed 8. Before the clip this ran to 8.17 at r=2.35.
             assert!(worst < 1e-3, "r={r}: a seam runs {worst:.4} past the r=8 wall — it's drawn off the part");
+            // ...and it must REACH both walls, not stop short of them. The mitred corners are not
+            // the fillet's extent at either end: at the bore the fillet runs out past them, and a
+            // seam left ending at the corner hangs 0.47 short of anything (measured at r=2.35).
+            assert!(furthest > 8.0 - 0.01, "r={r}: the seam stops {:.3} short of the r=8 wall", 8.0 - furthest);
+            assert!(nearest < 5.0 + 0.01, "r={r}: the seam stops {:.3} short of the r=5 bore", nearest - 5.0);
         }
     }
 
@@ -2239,7 +2278,7 @@ mod tests {
             let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
             [rad * a.cos(), rad * a.sin(), 2.0]
         };
-        for &k in &[1usize, 2, 4, 8, 16, 32] {
+        for &k in &[1usize, 2, 4, 5, 6, 7] {
             let chain: Vec<[f64; 3]> = (n / 4..=n / 4 + k).map(|i| pt(i, 8.0)).collect();
             let t0 = std::time::Instant::now();
             let got = crate::round_mesh(&body, 0.5, std::slice::from_ref(&chain));
