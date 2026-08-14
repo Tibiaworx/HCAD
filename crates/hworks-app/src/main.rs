@@ -32422,6 +32422,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_sticks_out -- --ignored --nocapture
+    fn diag_fillet_sticks_out() {
+        // Does the finished body poke OUT past the walls it is supposed to stay inside? Reads the
+        // cylinder radii straight off the document's first sketch, then regenerates the whole
+        // feature list (every fillet applied, in order) and measures every vertex against them.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let mut radii: Vec<f64> = Vec::new();
+        for f in &doc.features {
+            if let FeatureKind::Extrude { sketch, .. } = &f.kind {
+                for e in &sketch.entities {
+                    if let SketchEntity::Circle { radius, .. } = e {
+                        radii.push(*radius);
+                    }
+                }
+            }
+        }
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        radii.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        eprintln!("cylinder radii in the sketches: {radii:?}");
+        let (outer, inner) = (radii.last().copied().unwrap_or(0.0), radii.first().copied().unwrap_or(0.0));
+        for (label, r) in doc.features.iter().enumerate().filter_map(|(i, f)| match &f.kind {
+            FeatureKind::Fillet { radius, .. } => Some((format!("after fillet #{i}"), *radius)),
+            _ => None,
+        }) {
+            eprintln!("  (document has {label} r={r})");
+        }
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        // The part is a ring about the Y axis: every vertex must satisfy inner <= hypot(x,z) <= outer.
+        let (mut worst_out, mut worst_in, mut n_out, mut n_in) = (0.0f64, 0.0f64, 0usize, 0usize);
+        let mut examples: Vec<[f32; 3]> = Vec::new();
+        for p in &mesh.positions {
+            let d = ((p[0] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt();
+            if d > outer + 1e-3 {
+                n_out += 1;
+                if d - outer > worst_out { worst_out = d - outer; examples.push(*p); }
+            }
+            if d < inner - 1e-3 && (p[1] as f64) > 1.5 {
+                n_in += 1;
+                worst_in = worst_in.max(inner - d);
+            }
+        }
+        eprintln!("body: {} tris, manifold={}", mesh.indices.len() / 3, hworks_geometry::is_manifold(&mesh));
+        eprintln!("OUTSIDE the r={outer} wall: {n_out} vertices, worst {worst_out:.4}");
+        eprintln!("INSIDE  the r={inner} bore: {n_in} vertices, worst {worst_in:.4}");
+        for p in examples.iter().rev().take(6) {
+            eprintln!("   sticks out at ({:.3}, {:.3}, {:.3})  radius {:.4}", p[0], p[1], p[2],
+                ((p[0] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt());
+        }
+    }
+
+    #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_edge_loop_pick -- --ignored --nocapture
     fn diag_edge_loop_pick() {
         // What does clicking each feature edge actually select? Reports, per seed, what the

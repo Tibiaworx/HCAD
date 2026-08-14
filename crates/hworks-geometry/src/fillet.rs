@@ -495,6 +495,192 @@ fn fillet_circular(tris: &[[V3; 3]], radius: f64, loop_pts: &[[f64; 3]], _tol: f
 /// straight, convex segment between two flat faces it carves the corner with a tangent
 /// cylinder. Returns the rounded mesh, or `None` if it couldn't round any segment (caller
 /// falls back to the SDF round).
+/// The solid swept by every body triangle lying in the plane (`n`, `off`), pushed `height` along
+/// `n` — that face's own footprint, as a solid.
+///
+/// A concave fillet rests in the corner between two faces and cannot leave either of them, so
+/// intersecting the fill with this trims BOTH ends at once, and in the two opposite directions
+/// they need. Where the face's boundary curves away from the fill (a convex outer wall) the fill
+/// is cut back off the tab it would otherwise leave standing proud. Where the boundary curves
+/// TOWARD it (the r=5 bore) the fill — swept long on purpose — is cut to follow the bore round
+/// instead of stopping in the straight chord that leaves a square step. Facet for facet, since the
+/// footprint is the tessellated face itself.
+///
+/// Returns `None` if no such face is in the mesh, or its triangles don't close into a region.
+fn face_footprint_prism(tris: &[[V3; 3]], n: V3, off: f64, height: f64, tol: f64) -> Option<TriMesh> {
+    let face: Vec<[V3; 3]> = tris
+        .iter()
+        .filter(|t| {
+            let nf = norm(cross_perp(sub(t[1], t[0]), sub(t[2], t[0])));
+            dot(nf, n) > 0.999 && t.iter().all(|&v| (dot(n, v) - off).abs() < tol)
+        })
+        .copied()
+        .collect();
+    if face.is_empty() {
+        return None;
+    }
+    // Sink the base slightly so the intersection is robust where the fill touches the face.
+    let base = scale(n, -tol.max(1e-6) * 10.0);
+    let top = scale(n, height);
+    let mut b = MeshBuild::default();
+    for t in &face {
+        b.tri(add(t[0], top), add(t[1], top), add(t[2], top));
+        b.tri(add(t[2], base), add(t[1], base), add(t[0], base)); // reversed: outward-facing
+    }
+    // Walls on the region's boundary — the edges used by exactly one triangle.
+    let key = |p: V3| [(p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64];
+    let mut count: HashMap<([i64; 3], [i64; 3]), (usize, V3, V3)> = HashMap::new();
+    for t in &face {
+        for &(p, q) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let (kp, kq) = (key(p), key(q));
+            let k = if kp <= kq { (kp, kq) } else { (kq, kp) };
+            let e = count.entry(k).or_insert((0, p, q));
+            e.0 += 1;
+        }
+    }
+    for (_, (c, p, q)) in count {
+        if c != 1 {
+            continue; // interior edge
+        }
+        b.tri(add(p, base), add(q, base), add(q, top));
+        b.tri(add(p, base), add(q, top), add(p, top));
+    }
+    Some(b.finish())
+}
+
+/// Minimal triangle-soup accumulator for the footprint prism.
+#[derive(Default)]
+struct MeshBuild {
+    pos: Vec<[f32; 3]>,
+}
+impl MeshBuild {
+    fn tri(&mut self, a: V3, b: V3, c: V3) {
+        for p in [a, b, c] {
+            self.pos.push([p[0] as f32, p[1] as f32, p[2] as f32]);
+        }
+    }
+    fn finish(self) -> TriMesh {
+        let n = self.pos.len();
+        let mut normals = Vec::with_capacity(n);
+        for t in self.pos.chunks_exact(3) {
+            let g = |p: [f32; 3]| [p[0] as f64, p[1] as f64, p[2] as f64];
+            let nf = norm(cross_perp(sub(g(t[1]), g(t[0])), sub(g(t[2]), g(t[0]))));
+            for _ in 0..3 {
+                normals.push([nf[0] as f32, nf[1] as f32, nf[2] as f32]);
+            }
+        }
+        TriMesh { positions: self.pos, normals, indices: (0..n as u32).collect() }
+    }
+}
+
+/// A big box filling the material side of the plane through `p0` with outward normal `n`.
+/// Intersecting a tool with it clips the tool back to that side.
+fn halfspace_box(p0: V3, n: V3, size: f64) -> TriMesh {
+    let seed = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let u = norm(sub(seed, scale(n, dot(seed, n))));
+    let w = norm(cross_perp(n, u));
+    let square: Vec<V3> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .iter()
+        .map(|&(a, b)| add(p0, add(scale(u, a * size), scale(w, b * size))))
+        .collect();
+    extrude_prism(&square, scale(n, -1.0), size)
+}
+
+/// Trim a concave fillet's fill so it cannot add material outside the walls it runs out into.
+///
+/// The fill is a prism swept along the edge with FLAT ends, square to the edge. Where the edge
+/// terminates on a wall that curves away — the circular junction where a raised feature meets the
+/// part below it — the part's boundary bends inward while the prism's end does not, so the fill's
+/// far corner is left standing outside the body: the tab you see proud of the wall. Measured on
+/// the boss-sector junction before this trim: 134 vertices up to 0.397 outside an r=8 wall, each
+/// one the edge's endpoint displaced by the fillet's own radius.
+///
+/// The right end condition is the fillet trimmed by the faces it runs into, and those faces are
+/// already in the body. Take every triangle near the edge's ends that is not part of either face
+/// being blended, and clip the fill back to the material side of any whose plane it crosses. On a
+/// tessellated convex wall that reproduces the wall exactly, facet for facet; a plane the fill
+/// never crosses costs nothing, so a fillet ending in open air is left alone.
+fn trim_fill_to_walls(fill: &TriMesh, tris: &[[V3; 3]], ends: [V3; 2], n1: V3, n2: V3, radius: f64, tol: f64) -> TriMesh {
+    let verts: Vec<V3> = fill
+        .positions
+        .iter()
+        .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .collect();
+    if verts.is_empty() {
+        return fill.clone();
+    }
+    // Only walls within reach of an end can clip anything: the fill never extends further than
+    // its own radius from the edge.
+    let reach = 2.5 * radius;
+    let near_end = |p: V3| ends.iter().any(|&e| len(sub(p, e)) <= reach);
+    let mut planes: Vec<(V3, f64)> = Vec::new(); // (outward normal, offset) deduped on a grid
+    let mut seen: std::collections::HashSet<[i64; 4]> = std::collections::HashSet::new();
+    for t in tris {
+        if !t.iter().any(|&v| near_end(v)) {
+            continue;
+        }
+        let nf = norm(cross_perp(sub(t[1], t[0]), sub(t[2], t[0])));
+        if len(nf) < 0.5 {
+            continue; // degenerate sliver
+        }
+        // The two faces being blended are where the fill is SUPPOSED to sit proud — clipping to
+        // them would erase the fillet itself.
+        if dot(nf, n1).abs() > 0.996 || dot(nf, n2).abs() > 0.996 {
+            continue;
+        }
+        let off = dot(nf, t[0]);
+        let key = [
+            (nf[0] * 1e3).round() as i64,
+            (nf[1] * 1e3).round() as i64,
+            (nf[2] * 1e3).round() as i64,
+            (off * 1e3).round() as i64,
+        ];
+        if !seen.insert(key) {
+            continue;
+        }
+        // Only a plane the WHOLE body stays behind may be used as a clip. On a convex wall the
+        // facet's plane supports the body and cutting the fill back to it is exactly the trim; on
+        // a CONCAVE wall — the r=5 bore here — the tangent plane slices clean through the part, so
+        // clipping to it would carve away the fillet along with the tab. (That is what happened
+        // the first time: bore facets up to 60° away were trimming the fill down to a shaving,
+        // leaving the run-out flush but the fillet itself all but gone.)
+        let supports = tris
+            .iter()
+            .flatten()
+            .all(|&v| dot(nf, v) - off <= tol.max(1e-6) * 10.0);
+        if supports {
+            planes.push((nf, off));
+        }
+    }
+    // Box big enough to swallow the fill on the material side.
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for v in &verts {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v[k]);
+            hi[k] = hi[k].max(v[k]);
+        }
+    }
+    let size = len(sub(hi, lo)).max(radius) * 4.0;
+    let mut out = fill.clone();
+    for (nf, off) in planes {
+        let outside = verts.iter().map(|&v| dot(nf, v) - off).fold(f64::MIN, f64::max);
+        if outside <= tol {
+            continue; // the fill stays behind this wall already
+        }
+        let clipped = crate::mesh_intersection(&out, &halfspace_box(scale(nf, off), nf, size));
+        if std::env::var("HCAD_TRIM_DEBUG").is_ok() {
+            eprintln!(
+                "  clip by n=({:.3},{:.3},{:.3}) off={off:.3}: fill was {outside:.3} past it; tris {} → {}",
+                nf[0], nf[1], nf[2], out.indices.len() / 3, clipped.indices.len() / 3
+            );
+        }
+        if clipped.indices.len() >= 3 {
+            out = clipped;
+        }
+    }
+    out
+}
+
 fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     let tris: Vec<[V3; 3]> = mesh
         .indices
@@ -634,7 +820,44 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                     cross.push(add(c0, scale(dir, radius)));
                 }
                 cross.push(t2);
-                let fill = extrude_prism(&cross, axis, l); // exactly the edge length, no overhang
+                // Swept LONG at both ends on purpose, then trimmed to the two faces it rests in.
+                // The old fill spanned exactly the edge, on the reasoning that a union past the
+                // end adds a stray tab — true, and it does, but stopping square to the edge is
+                // just as wrong the other way: where the face's boundary curves toward the fill
+                // (the bore) the band ends in a straight chord and leaves a step. Running long
+                // and trimming to the footprint gets both ends from one rule.
+                let over = scale(axis, -radius);
+                let long: Vec<V3> = cross.iter().map(|&p| add(p, over)).collect();
+                let fill = extrude_prism(&long, axis, l + 2.0 * radius);
+                // Over EITHER face, not both. The two footprints are intersected with the fill as
+                // a UNION because the fillet is entitled to run out over whichever face reaches
+                // furthest: the ring top's boundary follows the bore round, while the sector's
+                // radial face is planar and stops in a straight line at the bore's radius. Taking
+                // them separately re-imposes that straight line and puts the step back — the
+                // fillet may go where either face still supports it, and ends only where both
+                // have run out.
+                let dbg = std::env::var("HCAD_TRIM_DEBUG").is_ok();
+                let mut allowed: Option<TriMesh> = None;
+                for &(nf, on) in &[(n1, a), (n2, a)] {
+                    if let Some(fp) = face_footprint_prism(&tris, nf, dot(nf, on), radius * 4.0, tol) {
+                        allowed = Some(match allowed {
+                            Some(prev) => crate::mesh_union(&prev, &fp),
+                            None => fp,
+                        });
+                    }
+                }
+                let fill = match allowed {
+                    Some(fp) => {
+                        let cut = crate::mesh_intersection(&fill, &fp);
+                        if dbg {
+                            eprintln!("  footprint union: {} tris, fill {} → {}", fp.indices.len() / 3, fill.indices.len() / 3, cut.indices.len() / 3);
+                        }
+                        if cut.indices.len() >= 3 { cut } else { fill }
+                    }
+                    None => fill,
+                };
+                // Belt and braces for anything the footprints couldn't bound.
+                let fill = trim_fill_to_walls(&fill, &tris, [a, b], n1, n2, radius, tol);
                 if fill.indices.len() >= 3 {
                     body = crate::mesh_union(&body, &fill);
                     any = true;

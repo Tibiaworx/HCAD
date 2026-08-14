@@ -795,12 +795,75 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
     out
 }
 
+/// How much of face `fi` the inset turns inside-out — the area of its triangles that end up facing
+/// against the face normal.
+///
+/// A flat face is re-emitted with its ORIGINAL triangulation and every vertex moved to its inset
+/// corner (step 1 below). That is only valid while the move stays injective — which it is exactly
+/// as long as each boundary vertex's setback is small next to the spacing of its neighbours along
+/// the boundary. Where a selected edge ENDS on a tessellated CURVED wall, it isn't: the setback is
+/// the full fillet radius while the neighbouring boundary vertices are facet chords away, a small
+/// fraction of it. The edge's end vertices are then dragged clean across several neighbours, the
+/// inset outline crosses itself, and the triangles hanging off those vertices flip over — leaving
+/// two coplanar sheets stacked in the same plane, which z-fight and read as stripes down the
+/// fillet's run-out. (Measured on the boss-sector junction at r=2.15: 5.49 units of face folded
+/// back, 96.4 units of triangle area in a plane that should hold 85.4.)
+///
+/// Volume cannot see this: a fold adds and removes material in equal measure, so the body still
+/// weighs exactly right and every Pappus check passes with the defect present. Orientation is what
+/// catches it. Judged against the FACE's normal, not each triangle's own before-normal, so a
+/// sliver's noisy normal can't cast the deciding vote.
+fn inset_fold_area(topo: &Topo, fi: usize, cpt: &dyn Fn(usize, usize) -> V3) -> f64 {
+    let n = topo.faces[fi].normal;
+    topo.faces[fi]
+        .tris
+        .iter()
+        .filter_map(|&ti| {
+            let t = topo.tris[ti];
+            let before = cross(sub(topo.verts[t[1]], topo.verts[t[0]]), sub(topo.verts[t[2]], topo.verts[t[0]]));
+            let after = cross(sub(cpt(t[1], fi), cpt(t[0], fi)), sub(cpt(t[2], fi), cpt(t[0], fi)));
+            (dot(before, n) > 1e-12 && dot(after, n) < -1e-12).then(|| dot(after, after).sqrt() * 0.5)
+        })
+        .sum()
+}
+
+/// How many selected model edges the CSG round can still finish in an interactive budget.
+///
+/// Handing a folded bevel to `round_mesh` only helps if it comes back. It unions one fillet solid
+/// per picked segment, and the cost is not linear — measured on the ring-and-sector body at r=0.5:
+/// 1 segment 26 ms, 2 segments 55 ms, 4 segments 135 ms, **8 segments 61 s**. So a lone terminal
+/// edge (the shape that folds in practice — a fillet running out onto a curved wall) is cheap to
+/// hand over, while a whole picked rim would wedge the UI, which regenerates on the main thread.
+/// Past this bound the folded mesh is emitted as-is: a striped run-out is a bad look, but it is a
+/// far better one than a frozen application.
+const CSG_ROUND_MAX_EDGES: usize = 4;
+
+/// Escape hatch for measuring the two engines against each other on the same document:
+/// `HCAD_BEVEL_NO_CSG_HANDOVER=1` keeps the folded surgery result instead of declining.
+fn csg_handover_enabled() -> bool {
+    std::env::var("HCAD_BEVEL_NO_CSG_HANDOVER").is_err()
+}
+
 /// The surgery half of a prepared bevel: flat faces inset to their corners, a convex/concave
 /// cylinder strip per selected edge, and a fanned patch per corner. `None` if the result isn't
 /// watertight (a partial-vertex T-junction the prototype can't split → caller falls back to CSG).
 fn run_surgery(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64, seg: usize) -> Option<TriMesh> {
     let verts = &topo.verts;
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
+    // A face the inset turns inside-out can only be emitted as a self-overlapping sheet — see
+    // `inset_fold_area`. Hand those to the CSG round, which does this shape properly (on the
+    // boss-sector junction: volume to 0.7%, the face plane covered exactly once, nothing through
+    // the walls) — but only while the pick is small enough for it to finish, per
+    // `CSG_ROUND_MAX_EDGES`. The threshold is on fold AREA, not on any fold at all, so a sliver
+    // flipped by rounding noise doesn't push a good bevel onto the slower path; a real fold runs
+    // to whole multiples of r², a numerical one to a millionth of it.
+    let folded: f64 = (0..topo.faces.len()).map(|fi| inset_fold_area(topo, fi, &cpt)).sum();
+    if folded > 0.01 * r * r
+        && selected.iter().filter(|&&s| s).count() <= CSG_ROUND_MAX_EDGES
+        && csg_handover_enabled()
+    {
+        return None;
+    }
     let mut b = Build::new();
 
     // 0) Terminal-edge splices. At a vertex where exactly ONE selected edge ends (its other
@@ -1807,6 +1870,73 @@ mod tests {
         (body, picked)
     }
 
+    /// A fillet that RUNS OUT onto a tessellated curved wall hands over to the CSG round.
+    ///
+    /// roundfilleterror2.hcad as saved: one concave straight radial edge under the sector, whose
+    /// two ends land on the outer (r=8) and inner (r=5) cylinder walls. The surgery insets that
+    /// edge's end vertices by the full radius while their neighbours on the wall are facet chords
+    /// away — so it drags them across several neighbours and folds the ring-top face back over
+    /// itself, stacking two coplanar sheets that z-fight into stripes down the run-out. It weighs
+    /// correctly the whole time (a fold cancels itself out), which is why only an orientation test
+    /// catches it. Rather than ship that, the surgery declines and `round_mesh` takes over.
+    #[test]
+    fn a_fillet_running_out_onto_a_curved_wall_hands_over_to_csg() {
+        let (body, picked) = ring_and_sector();
+        let edge = vec![picked[2].clone()]; // the straight radial edge at angle 0
+        let r = 2.15f64;
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        // A lone terminal edge is one model edge — cheap for the CSG round to take (26 ms), well
+        // inside `CSG_ROUND_MAX_EDGES`.
+        let (_, sel, _) = bevel_prep(&body, r, &edge).expect("prep");
+        assert_eq!(sel.iter().filter(|&&s| s).count(), 1, "a lone radial edge should select one model edge");
+        assert!(bevel_mesh_selected(&body, r, 12, &edge).is_none(), "the surgery must decline a fillet that folds its run-out");
+
+        let m = crate::round_mesh(&body, r, &edge).expect("the CSG round must handle a lone terminal edge");
+        assert!(crate::mesh_bool::is_manifold(&m), "the CSG run-out is not manifold");
+        let want = (1.0 - std::f64::consts::PI / 4.0) * r * r * 3.0;
+        let got = vol(&m) - vol(&body);
+        assert!((got - want).abs() < want * 0.05, "a concave fillet must add {want:.4}, this moved {got:+.4}");
+
+        // The point of the exercise: the ring-top plane is covered ONCE. The surgery stacked 96.4
+        // units of triangle where 85.4 belong; anything near that again is the fold returning.
+        let mut area = 0.0f64;
+        for t in m.indices.chunks_exact(3) {
+            let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+            let (a, b2, c) = (g(t[0]), g(t[1]), g(t[2]));
+            if [a, b2, c].iter().all(|p| (p[2] - 2.0).abs() < 1e-6) {
+                let n = cross(sub(b2, a), sub(c, a));
+                area += dot(n, n).sqrt() * 0.5;
+            }
+        }
+        let want_area = std::f64::consts::PI * (64.0 - 25.0) * 0.75 - 3.0 * r;
+        assert!(area < want_area * 1.02, "the ring-top plane holds {area:.2} of triangle where {want_area:.2} belongs — the sheets are stacked again");
+
+        // ...and the fillet stays INSIDE the walls it runs out into. The fill is swept with flat
+        // ends square to the edge, so before `trim_fill_to_walls` its far corner stood proud of
+        // the cylinder that curves away from it — the endpoint displaced by the fillet's own
+        // radius, 0.4 outside an r=8 wall, which is the tab the junction showed.
+        // The walls are 128-gons, so a facet sits a sagitta inside the ideal circle and a fillet
+        // tracking the wall faithfully reads as very slightly inside it too. Allow exactly that
+        // and no more — the tab this catches stood 0.4 out, two orders above it.
+        let sagitta = |rad: f64| rad * (1.0 - (std::f64::consts::PI / 128.0).cos());
+        let mut worst = 0.0f64;
+        for p in &m.positions {
+            let d = ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt();
+            worst = worst.max(d - 8.0); // the faceted wall is INSIDE r=8, so nothing may exceed it
+            if p[2] as f64 > 2.0 + 1e-6 {
+                worst = worst.max(5.0 - sagitta(5.0) - d); // nothing may hang into the bore
+            }
+        }
+        assert!(worst < 1e-3, "the fillet stands {worst:.4} proud of the walls — the run-out isn't trimmed");
+    }
+
     /// The junction loop of roundfilleterror2.hcad, which the curved-wall guard used to refuse:
     /// two CONCAVE straight radial edges and two CONVEX 270° arcs picked as one selection. Each
     /// piece must pull its own way — the arcs cutting material off the ring's rims, the straights
@@ -1815,6 +1945,14 @@ mod tests {
     /// (The whole loop was once read as evidence the surgery had the sign of a concave fillet
     /// wrong, on a measurement of about −61 at r=2.2. It doesn't: the two convex arcs simply
     /// outweigh the two short straights, and −57 is what this loop is supposed to give.)
+    ///
+    /// KNOWN LIMIT, deliberately not asserted away: the two straight edges still run out onto the
+    /// curved walls, so their four ends fold the ring-top face exactly as
+    /// `a_fillet_running_out_onto_a_curved_wall_hands_over_to_csg` describes. This pick is far too
+    /// big to hand to the CSG round — 194 model edges against a measured cliff at 8 — so the
+    /// folded mesh is emitted rather than freezing the app. What this test pins is the part that
+    /// IS right: each piece pulls its own way and the total is the signed sum. It cannot see the
+    /// fold, because volume never can.
     #[test]
     fn mixed_convex_and_concave_junction_loop_fillets() {
         let (body, picked) = ring_and_sector();
@@ -1848,6 +1986,71 @@ mod tests {
                 "r={r}: the loop moved {got:+.4}, the signed sum of its four pieces is {want:+.4} \
                  (outer arc {outer:+.3}, inner arc {inner:+.3}, straights {straights:+.3})"
             );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_both_radial_edges() {
+        // The user's current state: ONE fillet, r=2.35, on BOTH radial edges of the sector.
+        let (body, picked) = ring_and_sector();
+        let edges = vec![picked[2].clone(), picked[3].clone()];
+        let r = 2.35f64;
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let m = crate::round_mesh(&body, r, &edges).expect("CSG round");
+        eprintln!("volume added {:+.4} (untrimmed ideal {:+.4}), manifold={}",
+            vol(&m) - vol(&body), 2.0 * (1.0 - std::f64::consts::PI / 4.0) * r * r * 3.0, crate::mesh_bool::is_manifold(&m));
+        // Where does it sit relative to the two walls? Anything above the ring top (z>2) must
+        // stay in the annulus band 5..8.
+        let (mut out, mut into_bore) = (0.0f64, 0.0f64);
+        let (mut n_out, mut n_bore) = (0usize, 0usize);
+        let mut worst_bore: [f64; 3] = [0.0; 3];
+        for q in &m.positions {
+            let p = [q[0] as f64, q[1] as f64, q[2] as f64];
+            let d = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            if d > 8.0 + 1e-3 { n_out += 1; out = out.max(d - 8.0); }
+            if p[2] > 2.0 + 1e-6 && d < 5.0 - 1e-3 {
+                n_bore += 1;
+                if 5.0 - d > into_bore { into_bore = 5.0 - d; worst_bore = p; }
+            }
+        }
+        // The bore is a 128-gon, so a fillet tracking it faithfully reads a sagitta inside the
+        // ideal circle — 0.0015 at r=5. Anything materially past that is a real intrusion.
+        eprintln!("outside r=8 wall: {n_out} verts, worst {out:.4}");
+        eprintln!(
+            "into  r=5 bore : {n_bore} verts, worst {into_bore:.4} at ({:.3},{:.3},{:.3})  [128-gon sagitta {:.4}]",
+            worst_bore[0], worst_bore[1], worst_bore[2],
+            5.0 * (1.0 - (std::f64::consts::PI / 128.0).cos())
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_csg_round_cost_vs_pick_size() {
+        // Declining sends the caller to the CSG round. That is only a safe place to send work if
+        // it finishes — so measure how it scales with the number of picked segments.
+        let (body, _) = ring_and_sector();
+        let n = 128;
+        let pt = |i: usize, rad: f64| -> [f64; 3] {
+            let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+            [rad * a.cos(), rad * a.sin(), 2.0]
+        };
+        for &k in &[1usize, 2, 4, 8, 16, 32] {
+            let chain: Vec<[f64; 3]> = (n / 4..=n / 4 + k).map(|i| pt(i, 8.0)).collect();
+            let t0 = std::time::Instant::now();
+            let got = crate::round_mesh(&body, 0.5, std::slice::from_ref(&chain));
+            eprintln!("{k:3} segment pick: {:>8.2?}  {}", t0.elapsed(), if got.is_some() { "OK" } else { "declined" });
+            if t0.elapsed().as_secs() > 20 {
+                eprintln!("    (stopping the sweep — already past any interactive budget)");
+                break;
+            }
         }
     }
 
