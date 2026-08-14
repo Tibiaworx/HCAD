@@ -770,6 +770,88 @@ fn bevel_prep(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Option<BevelP
     Some((topo, selected, corner))
 }
 
+/// Clip a seam segment to the part of it lying inside face `fi`'s own outline.
+///
+/// A seam runs parallel to the model edge at the setback distance, between the two MITRED inset
+/// corners. Where the edge ends on a wall that curves away, that straight line leaves the face
+/// before it reaches the corner: on the boss-sector junction the ring-top seam ran 0.172 past an
+/// r=8 wall, drawn hanging in the air off the side of the part. The body itself is trimmed there
+/// (see `trim_fill_to_walls`), so the line has to be too.
+///
+/// Clipping against the face's real outline — the tessellated boundary, in the face's own plane —
+/// is exact and independent of how finely the wall is faceted. The alternative, letting
+/// `clip_edges_to_mesh` reject the overshoot on distance, cannot work at every radius: the
+/// overshoot shrinks with the fillet (0.17 at r=2.35, 0.06 at r=1.0) and slides under any
+/// tolerance loose enough to still accept a seam sitting on a coarsely tessellated wall.
+///
+/// Returns the inside runs; empty if the segment lies wholly outside.
+fn clip_seam_to_face(topo: &Topo, fi: usize, p: V3, q: V3) -> Vec<(V3, V3)> {
+    let f = &topo.faces[fi];
+    let n = f.normal;
+    let seed = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let u = norm(sub(seed, scale(n, dot(seed, n))));
+    let w = cross(n, u);
+    let to2 = |x: V3| [dot(x, u), dot(x, w)];
+    let (p2, q2) = (to2(p), to2(q));
+    let d2 = [q2[0] - p2[0], q2[1] - p2[1]];
+    let seg_len = (d2[0] * d2[0] + d2[1] * d2[1]).sqrt();
+    if seg_len < 1e-9 {
+        return Vec::new();
+    }
+    // Parameters where the segment crosses the outline, plus the two ends.
+    let mut ts: Vec<f64> = vec![0.0, 1.0];
+    for lp in &f.loops {
+        let m = lp.len();
+        for i in 0..m {
+            let a = to2(topo.verts[lp[i]]);
+            let b = to2(topo.verts[lp[(i + 1) % m]]);
+            let e = [b[0] - a[0], b[1] - a[1]];
+            let den = d2[0] * e[1] - d2[1] * e[0];
+            if den.abs() < 1e-12 {
+                continue; // parallel
+            }
+            let ap = [a[0] - p2[0], a[1] - p2[1]];
+            let t = (ap[0] * e[1] - ap[1] * e[0]) / den;
+            let s = (ap[0] * d2[1] - ap[1] * d2[0]) / den;
+            if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&s) {
+                ts.push(t);
+            }
+        }
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    // Even-odd point-in-polygon over every loop (an outer loop plus any holes).
+    let inside = |x: [f64; 2]| -> bool {
+        let mut c = false;
+        for lp in &f.loops {
+            let m = lp.len();
+            for i in 0..m {
+                let a = to2(topo.verts[lp[i]]);
+                let b = to2(topo.verts[lp[(i + 1) % m]]);
+                if (a[1] > x[1]) != (b[1] > x[1])
+                    && x[0] < (b[0] - a[0]) * (x[1] - a[1]) / (b[1] - a[1]) + a[0]
+                {
+                    c = !c;
+                }
+            }
+        }
+        c
+    };
+    let at = |t: f64| -> V3 { add(p, scale(sub(q, p), t)) };
+    let mut out = Vec::new();
+    for pair in ts.windows(2) {
+        let (t0, t1) = (pair[0], pair[1]);
+        if (t1 - t0) * seg_len < 1e-7 {
+            continue;
+        }
+        let mid = 0.5 * (t0 + t1);
+        if inside([p2[0] + d2[0] * mid, p2[1] + d2[1] * mid]) {
+            out.push((at(t0), at(t1)));
+        }
+    }
+    out
+}
+
 /// The selectable feature edges from a prepared bevel: the inset boundary segment along each
 /// selected model edge (a fillet's tangent edges / a chamfer's hard edges), one per adjacent
 /// face. Follows the rounded body and chains up for picking. Each segment carries the normal of
@@ -787,7 +869,11 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
                 if topo.edge_between(a, b).is_some_and(|ei| selected[ei]) {
                     let pa = corner.get(&(a, fi)).copied().unwrap_or(topo.verts[a]);
                     let pb = corner.get(&(b, fi)).copied().unwrap_or(topo.verts[b]);
-                    out.push(([f32a(pa), f32a(pb)], n));
+                    // Only the part that stays on the face — a mitred corner can put the line's
+                    // end outside it where the edge runs out onto a curved wall.
+                    for (ca, cb) in clip_seam_to_face(topo, fi, pa, pb) {
+                        out.push(([f32a(ca), f32a(cb)], n));
+                    }
                 }
             }
         }
@@ -1937,6 +2023,35 @@ mod tests {
         assert!(worst < 1e-3, "the fillet stands {worst:.4} proud of the walls — the run-out isn't trimmed");
     }
 
+    /// The seam lines drawn along a fillet stop at the wall the fillet runs out into.
+    ///
+    /// A seam runs parallel to the model edge at the setback distance, between the two MITRED
+    /// inset corners — and that straight line leaves the face before it reaches the corner when
+    /// the edge ends on a wall that curves away. The body is trimmed there, so the line was left
+    /// drawn hanging in the air off the side of the part: measured on this junction, 0.172 past an
+    /// r=8 wall. `clip_edges_to_mesh` kept it whole, its support tolerance (~0.24 here) being
+    /// wider than the overshoot — and no tolerance can do this job, because the overshoot shrinks
+    /// with the radius (0.06 at r=1.0) while a seam on a coarsely tessellated wall legitimately
+    /// sits a sagitta off the surface. Clipping to the face's own outline is exact instead.
+    #[test]
+    fn a_seam_stops_at_the_wall_it_runs_out_into() {
+        let (body, picked) = ring_and_sector();
+        for &r in &[1.0f64, 1.4, 2.35] {
+            let seams = bevel_feature_edges(&body, r, &[picked[2].clone()]);
+            assert!(!seams.is_empty(), "r={r}: the rim's seam edges must still be emitted");
+            let mut worst = 0.0f64;
+            for e in &seams {
+                for p in e {
+                    let d = ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt();
+                    worst = worst.max(d - 8.0);
+                }
+            }
+            // The wall is a 128-gon, so its outline is INSIDE r=8 — a seam ending on it can never
+            // exceed 8. Before the clip this ran to 8.17 at r=2.35.
+            assert!(worst < 1e-3, "r={r}: a seam runs {worst:.4} past the r=8 wall — it's drawn off the part");
+        }
+    }
+
     /// The junction loop of roundfilleterror2.hcad, which the curved-wall guard used to refuse:
     /// two CONCAVE straight radial edges and two CONVEX 270° arcs picked as one selection. Each
     /// piece must pull its own way — the arcs cutting material off the ring's rims, the straights
@@ -2029,6 +2144,88 @@ mod tests {
             worst_bore[0], worst_bore[1], worst_bore[2],
             5.0 * (1.0 - (std::f64::consts::PI / 128.0).cos())
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_lines_on_the_fillet_band() {
+        // What does the viewport actually DRAW along a filleted run-out? Classify every display
+        // edge by where it sits, so "the lines need cleaning up" becomes a count of kinds.
+        let (body, picked) = ring_and_sector();
+        let edges = vec![picked[2].clone(), picked[3].clone()];
+        let r = 2.35f64;
+        let base = crate::mesh_tessellation(body.clone());
+        let m = crate::round_mesh(&body, r, &edges).expect("CSG round");
+        let t = crate::mesh_tessellation(m.clone());
+        eprintln!("baseline body : {} sharp, {} tangent", base.edges.len(), base.tangent_edges.len());
+        eprintln!("filleted body : {} sharp, {} tangent", t.edges.len(), t.tangent_edges.len());
+        // The band lives above the ring top (z>2), within a radius of each radial edge.
+        let in_band = |e: &[[f32; 3]; 2]| {
+            e.iter().all(|p| {
+                let (x, y, z) = (p[0] as f64, p[1] as f64, p[2] as f64);
+                z > 2.0 - 1e-6 && z < 2.0 + r + 1e-3 && (y.abs() < r + 1e-3 || x.abs() < r + 1e-3)
+            })
+        };
+        let elen = |e: &[[f32; 3]; 2]| {
+            let d = [e[1][0] - e[0][0], e[1][1] - e[0][1], e[1][2] - e[0][2]];
+            ((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) as f64).sqrt()
+        };
+        // The deciding question: what is the real dihedral at each line being drawn? A fillet's
+        // own facet seams are a few degrees; if they read as tens, the band is genuinely creased
+        // and the fault is in the geometry, not the classifier.
+        {
+            let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+            let key = |p: [f64; 3]| [(p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64];
+            let mut adj: HashMap<([i64; 3], [i64; 3]), Vec<V3>> = HashMap::new();
+            for tri in m.indices.chunks_exact(3) {
+                let (a, b2, c) = (g(tri[0]), g(tri[1]), g(tri[2]));
+                let n = norm(cross(sub(b2, a), sub(c, a)));
+                for &(p, q) in &[(a, b2), (b2, c), (c, a)] {
+                    let (kp, kq) = (key(p), key(q));
+                    adj.entry(if kp <= kq { (kp, kq) } else { (kq, kp) }).or_default().push(n);
+                }
+            }
+            let mut hist = [0usize; 5]; // <2°, <8°, <25°, <60°, rest
+            let mut worst = 0.0f64;
+            for e in t.edges.iter().filter(|e| in_band(e)) {
+                let (p, q) = ([e[0][0] as f64, e[0][1] as f64, e[0][2] as f64], [e[1][0] as f64, e[1][1] as f64, e[1][2] as f64]);
+                let (kp, kq) = (key(p), key(q));
+                let Some(ns) = adj.get(&if kp <= kq { (kp, kq) } else { (kq, kp) }) else { continue };
+                if ns.len() != 2 { continue; }
+                let ang = dot(ns[0], ns[1]).clamp(-1.0, 1.0).acos().to_degrees();
+                worst = worst.max(ang);
+                let b = if ang < 2.0 { 0 } else if ang < 8.0 { 1 } else if ang < 25.0 { 2 } else if ang < 60.0 { 3 } else { 4 };
+                hist[b] += 1;
+            }
+            eprintln!("  band-edge dihedrals: <2°:{} <8°:{} <25°:{} <60°:{} 60°+:{}  (worst {worst:.1}°)",
+                hist[0], hist[1], hist[2], hist[3], hist[4]);
+            // Where are they? Print a sample with radius/height so they can be placed on the part.
+            for e in t.edges.iter().filter(|e| in_band(e)).take(10) {
+                let rad = |p: [f32; 3]| ((p[0] as f64).powi(2) + (p[1] as f64).powi(2)).sqrt();
+                eprintln!("     ({:.2},{:.2},{:.2})-({:.2},{:.2},{:.2})  r {:.2}→{:.2}",
+                    e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2], rad(e[0]), rad(e[1]));
+            }
+        }
+        for (label, set) in [("SHARP", &t.edges), ("tangent", &t.tangent_edges)] {
+            let band: Vec<&[[f32; 3]; 2]> = set.iter().filter(|e| in_band(e)).collect();
+            let total: f64 = band.iter().map(|e| elen(e)).sum();
+            eprintln!("  {label} in the band: {} segments, total length {total:.2}", band.len());
+            // Group by which of the two bands, and by direction: along the edge (radial) or across.
+            for (which, keep) in [("angle-0 band", true), ("angle-90 band", false)] {
+                let sub: Vec<&&[[f32; 3]; 2]> = band.iter().filter(|e| {
+                    let mid_y = (e[0][1] + e[1][1]) as f64 * 0.5;
+                    (mid_y.abs() < r) == keep
+                }).collect();
+                if sub.is_empty() { continue; }
+                let mut across = 0usize;
+                for e in &sub {
+                    let d = [(e[1][0] - e[0][0]) as f64, (e[1][1] - e[0][1]) as f64, (e[1][2] - e[0][2]) as f64];
+                    // "Across" = has a vertical component: an arc seam, not a run along the edge.
+                    if d[2].abs() > 1e-4 { across += 1; }
+                }
+                eprintln!("    {which}: {} segments ({across} crossing the arc, {} running along)", sub.len(), sub.len() - across);
+            }
+        }
     }
 
     #[test]

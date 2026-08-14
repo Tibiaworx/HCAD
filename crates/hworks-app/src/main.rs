@@ -32471,6 +32471,22 @@ mod tests {
             eprintln!("   sticks out at ({:.3}, {:.3}, {:.3})  radius {:.4}", p[0], p[1], p[2],
                 ((p[0] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt());
         }
+        // The LINES the viewport draws along the fillet: the seam edges. They come from the mesh
+        // surgery's inset corners even when the surgery declined and the CSG round built the body,
+        // so an end that overran the wall is an end drawn hanging off the part.
+        let (_, bevel_edges) = regenerate_mesh(&doc).expect("body");
+        let tess = mesh_tessellation(mesh.clone());
+        let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+        eprintln!("seam lines: {} emitted, {} kept after clipping", bevel_edges.len(), kept.len());
+        for e in &kept {
+            let rad = |p: [f32; 3]| ((p[0] as f64).powi(2) + (p[2] as f64).powi(2)).sqrt();
+            let over = rad(e[0]).max(rad(e[1])) - outer;
+            eprintln!(
+                "   ({:.2},{:.2},{:.2})-({:.2},{:.2},{:.2})  radius {:.3}→{:.3}{}",
+                e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2], rad(e[0]), rad(e[1]),
+                if over > 1e-3 { format!("   <-- {over:.3} PAST the r={outer:.2} wall") } else { String::new() }
+            );
+        }
     }
 
     #[test]
