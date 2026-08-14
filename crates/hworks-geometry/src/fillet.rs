@@ -715,14 +715,12 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
 
     let mut body = mesh.clone();
     let mut any = false;
-    // Per-segment tools are COLLECTED, not applied one at a time. Folding each into the body as it
-    // was built made the cost superlinear — every boolean re-tessellated the whole part and handed
-    // the next one a bigger mesh, measured at 1 segment 26 ms, 4 segments 135 ms, 8 segments 61 s.
-    // Combining the tools with each other first keeps that work on small meshes and leaves exactly
-    // one boolean against the body. Nothing in the loop reads `body` — the normals and the
-    // solid-angle probes all run against the ORIGINAL `tris` — so batching changes no result.
-    let mut add_tools: Vec<TriMesh> = Vec::new();
-    let mut sub_tools: Vec<TriMesh> = Vec::new();
+    // Each tool is applied to the body as it is built, one boolean at a time. Batching them —
+    // unioning the family and touching the body once — looks obviously better and is NOT safe: on
+    // a 6-segment arc pick it turned a correct 0.152-unit fillet into a 92.6-unit gouge, a quarter
+    // of the part. The corner slivers of adjacent segments along a curve overlap at slightly
+    // different angles, and unioning those produces a tool the difference then reads inside-out.
+    // The saving was 4 segments 135 ms → 77 ms; not worth a wrong body.
     // Convex straight-edge endpoints → the distinct face normals meeting there, so a corner
     // shared by ≥3 faces (a box vertex) can be blended with a sphere afterwards.
     let mut corners: HashMap<[i64; 3], (V3, Vec<V3>)> = HashMap::new();
@@ -795,7 +793,7 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                 let cyl = make_cylinder(add(c0, start_shift), axis, uu, w, radius, total_len, 48);
                 let tool = crate::mesh_difference(&prism, &cyl);
                 if tool.indices.len() >= 3 {
-                    sub_tools.push(tool);
+                    body = crate::mesh_difference(&body, &tool);
                     any = true;
                 }
                 // Record this convex edge's faces at both endpoints, for corner blending.
@@ -867,7 +865,7 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                 // Belt and braces for anything the footprints couldn't bound.
                 let fill = trim_fill_to_walls(&fill, &tris, [a, b], n1, n2, radius, tol);
                 if fill.indices.len() >= 3 {
-                    add_tools.push(fill);
+                    body = crate::mesh_union(&body, &fill);
                     any = true;
                 }
                 // Record this concave edge's faces at both endpoints, for corner blending.
@@ -882,29 +880,6 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             }
         }
     }
-    // Combine each family into one tool, then touch the body once per family. Pairwise so the
-    // meshes being merged stay small for as long as possible.
-    let merge = |mut ts: Vec<TriMesh>| -> Option<TriMesh> {
-        while ts.len() > 1 {
-            let mut next: Vec<TriMesh> = Vec::with_capacity(ts.len().div_ceil(2));
-            let mut it = ts.into_iter();
-            while let Some(a) = it.next() {
-                match it.next() {
-                    Some(b) => next.push(crate::mesh_union(&a, &b)),
-                    None => next.push(a),
-                }
-            }
-            ts = next;
-        }
-        ts.pop()
-    };
-    if let Some(t) = merge(sub_tools) {
-        body = crate::mesh_difference(&body, &t);
-    }
-    if let Some(t) = merge(add_tools) {
-        body = crate::mesh_union(&body, &t);
-    }
-
     // Corner blends: where three filleted faces meet at a vertex, round it to a sphere so
     // the edge fillets join smoothly. A convex corner (material in 1 of the 8 octants the
     // three faces carve) subtracts the sphere; a concave corner (a pocket's inside corner,
@@ -1218,11 +1193,27 @@ fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriM
 /// the change inside a box hugging the edge. Convex edges lose their shaved shell; concave
 /// edges gain their fill — both clipped to the edge band.
 fn local_round(body: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
-    let rounded = sdf_round(body, radius, &[])?;
     let band = edge_band_box(edges, radius)?;
-    let removed = crate::mesh_intersection(&crate::mesh_difference(body, &rounded), &band);
+    // Round only the NEIGHBOURHOOD of the picked edge, not the whole part.
+    //
+    // `sdf_round` grids the entire body's bounding box — up to ~100 cells on its longest axis —
+    // and evaluates a distance against every triangle at every voxel. Doing that to fillet one
+    // short arc is what made this path fall off a cliff: a 7-segment pick took 60 s against 706 ms
+    // for a 6-segment one, which the classifier sends down the per-facet boolean route instead.
+    // Everything outside `band` is discarded moments later anyway, so the work was pure waste.
+    //
+    // Clipping first shrinks BOTH factors — a smaller grid and far fewer triangles in it. The clip
+    // box is cut with a wider margin than the band (4·r against 2·r), leaving 2·r of clearance:
+    // rounding reaches about r from the clip's own cut faces, so what those faces attract stays
+    // outside the band that is kept. Wider than that is pure cost — the grid is sized by the
+    // box's bounding volume, so margin enters it cubed.
+    let work_box = edge_band_box(edges, radius * 2.0)?;
+    let work = crate::mesh_intersection(body, &work_box);
+    let work = if work.indices.len() >= 3 { work } else { body.clone() };
+    let rounded = sdf_round(&work, radius, &[])?;
+    let removed = crate::mesh_intersection(&crate::mesh_difference(&work, &rounded), &band);
     let mut out = crate::mesh_difference(body, &removed);
-    let added = crate::mesh_intersection(&crate::mesh_difference(&rounded, body), &band);
+    let added = crate::mesh_intersection(&crate::mesh_difference(&rounded, &work), &band);
     if added.indices.len() >= 3 {
         out = crate::mesh_union(&out, &added);
     }
@@ -1677,6 +1668,13 @@ fn sdf_round(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<Tri
     let h = (radius / 4.0).max(max_ext / MAX_DIM as f64);
     let dim = |e: f64| ((e / h).ceil() as usize + 1).clamp(2, MAX_DIM + 2);
     let (nx, ny, nz) = (dim(ext[0]), dim(ext[1]), dim(ext[2]));
+    if std::env::var("HCAD_SDF_DEBUG").is_ok() {
+        eprintln!(
+            "    sdf_round: {} tris, extent {:.2}x{:.2}x{:.2}, h={h:.4} → grid {nx}x{ny}x{nz} = {} voxels ({:.1}M tri-tests)",
+            tris.len(), ext[0], ext[1], ext[2], nx * ny * nz,
+            (nx * ny * nz * tris.len()) as f64 / 1e6
+        );
+    }
     let idx = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
     let pos = |i: usize, j: usize, k: usize| {
         [lo[0] + i as f64 * h, lo[1] + j as f64 * h, lo[2] + k as f64 * h]
@@ -2120,6 +2118,41 @@ fn ray_tri(o: V3, dir: V3, a: V3, b: V3, c: V3) -> Option<f64> {
     }
     let t = dot(e2, q) * inv;
     (t > 0.0).then_some(t)
+}
+
+#[cfg(test)]
+mod cliff_tests {
+    use super::*;
+
+    /// Which BRANCH does `round_mesh` send a partial-arc pick down, as the pick grows? The cost
+    /// wall between 6 and 7 segments is not a scaling curve, so it should be a change of route.
+    #[test]
+    #[ignore]
+    fn diag_which_branch_per_pick_size() {
+        let n = 128usize;
+        let pt = |i: usize, rad: f64| -> [f64; 3] {
+            let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+            [rad * a.cos(), rad * a.sin(), 2.0]
+        };
+        for k in 1..=8usize {
+            let chain: Vec<[f64; 3]> = (n / 4..=n / 4 + k).map(|i| pt(i, 8.0)).collect();
+            let circ = fit_circle(&chain).is_some();
+            let straight = is_straight_edge(&chain);
+            let pw = is_piecewise_straight(&chain);
+            let runs = if pw { split_straight_runs(&chain).len() } else { 0 };
+            let route = if circ || straight {
+                "boolean (whole chain)"
+            } else if pw {
+                "boolean (split into straight runs)"
+            } else {
+                "CURVED → fillet_swept / local_round (SDF)"
+            };
+            eprintln!(
+                "k={k} ({} pts): fit_circle={circ} straight={straight} piecewise={pw} runs={runs} → {route}",
+                chain.len()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

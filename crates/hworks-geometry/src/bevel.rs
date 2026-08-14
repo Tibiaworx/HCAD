@@ -2267,6 +2267,51 @@ mod tests {
         }
     }
 
+    /// A fillet on part of a rim removes ITS OWN corner and nothing else.
+    ///
+    /// Nothing was checking this, and it let a 92.6-unit gouge — a quarter of the part — pass a
+    /// green suite. The cause was batching `round_mesh`'s per-segment tools: unioning the corner
+    /// slivers of adjacent segments along a curve, which meet at slightly different angles,
+    /// produced a tool the difference then read inside-out. Every existing test either used a
+    /// whole rim or measured something a gouge doesn't disturb.
+    ///
+    /// The bound is deliberately loose. The tool overruns each edge end by half a radius so
+    /// neighbouring fillets meet, which on a short arc genuinely removes a couple of times the
+    /// ideal — but nothing legitimate removes ten times it, let alone seven hundred.
+    #[test]
+    fn an_arc_pick_removes_only_its_own_corner() {
+        let (body, _) = ring_and_sector();
+        let n = 128usize;
+        let pt = |i: usize, rad: f64| -> [f64; 3] {
+            let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+            [rad * a.cos(), rad * a.sin(), 2.0]
+        };
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let r = 0.5;
+        // Sizes that take the per-facet boolean route — 6 segments is where the gouge appeared.
+        for &k in &[1usize, 2, 4, 6] {
+            let chain: Vec<[f64; 3]> = (n / 4..=n / 4 + k).map(|i| pt(i, 8.0)).collect();
+            let arc: f64 = chain.windows(2).map(|w| { let d = sub(w[1], w[0]); dot(d, d).sqrt() }).sum();
+            let ideal = (1.0 - std::f64::consts::PI / 4.0) * r * r * arc;
+            let m = crate::round_mesh(&body, r, std::slice::from_ref(&chain))
+                .unwrap_or_else(|| panic!("k={k}: the CSG round declined a plain convex arc"));
+            // NOT asserted, because it does not hold and never has: at 6 segments the result is
+            // non-manifold, the per-facet cylinders meeting along a curve failing to stitch — the
+            // exact failure `is_piecewise_straight` warns about in its own comment. Pre-existing
+            // (the convex path here is unchanged from before this work) and its own job to fix.
+            let removed = vol(&body) - vol(&m);
+            assert!(removed > ideal * 0.5, "k={k}: removed {removed:.4}, less than half the {ideal:.4} a fillet takes — it barely cut");
+            assert!(removed < ideal * 10.0, "k={k}: removed {removed:.4} where a fillet takes {ideal:.4} — it is gouging the part");
+        }
+    }
+
     #[test]
     #[ignore]
     fn diag_csg_round_cost_vs_pick_size() {
@@ -2278,11 +2323,28 @@ mod tests {
             let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
             [rad * a.cos(), rad * a.sin(), 2.0]
         };
-        for &k in &[1usize, 2, 4, 5, 6, 7] {
+        for &k in &[1usize, 2, 4, 6, 7, 8, 12, 16, 24] {
             let chain: Vec<[f64; 3]> = (n / 4..=n / 4 + k).map(|i| pt(i, 8.0)).collect();
+            let vol = |m: &TriMesh| {
+                let mut v = 0.0f64;
+                for t in m.indices.chunks_exact(3) {
+                    let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                    v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+                }
+                v.abs()
+            };
             let t0 = std::time::Instant::now();
             let got = crate::round_mesh(&body, 0.5, std::slice::from_ref(&chain));
-            eprintln!("{k:3} segment pick: {:>8.2?}  {}", t0.elapsed(), if got.is_some() { "OK" } else { "declined" });
+            // A convex rim fillet removes (1-pi/4)r^2 per unit length. Checks the localised SDF
+            // still rounds what it should, rather than merely returning quickly.
+            let arc: f64 = chain.windows(2).map(|w| {
+                let d = sub(w[1], w[0]);
+                dot(d, d).sqrt()
+            }).sum();
+            let want = (1.0 - std::f64::consts::PI / 4.0) * 0.25 * arc;
+            let removed = got.as_ref().map(|m| vol(&body) - vol(m)).unwrap_or(0.0);
+            eprintln!("{k:3} segment pick: {:>8.2?}  {}  removed {removed:+.4} (a true fillet takes {want:.4})",
+                t0.elapsed(), if got.is_some() { "OK" } else { "declined" });
             if t0.elapsed().as_secs() > 20 {
                 eprintln!("    (stopping the sweep — already past any interactive budget)");
                 break;
