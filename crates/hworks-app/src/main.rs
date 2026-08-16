@@ -10746,6 +10746,53 @@ fn slot_width_geometry_off(a2: Vec2, b2: Vec2, half: f32, offset: f32) -> (Vec2,
 }
 
 /// Add a slot-width dimension (or return the existing one) driving the slot's half-width.
+/// What a SECOND dimension pick makes of the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DimPair {
+    /// One slot picked twice — its two sides — which is its thickness.
+    SlotWidth(usize),
+    /// A slot's centre line to a line. `(slot, line)`.
+    SlotLine(usize, usize),
+    /// Two lines: their separation if parallel, the angle between them if not.
+    LineLine(usize, usize),
+}
+
+/// Resolve a pair of dimension picks.
+///
+/// Split out from the click handler so the table below can be tested: the flow itself needs the
+/// whole Bevy input path and a live sketch session, which is why the same-slot case sat broken.
+///
+/// The same slot picked twice is its WIDTH. A slot is one entity, so its two long sides are two
+/// picks of the same thing — and the line-to-line gesture is how a machinist asks for a thickness.
+/// This case used to be filtered out before it was ever considered, so picking one side and then
+/// the other threw away the dimension that the first pick had already made.
+///
+/// It is checked FIRST because a slot now carries a construction centre line of its own: a click
+/// on the far side can find that line too, and reading the pair as line-to-line would dimension
+/// the slot's axis against itself.
+fn dim_pair_action(
+    first_line: Option<usize>,
+    first_slot: Option<usize>,
+    second_line: Option<usize>,
+    second_slot: Option<usize>,
+) -> Option<DimPair> {
+    if let (Some(s1), Some(s2)) = (first_slot, second_slot) {
+        if s1 == s2 {
+            return Some(DimPair::SlotWidth(s1));
+        }
+    }
+    if let (Some(sl), Some(ln)) = (first_slot, second_line) {
+        return Some(DimPair::SlotLine(sl, ln));
+    }
+    if let (Some(ln), Some(sl)) = (first_line, second_slot) {
+        return Some(DimPair::SlotLine(sl, ln));
+    }
+    if let (Some(l1), Some(l2)) = (first_line, second_line) {
+        return (l2 != l1).then_some(DimPair::LineLine(l1, l2));
+    }
+    None
+}
+
 fn add_slot_width_dim(sketch: &mut Sketch, slot_entity: usize) -> Option<usize> {
     let (a, b, radius) = entity_slot(sketch, slot_entity)?;
     if let Some(i) = sketch.constraints.iter().position(|c| {
@@ -12275,8 +12322,11 @@ fn sketch_interaction(
             if let Some(uv) = active_uv {
                 second_line = nearest_line_entity(&session.sketch, uv, snap * 2.0, first_line);
                 // A slot under the cursor (its centre line can be dimensioned to a line).
+                // The SAME slot counts now: its two sides are two picks of one entity, and that
+                // pair is its thickness. Filtering the first slot out here is what used to throw
+                // the dimension away when you picked one side and then the other.
                 if let Some(e) = nearest_entity(&session.sketch, uv, snap * 2.0) {
-                    if Some(e) != first_slot && entity_slot(&session.sketch, e).is_some() {
+                    if entity_slot(&session.sketch, e).is_some() {
                         second_slot = Some(e);
                     }
                 }
@@ -12296,28 +12346,18 @@ fn sketch_interaction(
                     }
                 }
             }
-            // Decide the new dimension: slot↔line distance, or line↔line distance/angle.
-            enum Act {
-                SlotLine(usize, usize), // (slot entity, line entity)
-                LineLine(usize, usize),
-            }
-            let act = if let (Some(sl), Some(ln)) = (first_slot, second_line) {
-                Some(Act::SlotLine(sl, ln))
-            } else if let (Some(ln), Some(sl)) = (first_line, second_slot) {
-                Some(Act::SlotLine(sl, ln))
-            } else if let (Some(l1), Some(l2)) = (first_line, second_line) {
-                (l2 != l1).then_some(Act::LineLine(l1, l2))
-            } else {
-                None
-            };
+            // Decide the new dimension: the slot's own width, a slot↔line distance, or a
+            // line↔line distance/angle.
+            let act = dim_pair_action(first_line, first_slot, second_line, second_slot);
             if let Some(act) = act {
                 // Drop the length/width dim we just made; replace it with the pair dim.
                 if ci + 1 == session.sketch.constraints.len() {
                     session.sketch.constraints.pop();
                 }
                 let new_ci = match act {
-                    Act::SlotLine(sl, ln) => add_slot_line_distance(&mut session.sketch, sl, ln),
-                    Act::LineLine(l1, l2) => {
+                    DimPair::SlotWidth(sl) => add_slot_width_dim(&mut session.sketch, sl),
+                    DimPair::SlotLine(sl, ln) => add_slot_line_distance(&mut session.sketch, sl, ln),
+                    DimPair::LineLine(l1, l2) => {
                         if lines_parallel(&session.sketch, l1, l2) {
                             add_point_line_distance(&mut session.sketch, l1, l2)
                         } else {
@@ -13065,12 +13105,40 @@ fn sketch_interaction(
                                     None
                                 }
                             }
-                        } else if entity_slot(&session.sketch, e).is_some() {
-                            // A slot is one entity — clicking it dimensions its width; but
-                            // remember it so a follow-up click on a line/edge instead makes
-                            // a distance from that line to the slot's centre line.
+                        } else if let Some((sa, sb, srad)) = entity_slot(&session.sketch, e) {
+                            // A slot is one entity, so WHERE it was clicked chooses the dimension.
+                            // On a round end it is that end's radius; anywhere along the sides it
+                            // is the width across. Both drive the same half-width, so this is two
+                            // ways of saying the thickness, and the drawing being worked from
+                            // decides which reads better. Either way the slot is remembered, so a
+                            // follow-up click on a line instead makes a distance from that line to
+                            // the slot's centre line.
                             slot_ctx = Some(e);
-                            add_slot_width_dim(&mut session.sketch, e)
+                            let pt = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+                            let on_end = match (pt(sa), pt(sb)) {
+                                // Nearer an end CENTRE than the centre line is long — i.e. out
+                                // past where the straight sides stop and the cap begins.
+                                (Some(pa), Some(pb)) => {
+                                    let axis = pb - pa;
+                                    let t = if axis.length_squared() > 1e-9 {
+                                        ((uv - pa).dot(axis) / axis.length_squared()).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let end = if t < 0.5 { pa } else { pb };
+                                    // Inside the cap's own quadrant: beyond the centre along the
+                                    // axis, which is exactly the semicircular part.
+                                    let past = (uv - end).dot(if t < 0.5 { -axis } else { axis });
+                                    past > 0.0 && (uv - end).length() <= srad as f32 * 1.6
+                                }
+                                _ => false,
+                            };
+                            if on_end {
+                                let center = if pt(sa).zip(pt(sb)).is_some_and(|(pa, pb)| (uv - pa).length() <= (uv - pb).length()) { sa } else { sb };
+                                add_radius_dim(&mut session.sketch, center, srad)
+                            } else {
+                                add_slot_width_dim(&mut session.sketch, e)
+                            }
                         } else {
                             None
                         }
@@ -15685,7 +15753,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 } else {
                     let a = session.pending.take().unwrap();
                     let b = session.pending_b.take().unwrap();
-                    commit_slot(session, a, b, None, perp_dist(uv, a, b));
+                    commit_slot(session, a, b, None, perp_dist(uv, a, b), None);
                 }
             }
             SlotMode::Centerpoint => {
@@ -15697,7 +15765,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                     let center = session.pending.take().unwrap();
                     let end = session.pending_b.take().unwrap();
                     let a = center * 2.0 - end; // mirrored end
-                    commit_slot(session, a, end, None, perp_dist(uv, a, end));
+                    commit_slot(session, a, end, None, perp_dist(uv, a, end), Some(center));
                 }
             }
             SlotMode::Arc => {
@@ -15711,7 +15779,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                     let a = session.pending.take().unwrap();
                     let b = session.pending_b.take().unwrap();
                     let p = session.pending_c.take().unwrap();
-                    commit_slot(session, a, b, Some(p), arc_slot_width(uv, a, p, b));
+                    commit_slot(session, a, b, Some(p), arc_slot_width(uv, a, p, b), None);
                 }
             }
         },
@@ -15958,7 +16026,12 @@ fn text_handles(sketch: &Sketch, idx: usize) -> Option<(Vec2, Vec2, Vec2)> {
 }
 
 /// Build a slot entity from end centres `a`,`b`, optional arc bend `mid`, and half-width `r`.
-fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>, r: f32) {
+/// `centre` is the point the user actually CLICKED in Centerpoint mode. It is kept as a real
+/// sketch point tied to the two ends, rather than thrown away once the ends are worked out —
+/// there is then something to snap to, dimension from, and drag the whole slot by. The other
+/// modes pass `None`: no centre was ever designated in them, and inventing one would put a point
+/// on the drawing that the user never asked for.
+fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>, r: f32, centre: Option<Vec2>) {
     let snap = session.snap_dist;
     // `_ref` rather than plain `get_or_add_point`: a slot butting up against existing geometry
     // needs its end centres LOCKED to the body features they were snapped to, exactly like a
@@ -15974,6 +16047,33 @@ fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>,
         construction: session.construction,
         mid: pmid,
     });
+    // The centre line, as construction geometry — the polygon's circumscribed circle plays the
+    // same part. A slot is ONE entity, so before this there was nothing to put a length on: its
+    // ends are points, and dimensioning point-to-point means picking two of them and hoping you
+    // hit the centres rather than the outline. A line joining the two arc centres is something to
+    // click, and because it is built on the slot's OWN end points, a length on it drives the slot
+    // — no new solver rule, the distance moves the points and the slot follows them.
+    //
+    // Construction, so it guides without forming a profile: the extrude still sees the slot's
+    // outline and nothing else.
+    //
+    // Straight slots only. An arc slot's centre line is an arc through the bend point, and a
+    // straight line between its ends would measure a chord — a length that means nothing and, if
+    // dimensioned, would fight the shape.
+    if pmid.is_none() {
+        session.sketch.add_line(pa, pb, true);
+    }
+    // The centre the user clicked, kept as a real point on the centre line. `Midpoint` holds it
+    // between the two ends, so it stays the middle when the slot is lengthened or dragged rather
+    // than drifting to wherever it happened to start — and dimensioning FROM it positions the
+    // whole slot, which is the reason to draw one from its centre in the first place.
+    if let Some(c) = centre {
+        let pc = get_or_add_point_ref(session, c, snap);
+        if pc != pa && pc != pb {
+            session.sketch.entities.push(SketchEntity::Point { at: pc });
+            session.sketch.constraints.push(Constraint::Midpoint { mid: pc, a: pa, b: pb });
+        }
+    }
     session.dirty = true;
 }
 
@@ -27587,6 +27687,202 @@ mod tests {
         // A degenerate rim (cursor on the centre) must not produce NaN.
         let z = snap_polygon_angle(c, c);
         assert!(z.is_finite(), "a zero-radius rim produced {z:?}");
+    }
+
+    /// A straight slot gets a construction centre line, and a length on it drives the slot.
+    ///
+    /// A slot is ONE entity, so before this there was nothing to dimension its length on — the
+    /// ends are points, and point-to-point means picking two of them and hoping you catch the
+    /// centres rather than the outline. The line joins the slot's OWN end points, so a distance
+    /// on it moves those points and the slot follows: no new solver rule for the length at all.
+    #[test]
+    fn a_straight_slot_gets_a_dimensionable_centre_line() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 2.0)); // width
+
+        let (sa, sb) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a slot");
+        // A construction line on the slot's own end points — not a copy of them.
+        let axis = s.sketch.entities.iter().position(|e| {
+            matches!(e, SketchEntity::Line { a, b, construction: true, .. }
+                if (*a == sa && *b == sb) || (*a == sb && *b == sa))
+        });
+        assert!(axis.is_some(), "a straight slot should carry a construction centre line");
+
+        // Dimension it, and the slot's length follows the value.
+        let ci = add_distance_dim(&mut s.sketch, sa, sb).expect("a length on the centre line");
+        if let Some(Constraint::Distance { value, .. }) = s.sketch.constraints.get_mut(ci) {
+            *value = 25.0;
+        }
+        s.sketch.solve();
+        let pt = |i: usize| Vec2::new(s.sketch.points[i].x as f32, s.sketch.points[i].y as f32);
+        let got = (pt(sb) - pt(sa)).length();
+        assert!((got - 25.0).abs() < 1e-3, "the centre line was dimensioned to 25, the slot is {got:.4} long");
+
+        // ...and it must not become a profile: construction geometry guides only.
+        let regions = s.sketch.regions();
+        assert!(!regions.is_empty(), "the slot itself should still form a region");
+    }
+
+    /// An ARC slot gets no straight centre line. A line between its ends measures a chord, which
+    /// is not its length, and dimensioning that would fight the bend.
+    #[test]
+    fn an_arc_slot_gets_no_straight_centre_line() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Arc;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 4.0)); // bend
+        place_point(&mut s, Vec2::new(5.0, 6.0)); // width
+
+        let has_mid = s.sketch.entities.iter().any(|e| matches!(e, SketchEntity::Slot { mid: Some(_), .. }));
+        assert!(has_mid, "expected an arc slot");
+        let lines = s.sketch.entities.iter().filter(|e| matches!(e, SketchEntity::Line { .. })).count();
+        assert_eq!(lines, 0, "an arc slot must not get a straight centre line");
+    }
+
+    /// Thickness can be given as the END RADIUS as well as the width across, so whichever the
+    /// drawing uses can be typed straight in. Both drive the same half-width.
+    #[test]
+    fn a_slot_takes_its_thickness_as_a_radius_too() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 2.0));
+
+        let (sa, _sb) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a slot");
+        // A radius on one END CENTRE — 1.5 means a 3.0-thick slot.
+        let ci = add_radius_dim(&mut s.sketch, sa, 2.0).expect("a radius on the slot's end");
+        if let Some(Constraint::Radius { value, diameter, .. }) = s.sketch.constraints.get_mut(ci) {
+            *value = 1.5;
+            *diameter = false;
+        }
+        s.sketch.solve();
+        let r = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .expect("a slot");
+        assert!((r - 1.5).abs() < 1e-6, "a radius of 1.5 should give a half-width of 1.5, got {r}");
+    }
+
+    /// A Centerpoint slot keeps the centre the user clicked, held between the two ends.
+    ///
+    /// Without it that click was consumed working out where the ends go and then thrown away, so
+    /// the one point the user actually placed — the one they drew the slot around — left nothing
+    /// behind to snap to, dimension from, or drag the slot by.
+    #[test]
+    fn a_centrepoint_slot_keeps_its_centre() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Centerpoint;
+        place_point(&mut s, Vec2::new(5.0, 0.0)); // centre
+        place_point(&mut s, Vec2::new(11.0, 0.0)); // one end
+        place_point(&mut s, Vec2::new(8.0, 2.0)); // width
+
+        let (sa, sb) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a slot");
+        let mid = s
+            .sketch
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                Constraint::Midpoint { mid, a, b } if (*a == sa && *b == sb) || (*a == sb && *b == sa) => Some(*mid),
+                _ => None,
+            })
+            .expect("the clicked centre, held between the ends");
+        assert!(
+            s.sketch.entities.iter().any(|e| matches!(e, SketchEntity::Point { at } if *at == mid)),
+            "the centre should be a real point, not just a constraint"
+        );
+        let pt = |sk: &Sketch, i: usize| Vec2::new(sk.points[i].x as f32, sk.points[i].y as f32);
+        assert!((pt(&s.sketch, mid) - Vec2::new(5.0, 0.0)).length() < 1e-4, "the centre moved off where it was clicked");
+
+        // It is the MIDDLE, not merely a point that started there: lengthen the slot and it
+        // stays centred rather than drifting to one end.
+        let ci = add_distance_dim(&mut s.sketch, sa, sb).expect("a length");
+        if let Some(Constraint::Distance { value, .. }) = s.sketch.constraints.get_mut(ci) {
+            *value = 20.0;
+        }
+        s.sketch.solve();
+        let off = (pt(&s.sketch, mid) - (pt(&s.sketch, sa) + pt(&s.sketch, sb)) * 0.5).length();
+        assert!(off < 1e-3, "after lengthening, the centre sits {off:.4} off the middle");
+    }
+
+    /// The other slot modes designate no centre, so they get no stray point.
+    #[test]
+    fn a_straight_slot_invents_no_centre_point() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 2.0));
+        assert!(
+            !s.sketch.constraints.iter().any(|c| matches!(c, Constraint::Midpoint { .. })),
+            "a straight slot should not invent a centre the user never placed"
+        );
+    }
+
+    /// Picking a slot's two SIDES is the line-to-line way of asking for its thickness.
+    ///
+    /// A slot is one entity, so both sides are picks of the same thing — and the same-slot case
+    /// was filtered out before it was considered, so picking one side and then the other threw
+    /// away the width dimension the first pick had already made.
+    #[test]
+    fn two_picks_on_one_slot_dimension_its_thickness() {
+        // Same slot twice — its two sides — is its width.
+        assert_eq!(dim_pair_action(None, Some(7), None, Some(7)), Some(DimPair::SlotWidth(7)));
+        // ...and that still holds when the second click also finds the slot's own construction
+        // centre line, which is exactly what a click on the far side can do.
+        assert_eq!(dim_pair_action(None, Some(7), Some(9), Some(7)), Some(DimPair::SlotWidth(7)));
+
+        // Two DIFFERENT slots are not a width — that pair means nothing, and must not silently
+        // dimension one of them.
+        assert_eq!(dim_pair_action(None, Some(7), None, Some(8)), None);
+
+        // The pairs that already worked, unchanged.
+        assert_eq!(dim_pair_action(None, Some(7), Some(3), None), Some(DimPair::SlotLine(7, 3)));
+        assert_eq!(dim_pair_action(Some(3), None, None, Some(7)), Some(DimPair::SlotLine(7, 3)));
+        assert_eq!(dim_pair_action(Some(1), None, Some(2), None), Some(DimPair::LineLine(1, 2)));
+        // One line picked twice is not a pair.
+        assert_eq!(dim_pair_action(Some(1), None, Some(1), None), None);
+        // Nothing under the second click: nothing to make.
+        assert_eq!(dim_pair_action(Some(1), None, None, None), None);
+        assert_eq!(dim_pair_action(None, None, None, None), None);
     }
 
     /// A slot butted up against existing geometry must LOCK its end centres to the body

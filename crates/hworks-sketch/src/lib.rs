@@ -1826,6 +1826,37 @@ impl Sketch {
                 }
             }
         }
+        // A Radius/Diameter on one of a slot's END CENTRES drives the same half-width, so the
+        // thickness can be given either way round: across the slot as a width, or on the round
+        // end as the radius it actually is. Machinists reach for whichever the drawing uses, and
+        // an end cap IS a semicircle — there is no reason to make them convert it by hand.
+        //
+        // Keyed on the end point, exactly as SlotWidth is keyed on the pair, so nothing has to
+        // know which of the two ends was clicked.
+        let end_radii: Vec<(usize, f64)> = self
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::Radius { center, value, diameter, .. } => {
+                    Some((*center, if *diameter { *value * 0.5 } else { *value }))
+                }
+                _ => None,
+            })
+            .collect();
+        for (center, r) in end_radii {
+            // Only when that point is a slot end and NOT a circle's centre — a real circle owns
+            // its radius, and a point serving both would otherwise be read twice.
+            if self.entities.iter().any(|e| matches!(e, SketchEntity::Circle { center: c, .. } if *c == center)) {
+                continue;
+            }
+            for e in self.entities.iter_mut() {
+                if let SketchEntity::Slot { a, b, radius, .. } = e {
+                    if *a == center || *b == center {
+                        *radius = r.max(1e-4);
+                    }
+                }
+            }
+        }
     }
 
     /// How many scalar residual rows a single constraint contributes (in the same
