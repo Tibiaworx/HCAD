@@ -9042,7 +9042,21 @@ fn ui_system(
         // interactable: the label tracks the cursor, so an interactive one sits under the pointer
         // and eats the very click that would put the dimension down — you had to swing the mouse
         // wide of it to land one at all.
+        // A label only takes clicks under the SELECT tool.
+        //
+        // These sit in `Order::Foreground`, above the sketch, and anything the pointer is over
+        // there makes `blocking.0` true — which returns out of the whole sketch input handler
+        // before it reads a thing. So with any other tool the labels quietly eat presses meant for
+        // the geometry beneath them: on a circle smaller than its own value chip that is every
+        // press there is, and the Dimension tool reads as looping because the click that should
+        // have PLACED the pending dimension never arrives.
+        //
+        // Nothing is lost by it. Clicking a dimension to reopen it is wanted with Select, which
+        // still has it; and the Dimension tool does its own hit-testing in sketch space
+        // (`dim_at`), which has been unreachable all along because the Area took the click first.
+        let labels_interactive = session.tool == Tool::Select;
         let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String, selected: bool, live: bool| -> Option<egui::Response> {
+            let live = live || !labels_interactive;
             // An egui Area cannot be clipped by its caller, so a dimension whose geometry has
             // scrolled off the view is dropped rather than drawn over a panel. Clamping it to
             // the edge instead would leave the number pointing at the wrong geometry.
@@ -9083,6 +9097,32 @@ fn ui_system(
                     })
                     .inner
             })
+        };
+        // Keep a default-placed label off the geometry it belongs to, measured in PIXELS.
+        //
+        // The chip a value sits on is a fixed size on screen — about 40 by 18 — while the default
+        // placements are in model units, `0.707·r` from a circle's centre for a radius. Below
+        // roughly half a millimetre of radius the chip is wider than the whole circle and covers
+        // it completely, so the geometry can be neither read nor reached. Push such a label out
+        // along its own bearing until it clears. Only DEFAULT placements move; one that has been
+        // dragged somewhere stays exactly where it was put.
+        const LABEL_CLEAR_PX: f32 = 34.0;
+        let clear_of_geometry = |anchor: Vec2, label: Vec2| -> Vec2 {
+            let d = label - anchor;
+            if d.length() < 1e-9 {
+                return label;
+            }
+            let (Ok(a_s), Ok(l_s)) = (
+                camera.world_to_viewport(cam_gt, ap.to_world(anchor)),
+                camera.world_to_viewport(cam_gt, ap.to_world(label)),
+            ) else {
+                return label;
+            };
+            let px = (egui::pos2(l_s.x, l_s.y) - egui::pos2(a_s.x, a_s.y)).length();
+            if px >= LABEL_CLEAR_PX || px < 1e-6 {
+                return label;
+            }
+            anchor + d * (LABEL_CLEAR_PX / px)
         };
         // Deferred click actions (the constraint loop holds an immutable borrow of session).
         let mut dim_action: Option<(usize, bool)> = None; // (constraint index, double-clicked?)
@@ -9187,6 +9227,8 @@ fn ui_system(
                         let cu = Vec2::new(c.x as f32, c.y as f32);
                         let r = *value as f32;
                         let edge = radius_label_pos(cu, r, *label);
+                        // A tiny circle's default label would sit on top of it.
+                        let edge = if label[1] <= 1e-9 { clear_of_geometry(cu, edge) } else { edge };
                         let text = if *diameter { format!("Ø{}", fmt_len_bare(*value as f32 * 2.0, unit)) } else { format!("R{}", fmt_len_bare(*value as f32, unit)) };
                         act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on, false), k, &mut dim_action);
                     }
@@ -11625,6 +11667,20 @@ fn sketch_interaction(
     }
 
     if blocking.0 {
+        // A drag that BEGAN in the viewport has to be able to finish there, wherever the pointer
+        // happens to come to rest. `blocking.0` is `wants_pointer_input() || is_pointer_over_area()`,
+        // and a dimension's value floats over the sketch in `Order::Foreground` — so every pixel of
+        // every label is "over an area" and skips this whole handler. Release the mouse over one and
+        // the release was simply never seen: the box-select rectangle stayed on screen with nothing
+        // able to clear it, and the label being dragged never let go.
+        //
+        // This is why it took editing an EXISTING sketch to see it. A sketch drawn from scratch has
+        // no dimensions yet, so there are no labels to release over; reopen one that already has
+        // them and they are lying over the geometry from the first click.
+        if buttons.just_released(MouseButton::Left) {
+            session.box_select = None;
+            session.dim_drag = None;
+        }
         return;
     }
 
