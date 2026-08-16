@@ -18266,6 +18266,9 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 // A circle snapped onto an existing hole's rim would give the tool walls
                 // exactly coincident with the hole — prune footprint-over-void geometry.
                 prune_void_cut_geometry(&mut cut_regs, cur0, &plane, into as f32);
+                // ...and where the wall lands ON the body rather than over a void, widen it off
+                // the coincidence so the boolean isn't asked to cut along a face it shares.
+                clear_coincident_cut_walls(&mut cut_regs, cur0, &plane, into as f32, distance.abs() as f32);
                 for r in &cut_regs {
                     let Some(cur) = body.take() else { break };
                     let signed = into * *distance;
@@ -21150,6 +21153,102 @@ fn ray_tri_hit(o: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
 /// Geometry standing over SOLID (a post being preserved inside a pocket) is kept: the
 /// probe tests several interior points at a few depths below the surface along the cut
 /// direction, and any solid hit keeps the loop/region.
+/// Give a cut tool lateral clearance wherever its wall would land exactly on the body's.
+///
+/// `cut_tol` already pads the tool ALONG the cut — `eps = 0.05 + depth*0.02` at each end — which is
+/// why a cut's floor and top come out clean even when they sit exactly on a face. Nothing did the
+/// same ACROSS the profile, so a circle snapped to an existing cylinder's radius put the tool's
+/// wall exactly on the body's. That is a coincident-face boolean, and it leaves the wall speckled
+/// with needle triangles (areas of 1e-9) and the stray micro-edges drawn over them.
+///
+/// Widening the whole profile would be wrong: a pocket's wall is interior, and moving it changes a
+/// dimension the user typed. The test that separates the two cases is what lies just OUTSIDE the
+/// wall at cutting depth. Where the material has already ended there, the wall is on the body's
+/// silhouette and sweeping a little wider removes nothing extra — it only takes air. Where there
+/// is still material, the wall is interior and is left exactly where it was sketched.
+fn clear_coincident_cut_walls(
+    regs: &mut [hworks_sketch::Region],
+    mesh: &TriMesh,
+    plane: &PlaneRef,
+    into: f32,
+    depth: f32,
+) {
+    if mesh.indices.len() < 3 {
+        return;
+    }
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let nrm = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+    // Clearance scaled to the model: far above the 1e-5 weld grid the kernels snap on, far below
+    // anything that reads on screen or in a measurement (0.03% of this part's radius).
+    let (lo, hi) = mesh_bbox(mesh);
+    let eps = ((hi - lo).length() * 1.0e-4).max(1.0e-4);
+    let probe = eps * 4.0;
+    // Sample at a few depths: a wall is only "on the silhouette" if the material has ended along
+    // the whole sweep, not merely at the one height a single probe happened to pick.
+    let outside_at = |p: [f64; 2], dir: [f64; 2], dist: f32| -> bool {
+        let q = [p[0] + dir[0] * dist as f64, p[1] + dir[1] * dist as f64];
+        [0.25f32, 0.5, 0.75].iter().all(|f| {
+            let w = o + u * q[0] as f32 + v * q[1] as f32 + nrm * (into * depth * f);
+            !point_inside_mesh(mesh, w)
+        })
+    };
+    let signed_area = |l: &[[f64; 2]]| -> f64 {
+        let m = l.len();
+        (0..m).map(|i| { let (a, b) = (l[i], l[(i + 1) % m]); a[0] * b[1] - b[0] * a[1] }).sum::<f64>() * 0.5
+    };
+    // Per-vertex direction that ENLARGES the cut: away from an outer loop's interior, and into a
+    // hole's (a hole is material the cut leaves behind, so shrinking it widens the cut).
+    let widen_dirs = |l: &[[f64; 2]], is_hole: bool| -> Vec<[f64; 2]> {
+        let m = l.len();
+        let s = if signed_area(l) >= 0.0 { 1.0 } else { -1.0 };
+        let flip = if is_hole { -1.0 } else { 1.0 };
+        (0..m)
+            .map(|i| {
+                let prev = l[(i + m - 1) % m];
+                let next = l[(i + 1) % m];
+                let mut acc = [0.0f64; 2];
+                for (a, b) in [(prev, l[i]), (l[i], next)] {
+                    let d = [b[0] - a[0], b[1] - a[1]];
+                    let n = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                    if n > 1e-12 {
+                        // Right of the directed edge is outward for a CCW loop.
+                        acc[0] += d[1] / n * s * flip;
+                        acc[1] += -d[0] / n * s * flip;
+                    }
+                }
+                let n = (acc[0] * acc[0] + acc[1] * acc[1]).sqrt();
+                if n > 1e-12 { [acc[0] / n, acc[1] / n] } else { [0.0, 0.0] }
+            })
+            .collect()
+    };
+    let mut widened = 0usize;
+    for r in regs.iter_mut() {
+        for (is_hole, loops) in [(false, std::slice::from_mut(&mut r.outer)), (true, r.holes.as_mut_slice())] {
+            for l in loops {
+                let dirs = widen_dirs(l, is_hole);
+                let moved: Vec<[f64; 2]> = l
+                    .iter()
+                    .zip(&dirs)
+                    .map(|(p, d)| {
+                        if *d != [0.0, 0.0] && outside_at(*p, *d, probe) {
+                            widened += 1;
+                            [p[0] + d[0] * eps as f64, p[1] + d[1] * eps as f64]
+                        } else {
+                            *p
+                        }
+                    })
+                    .collect();
+                *l = moved;
+            }
+        }
+    }
+    if widened > 0 {
+        debug!("Cut: gave {widened} profile vertices {eps:.5} of lateral clearance (wall on the body's silhouette)");
+    }
+}
+
 fn prune_void_cut_geometry(regs: &mut Vec<hworks_sketch::Region>, mesh: &TriMesh, plane: &PlaneRef, into: f32) {
     let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
     let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
@@ -32422,6 +32521,262 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_leftover_walls -- --ignored --nocapture
+    fn diag_fillet_leftover_walls() {
+        // Where a rim fillet RUNS OUT — here because a cut took away part of the face the rim sat
+        // on — does material stay standing inside the fillet's own surface? Probes the ideal
+        // rolling-ball torus and reports what is left, bucketed by angle so a run-out end shows up
+        // as a cluster rather than a total.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let fil = doc.features.iter().find_map(|f| match &f.kind {
+            FeatureKind::Fillet { radius, edges } => Some((*radius, edges.clone())),
+            _ => None,
+        });
+        let Some((fr, edges)) = fil else { eprintln!("no Fillet"); return };
+        let chain = &edges[0];
+        // The rim: its plane height and radius, straight off the picked chain.
+        let ys: Vec<f64> = chain.iter().map(|p| p[1]).collect();
+        let top = ys.iter().cloned().fold(f64::MIN, f64::max);
+        let rim_r = chain.iter().map(|p| (p[0] * p[0] + p[2] * p[2]).sqrt()).sum::<f64>() / chain.len() as f64;
+        // Which angles does the pick actually cover?
+        let mut covered: Vec<f64> = chain.iter().map(|p| p[2].atan2(p[0]).to_degrees()).collect();
+        covered.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("fillet r={fr:.3} on a rim of radius {rim_r:.3} at height {top:.4}, {} pts", chain.len());
+        // A convex rim fillet's rolling ball runs on a circle of radius rim+r, dropped r below the
+        // face; anything still solid within r of THAT circle was not taken off.
+        let axis_r = rim_r + fr;
+        let axis_y = top - fr;
+        let (mut solid, mut total) = (0usize, 0usize);
+        let mut by_angle: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        eprintln!("body: {} tris, manifold={}", mesh.indices.len() / 3, hworks_geometry::is_manifold(&mesh));
+        for adeg in 0..360 {
+            let a = (adeg as f64).to_radians();
+            for ri in 0..=14 {
+                for hi in 0..=14 {
+                    // Sample the fillet's cross-section quadrant, strictly inside the tube.
+                    // The region a convex rim fillet REMOVES: cornerward of the rolling ball —
+                    // inside the corner box, but outside the ball itself. (Inside the ball is
+                    // material the fillet keeps; probing there measures nothing.)
+                    let rr = rim_r + (axis_r - rim_r) * (ri as f64 / 14.0);
+                    let yy = axis_y + (top - axis_y) * (hi as f64 / 14.0);
+                    let (du, dv) = (rr - axis_r, yy - axis_y);
+                    if (du * du + dv * dv).sqrt() < fr * 1.05 {
+                        continue; // inside the ball: kept material
+                    }
+                    if rr < rim_r + 0.05 || yy > top - 0.05 {
+                        continue; // hard against the hole wall or the face; leave the seam alone
+                    }
+                    let p = Vec3::new((rr * a.cos()) as f32, yy as f32, (rr * a.sin()) as f32);
+                    total += 1;
+                    if point_inside_mesh(&mesh, p) {
+                        solid += 1;
+                        *by_angle.entry(adeg / 10 * 10).or_default() += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("material still standing inside the fillet: {solid} of {total} probes");
+        let hot: Vec<(i32, usize)> = by_angle.iter().filter(|(_, &c)| c > 0).map(|(&a, &c)| (a, c)).collect();
+        eprintln!("by angle (10° buckets, only non-empty): {hot:?}");
+        // Where does the PICK stop? The run-out ends are the gap in its angular coverage.
+        let mut gaps: Vec<(f64, f64)> = Vec::new();
+        for w in covered.windows(2) {
+            if w[1] - w[0] > 15.0 {
+                gaps.push((w[0], w[1]));
+            }
+        }
+        eprintln!("picked-rim angular gaps (the run-out ends): {gaps:?}");
+        // The walls in question stand at the run-out ends. Measure how THICK they are: sweep the
+        // angle across each end and find the material's angular extent at a grid of (radius,
+        // height). A legitimate cut wall is bounded by its neighbours; a knife-edge left by two
+        // features meeting is thin enough to read as an error even though the body is manifold.
+        for (label, end) in gaps.iter().flat_map(|(a, b)| [("gap start", *a), ("gap end", *b)]) {
+            let mut thinnest = f64::MAX;
+            let mut at = (0.0f64, 0.0f64, 0.0f64);
+            let mut sampled = 0usize;
+            for ri in 0..=20 {
+                let rr = rim_r + (4.7 - rim_r) * (ri as f64 / 20.0);
+                for hi in 0..=20 {
+                    let yy = (top - fr - 0.2) + (fr + 0.2) * (hi as f64 / 20.0);
+                    // Walk out from the wall plane in both angular directions.
+                    let solid_at = |deg: f64| {
+                        let a = deg.to_radians();
+                        point_inside_mesh(&mesh, Vec3::new((rr * a.cos()) as f32, yy as f32, (rr * a.sin()) as f32))
+                    };
+                    if !solid_at(end) {
+                        continue; // no material on the wall here
+                    }
+                    sampled += 1;
+                    let mut span = 0.0;
+                    for s in [-1.0f64, 1.0] {
+                        let mut d = 0.0;
+                        while d < 12.0 && solid_at(end + s * (d + 0.25)) {
+                            d += 0.25;
+                        }
+                        span += d;
+                    }
+                    let arc = span.to_radians() * rr; // angular span as a real thickness
+                    if arc < thinnest {
+                        thinnest = arc;
+                        at = (rr, yy, end);
+                    }
+                }
+            }
+            if sampled > 0 {
+                eprintln!("{label} {end:.2}°: thinnest standing material {thinnest:.4} at r={:.3} y={:.3} ({sampled} probes on the wall)", at.0, at.1);
+            } else {
+                eprintln!("{label} {end:.2}°: no material standing on this plane");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_cut_slivers -- --ignored --nocapture
+    fn diag_cut_slivers() {
+        // What is left behind by a Cut? Probes the void the cut should have opened and reports any
+        // material still standing in it, plus the thinnest triangles in the body.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        // The cut's own parameters, straight from the document.
+        let cut = doc.features.iter().find_map(|f| match &f.kind {
+            FeatureKind::Cut { plane, distance, sketch, region_pts, .. } => Some((plane.clone(), *distance, sketch.clone(), region_pts.clone())),
+            _ => None,
+        });
+        let Some((plane, depth, sketch, region_pts)) = cut else { eprintln!("no Cut feature"); return };
+        let rad = sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Circle { radius, .. } => Some(*radius),
+            _ => None,
+        }).unwrap_or(0.0);
+        let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+        eprintln!("cut plane origin {o:?} normal {n:?} depth {depth} circle r={rad}");
+        eprintln!("region_pts {region_pts:?}");
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        eprintln!("body: {} tris, manifold={}", mesh.indices.len() / 3, hworks_geometry::is_manifold(&mesh));
+        let vol = tri_vol(&mesh);
+        eprintln!("volume {vol:.3}");
+
+        // Probe the void: the sketch region swept `depth` along -normal. Sample in sketch
+        // coordinates around the region point so the quadrant comes from the document.
+        let Some(rp) = region_pts.first() else { return };
+        let (rx, ry) = (rp[0] as f32, rp[1] as f32);
+        let (mut solid, mut total) = (0usize, 0usize);
+        let mut worst: Option<(Vec3, f32)> = None;
+        let steps = 60;
+        for i in 0..=steps {
+            for j in 0..=steps {
+                // Sample the quarter's sketch-space box, keeping points inside the circle and on
+                // the region point's side of both axes.
+                // Strictly INSIDE: a probe sitting exactly on the cut's own boundary plane reads as
+                // inside the mesh whichever way the boolean went, so it measures nothing at all.
+                let inset = rad as f32 * 0.015;
+                let sx = (inset + (rad as f32 - inset) * (i as f32 / steps as f32)) * rx.signum();
+                let sy = (inset + (rad as f32 - inset) * (j as f32 / steps as f32)) * ry.signum();
+                if (sx * sx + sy * sy).sqrt() > rad as f32 * 0.985f32 {
+                    continue; // stay off the wall itself
+                }
+                for k in 1..10 {
+                    // Depth fractions, skipping the very ends so the probe is unambiguous.
+                    let d = depth as f32 * (k as f32 / 10.0);
+                    let p = o + u * sx + v * sy - n * d;
+                    total += 1;
+                    if point_inside_mesh(&mesh, p) {
+                        solid += 1;
+                        let from_axis = ((p - o).dot(u).powi(2) + (p - o).dot(v).powi(2)).sqrt();
+                        let key = rad as f32 - from_axis; // how far in from the wall it stands
+                        if worst.map_or(true, |(_, w)| key > w) {
+                            worst = Some((p, key));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("LEFTOVER material in the cut void: {solid} of {total} probes");
+        if let Some((p, k)) = worst {
+            eprintln!("   deepest leftover at ({:.4},{:.4},{:.4}) — {k:.4} in from the wall", p.x, p.y, p.z);
+        }
+        // WHERE are they? Two candidates look alike in a total: a skin left against the coincident
+        // wall, or a wedge standing along the region's straight edges. Bucket by distance from the
+        // axis and by depth to tell them apart.
+        {
+            let mut by_depth = vec![0usize; 10];
+            let mut by_ring = vec![0usize; 10];
+            let (mut rmin, mut rmax) = (f32::MAX, 0.0f32);
+            let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+            let mut near_axis = 0usize;
+            for i in 0..=steps {
+                for j in 0..=steps {
+                    let inset = rad as f32 * 0.015;
+                    let sx = (inset + (rad as f32 - inset) * (i as f32 / steps as f32)) * rx.signum();
+                    let sy = (inset + (rad as f32 - inset) * (j as f32 / steps as f32)) * ry.signum();
+                    let fr = (sx * sx + sy * sy).sqrt();
+                    if fr > rad as f32 * 0.985f32 {
+                        continue;
+                    }
+                    for k in 1..10 {
+                        let d = depth as f32 * (k as f32 / 10.0);
+                        let p = o + u * sx + v * sy - n * d;
+                        if point_inside_mesh(&mesh, p) {
+                            by_depth[k] += 1;
+                            by_ring[((fr / rad as f32) * 9.99) as usize] += 1;
+                            rmin = rmin.min(fr);
+                            rmax = rmax.max(fr);
+                            ymin = ymin.min(p.y);
+                            ymax = ymax.max(p.y);
+                            // "Along the straight edges" = close to one of the two sketch axes.
+                            if sx.abs().min(sy.abs()) < rad as f32 * 0.06 {
+                                near_axis += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("   spread: radius {rmin:.3}..{rmax:.3} of {rad:.3}, height {ymin:.4}..{ymax:.4}");
+            eprintln!("   by depth below the cut plane (0.2 .. 1.8): {by_depth:?}");
+            eprintln!("   by ring, axis → wall:                      {by_ring:?}");
+            eprintln!("   hugging one of the region's straight edges: {near_axis} of {solid}");
+        }
+        // Thinnest triangles: a sliver shows up as a long, near-zero-area face.
+        let mut slivers: Vec<(f32, Vec3)> = Vec::new();
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            let area = (b - a).cross(c - a).length() * 0.5;
+            let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+            if longest > 1e-4 && area / longest < 1e-3 {
+                slivers.push((area, (a + b + c) / 3.0));
+            }
+        }
+        slivers.sort_by(|x, y| x.0.total_cmp(&y.0));
+        eprintln!("needle triangles (height under 1e-3): {}", slivers.len());
+        for (a, m) in slivers.iter().take(6) {
+            eprintln!("   area {a:.3e} at ({:.4},{:.4},{:.4})", m.x, m.y, m.z);
+        }
+        // A sub-pixel triangle is invisible as a surface — what would SHOW is the lines it makes
+        // the edge detector draw. Compare the body's drawn edges against the same body without
+        // the cut, and report anything short or stranded.
+        {
+            let tess = mesh_tessellation(mesh.clone());
+            let mut before = doc.clone();
+            before.rollback = doc.features.iter().position(|f| matches!(f.kind, FeatureKind::Cut { .. })).unwrap_or(0);
+            let base = regenerate_mesh(&before).map(|(m, _)| mesh_tessellation(m).edges.len()).unwrap_or(0);
+            let elen = |e: &[[f32; 3]; 2]| Vec3::from_array(e[0]).distance(Vec3::from_array(e[1]));
+            let mut short: Vec<&[[f32; 3]; 2]> = tess.edges.iter().filter(|e| elen(e) < 0.05).collect();
+            short.sort_by(|a, b| elen(a).total_cmp(&elen(b)));
+            eprintln!("drawn edges: {} (uncut body had {base}); {} shorter than 0.05", tess.edges.len(), short.len());
+            for e in short.iter().take(6) {
+                let m = (Vec3::from_array(e[0]) + Vec3::from_array(e[1])) * 0.5;
+                eprintln!("   len {:.2e} at ({:.4},{:.4},{:.4})  r={:.4}", elen(e), m.x, m.y, m.z, (m.x * m.x + m.z * m.z).sqrt());
+            }
+        }
+    }
+
+    #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_sticks_out -- --ignored --nocapture
     fn diag_fillet_sticks_out() {
         // Does the finished body poke OUT past the walls it is supposed to stay inside? Reads the
@@ -32931,6 +33286,63 @@ mod tests {
         // floor, or it is a hang waiting to happen.
         assert!(ROBUST_TOL >= ARC_BOOL_MIN_TOL, "the ladders' loosest rung must still be able to use exact arcs");
         assert!(COINCIDENT_TOL < ARC_BOOL_MIN_TOL, "the tight rung must run faceted");
+    }
+
+    /// A cut whose wall lands exactly on the body's leaves no degenerate geometry behind.
+    ///
+    /// From "bad extrude cut.hcad": a cylinder, then a quarter notch cut with a circle SNAPPED to
+    /// the same radius — so the tool's wall sits exactly on the body's. The snap is doing what it
+    /// should; what it exposes is a coincident-face boolean, which left the wall carrying needle
+    /// triangles of 4e-9 and 1e-7 and drew stray micro-edges over them. Nothing caught it because
+    /// the cut is otherwise perfect: manifold, right volume, and the void genuinely empty.
+    ///
+    /// `clear_coincident_cut_walls` widens the profile off the coincidence, but only where the
+    /// material has already ended just outside it, so a pocket's interior wall keeps its dimension.
+    #[test]
+    fn a_cut_flush_with_the_wall_leaves_no_needles() {
+        // The real file's numbers exactly: the plane sits 0.0053 ABOVE the top face (it snapped to
+        // a 1/32 grid, not onto the face), and the two radii carry the sketch solver's residue.
+        let r = 4.721334934234619_f64;
+        let h = 5.025900363922119_f64;
+        let plane_z = 5.03125_f64;
+        let mut doc = Document::with_default_planes();
+        let mut base = Sketch::default();
+        let bc = base.add_point(0.0, 0.0);
+        base.add_circle(bc, r);
+        doc.add_feature(FeatureKind::Extrude { sketch: base, regions: vec![], region_pts: vec![], plane: xy(), distance: h, back: 0.0, thin: 0.0, thin_side: 0 });
+        // The quarter: the SAME circle, plus the two radii bounding it.
+        let mut cs = Sketch::default();
+        let c0 = cs.add_point(0.0, 0.0);
+        cs.add_circle(c0, r);
+        let p1 = cs.add_point(-0.00000005999614671736708, r);
+        let p2 = cs.add_point(r, 0.00000011427722057533174);
+        cs.add_line(p1, c0, false);
+        cs.add_line(c0, p2, false);
+        let top = PlaneRef { origin: [0.0, 0.0, plane_z], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Cut { sketch: cs, regions: vec![0], region_pts: vec![[r * 0.61, r * 0.61]], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        assert!(hworks_geometry::is_manifold(&mesh), "the flush cut is not manifold");
+
+        // Still the right cut: a 32-gon prism less a quarter of it over the cut depth.
+        let vol = tri_vol(&mesh);
+        let poly = 16.0 * r * r * (std::f64::consts::TAU / 32.0).sin(); // 32-gon area
+        let want = poly * h - poly * 0.25 * 2.0;
+        assert!((vol - want).abs() < want * 0.02, "volume {vol:.3}, expected about {want:.3}");
+
+        // The point of the exercise: no needles. A degenerate triangle is one with no HEIGHT —
+        // area over its longest side. Before the clearance this held two at 9e-8 and 2e-6.
+        let mut thinnest = f32::MAX;
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+            if longest > 1e-4 {
+                thinnest = thinnest.min((b - a).cross(c - a).length() * 0.5 / longest);
+            }
+        }
+        assert!(thinnest > 1e-5, "a triangle only {thinnest:.2e} tall survives on the flush wall");
     }
 
     #[test]
