@@ -31,7 +31,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, GearType, Loft
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, fillet_segments, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -18594,7 +18594,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
             // and returns None on cases it can't resolve, so we fall back to the CSG round.
             FeatureKind::Fillet { radius, edges } => {
                 if let Some(b) = body.take() {
-                    let seg = ((*radius * 6.0).round() as usize).clamp(3, 12);
+                    let seg = fillet_segments();
                     // One topology pass gives both the surgery mesh and the tangent edges. The
                     // edges are emitted whether the surgery succeeded or fell back to CSG (they
                     // sit at the same contact lines), so the rounded edges stay selectable. Stacked
@@ -19388,7 +19388,7 @@ fn fillet_preview(
         ui_state.fillet_shown = Some(r);
         return;
     }
-    let seg = ((r * 6.0).round() as usize).clamp(3, 12);
+    let seg = fillet_segments();
     let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Mesh bevel first (clean corners); CSG round on anything it can't resolve.
         bevel_mesh_selected(&base, r as f64, seg, &edges).or_else(|| round_mesh(&base, r as f64, &edges))
@@ -26336,7 +26336,7 @@ mod tests {
         let open: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
         let mut shut = open.clone();
         shut.push(shut[0]); // what toggle_fillet_edge now stores for a closed pick
-        let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         for (label, picked) in [("open (old doc, wrap-healed)", vec![open]), ("closed (new store)", vec![shut])] {
             let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
             // The mesh surgery must TAKE this rim. It used to be refused on the grounds that a
@@ -28326,7 +28326,7 @@ mod tests {
         let (chain, closed) = edge_loop(&tess0.edges, rim_seed);
         eprintln!("picked rim: {} pts, closed={closed}", chain.len());
         let picked: Vec<Vec<[f64; 3]>> = vec![chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect()];
-        let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         for round in 0..10 {
             let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
             let path = if round >= 5 || beveled.is_none() { "CSG-fallback" } else { "surgery" };
@@ -32846,7 +32846,7 @@ mod tests {
         let (pre, _) = regenerate_mesh(&before).expect("body before the fillet");
         eprintln!("before: {} tris, manifold={}", pre.indices.len() / 3, hworks_geometry::is_manifold(&pre));
 
-        let seg = ((radius * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         let (surgery, _) = hworks_geometry::bevel_mesh_and_edges(&pre, *radius, seg, edges);
         eprintln!("mesh-surgery bevel: {}", match &surgery {
             Some(m) => format!("OK, {} tris, manifold={}", m.indices.len() / 3, hworks_geometry::is_manifold(m)),
@@ -33853,7 +33853,7 @@ mod tests {
                 eprintln!("  corner-line vertex y={y:.4} off-line={dr:.5}");
             }
         }
-        let seg = ((radius * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         let (surg, _) = bevel_mesh_and_edges(&pre, radius, seg, &edges);
         match surg {
             Some(m) => eprintln!("surgery: SUCCEEDED, flaps {}", count_flaps(&m)),

@@ -36,9 +36,26 @@ fn weld_tol(m: &TriMesh, rel: f32) -> (Vec<f32>, Vec<u32>) {
         }
     }
     let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    // ...but never coarser than the mesh's own detail. A fillet's facets are far smaller than a
+    // thousandth of the part it sits on, and welding across one collapses it: the two ends of a
+    // real edge become one vertex and the triangles that shared it tear open. That is how a
+    // perfectly built fillet — watertight, consistently wound, nothing degenerate — arrived at the
+    // kernel as a torn surface and came back rejected, on nothing more than how many facets it
+    // happened to have. Edges already below the floor are degenerate, and merging those is the
+    // point, so they don't hold the tolerance down.
+    let mut shortest = f32::INFINITY;
+    for t in m.indices.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let (p, q) = (m.positions[a as usize], m.positions[b as usize]);
+            let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+            if d > 1.0e-5 {
+                shortest = shortest.min(d);
+            }
+        }
+    }
     // `rel` of the model size: comfortably exceeds the seam gap yet stays far below any real
     // feature; floored so tiny models still merge exact duplicates.
-    let tol = (diag * rel).max(1.0e-5);
+    let tol = (diag * rel).min(shortest * 0.3).max(1.0e-5);
     let inv = 1.0 / tol;
     let cell = |c: f32| (c * inv).floor() as i64;
     let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
