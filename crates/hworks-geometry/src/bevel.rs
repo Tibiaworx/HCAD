@@ -740,6 +740,27 @@ fn edge_is_picked(topo: &Topo, e: &TopoEdge, picked: &[Vec<[f64; 3]>]) -> bool {
     })
 }
 
+/// Greatest a facet of a fillet's quarter-round is allowed to sag below the true arc, as a
+/// fraction of the fillet radius. 1/400th holds the removed volume to within about 1% of the exact
+/// answer, which is finer than the tessellation of the walls the fillet runs between.
+const FILLET_SAG: f64 = 0.0025;
+
+/// How many facets to lay across a fillet's quarter-round profile.
+///
+/// Deliberately **independent of the radius**. Roundness is an angle, not a length: a 0.2 mm fillet
+/// and a 20 mm one need the same number of facets to look round and to hold the same share of their
+/// volume. The old rule multiplied the radius by six, which gave anything under 0.58 units three
+/// facets — 30° apiece, visibly faceted, and cutting 15% more material than a true fillet, since
+/// each chord runs inside the arc. It also meant the same physical part came out coarser in inches
+/// than in millimetres.
+///
+/// The count is what the sag bound asks for: with a quarter turn split `k` ways, each facet sags
+/// `1 − cos(45°/k)` of the radius below the arc.
+pub fn fillet_segments() -> usize {
+    let per_facet = 2.0 * (1.0 - FILLET_SAG).acos(); // widest facet meeting the sag bound
+    ((std::f64::consts::FRAC_PI_2 / per_facet).ceil() as usize).max(3)
+}
+
 /// Round **every** edge of a solid (the all-edges prototype). See [`bevel_mesh_selected`].
 pub fn bevel_mesh(mesh: &TriMesh, r: f64, seg: usize) -> Option<TriMesh> {
     bevel_mesh_selected(mesh, r, seg, &[])
@@ -976,6 +997,79 @@ fn csg_handover_enabled() -> bool {
     std::env::var("HCAD_BEVEL_NO_CSG_HANDOVER").is_err()
 }
 
+/// Does the mesh lay two sheets over the same patch of one plane?
+///
+/// This is what a folded inset emits: the face comes back over itself reversed, so the plane is
+/// covered twice and the two sheets fight for the same pixels — the stripes down a bad run-out.
+/// Neither volume nor a watertightness check can see it, because a fold cancels itself out in the
+/// one and closes perfectly in the other.
+///
+/// The two sheets face opposite ways, so the plane has to be keyed without its direction or they
+/// are never compared. Triangles are grouped by that plane and each one's centre tested against
+/// the others in its group; only called once a fold is already suspected, since that comparison is
+/// quadratic in the size of a group.
+fn covers_a_plane_twice(m: &TriMesh) -> bool {
+    let mut groups: HashMap<[i64; 4], Vec<[V3; 3]>> = HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        let v = [t[0], t[1], t[2]].map(|i| {
+            let q = m.positions[i as usize];
+            [q[0] as f64, q[1] as f64, q[2] as f64]
+        });
+        let n = cross(sub(v[1], v[0]), sub(v[2], v[0]));
+        let len = dot(n, n).sqrt();
+        if len < 1e-12 {
+            continue; // a degenerate sliver covers nothing
+        }
+        let (mut n, mut d) = ([n[0] / len, n[1] / len, n[2] / len], 0.0);
+        d = dot(n, v[0]);
+        if n.iter().copied().find(|x| x.abs() > 1e-9).unwrap_or(1.0) < 0.0 {
+            n = [-n[0], -n[1], -n[2]]; // same plane, either way up
+            d = -d;
+        }
+        let k = |x: f64| (x * 1.0e4).round() as i64;
+        groups.entry([k(n[0]), k(n[1]), k(n[2]), k(d)]).or_default().push(v);
+    }
+    for (key, tris) in &groups {
+        if tris.len() < 2 {
+            continue;
+        }
+        // Drop the plane's dominant axis and compare in 2D.
+        let n = [key[0] as f64, key[1] as f64, key[2] as f64];
+        let ax = if n[0].abs() >= n[1].abs() && n[0].abs() >= n[2].abs() {
+            0
+        } else if n[1].abs() >= n[2].abs() {
+            1
+        } else {
+            2
+        };
+        let flat = |p: V3| -> [f64; 2] {
+            match ax {
+                0 => [p[1], p[2]],
+                1 => [p[0], p[2]],
+                _ => [p[0], p[1]],
+            }
+        };
+        let inside = |p: [f64; 2], t: &[V3; 3]| {
+            let (a, b, c) = (flat(t[0]), flat(t[1]), flat(t[2]));
+            let side = |u: [f64; 2], v: [f64; 2]| (v[0] - u[0]) * (p[1] - u[1]) - (v[1] - u[1]) * (p[0] - u[0]);
+            let (s1, s2, s3) = (side(a, b), side(b, c), side(c, a));
+            (s1 >= -1e-9 && s2 >= -1e-9 && s3 >= -1e-9) || (s1 <= 1e-9 && s2 <= 1e-9 && s3 <= 1e-9)
+        };
+        for (i, t) in tris.iter().enumerate() {
+            let mid = [
+                (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+                (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+                (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+            ];
+            let c = flat(mid);
+            if tris.iter().enumerate().any(|(j, o)| j != i && inside(c, o)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The surgery half of a prepared bevel: flat faces inset to their corners, a convex/concave
 /// cylinder strip per selected edge, and a fanned patch per corner. `None` if the result isn't
 /// watertight (a partial-vertex T-junction the prototype can't split → caller falls back to CSG).
@@ -993,17 +1087,24 @@ fn run_surgery(
 ) -> Option<TriMesh> {
     let verts = &topo.verts;
     let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(verts[vi]) };
-    // A face the inset turns inside-out can only be emitted as a self-overlapping sheet — see
-    // `inset_fold_area`. Hand those to the CSG round, which does this shape properly (on the
-    // boss-sector junction: volume to 0.7%, the face plane covered exactly once, nothing through
-    // the walls) — but only while the round can still finish, per `CSG_ROUND_MAX_BOOLEANS`. The
-    // threshold is on fold AREA, not on any fold at all, so a sliver flipped by rounding noise
+    // A face the inset turns inside-out CAN come out as a self-overlapping sheet — see
+    // `inset_fold_area` — and those are better done by the CSG round (on the boss-sector junction:
+    // volume to 0.7%, the face plane covered exactly once, nothing through the walls), while the
+    // round can still finish, per `CSG_ROUND_MAX_BOOLEANS`.
+    //
+    // But a fold predicted from the inset is only a suspicion. Insetting a tube's top annulus from
+    // both of its rims folds it by the same measure, and there the surgery produces the exact
+    // shape (volume to 0.1%, nothing double-covered) while the round comes back 8.8% heavy and
+    // torn. So this is a SCREEN, not the verdict: the decision is made below on the mesh actually
+    // built. The screen keeps the cost off every ordinary fillet, since confirming means comparing
+    // coplanar triangles against each other.
+    //
+    // The threshold is on fold AREA, not on any fold at all, so a sliver flipped by rounding noise
     // doesn't push a good bevel onto the slower path; a real fold runs to whole multiples of r², a
     // numerical one to a millionth of it.
     let folded: f64 = (0..topo.faces.len()).map(|fi| inset_fold_area(topo, fi, &cpt)).sum();
-    if folded > 0.01 * r * r && csg_handover_enabled() && csg_booleans() <= CSG_ROUND_MAX_BOOLEANS {
-        return None;
-    }
+    let suspect_fold =
+        folded > 0.01 * r * r && csg_handover_enabled() && csg_booleans() <= CSG_ROUND_MAX_BOOLEANS;
     let mut b = Build::new();
 
     // 0) Terminal-edge splices. At a vertex where exactly ONE selected edge ends (its other
@@ -1461,6 +1562,10 @@ fn run_surgery(
     }
 
     let out = b.finish();
+    // The suspected fold, confirmed or cleared against what was actually built.
+    if suspect_fold && covers_a_plane_twice(&out) {
+        return None;
+    }
     if is_closed(&out) {
         Some(out)
     } else {
@@ -2608,6 +2713,244 @@ mod tests {
             if t0.elapsed().as_secs() > 20 {
                 eprintln!("    (stopping the sweep — already past any interactive budget)");
                 break;
+            }
+        }
+    }
+
+    /// A tube: outer radius `ro`, bore `ri`, height `h`, on a shared tessellation.
+    fn tube(ro: f64, ri: f64, h: f64, n: usize) -> (TriMesh, Vec<[f64; 2]>, Vec<[f64; 2]>) {
+        let ring = |rad: f64| -> Vec<[f64; 2]> {
+            (0..n).map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [rad * a.cos(), rad * a.sin()]
+            }).collect()
+        };
+        let (o, i) = (ring(ro), ring(ri));
+        let m = extrude_tool_mesh(&o, &[i.iter().rev().copied().collect()], &xy(), 0.0, h).unwrap();
+        (m, o, i)
+    }
+
+    #[test]
+    fn a_fillet_is_as_round_at_a_hundredth_the_size() {
+        // How round a fillet comes out must not depend on how big it is. The rule used to be the
+        // radius times six, which gave anything under 0.58 units three facets across the quarter
+        // round — 30° apiece, and 15% more material gone than a fillet actually removes, since
+        // every chord runs inside the arc. It also made the same physical part coarser drawn in
+        // inches than in millimetres.
+        //
+        // Same shape at three scales, two orders of magnitude apart: the error must be the same
+        // small number at each.
+        let pi = std::f64::consts::PI;
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        for scale in [0.05f64, 1.0, 100.0] {
+            let (rad, h, r) = (4.0 * scale, 6.0 * scale, 0.5 * scale);
+            let n = 32;
+            let circ: Vec<[f64; 2]> = (0..n)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / n as f64;
+                    [rad * a.cos(), rad * a.sin()]
+                })
+                .collect();
+            let cyl = extrude_tool_mesh(&circ, &[], &xy(), 0.0, h).unwrap();
+            let mut rim: Vec<[f64; 3]> = circ.iter().map(|p| [p[0], p[1], h]).collect();
+            rim.push(rim[0]);
+            let m = bevel_mesh_selected(&cyl, r, fillet_segments(), &[rim]).expect("rim fillet");
+            // Pappus: the corner's area r²(1−π/4), swept round its own centroid.
+            let area = r * r * (1.0 - pi / 4.0);
+            let ubar = r * (5.0 / 6.0 - pi / 4.0) / (1.0 - pi / 4.0);
+            let want = 2.0 * pi * (rad - ubar) * area;
+            let got = vol(&cyl) - vol(&m);
+            assert!(
+                (got - want).abs() < want * 0.01,
+                "at scale {scale}: removed {got:.6}, a real fillet removes {want:.6} ({:+.1}%)",
+                (got - want) / want * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_tube_filleted_on_both_rims_of_one_face_keeps_the_surgery() {
+        // Filleting both rims of a tube's end insets that annulus from both sides, which reads as a
+        // folded face — and a fold used to be handed straight to the CSG round whenever the round
+        // looked cheap enough to run. On this shape the round comes back 8.8% heavy with a torn
+        // surface, while the surgery has it to 0.1%. Picking all four rims instead priced the round
+        // out and quietly got the better answer, so picking FEWER edges made the part worse.
+        //
+        // The fold is now confirmed against the mesh actually built rather than predicted from the
+        // inset, so this shape stays where it belongs.
+        let (ro, ri, h, n) = (4.0f64, 2.0f64, 6.0f64, 32usize);
+        let ring = |rad: f64| -> Vec<[f64; 2]> {
+            (0..n).map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [rad * a.cos(), rad * a.sin()]
+            }).collect()
+        };
+        let (outer, inner) = (ring(ro), ring(ri));
+        let body = extrude_tool_mesh(&outer, &[inner.iter().rev().copied().collect()], &xy(), 0.0, h).unwrap();
+        let loop_at = |ring: &[[f64; 2]]| -> Vec<[f64; 3]> {
+            let mut v: Vec<[f64; 3]> = ring.iter().map(|p| [p[0], p[1], h]).collect();
+            v.push(v[0]);
+            v
+        };
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let pi = std::f64::consts::PI;
+        // Up to r=1 the two fillets meet in the middle of the 2-wide annulus; at exactly 1 the flat
+        // between them vanishes, which is the worst case for the fold.
+        for r in [0.25f64, 0.5, 1.0] {
+            let picked = vec![loop_at(&outer), loop_at(&inner)];
+            let m = bevel_mesh_selected(&body, r, fillet_segments(), &picked)
+                .unwrap_or_else(|| panic!("r={r}: the surgery gave up a tube's end rims"));
+            assert!(crate::mesh_bool::is_manifold(&m), "r={r}: the filleted tube is not manifold");
+            let area = r * r * (1.0 - pi / 4.0);
+            let ubar = r * (5.0 / 6.0 - pi / 4.0) / (1.0 - pi / 4.0);
+            let want = 2.0 * pi * ((ro - ubar) + (ri + ubar)) * area;
+            let got = vol(&body) - vol(&m);
+            assert!(
+                (got - want).abs() < want * 0.01,
+                "r={r}: removed {got:.4}, two real fillets remove {want:.4} ({:+.1}%)",
+                (got - want) / want * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn filleting_every_edge_is_a_solid_at_any_facet_count() {
+        // A block with a pocket, every edge filleted — the app's "fillet all". The surgery builds
+        // this correctly at every facet count: watertight, consistently wound, nothing degenerate.
+        // It still reached the kernel torn, because the ingest welds vertices at a fraction of the
+        // PART's size and a fillet's facets are far smaller than that — so two ends of one facet
+        // could merge into a single vertex and open the surface. Whether that happened came down to
+        // how many facets the fillet happened to have: nine (what radius 1.5 used to ask for) was
+        // sound, twelve was not, and the body exported as invalid with nothing visibly wrong.
+        let block = extrude_tool_mesh(&[[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], &[], &xy(), 0.0, 10.0).unwrap();
+        let pocket = extrude_tool_mesh(&[[7.0, 7.0], [13.0, 7.0], [13.0, 13.0], [7.0, 13.0]], &[], &xy(), 6.0, 5.0).unwrap();
+        let body = crate::mesh_difference(&block, &pocket);
+        assert!(crate::mesh_bool::is_manifold(&body), "the pocketed block is not a solid to begin with");
+        for seg in 3..=16 {
+            let m = bevel_mesh_selected(&body, 1.5, seg, &[])
+                .unwrap_or_else(|| panic!("seg={seg}: the surgery declined an all-edges fillet"));
+            assert!(crate::mesh_bool::is_manifold(&m), "seg={seg}: the filleted block is not a solid");
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: cargo test diag_tube_fillets -- --ignored --nocapture
+    fn diag_tube_fillets() {
+        // What does a fillet on a TUBE actually produce? Same measurements the solid-cylinder rim
+        // test makes — ideal torus, exact Pappus volume — applied to each of a tube's four rims and
+        // to the pairs a user picks together.
+        let (ro, ri, h, n) = (4.0f64, 2.0f64, 6.0f64, 32usize);
+        let (body, outer, inner) = tube(ro, ri, h, n);
+        let pi = std::f64::consts::PI;
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+            }
+            v.abs()
+        };
+        let torn = |m: &TriMesh| -> usize {
+            use std::collections::HashMap;
+            let key = |p: [f32; 3]| ((p[0] * 1e4) as i64, (p[1] * 1e4) as i64, (p[2] * 1e4) as i64);
+            let mut e: HashMap<((i64, i64, i64), (i64, i64, i64)), u32> = HashMap::new();
+            for t in m.indices.chunks_exact(3) {
+                let v = [key(m.positions[t[0] as usize]), key(m.positions[t[1] as usize]), key(m.positions[t[2] as usize])];
+                for &(x, y) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] { *e.entry((x.min(y), x.max(y))).or_default() += 1; }
+            }
+            e.values().filter(|&&c| c != 2).count()
+        };
+        let loop_at = |ring: &[[f64; 2]], z: f64| -> Vec<[f64; 3]> {
+            let mut v: Vec<[f64; 3]> = ring.iter().map(|p| [p[0], p[1], z]).collect();
+            v.push(v[0]);
+            v
+        };
+        // Exact corner volume for a rim of radius `rad`; `out` = the material lies inside it.
+        let want_vol = |rad: f64, r: f64, out: bool| {
+            let area = r * r * (1.0 - pi / 4.0);
+            let ubar = r * (5.0 / 6.0 - pi / 4.0) / (1.0 - pi / 4.0);
+            2.0 * pi * (if out { rad - ubar } else { rad + ubar }) * area
+        };
+        let cases: Vec<(&str, Vec<Vec<[f64; 3]>>, Vec<(f64, bool)>)> = vec![
+            ("outer top      ", vec![loop_at(&outer, h)], vec![(ro, true)]),
+            ("bore top       ", vec![loop_at(&inner, h)], vec![(ri, false)]),
+            ("outer bottom   ", vec![loop_at(&outer, 0.0)], vec![(ro, true)]),
+            ("bore bottom    ", vec![loop_at(&inner, 0.0)], vec![(ri, false)]),
+            ("both top rims  ", vec![loop_at(&outer, h), loop_at(&inner, h)], vec![(ro, true), (ri, false)]),
+            ("outer both ends", vec![loop_at(&outer, h), loop_at(&outer, 0.0)], vec![(ro, true), (ro, true)]),
+            ("all four rims  ", vec![loop_at(&outer, h), loop_at(&inner, h), loop_at(&outer, 0.0), loop_at(&inner, 0.0)],
+                vec![(ro, true), (ri, false), (ro, true), (ri, false)]),
+        ];
+        // Control: the same outer rim with no bore behind it, swept across facet counts. If the
+        // over-removal is the profile's chords cutting inside the arc, the error must fall as 1/k²
+        // and be the same at every radius for a given k.
+        let solid = extrude_tool_mesh(&outer, &[], &xy(), 0.0, h).unwrap();
+        for r in [0.25f64, 0.5, 1.0, 1.5] {
+            let mut line = format!("  CONTROL solid cylinder r={r}: ");
+            for seg in [3usize, 6, 8, 11, 16, 24] {
+                let m = bevel_mesh_selected(&solid, r, seg, &[loop_at(&outer, h)]).expect("solid rim");
+                let want = want_vol(ro, r, true);
+                let got = vol(&solid) - vol(&m);
+                line.push_str(&format!("seg{seg}={:+.1}%  ", (got - want) / want * 100.0));
+            }
+            eprintln!("{line}");
+        }
+        for r in [0.25f64, 0.5, 1.0, 1.5] {
+            eprintln!("
+=== fillet r={r} on a tube ro={ro} ri={ri} h={h} ({n}-gon) ===");
+            for (name, picked, rims) in &cases {
+                let seg = fillet_segments();
+                let surgery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    bevel_mesh_selected(&body, r, seg, picked)
+                })).unwrap_or(None);
+                let via = if surgery.is_some() { "surgery" } else { "CSG    " };
+                let Some(m) = surgery.or_else(|| crate::round_mesh(&body, r, picked)) else {
+                    eprintln!("  {name}: NO RESULT (both engines declined)");
+                    continue;
+                };
+                let want: f64 = rims.iter().map(|&(rad, out)| want_vol(rad, r, out)).sum();
+                let got = vol(&body) - vol(&m);
+                // How far the rounded band strays from the ideal torus it should lie on. A point in
+                // the band belongs to the nearest one, so take each point's best and report the
+                // worst of those.
+                let mut worst = 0.0f64;
+                for q in &m.positions {
+                    let (x, y, z) = (q[0] as f64, q[1] as f64, q[2] as f64);
+                    let d = (x * x + y * y).sqrt();
+                    let mut best = f64::MAX;
+                    for &(rad, out) in rims {
+                        for zc in [h - r, r] {
+                            if (z - zc).abs() > r + 1e-6 {
+                                continue; // outside this band's height
+                            }
+                            let ac = if out { rad - r } else { rad + r };
+                            if (out && d < ac - 1e-6) || (!out && d > ac + 1e-6) {
+                                continue; // flat wall/cap, not the band
+                            }
+                            best = best.min((((d - ac).powi(2) + (z - zc).powi(2)).sqrt() - r).abs());
+                        }
+                    }
+                    if best < f64::MAX {
+                        worst = worst.max(best);
+                    }
+                }
+                let err = if want > 0.0 { (got - want) / want * 100.0 } else { 0.0 };
+                eprintln!("  {name} via {via} seg={seg:<2}: {:>5} tris, manifold={}, torn={:<3} removed {got:8.4} want {want:8.4} ({err:+6.1}%), off-torus {worst:.4}",
+                    m.indices.len() / 3, crate::mesh_bool::is_manifold(&m), torn(&m));
             }
         }
     }

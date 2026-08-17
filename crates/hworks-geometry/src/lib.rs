@@ -17,7 +17,7 @@ mod bevel;
 mod csg;
 mod fillet;
 mod mesh_bool;
-pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_and_edges, bevel_mesh_selected};
+pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_and_edges, bevel_mesh_selected, fillet_segments};
 pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
 pub use mesh_bool::{feature_edges_by_face, is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, remesh_solid, take_dense_skip_count, take_fallback_count};
 
