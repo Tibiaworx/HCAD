@@ -33268,6 +33268,190 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_membrane_origin -- --ignored --nocapture
+    fn diag_membrane_origin() {
+        // Which feature first tears the surface? A sheet floating inside the body is not a solid
+        // boundary, so its rim edges cannot carry exactly two faces. Counting edges by how many
+        // faces meet along them is O(n) and names the step that introduced the tear, which volume
+        // and bounding boxes cannot see.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        for (i, f) in doc.features.iter().enumerate() {
+            let kind = match &f.kind {
+                FeatureKind::Plane(_) => continue,
+                FeatureKind::Extrude { distance, .. } => format!("Extrude {distance:.3}"),
+                FeatureKind::Cut { distance, .. } => format!("Cut {distance:.3}"),
+                other => format!("{other:?}").chars().take(24).collect(),
+            };
+            let mut upto = doc.clone();
+            upto.rollback = i + 1;
+            let Some((m, _)) = regenerate_mesh(&upto) else {
+                eprintln!("#{i} {kind}: NO BODY");
+                continue;
+            };
+            use std::collections::HashMap;
+            let key = |p: [f32; 3]| ((p[0] * 1e4) as i64, (p[1] * 1e4) as i64, (p[2] * 1e4) as i64);
+            let mut id: HashMap<(i64, i64, i64), usize> = HashMap::new();
+            let mut pos: Vec<Vec3> = Vec::new();
+            let mut vid = |p: [f32; 3]| {
+                *id.entry(key(p)).or_insert_with(|| {
+                    pos.push(Vec3::from_array(p));
+                    pos.len() - 1
+                })
+            };
+            let mut edges: HashMap<(usize, usize), usize> = HashMap::new();
+            for t in m.indices.chunks_exact(3) {
+                let v = [
+                    vid(m.positions[t[0] as usize]),
+                    vid(m.positions[t[1] as usize]),
+                    vid(m.positions[t[2] as usize]),
+                ];
+                for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                    *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
+            }
+            let open: Vec<&(usize, usize)> = edges.iter().filter(|(_, &c)| c == 1).map(|(e, _)| e).collect();
+            let extra: Vec<&(usize, usize)> = edges.iter().filter(|(_, &c)| c > 2).map(|(e, _)| e).collect();
+            let span = |es: &[&(usize, usize)]| -> String {
+                if es.is_empty() {
+                    return String::new();
+                }
+                let ys: Vec<f32> = es.iter().flat_map(|(a, b)| [pos[*a].y, pos[*b].y]).collect();
+                let lo = ys.iter().copied().fold(f32::MAX, f32::min);
+                let hi = ys.iter().copied().fold(f32::MIN, f32::max);
+                format!(" (y {lo:.3}..{hi:.3})")
+            };
+            eprintln!(
+                "#{i} {kind}: {} tris, {} open edges{}, {} over-used edges{}",
+                m.indices.len() / 3,
+                open.len(),
+                span(&open),
+                extra.len(),
+                span(&extra)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_last_cut_leftovers -- --ignored --nocapture
+    fn diag_last_cut_leftovers() {
+        // What survives inside the LAST cut's swept volume? Walks the cut direction at a grid of
+        // points across its profile and reports every span of material still standing, so a sheet
+        // left behind shows up with its thickness and where it is.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let last = doc.features.iter().enumerate().filter(|(_, f)| matches!(f.kind, FeatureKind::Cut { .. })).next_back();
+        let Some((fi, feat)) = last else { eprintln!("no Cut"); return };
+        let FeatureKind::Cut { plane, distance, sketch, .. } = &feat.kind else { return };
+        let rad = sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Circle { radius, .. } => Some(*radius),
+            _ => None,
+        }).unwrap_or(0.0);
+        let ctr = sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Circle { center, .. } => sketch.points.get(*center).map(|p| (p.x, p.y)),
+            _ => None,
+        }).unwrap_or((0.0, 0.0));
+        let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+        eprintln!("last cut is #{fi}: circle r={rad:.3} at sketch ({:.3},{:.3}), depth {distance:.3}", ctr.0, ctr.1);
+        eprintln!("  plane {o:?} normal {n:?}");
+
+        // Did any boolean fall back to the lossy BSP path? Manifold guarantees a 2-manifold
+        // result; the fallback does not, and a survived internal face is exactly what it leaves.
+        let _ = take_fallback_count();
+        let (before, _) = { let mut d = doc.clone(); d.rollback = fi; regenerate_mesh(&d).expect("body before the cut") };
+        eprintln!("  BSP fallbacks building up to the cut: {}", take_fallback_count());
+        let (after, _) = { let mut d = doc.clone(); d.rollback = fi + 1; regenerate_mesh(&d).expect("body after") };
+        eprintln!("  volume {:.3} → {:.3} (removed {:.3})", tri_vol(&before), tri_vol(&after), tri_vol(&before) - tri_vol(&after));
+
+        // Which TRIANGLES ended up inside the cut's own swept volume?
+        //
+        // Ray-marching a grid misses exactly the thing being looked for: a thin sheet standing
+        // parallel to the rays slips between them, and at a radius of 6.9 a 13x13 grid leaves 1.0
+        // between neighbours. Testing the mesh directly cannot miss it — anything with a centroid
+        // inside the cylinder the cut swept is material the cut should have taken.
+        let depth = *distance as f32;
+        let ctr_w = o + u * ctr.0 as f32 + v * ctr.1 as f32;
+        let inside_cut = |p: Vec3| -> Option<(f32, f32)> {
+            let d = p - ctr_w;
+            let along = -d.dot(n); // the cut bites along -n from the plane
+            let radial = (d - n * d.dot(n)).length();
+            (along > 0.02 && along < depth - 0.02 && radial < rad as f32 - 0.02).then_some((along, radial))
+        };
+        let mut inside: Vec<(Vec3, f32, f32)> = Vec::new();
+        for t in after.indices.chunks_exact(3) {
+            let a = Vec3::from_array(after.positions[t[0] as usize]);
+            let b = Vec3::from_array(after.positions[t[1] as usize]);
+            let c = Vec3::from_array(after.positions[t[2] as usize]);
+            let mid = (a + b + c) / 3.0;
+            if let Some((along, radial)) = inside_cut(mid) {
+                inside.push((mid, along, radial));
+            }
+        }
+        if inside.is_empty() {
+            eprintln!("  no triangles inside the cut's swept volume — it went right through");
+            return;
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for (p, _, _) in &inside {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        eprintln!(
+            "  {} triangles STILL INSIDE the cut, spanning {:.3} x {:.3} x {:.3}",
+            inside.len(),
+            hi.x - lo.x,
+            hi.y - lo.y,
+            hi.z - lo.z
+        );
+        eprintln!("    from ({:.3},{:.3},{:.3}) to ({:.3},{:.3},{:.3})", lo.x, lo.y, lo.z, hi.x, hi.y, hi.z);
+        let (amin, amax) = inside.iter().fold((f32::MAX, f32::MIN), |(x, y), (_, a, _)| (x.min(*a), y.max(*a)));
+        eprintln!("    {amin:.3} to {amax:.3} along the cut (of {depth:.3})");
+        // Is it MATERIAL, or a bare face standing in the void? A sheet with nothing behind it is
+        // an internal face the boolean failed to remove, not a piece of the part.
+        let mut solid_behind = 0;
+        let mut in_void = 0;
+        let mut buried = 0;
+        for t in after.indices.chunks_exact(3) {
+            let a = Vec3::from_array(after.positions[t[0] as usize]);
+            let b = Vec3::from_array(after.positions[t[1] as usize]);
+            let c = Vec3::from_array(after.positions[t[2] as usize]);
+            let mid = (a + b + c) / 3.0;
+            if inside_cut(mid).is_none() {
+                continue;
+            }
+            let fnorm = (b - a).cross(c - a);
+            if fnorm.length() < 1e-9 {
+                continue;
+            }
+            let fnorm = fnorm.normalize();
+            let eps = 0.02;
+            // A face on a real solid has material on exactly one side.
+            let front = point_inside_mesh(&after, mid + fnorm * eps);
+            let back = point_inside_mesh(&after, mid - fnorm * eps);
+            match (front, back) {
+                (true, true) => buried += 1,   // material on BOTH sides: an internal face
+                (false, false) => in_void += 1, // void on both: a sheet floating in a cavity
+                _ => solid_behind += 1,         // an ordinary boundary face
+            }
+        }
+        eprintln!("    of these: {solid_behind} ordinary boundary, {buried} BURIED (material both sides), {in_void} floating in void");
+        // Which planes do they lie in?
+        let mut planes: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        for (p, _, _) in &inside {
+            *planes.entry((p.y * 1000.0).round() as i64).or_default() += 1;
+        }
+        let mut top: Vec<(i64, usize)> = planes.into_iter().collect();
+        top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        eprintln!("    heights (y x1000 → count): {:?}", &top[..top.len().min(6)]);
+        for (p, along, radial) in inside.iter().take(4) {
+            eprintln!("      ({:.3},{:.3},{:.3})  {along:.3} in, {radial:.3} out from the axis", p.x, p.y, p.z);
+        }
+    }
+
+    #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_cut_slivers -- --ignored --nocapture
     fn diag_cut_slivers() {
         // What is left behind by a Cut? Probes the void the cut should have opened and reports any

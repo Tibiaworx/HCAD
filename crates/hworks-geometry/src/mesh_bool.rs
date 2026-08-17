@@ -299,21 +299,271 @@ fn manifold_try(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     (!mesh.indices.is_empty()).then_some(mesh)
 }
 
+/// Give every vertex position an id, merging points closer together than a whisker of the part's
+/// own size. Meshes reach a boolean from two directions — Manifold stores one position per vertex,
+/// but a freshly built extrude computes a corner once for its cap and again for its wall — so
+/// matching bit patterns would call an ordinary solid torn. The tolerance is relative because HCAD
+/// parts run from millimetres to hundreds of units: it has to sit above f32 rounding noise at the
+/// coordinates in play and below the smallest feature a sketch can carry.
+fn weld_ids(m: &TriMesh) -> Vec<usize> {
+    use std::collections::HashMap;
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let tol = (diag * 1.0e-6).max(1.0e-12);
+    let cell = |p: [f32; 3]| [(p[0] / tol).floor() as i64, (p[1] / tol).floor() as i64, (p[2] / tol).floor() as i64];
+    let mut buckets: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+    let mut exact: HashMap<[u32; 3], usize> = HashMap::new();
+    let mut rep: Vec<[f32; 3]> = Vec::new();
+    let mut ids = Vec::with_capacity(m.positions.len());
+    for p in &m.positions {
+        // A boolean result repeats each vertex exactly, so nearly every lookup lands here.
+        let bits = [p[0] + 0.0, p[1] + 0.0, p[2] + 0.0].map(f32::to_bits); // −0.0 is 0.0
+        if let Some(&id) = exact.get(&bits) {
+            ids.push(id);
+            continue;
+        }
+        let c = cell(*p);
+        let mut found = None;
+        // Search the neighbouring cells too: two copies of one point can straddle a cell boundary.
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(list) = buckets.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) else { continue };
+                    for &id in list {
+                        let q = rep[id];
+                        let d2 = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+                        if d2 <= tol * tol {
+                            found = Some(id);
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        let id = found.unwrap_or_else(|| {
+            rep.push(*p);
+            buckets.entry(c).or_default().push(rep.len() - 1);
+            rep.len() - 1
+        });
+        exact.insert(bits, id);
+        ids.push(id);
+    }
+    ids
+}
+
+/// How many edges do **not** carry exactly two faces. A closed solid has none: one face means a
+/// hole in the surface, four means two surfaces meeting along it.
+///
+/// This is the only cheap check that sees a *sheet sealed inside a part* — two solids joined flush
+/// can come back with both of their shared faces still in the middle. Volume can't see it (a sheet
+/// has none), the bounding box can't, and it cuts like a wall the user can't remove.
+fn torn_edges(m: &TriMesh) -> usize {
+    use std::collections::HashMap;
+    let ids = weld_ids(m);
+    let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        let v = [ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]];
+        for &(x, y) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+            *edges.entry((x.min(y), x.max(y))).or_default() += 1;
+        }
+    }
+    edges.values().filter(|&&c| c != 2).count()
+}
+
+/// How many separate pieces the mesh is in (flood-fill across shared vertices).
+fn shell_count(m: &TriMesh) -> usize {
+    let ids = weld_ids(m);
+    let n = ids.iter().copied().max().map_or(0, |m| m + 1);
+    let mut uf: Vec<usize> = (0..n).collect();
+    fn find(uf: &mut [usize], mut x: usize) -> usize {
+        while uf[x] != x {
+            uf[x] = uf[uf[x]];
+            x = uf[x];
+        }
+        x
+    }
+    for t in m.indices.chunks_exact(3) {
+        let v = [ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]];
+        for &(a, b) in &[(v[0], v[1]), (v[1], v[2])] {
+            let (ra, rb) = (find(&mut uf, a), find(&mut uf, b));
+            if ra != rb {
+                uf[ra] = rb;
+            }
+        }
+    }
+    let mut roots: Vec<usize> = (0..n).map(|i| find(&mut uf, i)).collect();
+    roots.sort_unstable();
+    roots.dedup();
+    roots.len()
+}
+
+/// Is the point inside the solid? Ray parity along a direction chosen not to line up with any
+/// axis or facet, so it doesn't graze an edge.
+fn inside_solid(m: &TriMesh, p: [f32; 3]) -> bool {
+    let dir = [0.573_257_f32, 0.577_350, 0.581_443];
+    let mut crossings = 0u32;
+    for t in m.indices.chunks_exact(3) {
+        let [a, b, c] = [t[0], t[1], t[2]].map(|i| m.positions[i as usize]);
+        // Möller–Trumbore, forward hits only.
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let pv = [dir[1] * e2[2] - dir[2] * e2[1], dir[2] * e2[0] - dir[0] * e2[2], dir[0] * e2[1] - dir[1] * e2[0]];
+        let det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+        if det.abs() < 1e-12 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let tv = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+        let u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let qv = [tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0]];
+        let v = (dir[0] * qv[0] + dir[1] * qv[1] + dir[2] * qv[2]) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        if (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv > 0.0 {
+            crossings += 1;
+        }
+    }
+    crossings % 2 == 1
+}
+
+/// Does the result hold a **sheet sealed inside the part**?
+///
+/// A face of a solid has material on exactly one side of it. A face with the same answer on both
+/// sides bounds nothing — it is a sheet in the middle of the part, left behind when a join keeps
+/// both of its shared faces. Buried in material it is invisible; once a later cut opens the space
+/// around it, the user meets it as a thin wall in the middle of the cut that will not go away,
+/// because a cut removes material and this is not material.
+///
+/// This is narrower than a torn edge, which is what makes it the right trigger: two lumps of solid
+/// meeting along a line also leave an edge carrying four faces, but every one of those faces still
+/// bounds material and the part is sound. Only faces along a torn edge can be sheets, so only
+/// those are probed, and no more than [`SHEET_PROBES`] of them — each probe reads the whole mesh,
+/// and a sheet is made of many faces, so the first handful finds one whenever there is one.
+fn seals_a_sheet(m: &TriMesh) -> bool {
+    /// Cap on faces probed per result: enough to find a sheet, few enough that a mesh with many
+    /// legitimate pinches doesn't pay a full inside/outside test for every one of them.
+    const SHEET_PROBES: usize = 128;
+
+    use std::collections::{HashMap, HashSet};
+    let ids = weld_ids(m);
+    let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        let v = [ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]];
+        for &(x, y) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+            *edges.entry((x.min(y), x.max(y))).or_default() += 1;
+        }
+    }
+    let torn: HashSet<(usize, usize)> = edges.iter().filter(|(_, &c)| c != 2).map(|(&e, _)| e).collect();
+    if torn.is_empty() {
+        return false;
+    }
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in &m.positions {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    // Far enough off the surface to clear a coincident copy of it, near enough to stay inside the
+    // material a sound face bounds.
+    let eps = diag * 1.0e-5;
+    let mut probed = 0;
+    for t in m.indices.chunks_exact(3) {
+        let v = [ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]];
+        if !torn.contains(&(v[0].min(v[1]), v[0].max(v[1])))
+            && !torn.contains(&(v[1].min(v[2]), v[1].max(v[2])))
+            && !torn.contains(&(v[2].min(v[0]), v[2].max(v[0])))
+        {
+            continue;
+        }
+        let [a, b, c] = [t[0], t[1], t[2]].map(|i| m.positions[i as usize]);
+        let n = face_normal(a, b, c);
+        let mid = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let off = |s: f32| [mid[0] + n[0] * s, mid[1] + n[1] * s, mid[2] + n[2] * s];
+        if inside_solid(m, off(eps)) == inside_solid(m, off(-eps)) {
+            return true; // the same on both sides: it divides nothing
+        }
+        probed += 1;
+        if probed >= SHEET_PROBES {
+            break;
+        }
+    }
+    false
+}
+
+/// Enclosed volume, via the divergence theorem. Used to hold a repair to its job: nudging an
+/// operand may only resolve a degeneracy, never move the shape.
+fn enclosed_volume(m: &TriMesh) -> f64 {
+    let mut v = 0.0;
+    for t in m.indices.chunks_exact(3) {
+        let p = [t[0], t[1], t[2]].map(|i| m.positions[i as usize].map(f64::from));
+        v += (p[0][0] * (p[1][1] * p[2][2] - p[1][2] * p[2][1])
+            - p[0][1] * (p[1][0] * p[2][2] - p[1][2] * p[2][0])
+            + p[0][2] * (p[1][0] * p[2][1] - p[1][1] * p[2][0]))
+            / 6.0;
+    }
+    v.abs()
+}
+
 /// Manifold boolean with a tangency-breaking retry; `None` only if every attempt fails (then the
 /// caller drops to the BSP CSG). The retries nudge `b` by a few sub-micron offsets — when the two
 /// solids share a tangent/coincident band (a concentric revolve grazing the boss wall), the exact
 /// coincidence is what trips Manifold up, and a tiny perturbation makes it resolve cleanly.
+///
+/// The same coincidence can also make it return **success with a torn surface** — join a foot flush
+/// under a plate with the same bores through both and the two shared faces both survive, sealing a
+/// sheet inside the part. So a result is judged, not just accepted: a torn one is treated exactly
+/// like a failure and sent round the same retries.
 fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
-    if let Some(m) = manifold_try(a, b, op) {
-        return Some(m);
-    }
-    // Asymmetric, irrational-ish nudges so no offset lands back on another coincidence.
-    for d in [[1.7e-4, 1.1e-4, 1.3e-4], [-2.3e-4, 1.9e-4, -1.5e-4], [3.1e-4, -2.7e-4, 2.1e-4]] {
-        if let Some(m) = manifold_try(a, &nudged(b, d), op) {
-            return Some(m);
+    let first = manifold_try(a, b, op);
+    if let Some(m) = &first {
+        if !seals_a_sheet(m) {
+            return first;
+        }
+        // A sheet already carried by an operand comes back out of every attempt, so nudging only
+        // trades one damaged mesh for another. Hand back what the caller would have had.
+        if seals_a_sheet(a) || seals_a_sheet(b) {
+            return first;
         }
     }
-    None
+    let joined = first.as_ref().map(shell_count);
+    let held = first.as_ref().map(enclosed_volume);
+    let (mut repaired, mut fallback) = (None, None);
+    // Asymmetric, irrational-ish nudges so no offset lands back on another coincidence.
+    for d in [[1.7e-4, 1.1e-4, 1.3e-4], [-2.3e-4, 1.9e-4, -1.5e-4], [3.1e-4, -2.7e-4, 2.1e-4]] {
+        let Some(m) = manifold_try(a, &nudged(b, d), op) else { continue };
+        let sound = !seals_a_sheet(&m)
+            // A nudge big enough to part two solids that were touching also comes back sound — as
+            // two separate bodies. Breaking the part in half is not a repair.
+            && !matches!(joined, Some(k) if shell_count(&m) > k)
+            // Nor is building a different shape. An offset this small can only move a hair of
+            // material; more than that means the nudge landed the operands in a different
+            // arrangement, and what the caller asked for is the un-nudged result.
+            && !matches!(held, Some(v) if (enclosed_volume(&m) - v).abs() > v * 1.0e-3);
+        if sound {
+            // A sound result can still pinch — two walls meeting exactly along a line, which is a
+            // real shape and not the damage being repaired. Take one without even that if an
+            // offset offers it, since every later boolean has an easier time of it.
+            if torn_edges(&m) == 0 {
+                return Some(m);
+            }
+            repaired.get_or_insert(m);
+        } else if fallback.is_none() {
+            fallback = Some(m);
+        }
+    }
+    repaired.or(first).or(fallback)
 }
 
 /// Above this combined triangle count, the O(n²)-ish BSP CSG fallback is a multi-minute
@@ -942,6 +1192,66 @@ mod tests {
         let u = mesh_union(&body, &boss);
         let expect = 10.0 * 10.0 * 4.0 + 4.0 * 4.0 * 4.01 - 4.0 * 4.0 * 0.01;
         assert!((volume(&u) - expect).abs() < 1.0, "flush-boss volume was {} (want {expect})", volume(&u));
+    }
+
+    #[test]
+    fn a_block_stacked_exactly_flush_merges_into_one_solid() {
+        // Two blocks meeting exactly at z=4 — the everyday "extrude up from the face I just made".
+        // They only touch, so a boolean can call the pair disjoint and hand back both bodies with
+        // the shared cap still in the middle: a sheet sealed inside the part that no later cut can
+        // remove, because it is not material and nothing bounds it.
+        let sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let lower = extrude_tool_mesh(&sq, &[], &xy(), 0.0, 4.0).unwrap();
+        let upper = extrude_tool_mesh(&sq, &[], &xy(), 4.0, 2.0).unwrap();
+        let u = mesh_union(&lower, &upper);
+        assert!((volume(&u) - 600.0).abs() < 0.5, "stacked volume was {}", volume(&u));
+        assert_eq!(torn_edges(&u), 0, "the shared face at z=4 was left inside the solid");
+    }
+
+    /// Load a fixture solid from `testdata` (vertex/face OBJ, no normals or texture coords).
+    fn fixture(name: &str) -> TriMesh {
+        let path = format!("{}/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
+        let txt = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut m = TriMesh::default();
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        for line in txt.lines() {
+            let mut it = line.split_whitespace();
+            match it.next() {
+                Some("v") => {
+                    let p: Vec<f32> = it.take(3).map(|x| x.parse().expect("vertex")).collect();
+                    verts.push([p[0], p[1], p[2]]);
+                }
+                Some("f") => {
+                    for x in it.take(3) {
+                        let v = verts[x.parse::<usize>().expect("index") - 1];
+                        m.indices.push(m.positions.len() as u32);
+                        m.positions.push(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn a_flush_join_does_not_seal_a_sheet_inside_the_part() {
+        // motormount.hcad's join, as the two solids that were actually handed to the boolean. A
+        // foot sits exactly flush under the plate at y=0 and the same bolt holes run through both,
+        // so each bore is the same cylinder twice over. Manifold reports success and hands back a
+        // mesh whose bore rims carry four faces: two bores plus BOTH solids' shared caps. Those
+        // caps are a sheet sealed inside the part — the user meets it as a thin wall in the middle
+        // of a later cut that nothing will remove, because it is not material and a cut only
+        // removes material.
+        let (plate, foot) = (fixture("flush_join_plate.obj"), fixture("flush_join_foot.obj"));
+        assert!(!seals_a_sheet(&plate), "fixture plate is already damaged");
+        assert!(!seals_a_sheet(&foot), "fixture foot is already damaged");
+        let u = mesh_union(&plate, &foot);
+        assert!(!seals_a_sheet(&u), "the join left a sheet inside the part");
+        // ...and the repair must join them, not sidestep the problem by parting them.
+        assert_eq!(shell_count(&u), 1, "the join left the part in pieces");
+        let expect = volume(&plate) + volume(&foot);
+        assert!((volume(&u) - expect).abs() < expect * 1e-4, "union volume was {} (want {expect})", volume(&u));
     }
 
     #[test]
