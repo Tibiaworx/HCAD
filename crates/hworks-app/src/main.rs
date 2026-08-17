@@ -3680,6 +3680,7 @@ fn open_cli_file(
                 ui_state.current_file = Some(path.clone());
                 ui_state.regen = true;
                 ui_state.home_view_request = Some(HOME_VIEW_WAIT);
+                warn_about_needle_circles(&doc.0, &mut ui_state);
                 info!("Opened {} (command line)", path.display());
             }
             Err(e) => {
@@ -13262,11 +13263,69 @@ fn commit_line_length(session: &mut SketchSession, length: f32) {
     session.dirty = true;
 }
 
+/// Warn about circles a document carries that are too small to build with.
+///
+/// They are skipped when a profile is made (see `MIN_BUILDABLE_RADIUS`), so without saying so the
+/// part would come out right while the sketch still showed a feature that is not in it. A file
+/// written before the draw-time guard can hold one — pinch.hcad does, an r=0.01 left by a stray
+/// click — and at that size there is nothing to see on screen at any sane zoom, so the user has
+/// no other way to find it.
+fn warn_about_needle_circles(doc: &Document, ui_state: &mut UiState) {
+    let mut found: Vec<f64> = Vec::new();
+    for f in &doc.features {
+        match &f.kind {
+            FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } => found.extend(sketch.needle_circles()),
+            FeatureKind::Revolve { sketch, .. } => found.extend(sketch.needle_circles()),
+            _ => {}
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    let smallest = found.iter().cloned().fold(f64::MAX, f64::min);
+    ui_state.toasts.push((
+        format!(
+            "{} circle{} too small to build with (smallest dia {:.3}) — ignored when making the profile. Probably a stray click; delete {} from the sketch.",
+            found.len(),
+            if found.len() == 1 { "" } else { "s" },
+            smallest * 2.0,
+            if found.len() == 1 { "it" } else { "them" }
+        ),
+        9.0,
+    ));
+    warn!("{} needle circle(s) in the document, radii {found:?} — skipped when building profiles", found.len());
+}
+
+/// Is this radius a circle the user meant to draw, or a click that never moved?
+///
+/// Two floors, and both are needed. The zoom-relative one — a quarter of the snap distance, the
+/// same fraction `poly_rim` uses to take a deliberate aim — catches the mis-click: a press and
+/// release in one spot, or a double-click on the centre, which is what put a stray circle in
+/// pinch.hcad. Because it scales with the view, a genuinely small circle is still drawable by
+/// zooming in to where it is a real gesture.
+///
+/// The snap distance is the right yardstick because it already scales with the view: judging the
+/// GESTURE rather than the millimetres means a genuinely small circle stays drawable by zooming in
+/// to where drawing it is a real movement, while a press-and-release never makes one at any scale.
+/// Whether it can then be BUILT is a separate question, answered against the sketch's own size by
+/// `MIN_BUILDABLE_RADIUS_FRACTION` — an absolute floor here would refuse to draw the ordinary
+/// geometry of a part modelled in microns.
+fn circle_is_drawable(session: &SketchSession, radius: f32) -> bool {
+    radius >= session.snap_dist * 0.25
+}
+
 /// Commit the in-progress circle at an exact `radius`.
 fn commit_circle_radius(session: &mut SketchSession, radius: f32) {
     let Some(center) = session.pending else { return };
+    // No radius means NO CIRCLE. `.max(0.01)` used to turn it into the smallest circle the clamp
+    // allowed — which is how a stray click became a permanent ⌀0.02 hole in pinch.hcad, and it is
+    // invisible on screen at any sane zoom. A click that sets no size is a mis-click; keep the
+    // centre pending so the next one can size it properly.
+    if !circle_is_drawable(session, radius) {
+        return;
+    }
     let c = get_or_add_point(&mut session.sketch, center, session.snap_dist);
-    session.sketch.add_circle(c, radius.max(0.01) as f64);
+    session.sketch.add_circle(c, radius as f64);
     session.pending = None;
     session.dirty = true;
 }
@@ -15672,7 +15731,11 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             // centre is their midpoint and the radius is half the distance.
             if let Some(p1) = session.pending.take() {
                 let center = (p1 + uv) * 0.5;
-                let radius = ((uv - p1).length() * 0.5).max(0.01);
+                let radius = (uv - p1).length() * 0.5;
+                if !circle_is_drawable(session, radius) {
+                    session.pending = Some(p1); // the second click landed on the first: keep waiting
+                    return;
+                }
                 let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
@@ -15684,6 +15747,10 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
         Tool::Circle => {
             if let Some(center) = session.pending.take() {
                 let radius = snap_radius(center.distance(uv), &session.reference_circles, snap);
+                if !circle_is_drawable(session, radius) {
+                    session.pending = Some(center); // clicked the centre twice: no circle yet
+                    return;
+                }
                 let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
@@ -17059,6 +17126,7 @@ fn handle_file_io(
                         ui_state.home_view_request = Some(HOME_VIEW_WAIT);
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
                         ui_state.toasts.push((format!("Opened {name}"), 2.5));
+                        warn_about_needle_circles(&doc.0, &mut ui_state);
                         info!("Opened {}", path.display());
                     }
                     Err(e) => {
@@ -27792,6 +27860,59 @@ mod tests {
         assert!((r - 1.5).abs() < 1e-6, "a radius of 1.5 should give a half-width of 1.5, got {r}");
     }
 
+    /// A circle too small to tessellate must not be able to break the body.
+    ///
+    /// pinch.hcad's shape: a ⌀12 disc with a stray r=0.01 circle inside it, left by a click that
+    /// never moved. Read as a hole it is a 0.02 shaft through a 25.5 tall part — thinner than the
+    /// tolerances the kernel welds at — and the extrude came out NON-MANIFOLD before any cut, with
+    /// every boolean after inheriting the damage: the finished part was 62,517 triangles and
+    /// broken, against 1,244 and sound without it.
+    #[test]
+    fn a_needle_circle_cannot_break_the_body() {
+        let mut doc = Document::with_default_planes();
+        let mut sk = Sketch::default();
+        let c0 = sk.add_point(0.0, 0.0);
+        sk.add_circle(c0, 6.0);
+        let c1 = sk.add_point(4.177_728_176_116_943, 4.016_993_522_644_043);
+        sk.add_circle(c1, 0.01);
+        // It is reported, so it can be pointed out rather than silently dropped.
+        assert_eq!(sk.needle_circles(), vec![0.01], "the needle should be findable for a warning");
+        doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 25.514, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        assert!(hworks_geometry::is_manifold(&mesh), "a needle circle left the body non-manifold");
+        // The hole is skipped, so this is the plain disc — its own area, not one shy of it.
+        let want = std::f64::consts::PI * 36.0 * 25.514;
+        assert!((tri_vol(&mesh) - want).abs() < want * 0.01, "volume {:.3}, expected about {want:.3}", tri_vol(&mesh));
+        // And nothing exploded: a disc is a few hundred triangles, not tens of thousands.
+        assert!(mesh.indices.len() / 3 < 2000, "{} triangles for a plain disc", mesh.indices.len() / 3);
+    }
+
+    /// A click that never moved draws no circle at all.
+    ///
+    /// The clamp it replaces (`radius.max(0.01)`) turned "no size given" into the smallest circle
+    /// it would allow, which is how a stray click became a permanent ⌀0.02 hole. Both floors are
+    /// needed: the zoom-relative one catches the mis-click at any scale, and the absolute one
+    /// refuses to draw what the profile builder would later have to skip.
+    #[test]
+    fn a_click_that_never_moved_draws_no_circle() {
+        let mut s = session_on_a_face(&[]);
+        s.snap_dist = 0.4; // a normal working zoom
+
+        assert!(!circle_is_drawable(&s, 0.0), "a zero radius is a mis-click");
+        assert!(!circle_is_drawable(&s, 0.01), "the old clamp's value must no longer draw");
+        assert!(!circle_is_drawable(&s, 0.05), "below a quarter of the snap distance is a mis-click");
+        assert!(circle_is_drawable(&s, 3.0), "an ordinary circle must still draw");
+
+        // Zoomed right in, the snap distance shrinks and a genuinely small circle becomes
+        // drawable again — the gesture is what is being judged, not the millimetres. Whether such
+        // a circle can be BUILT is answered separately, against the sketch's own size.
+        s.snap_dist = 0.02;
+        assert!(circle_is_drawable(&s, 0.05), "zoomed in, a small circle is a real gesture");
+        assert!(!circle_is_drawable(&s, 0.004), "still nothing for a press that never moved");
+    }
+
     /// A Centerpoint slot keeps the centre the user clicked, held between the two ends.
     ///
     /// Without it that click was consumed working out where the ends go and then thrown away, so
@@ -29299,6 +29420,43 @@ mod tests {
         let ray = Ray3d { origin: Vec3::new(0.0, 100.0, 0.0), direction: Dir3::NEG_Y };
         let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
         assert!(ap.origin.distance(Vec3::new(0.0, Y, 0.0)) < 0.05, "face origin drifted to {:?}", ap.origin);
+    }
+
+    /// A sketch plane picked on a face lands EXACTLY on it, at whatever untidy height the face
+    /// happens to sit at — never rounded to something neater.
+    ///
+    /// "bad extrude cut.hcad" stores a cut plane at 5.03125 over a face at 5.025900. 5.03125 is
+    /// 5 + 1/32, which reads like a grid snap of the face's real height, and a sketch half a
+    /// hundredth off the face it looks attached to is worth pinning down. The plane in that file
+    /// turns out to predate the current code — this holds today's `pick_face` to the exact height,
+    /// so it cannot start rounding again.
+    #[test]
+    fn a_sketch_plane_picked_on_a_face_lands_exactly_on_it() {
+        // The awkward height from that file: nowhere near a grid line, and not representable as
+        // a tidy fraction — if anything rounds, it shows.
+        const Y: f32 = 5.025_900_4;
+        const R: f32 = 4.721_335;
+        const N: usize = 64;
+        let mut positions: Vec<[f32; 3]> = vec![[0.0, Y, 0.0]];
+        for k in 0..=N {
+            let a = std::f32::consts::TAU * k as f32 / N as f32;
+            positions.push([R * a.cos(), Y, R * a.sin()]);
+        }
+        let mut indices: Vec<u32> = Vec::new();
+        for k in 1..=N {
+            indices.extend([0u32, (k + 1) as u32, k as u32]);
+        }
+        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices };
+        let ray = Ray3d { origin: Vec3::new(1.5, 100.0, -0.75), direction: Dir3::NEG_Y };
+        let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
+        let off = (ap.origin.y - Y).abs();
+        assert!(off < 1.0e-5, "the plane sits {off:.6} off the face (origin y={}, face y={Y})", ap.origin.y);
+        // ...and it is not merely close to the face but sitting on a rounder number nearby.
+        let sixteenth = (Y * 32.0).round() / 32.0;
+        assert!(
+            (ap.origin.y - sixteenth).abs() > 1.0e-4,
+            "the plane landed on {sixteenth}, a 1/32 grid value, rather than the face's own height"
+        );
     }
 
     #[test]
@@ -32984,6 +33142,131 @@ mod tests {
         }
     }
 
+    /// At what radius does a hole stop being buildable? Sweeps a small circle inside a ⌀12 disc
+    /// (pinch.hcad's shape) and reports where the extrude turns non-manifold, so the floor that
+    /// rejects one is measured rather than picked.
+    #[test]
+    #[ignore]
+    fn diag_needle_hole_threshold() {
+        for r in [0.02f64, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05] {
+            let mut doc = Document::with_default_planes();
+            let mut sk = Sketch::default();
+            let c0 = sk.add_point(0.0, 0.0);
+            sk.add_circle(c0, 6.0);
+            let c1 = sk.add_point(4.177_728_176_116_943, 4.016_993_522_644_043);
+            sk.add_circle(c1, r);
+            doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 25.514, back: 0.0, thin: 0.0, thin_side: 0 });
+            doc.rollback = doc.features.len();
+            match regenerate_mesh(&doc) {
+                Some((m, _)) => {
+                    // A ⌀12 x 25.514 disc less the hole.
+                    let want = std::f64::consts::PI * (36.0 - r * r) * 25.514;
+                    eprintln!(
+                        "hole r={r:<6}: {:>6} tris, manifold={:<5}, vol {:.3} (want {:.3}), segment {:.5}",
+                        m.indices.len() / 3,
+                        hworks_geometry::is_manifold(&m),
+                        tri_vol(&m),
+                        want,
+                        std::f64::consts::TAU * r / 128.0
+                    );
+                }
+                None => eprintln!("hole r={r:<6}: NO BODY"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_body_health -- --ignored --nocapture
+    fn diag_body_health() {
+        // What does a document actually build, feature by feature? Reports each step's size,
+        // manifoldness and volume, so a step that loses the body — or grows a needle — is
+        // attributable to the operation that did it rather than to the finished shape.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        for (i, f) in doc.features.iter().enumerate() {
+            let kind = match &f.kind {
+                FeatureKind::Plane(_) => continue,
+                FeatureKind::Extrude { distance, .. } => format!("Extrude {distance:.3}"),
+                FeatureKind::Cut { distance, .. } => format!("Cut {distance:.3}"),
+                other => format!("{other:?}").chars().take(24).collect(),
+            };
+            let mut upto = doc.clone();
+            upto.rollback = i + 1;
+            match regenerate_mesh(&upto) {
+                Some((m, _)) if !m.positions.is_empty() => {
+                    let (lo, hi) = mesh_bbox(&m);
+                    // Shells: weld and flood-fill across shared edges. More than one means the
+                    // body has come apart into pieces.
+                    let shells = {
+                        use std::collections::HashMap;
+                        let key = |p: [f32; 3]| ((p[0] * 1e4) as i64, (p[1] * 1e4) as i64, (p[2] * 1e4) as i64);
+                        let mut id: HashMap<(i64, i64, i64), usize> = HashMap::new();
+                        let mut next = 0usize;
+                        let mut vid = |p: [f32; 3]| *id.entry(key(p)).or_insert_with(|| { next += 1; next - 1 });
+                        let tris: Vec<[usize; 3]> = m.indices.chunks_exact(3)
+                            .map(|t| [vid(m.positions[t[0] as usize]), vid(m.positions[t[1] as usize]), vid(m.positions[t[2] as usize])])
+                            .collect();
+                        let mut uf: Vec<usize> = (0..next).collect();
+                        fn find(uf: &mut [usize], mut x: usize) -> usize { while uf[x] != x { uf[x] = uf[uf[x]]; x = uf[x]; } x }
+                        for t in &tris {
+                            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                                let (ra, rb) = (find(&mut uf, a), find(&mut uf, b));
+                                if ra != rb { uf[ra] = rb; }
+                            }
+                        }
+                        let mut roots: Vec<usize> = (0..next).map(|i| find(&mut uf, i)).collect();
+                        roots.sort_unstable();
+                        roots.dedup();
+                        roots.len()
+                    };
+                    eprintln!(
+                        "#{i} {kind}: {} tris, manifold={}, vol {:.3}, bbox {:.2}x{:.2}x{:.2}, {shells} shell(s)",
+                        m.indices.len() / 3, hworks_geometry::is_manifold(&m), tri_vol(&m),
+                        hi.x - lo.x, hi.y - lo.y, hi.z - lo.z
+                    );
+                }
+                Some(_) | None => eprintln!("#{i} {kind}: NO BODY"),
+            }
+        }
+        // Needle circles: a stray click can leave a circle far below anything the tessellation can
+        // represent, and as a hole in a profile it is a shaft narrower than the mesh's own weld
+        // tolerance. Report them, then rebuild without them to see what they cost.
+        let mut tiny: Vec<(usize, f64, [f64; 2])> = Vec::new();
+        for (i, f) in doc.features.iter().enumerate() {
+            let sk = match &f.kind {
+                FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } => sketch,
+                _ => continue,
+            };
+            for e in &sk.entities {
+                if let SketchEntity::Circle { center, radius, construction: false } = e {
+                    if *radius < 0.05 {
+                        let c = sk.points.get(*center).map(|p| [p.x, p.y]).unwrap_or([0.0; 2]);
+                        tiny.push((i, *radius, c));
+                    }
+                }
+            }
+        }
+        eprintln!("needle circles (r < 0.05): {tiny:?}");
+        if !tiny.is_empty() {
+            let mut clean = doc.clone();
+            for f in clean.features.iter_mut() {
+                if let FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } = &mut f.kind {
+                    sketch.entities.retain(|e| !matches!(e, SketchEntity::Circle { radius, construction: false, .. } if *radius < 0.05));
+                }
+            }
+            clean.rollback = clean.features.len();
+            match regenerate_mesh(&clean) {
+                Some((m, _)) => eprintln!(
+                    "WITHOUT them: {} tris, manifold={}, vol {:.3}",
+                    m.indices.len() / 3,
+                    hworks_geometry::is_manifold(&m),
+                    tri_vol(&m)
+                ),
+                None => eprintln!("WITHOUT them: NO BODY"),
+            }
+        }
+    }
+
     #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_cut_slivers -- --ignored --nocapture
     fn diag_cut_slivers() {
@@ -33007,6 +33290,37 @@ mod tests {
         let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
         eprintln!("cut plane origin {o:?} normal {n:?} depth {depth} circle r={rad}");
         eprintln!("region_pts {region_pts:?}");
+        // Does the STORED plane get used, or is it reprojected onto the face at regen? Probe down
+        // the cut's own quadrant and find where material actually starts and stops.
+        {
+            let (m0, _) = regenerate_mesh(&doc).expect("body");
+            let probe = |world: Vec3| point_inside_mesh(&m0, world);
+            if let Some(rp) = region_pts.first() {
+                let s = o + u * (rp[0] as f32) + v * (rp[1] as f32);
+                // Walk along the cut direction from well above the plane to well below it.
+                let mut floor = None;
+                let mut roof = None;
+                let mut prev = false;
+                for k in -4000..=8000 {
+                    let d = k as f32 * 0.0005;
+                    let solid = probe(s - n * d);
+                    if solid && !prev {
+                        roof.get_or_insert(d);
+                    }
+                    if !solid && prev {
+                        floor = Some(d);
+                    }
+                    prev = solid;
+                }
+                let at = |d: f32| (s - n * d).y;
+                eprintln!(
+                    "along the cut from the STORED plane (y={:.5}): material starts {:?} and ends {:?}",
+                    s.y,
+                    roof.map(|d| format!("{:.4} in (y={:.5})", d, at(d))),
+                    floor.map(|d| format!("{:.4} in (y={:.5})", d, at(d)))
+                );
+            }
+        }
         let (mesh, _) = regenerate_mesh(&doc).expect("body");
         eprintln!("body: {} tris, manifold={}", mesh.indices.len() / 3, hworks_geometry::is_manifold(&mesh));
         let vol = tri_vol(&mesh);
