@@ -33707,6 +33707,34 @@ mod tests {
                 let rad = (m[0]*m[0] + m[2]*m[2]).sqrt();
                 let ang = m[2].atan2(m[0]).to_degrees();
                 eprintln!("    at ({:.3},{:.3},{:.3})  rad {rad:.3} ang {ang:.1}", m[0], m[1], m[2]);
+                // Full display edges near this midpoint, and every mesh vertex within 0.35 —
+                // enough to see the artifact's actual shape and extent.
+                for e in &tess.edges {
+                    let em = [
+                        (e[0][0] + e[1][0]) as f64 * 0.5,
+                        (e[0][1] + e[1][1]) as f64 * 0.5,
+                        (e[0][2] + e[1][2]) as f64 * 0.5,
+                    ];
+                    let d2 = (em[0]-m[0]).powi(2) + (em[1]-m[1]).powi(2) + (em[2]-m[2]).powi(2);
+                    if d2 < 0.12 {
+                        eprintln!("      edge ({:.3},{:.3},{:.3})-({:.3},{:.3},{:.3}) len {:.4}",
+                            e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2],
+                            (((e[1][0]-e[0][0]).powi(2) + (e[1][1]-e[0][1]).powi(2) + (e[1][2]-e[0][2]).powi(2)) as f32).sqrt());
+                    }
+                }
+            }
+            // Where do the flat floors actually sit? Histogram of vertex y values.
+            {
+                use std::collections::HashMap as HM;
+                let mut hist: HM<i64, usize> = HM::new();
+                for q in &mesh.positions {
+                    *hist.entry((q[1] as f64 * 1e3).round() as i64).or_default() += 1;
+                }
+                let mut rows: Vec<(i64, usize)> = hist.into_iter().filter(|(_, c)| *c >= 8).collect();
+                rows.sort();
+                for (y, c) in rows {
+                    eprintln!("      y={:.3}: {c} verts", y as f64 * 1e-3);
+                }
             }
         }
     }
