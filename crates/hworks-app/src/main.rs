@@ -32423,6 +32423,91 @@ mod tests {
 
     #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_sticks_out -- --ignored --nocapture
+    fn diag_sliver_hunt() {
+        // Hunt the "thin sliver coming from the fillet" in sliver.hcad: regen the document at
+        // each rollback step, and scan the result for fin geometry — adjacent triangles folded
+        // nearly back onto each other (dihedral near 180), thin-but-real walls, and sharp
+        // display edges that sit on a fillet band rather than on a model edge.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let nfeat = doc.features.len();
+        for stop in [nfeat - 2, nfeat] {
+            let mut d = doc.clone();
+            d.rollback = stop;
+            let (mesh, _) = regenerate_mesh(&d).expect("regen");
+            eprintln!("=== rollback {stop} (features 0..{stop}): {} tris ===", mesh.indices.len() / 3);
+            let g = |i: u32| { let q = mesh.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+            let sub = |a: [f64; 3], b: [f64; 3]| [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+            let cross = |a: [f64; 3], b: [f64; 3]| [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+            let dot = |a: [f64; 3], b: [f64; 3]| a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+            let len = |a: [f64; 3]| dot(a, a).sqrt();
+            // Edge → triangle normals (welded on 1e-4).
+            use std::collections::HashMap;
+            let key = |q: [f64; 3]| ((q[0]*1e4).round() as i64, (q[1]*1e4).round() as i64, (q[2]*1e4).round() as i64);
+            let mut owners: HashMap<((i64,i64,i64),(i64,i64,i64)), Vec<([f64;3], f64)>> = HashMap::new();
+            for t in mesh.indices.chunks_exact(3) {
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                let n = cross(sub(b, a), sub(c, a));
+                let nl = len(n);
+                let longest = len(sub(b,a)).max(len(sub(c,b))).max(len(sub(a,c)));
+                if nl < 1e-12 || longest < 1e-9 { continue; }
+                let alt = nl / longest; // ~ min altitude
+                let nrm = [n[0]/nl, n[1]/nl, n[2]/nl];
+                for (u, v) in [(a,b),(b,c),(c,a)] {
+                    let (ku, kv) = (key(u), key(v));
+                    let e = if ku <= kv { (ku, kv) } else { (kv, ku) };
+                    owners.entry(e).or_default().push((nrm, alt));
+                }
+            }
+            // Fins: adjacent triangles with near-opposite normals and NON-hairline size.
+            let mut fins = 0;
+            for (e, own) in &owners {
+                for i in 0..own.len() {
+                    for j in i+1..own.len() {
+                        let d0 = dot(own[i].0, own[j].0).clamp(-1.0, 1.0);
+                        let ang = d0.acos().to_degrees();
+                        if ang > 150.0 && own[i].1.min(own[j].1) > 0.01 {
+                            if fins < 8 {
+                                eprintln!("  FIN {ang:.0}deg alt {:.3}/{:.3} at ({:.3},{:.3},{:.3})",
+                                    own[i].1, own[j].1,
+                                    (e.0.0 + e.1.0) as f64 * 0.5e-4, (e.0.1 + e.1.1) as f64 * 0.5e-4, (e.0.2 + e.1.2) as f64 * 0.5e-4);
+                            }
+                            fins += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!("  fins(>150deg, alt>0.01): {fins}");
+            // Sharp display edges NOT near the expected sharp features: print clusters.
+            let tess = mesh_tessellation(mesh.clone());
+            let mut band_edges: Vec<[f64; 3]> = Vec::new();
+            for e in &tess.edges {
+                let mid = [
+                    (e[0][0] + e[1][0]) as f64 * 0.5,
+                    (e[0][1] + e[1][1]) as f64 * 0.5,
+                    (e[0][2] + e[1][2]) as f64 * 0.5,
+                ];
+                let rad = (mid[0]*mid[0] + mid[2]*mid[2]).sqrt();
+                // Expected sharp: on the outer/bore walls (rims + verticals), on the flat tops
+                // y=6.99 / floors y=4.06/4.99 boundaries. A sharp edge OFF both walls and OFF
+                // those planes, in a fillet's y-range, is band furniture.
+                let on_wall = (rad - 6.3952).abs() < 0.01 || (rad - 5.6115).abs() < 0.01;
+                let on_plane = [6.9902f64, 6.9876, 4.0589, 4.9902].iter().any(|y| (mid[1] - y).abs() < 0.01);
+                if !on_wall && !on_plane {
+                    band_edges.push(mid);
+                }
+            }
+            eprintln!("  sharp display edges off walls/planes: {}", band_edges.len());
+            for m in band_edges.iter().take(14) {
+                let rad = (m[0]*m[0] + m[2]*m[2]).sqrt();
+                let ang = m[2].atan2(m[0]).to_degrees();
+                eprintln!("    at ({:.3},{:.3},{:.3})  rad {rad:.3} ang {ang:.1}", m[0], m[1], m[2]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn diag_fillet_sticks_out() {
         // Does the finished body poke OUT past the walls it is supposed to stay inside? Reads the
         // cylinder radii straight off the document's first sketch, then regenerates the whole

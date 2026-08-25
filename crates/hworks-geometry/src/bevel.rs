@@ -970,6 +970,13 @@ fn inset_fold_area(topo: &Topo, fi: usize, cpt: &dyn Fn(usize, usize) -> V3) -> 
 /// better one than a wronger body.
 const CSG_ROUND_MAX_BOOLEANS: usize = 3;
 
+/// The cost KNEE from the same measurement: up to 6 booleans the CSG round returns within a
+/// frame or two (49 ms at 6, 238 ms at 8 in release). Used by the handovers where the surgery's
+/// own answer would be WRONG rather than merely striped — a corner weld across a real turn —
+/// because there the accuracy argument for staying (the reason `CSG_ROUND_MAX_BOOLEANS` sits at
+/// 3) does not exist: the choice is a wrong body or a slower right one.
+const CSG_ROUND_COST_KNEE: usize = 6;
+
 /// Escape hatch for measuring the two engines against each other on the same document:
 /// `HCAD_BEVEL_NO_CSG_HANDOVER=1` keeps the folded surgery result instead of declining.
 fn csg_handover_enabled() -> bool {
@@ -1092,6 +1099,24 @@ fn run_surgery(
         let tol2 = (1.0e-6 * (1.0 + r)).powi(2);
         if d2(r2o[0], r1[0]) > tol2 || d2(r2o[r2o.len() - 1], r1[r1.len() - 1]) > tol2 {
             continue;
+        }
+        // A weld is only honest between near-COLLINEAR edges — a subdivided straight run, a
+        // tessellated arc's facets — where the two cross-sections nearly agree and their mean
+        // is the shared ring. Across a real corner (a box rim's 90°) the mean of two
+        // perpendicular arcs bulges up to (√2−1)·r off both cylinders, and because a straight
+        // edge's strip has only its two end rings as stations, the error does not stay at the
+        // corner: it drags the WHOLE strip off the fillet surface. Measured on a 16×12 box top
+        // rim at r=1: removed 6.08 where a fillet takes 12.21 — a shallow graze down the full
+        // length of every edge, watertight and volume-plausible, which is why nothing caught
+        // it. The CSG round does this shape properly (one cylinder per straight run, a sphere
+        // octant per corner), so decline and hand over — bounded by the cost KNEE, not the
+        // accuracy bound the fold handover uses: a welded-corner result is not a slightly
+        // worse fillet but a wrong one, so it is worth handing over anything the round can
+        // finish interactively. Past the knee the mitre-welded mesh ships (freeze-avoidance).
+        let t1 = norm(sub(verts[if e1.a == vi { e1.b } else { e1.a }], verts[vi]));
+        let t2 = norm(sub(verts[if e2.a == vi { e2.b } else { e2.a }], verts[vi]));
+        if dot(t1, t2) > -0.7 && csg_handover_enabled() && csg_booleans() <= CSG_ROUND_COST_KNEE {
+            return None;
         }
         let blended: Vec<V3> = r1.iter().zip(&r2o).map(|(&p, &q)| scale(add(p, q), 0.5)).collect();
         // Store each edge's override in that edge's OWN ring orientation (edge 2 saw the
@@ -1742,8 +1767,13 @@ mod tests {
             vec![[7.0, 7.0, 5.0], [3.0, 7.0, 5.0]],
             vec![[3.0, 7.0, 5.0], [3.0, 3.0, 5.0]],
         ];
-        let rounded = bevel_mesh_selected(&body, 0.3, 3, &rim).expect("rim loop bevels");
-        assert!(is_watertight(&rounded), "selective rim-loop bevel must be closed");
+        // The surgery declines this pick now — its corner weld was measured wrong on
+        // real-turn corners (see the weld loop in `run_surgery`) — so the app's route lands
+        // on the CSG round. The property pinned here is the same either way: closed surface.
+        let rounded = bevel_mesh_selected(&body, 0.3, 3, &rim)
+            .or_else(|| crate::round_mesh(&body, 0.3, &rim))
+            .expect("rim loop fillets through one of the two engines");
+        assert!(is_watertight(&rounded), "selective rim-loop fillet must be closed");
     }
 
     /// Replica of the app's reproject_plane_on_mesh: snap a +z sketch plane at `o` onto the
@@ -1795,7 +1825,9 @@ mod tests {
             vec![[2.0, 2.0, 6.0], [6.0, 2.0, 6.0]], vec![[6.0, 2.0, 6.0], [6.0, 6.0, 6.0]],
             vec![[6.0, 6.0, 6.0], [2.0, 6.0, 6.0]], vec![[2.0, 6.0, 6.0], [2.0, 2.0, 6.0]],
         ];
-        let body = bevel_mesh_selected(&pocketed, 0.4, 3, &rim).expect("rim fillets");
+        let body = bevel_mesh_selected(&pocketed, 0.4, 3, &rim)
+            .or_else(|| crate::round_mesh(&pocketed, 0.4, &rim))
+            .expect("rim fillets through one of the two engines");
         // A second cut sketched on the top frame (origin at (9,9,6)) must reproject to z=6.
         let z = reproject_z(&body, [9.0, 9.0, 6.0]);
         assert!((z - 6.0).abs() < 0.01, "reproject snapped cut plane to z={z}, not the top (6)");
@@ -2748,7 +2780,9 @@ mod tests {
             vec![[6.0, 6.0, 6.0], [2.0, 6.0, 6.0]],
             vec![[2.0, 6.0, 6.0], [2.0, 2.0, 6.0]],
         ];
-        let filleted = bevel_mesh_selected(&pocketed, 0.4, 3, &rim).expect("rim fillets");
+        let filleted = bevel_mesh_selected(&pocketed, 0.4, 3, &rim)
+            .or_else(|| crate::round_mesh(&pocketed, 0.4, &rim))
+            .expect("rim fillets through one of the two engines");
         // A second pocket on the far side, full through-ish: z 2..6.5 over [8,11]².
         let pk2 = [[8.0, 8.0], [11.0, 8.0], [11.0, 11.0], [8.0, 11.0]];
         let tool2 = extrude_tool_mesh(&pk2, &[], &xy(), 2.0, 6.5).unwrap();
@@ -2823,7 +2857,13 @@ mod tests {
         let radius = 4.893707752227783;
         let top_rim = vec![vec![[x1, dist, z1], [x1, dist, z0], [x0, dist, z0], [x0, dist, z1]]];
         let seg = 12;
-        let beveled = bevel_mesh_selected(&mesh, radius, seg, &top_rim).expect("top-rim fillet builds");
+        // Routed like regen: the surgery declines real-corner rim picks now (its corner weld
+        // shallow-cut every strip — measured on a box rim: removed 6.08 where a fillet takes
+        // 12.21), so this body comes from the CSG round. Containment is the property either
+        // engine must honour: a convex fillet only ever removes material.
+        let beveled = bevel_mesh_selected(&mesh, radius, seg, &top_rim)
+            .or_else(|| crate::round_mesh(&mesh, radius, &top_rim))
+            .expect("top-rim fillet builds through one of the two engines");
         assert!(is_watertight(&beveled), "beveled box must stay a closed surface");
 
         let tol = 1.0e-4;
@@ -2834,18 +2874,22 @@ mod tests {
         }
     }
 
+    /// A corner where exactly two rounded edges meet across a REAL turn (a box top rim's 90
+    /// degrees — the fillererror.hcad / fillererror3 loop picks) used to be welded: both strips
+    /// terminated on the point-by-point mean of their two end rings, Blender's M_NONE move. That
+    /// mean is not on either cylinder — at 90 degrees it bulges (sqrt(2)-1)r off both — and since a
+    /// straight edge's strip has only its two end rings as stations, the error spread down the
+    /// FULL length of every strip: measured on a 16x12 box rim at r=1, the welded body removed
+    /// 6.08 where a fillet takes 12.21, watertight and contained the whole time (which is what
+    /// the old assertions checked, and why it survived). The weld is only honest between
+    /// near-collinear edges, where the two rings nearly agree.
+    ///
+    /// So the surgery now DECLINES real-corner welds while the CSG round can afford the pick,
+    /// and the app's fallback produces the fillet properly: one cylinder per straight run, a
+    /// sphere octant per corner. Collinear/facet welds (a tessellated arc's chain) still weld —
+    /// `fillet_cylinder_top_rim` pins that side.
     #[test]
-    fn weld_corner_uses_the_blended_shared_profile() {
-        // A corner where exactly two rounded edges meet (a box's top-rim fillet —
-        // fillererror.hcad / fillererror2 / fillererror3 loop-picks) is Blender's M_NONE
-        // "weld" case: each edge's own end ring sits on its own cylinder's cross-section,
-        // and the two cross-sections DISAGREE between the shared mitred endpoints — so
-        // terminating each strip on its own ring leaves a twisted gap that a fanned patch
-        // could only paper over (the reported "wing" fins). The correct construction
-        // (bmesh_bevel.cc, mid_v3_v3v3) terminates BOTH strips on the single point-by-point
-        // BLEND of the two rings, with no corner patch at all. So: every mesh vertex near
-        // the corner must lie on {the blended arc} ∪ {the two strips' own geometry},
-        // and the fanned patch's old apex points must not exist.
+    fn a_real_corner_weld_declines_and_the_csg_round_takes_it() {
         let (x0, x1) = (10.300506591787663, 30.300506591807387);
         let (z0, z1) = (7.451744079581647, 27.451744079596413);
         let outer = [[x0, -z0], [x1, -z0], [x1, -z1], [x0, -z1]];
@@ -2854,56 +2898,35 @@ mod tests {
         let mesh = crate::extrude_tool_mesh(&outer, &[], &basis, 0.0, dist).unwrap();
         let radius = 4.893707752227783;
         let top_rim = vec![vec![[x1, dist, z1], [x1, dist, z0], [x0, dist, z0], [x0, dist, z1]]];
-        let seg = 12;
-
-        // Independently recompute the allowed positions at the (x1, dist, z1) corner with
-        // the same low-level machinery: the two edges' own rings (strip interior columns
-        // still use them away from the corner), their point-by-point blend (the shared
-        // terminal arc), and the sharp vertical edge's corners.
-        let (topo, selected, corner) = bevel_prep(&mesh, radius, &top_rim).expect("prep succeeds");
-        let cpt = |vi: usize, fi: usize| -> V3 { corner.get(&(vi, fi)).copied().unwrap_or(topo.verts[vi]) };
-        let vi = topo
-            .verts
-            .iter()
-            .position(|&v| (v[0] - x1).abs() < 1e-6 && (v[1] - dist).abs() < 1e-6 && (v[2] - z1).abs() < 1e-6)
-            .expect("corner vertex exists");
-        let mut rings: Vec<Vec<V3>> = Vec::new();
-        let mut allowed: Vec<V3> = Vec::new();
-        for &ei in &topo.vert_edges[vi] {
-            let e = &topo.edges[ei];
-            if selected[ei] {
-                let ring = edge_end_ring(&topo, e, vi, &cpt, radius, seg).expect("selected edge has a ring");
-                allowed.extend(ring.iter().copied());
-                rings.push(ring);
-            } else {
-                allowed.push(cpt(vi, e.faces[0]));
-                allowed.push(cpt(vi, e.faces[1]));
+        assert!(
+            bevel_mesh_selected(&mesh, radius, 12, &top_rim).is_none(),
+            "the surgery must decline a rim pick whose corners it would mitre-weld"
+        );
+        let m = crate::round_mesh(&mesh, radius, &top_rim).expect("the CSG round takes the rim pick");
+        assert!(is_watertight(&m), "the CSG rim fillet must be closed");
+        // ...and it must actually CUT like a fillet, which the welded mesh never did: the pick
+        // covers three of the four rim edges, each spanning 20 with sharp-corner setbacks.
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
             }
-        }
-        assert_eq!(rings.len(), 2, "a weld corner has exactly two rounded edges");
-        let d2 = |p: V3, q: V3| dot(sub(p, q), sub(p, q));
-        let r2o: Vec<V3> = if d2(rings[1][0], rings[0][0]) <= d2(rings[1][seg], rings[0][0]) {
-            rings[1].clone()
-        } else {
-            rings[1].iter().rev().copied().collect()
+            v.abs()
         };
-        for (p, q) in rings[0].iter().zip(&r2o) {
-            allowed.push(scale(add(*p, *q), 0.5)); // the blended shared arc
-        }
-
-        let beveled = bevel_mesh_selected(&mesh, radius, seg, &top_rim).expect("top-rim fillet builds");
-        let near_corner: Vec<[f32; 3]> = beveled
-            .positions
-            .iter()
-            .copied()
-            .filter(|p| (p[0] as f64 - x1).abs() < radius && (p[1] as f64 - dist).abs() < radius && (p[2] as f64 - z1).abs() < radius)
-            .collect();
-        assert!(near_corner.len() > 4, "expected several corner-area vertices, found {}", near_corner.len());
-        for p in &near_corner {
-            let pd = [p[0] as f64, p[1] as f64, p[2] as f64];
-            let closest = allowed.iter().map(|&a| dot(sub(a, pd), sub(a, pd))).fold(f64::INFINITY, f64::min).sqrt();
-            assert!(closest < 1.0e-4, "corner-area vertex {pd:?} isn't ring/blend/corner geometry (closest {closest:.4}) — stray corner-patch geometry is back");
-        }
+        let removed = vol(&mesh) - vol(&m);
+        let a = (1.0 - std::f64::consts::PI / 4.0) * radius * radius;
+        // Three full-length runs (the CSG tools span corner to corner; overlapping removals
+        // don't double-count in a difference), plus two corner cubes less their sphere
+        // octants. Loose bound: at r half the wall height the end effects are chunky and the
+        // corner blend details vary — but the halving bug this replaces sat at ~50%, far out.
+        let runs = 3.0 * 20.0;
+        let corners = 2.0 * (radius.powi(3) - std::f64::consts::PI * radius.powi(3) / 6.0);
+        let want = a * runs + corners;
+        assert!(
+            (removed - want).abs() < want * 0.25,
+            "CSG rim fillet removed {removed:.2}, a fillet takes about {want:.2}"
+        );
     }
 
     #[test]

@@ -1440,13 +1440,13 @@ fn corner_sphere_tool(corner: V3, n1: V3, n2: V3, n3: V3, r: f64, concave: bool)
         // past the fillet into the open pocket.
         let center = add(corner, scale(s, r));
         let bbox = make_box(corner, e1, e2, e3, 0.0, r);
-        crate::mesh_difference(&bbox, &make_sphere(center, r, 20, 28))
+        crate::mesh_difference(&bbox, &make_sphere(center, r, 24, 48))
     } else {
         // Convex corner: the sphere sits in the material; carving the corner octant outside
         // it (out past the vertex into air) rounds the corner.
         let center = add(corner, scale(s, -r));
         let bbox = make_box(center, e1, e2, e3, 0.0, r + r);
-        crate::mesh_difference(&bbox, &make_sphere(center, r, 20, 28))
+        crate::mesh_difference(&bbox, &make_sphere(center, r, 24, 48))
     };
     if tool.indices.len() >= 3 {
         Some(tool)
