@@ -31,7 +31,7 @@ use hworks_document::{Assembly, Document, FeatureId, FeatureKind, GearType, Loft
 use hworks_geometry::{
     bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, fillet_segments, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -3680,6 +3680,7 @@ fn open_cli_file(
                 ui_state.current_file = Some(path.clone());
                 ui_state.regen = true;
                 ui_state.home_view_request = Some(HOME_VIEW_WAIT);
+                warn_about_needle_circles(&doc.0, &mut ui_state);
                 info!("Opened {} (command line)", path.display());
             }
             Err(e) => {
@@ -9042,7 +9043,21 @@ fn ui_system(
         // interactable: the label tracks the cursor, so an interactive one sits under the pointer
         // and eats the very click that would put the dimension down — you had to swing the mouse
         // wide of it to land one at all.
+        // A label only takes clicks under the SELECT tool.
+        //
+        // These sit in `Order::Foreground`, above the sketch, and anything the pointer is over
+        // there makes `blocking.0` true — which returns out of the whole sketch input handler
+        // before it reads a thing. So with any other tool the labels quietly eat presses meant for
+        // the geometry beneath them: on a circle smaller than its own value chip that is every
+        // press there is, and the Dimension tool reads as looping because the click that should
+        // have PLACED the pending dimension never arrives.
+        //
+        // Nothing is lost by it. Clicking a dimension to reopen it is wanted with Select, which
+        // still has it; and the Dimension tool does its own hit-testing in sketch space
+        // (`dim_at`), which has been unreachable all along because the Area took the click first.
+        let labels_interactive = session.tool == Tool::Select;
         let label_at = |ctx: &egui::Context, id: egui::Id, world: Vec3, text: String, selected: bool, live: bool| -> Option<egui::Response> {
+            let live = live || !labels_interactive;
             // An egui Area cannot be clipped by its caller, so a dimension whose geometry has
             // scrolled off the view is dropped rather than drawn over a panel. Clamping it to
             // the edge instead would leave the number pointing at the wrong geometry.
@@ -9083,6 +9098,32 @@ fn ui_system(
                     })
                     .inner
             })
+        };
+        // Keep a default-placed label off the geometry it belongs to, measured in PIXELS.
+        //
+        // The chip a value sits on is a fixed size on screen — about 40 by 18 — while the default
+        // placements are in model units, `0.707·r` from a circle's centre for a radius. Below
+        // roughly half a millimetre of radius the chip is wider than the whole circle and covers
+        // it completely, so the geometry can be neither read nor reached. Push such a label out
+        // along its own bearing until it clears. Only DEFAULT placements move; one that has been
+        // dragged somewhere stays exactly where it was put.
+        const LABEL_CLEAR_PX: f32 = 34.0;
+        let clear_of_geometry = |anchor: Vec2, label: Vec2| -> Vec2 {
+            let d = label - anchor;
+            if d.length() < 1e-9 {
+                return label;
+            }
+            let (Ok(a_s), Ok(l_s)) = (
+                camera.world_to_viewport(cam_gt, ap.to_world(anchor)),
+                camera.world_to_viewport(cam_gt, ap.to_world(label)),
+            ) else {
+                return label;
+            };
+            let px = (egui::pos2(l_s.x, l_s.y) - egui::pos2(a_s.x, a_s.y)).length();
+            if px >= LABEL_CLEAR_PX || px < 1e-6 {
+                return label;
+            }
+            anchor + d * (LABEL_CLEAR_PX / px)
         };
         // Deferred click actions (the constraint loop holds an immutable borrow of session).
         let mut dim_action: Option<(usize, bool)> = None; // (constraint index, double-clicked?)
@@ -9187,6 +9228,8 @@ fn ui_system(
                         let cu = Vec2::new(c.x as f32, c.y as f32);
                         let r = *value as f32;
                         let edge = radius_label_pos(cu, r, *label);
+                        // A tiny circle's default label would sit on top of it.
+                        let edge = if label[1] <= 1e-9 { clear_of_geometry(cu, edge) } else { edge };
                         let text = if *diameter { format!("Ø{}", fmt_len_bare(*value as f32 * 2.0, unit)) } else { format!("R{}", fmt_len_bare(*value as f32, unit)) };
                         act(label_at(ctx, egui::Id::new(("radlabel", k)), ap.to_world(edge), text, on, false), k, &mut dim_action);
                     }
@@ -10704,6 +10747,53 @@ fn slot_width_geometry_off(a2: Vec2, b2: Vec2, half: f32, offset: f32) -> (Vec2,
 }
 
 /// Add a slot-width dimension (or return the existing one) driving the slot's half-width.
+/// What a SECOND dimension pick makes of the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DimPair {
+    /// One slot picked twice — its two sides — which is its thickness.
+    SlotWidth(usize),
+    /// A slot's centre line to a line. `(slot, line)`.
+    SlotLine(usize, usize),
+    /// Two lines: their separation if parallel, the angle between them if not.
+    LineLine(usize, usize),
+}
+
+/// Resolve a pair of dimension picks.
+///
+/// Split out from the click handler so the table below can be tested: the flow itself needs the
+/// whole Bevy input path and a live sketch session, which is why the same-slot case sat broken.
+///
+/// The same slot picked twice is its WIDTH. A slot is one entity, so its two long sides are two
+/// picks of the same thing — and the line-to-line gesture is how a machinist asks for a thickness.
+/// This case used to be filtered out before it was ever considered, so picking one side and then
+/// the other threw away the dimension that the first pick had already made.
+///
+/// It is checked FIRST because a slot now carries a construction centre line of its own: a click
+/// on the far side can find that line too, and reading the pair as line-to-line would dimension
+/// the slot's axis against itself.
+fn dim_pair_action(
+    first_line: Option<usize>,
+    first_slot: Option<usize>,
+    second_line: Option<usize>,
+    second_slot: Option<usize>,
+) -> Option<DimPair> {
+    if let (Some(s1), Some(s2)) = (first_slot, second_slot) {
+        if s1 == s2 {
+            return Some(DimPair::SlotWidth(s1));
+        }
+    }
+    if let (Some(sl), Some(ln)) = (first_slot, second_line) {
+        return Some(DimPair::SlotLine(sl, ln));
+    }
+    if let (Some(ln), Some(sl)) = (first_line, second_slot) {
+        return Some(DimPair::SlotLine(sl, ln));
+    }
+    if let (Some(l1), Some(l2)) = (first_line, second_line) {
+        return (l2 != l1).then_some(DimPair::LineLine(l1, l2));
+    }
+    None
+}
+
 fn add_slot_width_dim(sketch: &mut Sketch, slot_entity: usize) -> Option<usize> {
     let (a, b, radius) = entity_slot(sketch, slot_entity)?;
     if let Some(i) = sketch.constraints.iter().position(|c| {
@@ -11625,6 +11715,20 @@ fn sketch_interaction(
     }
 
     if blocking.0 {
+        // A drag that BEGAN in the viewport has to be able to finish there, wherever the pointer
+        // happens to come to rest. `blocking.0` is `wants_pointer_input() || is_pointer_over_area()`,
+        // and a dimension's value floats over the sketch in `Order::Foreground` — so every pixel of
+        // every label is "over an area" and skips this whole handler. Release the mouse over one and
+        // the release was simply never seen: the box-select rectangle stayed on screen with nothing
+        // able to clear it, and the label being dragged never let go.
+        //
+        // This is why it took editing an EXISTING sketch to see it. A sketch drawn from scratch has
+        // no dimensions yet, so there are no labels to release over; reopen one that already has
+        // them and they are lying over the geometry from the first click.
+        if buttons.just_released(MouseButton::Left) {
+            session.box_select = None;
+            session.dim_drag = None;
+        }
         return;
     }
 
@@ -12219,8 +12323,11 @@ fn sketch_interaction(
             if let Some(uv) = active_uv {
                 second_line = nearest_line_entity(&session.sketch, uv, snap * 2.0, first_line);
                 // A slot under the cursor (its centre line can be dimensioned to a line).
+                // The SAME slot counts now: its two sides are two picks of one entity, and that
+                // pair is its thickness. Filtering the first slot out here is what used to throw
+                // the dimension away when you picked one side and then the other.
                 if let Some(e) = nearest_entity(&session.sketch, uv, snap * 2.0) {
-                    if Some(e) != first_slot && entity_slot(&session.sketch, e).is_some() {
+                    if entity_slot(&session.sketch, e).is_some() {
                         second_slot = Some(e);
                     }
                 }
@@ -12240,28 +12347,18 @@ fn sketch_interaction(
                     }
                 }
             }
-            // Decide the new dimension: slot↔line distance, or line↔line distance/angle.
-            enum Act {
-                SlotLine(usize, usize), // (slot entity, line entity)
-                LineLine(usize, usize),
-            }
-            let act = if let (Some(sl), Some(ln)) = (first_slot, second_line) {
-                Some(Act::SlotLine(sl, ln))
-            } else if let (Some(ln), Some(sl)) = (first_line, second_slot) {
-                Some(Act::SlotLine(sl, ln))
-            } else if let (Some(l1), Some(l2)) = (first_line, second_line) {
-                (l2 != l1).then_some(Act::LineLine(l1, l2))
-            } else {
-                None
-            };
+            // Decide the new dimension: the slot's own width, a slot↔line distance, or a
+            // line↔line distance/angle.
+            let act = dim_pair_action(first_line, first_slot, second_line, second_slot);
             if let Some(act) = act {
                 // Drop the length/width dim we just made; replace it with the pair dim.
                 if ci + 1 == session.sketch.constraints.len() {
                     session.sketch.constraints.pop();
                 }
                 let new_ci = match act {
-                    Act::SlotLine(sl, ln) => add_slot_line_distance(&mut session.sketch, sl, ln),
-                    Act::LineLine(l1, l2) => {
+                    DimPair::SlotWidth(sl) => add_slot_width_dim(&mut session.sketch, sl),
+                    DimPair::SlotLine(sl, ln) => add_slot_line_distance(&mut session.sketch, sl, ln),
+                    DimPair::LineLine(l1, l2) => {
                         if lines_parallel(&session.sketch, l1, l2) {
                             add_point_line_distance(&mut session.sketch, l1, l2)
                         } else {
@@ -13009,12 +13106,40 @@ fn sketch_interaction(
                                     None
                                 }
                             }
-                        } else if entity_slot(&session.sketch, e).is_some() {
-                            // A slot is one entity — clicking it dimensions its width; but
-                            // remember it so a follow-up click on a line/edge instead makes
-                            // a distance from that line to the slot's centre line.
+                        } else if let Some((sa, sb, srad)) = entity_slot(&session.sketch, e) {
+                            // A slot is one entity, so WHERE it was clicked chooses the dimension.
+                            // On a round end it is that end's radius; anywhere along the sides it
+                            // is the width across. Both drive the same half-width, so this is two
+                            // ways of saying the thickness, and the drawing being worked from
+                            // decides which reads better. Either way the slot is remembered, so a
+                            // follow-up click on a line instead makes a distance from that line to
+                            // the slot's centre line.
                             slot_ctx = Some(e);
-                            add_slot_width_dim(&mut session.sketch, e)
+                            let pt = |i: usize| session.sketch.points.get(i).map(|q| Vec2::new(q.x as f32, q.y as f32));
+                            let on_end = match (pt(sa), pt(sb)) {
+                                // Nearer an end CENTRE than the centre line is long — i.e. out
+                                // past where the straight sides stop and the cap begins.
+                                (Some(pa), Some(pb)) => {
+                                    let axis = pb - pa;
+                                    let t = if axis.length_squared() > 1e-9 {
+                                        ((uv - pa).dot(axis) / axis.length_squared()).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let end = if t < 0.5 { pa } else { pb };
+                                    // Inside the cap's own quadrant: beyond the centre along the
+                                    // axis, which is exactly the semicircular part.
+                                    let past = (uv - end).dot(if t < 0.5 { -axis } else { axis });
+                                    past > 0.0 && (uv - end).length() <= srad as f32 * 1.6
+                                }
+                                _ => false,
+                            };
+                            if on_end {
+                                let center = if pt(sa).zip(pt(sb)).is_some_and(|(pa, pb)| (uv - pa).length() <= (uv - pb).length()) { sa } else { sb };
+                                add_radius_dim(&mut session.sketch, center, srad)
+                            } else {
+                                add_slot_width_dim(&mut session.sketch, e)
+                            }
                         } else {
                             None
                         }
@@ -13138,11 +13263,69 @@ fn commit_line_length(session: &mut SketchSession, length: f32) {
     session.dirty = true;
 }
 
+/// Warn about circles a document carries that are too small to build with.
+///
+/// They are skipped when a profile is made (see `MIN_BUILDABLE_RADIUS`), so without saying so the
+/// part would come out right while the sketch still showed a feature that is not in it. A file
+/// written before the draw-time guard can hold one — pinch.hcad does, an r=0.01 left by a stray
+/// click — and at that size there is nothing to see on screen at any sane zoom, so the user has
+/// no other way to find it.
+fn warn_about_needle_circles(doc: &Document, ui_state: &mut UiState) {
+    let mut found: Vec<f64> = Vec::new();
+    for f in &doc.features {
+        match &f.kind {
+            FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } => found.extend(sketch.needle_circles()),
+            FeatureKind::Revolve { sketch, .. } => found.extend(sketch.needle_circles()),
+            _ => {}
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    let smallest = found.iter().cloned().fold(f64::MAX, f64::min);
+    ui_state.toasts.push((
+        format!(
+            "{} circle{} too small to build with (smallest dia {:.3}) — ignored when making the profile. Probably a stray click; delete {} from the sketch.",
+            found.len(),
+            if found.len() == 1 { "" } else { "s" },
+            smallest * 2.0,
+            if found.len() == 1 { "it" } else { "them" }
+        ),
+        9.0,
+    ));
+    warn!("{} needle circle(s) in the document, radii {found:?} — skipped when building profiles", found.len());
+}
+
+/// Is this radius a circle the user meant to draw, or a click that never moved?
+///
+/// Two floors, and both are needed. The zoom-relative one — a quarter of the snap distance, the
+/// same fraction `poly_rim` uses to take a deliberate aim — catches the mis-click: a press and
+/// release in one spot, or a double-click on the centre, which is what put a stray circle in
+/// pinch.hcad. Because it scales with the view, a genuinely small circle is still drawable by
+/// zooming in to where it is a real gesture.
+///
+/// The snap distance is the right yardstick because it already scales with the view: judging the
+/// GESTURE rather than the millimetres means a genuinely small circle stays drawable by zooming in
+/// to where drawing it is a real movement, while a press-and-release never makes one at any scale.
+/// Whether it can then be BUILT is a separate question, answered against the sketch's own size by
+/// `MIN_BUILDABLE_RADIUS_FRACTION` — an absolute floor here would refuse to draw the ordinary
+/// geometry of a part modelled in microns.
+fn circle_is_drawable(session: &SketchSession, radius: f32) -> bool {
+    radius >= session.snap_dist * 0.25
+}
+
 /// Commit the in-progress circle at an exact `radius`.
 fn commit_circle_radius(session: &mut SketchSession, radius: f32) {
     let Some(center) = session.pending else { return };
+    // No radius means NO CIRCLE. `.max(0.01)` used to turn it into the smallest circle the clamp
+    // allowed — which is how a stray click became a permanent ⌀0.02 hole in pinch.hcad, and it is
+    // invisible on screen at any sane zoom. A click that sets no size is a mis-click; keep the
+    // centre pending so the next one can size it properly.
+    if !circle_is_drawable(session, radius) {
+        return;
+    }
     let c = get_or_add_point(&mut session.sketch, center, session.snap_dist);
-    session.sketch.add_circle(c, radius.max(0.01) as f64);
+    session.sketch.add_circle(c, radius as f64);
     session.pending = None;
     session.dirty = true;
 }
@@ -15548,7 +15731,11 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
             // centre is their midpoint and the radius is half the distance.
             if let Some(p1) = session.pending.take() {
                 let center = (p1 + uv) * 0.5;
-                let radius = ((uv - p1).length() * 0.5).max(0.01);
+                let radius = (uv - p1).length() * 0.5;
+                if !circle_is_drawable(session, radius) {
+                    session.pending = Some(p1); // the second click landed on the first: keep waiting
+                    return;
+                }
                 let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
@@ -15560,6 +15747,10 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
         Tool::Circle => {
             if let Some(center) = session.pending.take() {
                 let radius = snap_radius(center.distance(uv), &session.reference_circles, snap);
+                if !circle_is_drawable(session, radius) {
+                    session.pending = Some(center); // clicked the centre twice: no circle yet
+                    return;
+                }
                 let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
                 session.dirty = true;
@@ -15629,7 +15820,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                 } else {
                     let a = session.pending.take().unwrap();
                     let b = session.pending_b.take().unwrap();
-                    commit_slot(session, a, b, None, perp_dist(uv, a, b));
+                    commit_slot(session, a, b, None, perp_dist(uv, a, b), None);
                 }
             }
             SlotMode::Centerpoint => {
@@ -15641,7 +15832,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                     let center = session.pending.take().unwrap();
                     let end = session.pending_b.take().unwrap();
                     let a = center * 2.0 - end; // mirrored end
-                    commit_slot(session, a, end, None, perp_dist(uv, a, end));
+                    commit_slot(session, a, end, None, perp_dist(uv, a, end), Some(center));
                 }
             }
             SlotMode::Arc => {
@@ -15655,7 +15846,7 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
                     let a = session.pending.take().unwrap();
                     let b = session.pending_b.take().unwrap();
                     let p = session.pending_c.take().unwrap();
-                    commit_slot(session, a, b, Some(p), arc_slot_width(uv, a, p, b));
+                    commit_slot(session, a, b, Some(p), arc_slot_width(uv, a, p, b), None);
                 }
             }
         },
@@ -15902,7 +16093,12 @@ fn text_handles(sketch: &Sketch, idx: usize) -> Option<(Vec2, Vec2, Vec2)> {
 }
 
 /// Build a slot entity from end centres `a`,`b`, optional arc bend `mid`, and half-width `r`.
-fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>, r: f32) {
+/// `centre` is the point the user actually CLICKED in Centerpoint mode. It is kept as a real
+/// sketch point tied to the two ends, rather than thrown away once the ends are worked out —
+/// there is then something to snap to, dimension from, and drag the whole slot by. The other
+/// modes pass `None`: no centre was ever designated in them, and inventing one would put a point
+/// on the drawing that the user never asked for.
+fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>, r: f32, centre: Option<Vec2>) {
     let snap = session.snap_dist;
     // `_ref` rather than plain `get_or_add_point`: a slot butting up against existing geometry
     // needs its end centres LOCKED to the body features they were snapped to, exactly like a
@@ -15918,6 +16114,33 @@ fn commit_slot(session: &mut SketchSession, a: Vec2, b: Vec2, mid: Option<Vec2>,
         construction: session.construction,
         mid: pmid,
     });
+    // The centre line, as construction geometry — the polygon's circumscribed circle plays the
+    // same part. A slot is ONE entity, so before this there was nothing to put a length on: its
+    // ends are points, and dimensioning point-to-point means picking two of them and hoping you
+    // hit the centres rather than the outline. A line joining the two arc centres is something to
+    // click, and because it is built on the slot's OWN end points, a length on it drives the slot
+    // — no new solver rule, the distance moves the points and the slot follows them.
+    //
+    // Construction, so it guides without forming a profile: the extrude still sees the slot's
+    // outline and nothing else.
+    //
+    // Straight slots only. An arc slot's centre line is an arc through the bend point, and a
+    // straight line between its ends would measure a chord — a length that means nothing and, if
+    // dimensioned, would fight the shape.
+    if pmid.is_none() {
+        session.sketch.add_line(pa, pb, true);
+    }
+    // The centre the user clicked, kept as a real point on the centre line. `Midpoint` holds it
+    // between the two ends, so it stays the middle when the slot is lengthened or dragged rather
+    // than drifting to wherever it happened to start — and dimensioning FROM it positions the
+    // whole slot, which is the reason to draw one from its centre in the first place.
+    if let Some(c) = centre {
+        let pc = get_or_add_point_ref(session, c, snap);
+        if pc != pa && pc != pb {
+            session.sketch.entities.push(SketchEntity::Point { at: pc });
+            session.sketch.constraints.push(Constraint::Midpoint { mid: pc, a: pa, b: pb });
+        }
+    }
     session.dirty = true;
 }
 
@@ -16903,6 +17126,7 @@ fn handle_file_io(
                         ui_state.home_view_request = Some(HOME_VIEW_WAIT);
                         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part").to_string();
                         ui_state.toasts.push((format!("Opened {name}"), 2.5));
+                        warn_about_needle_circles(&doc.0, &mut ui_state);
                         info!("Opened {}", path.display());
                     }
                     Err(e) => {
@@ -18266,6 +18490,9 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 // A circle snapped onto an existing hole's rim would give the tool walls
                 // exactly coincident with the hole — prune footprint-over-void geometry.
                 prune_void_cut_geometry(&mut cut_regs, cur0, &plane, into as f32);
+                // ...and where the wall lands ON the body rather than over a void, widen it off
+                // the coincidence so the boolean isn't asked to cut along a face it shares.
+                clear_coincident_cut_walls(&mut cut_regs, cur0, &plane, into as f32, distance.abs() as f32);
                 for r in &cut_regs {
                     let Some(cur) = body.take() else { break };
                     let signed = into * *distance;
@@ -18367,7 +18594,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
             // and returns None on cases it can't resolve, so we fall back to the CSG round.
             FeatureKind::Fillet { radius, edges } => {
                 if let Some(b) = body.take() {
-                    let seg = ((*radius * 6.0).round() as usize).clamp(3, 12);
+                    let seg = fillet_segments();
                     // One topology pass gives both the surgery mesh and the tangent edges. The
                     // edges are emitted whether the surgery succeeded or fell back to CSG (they
                     // sit at the same contact lines), so the rounded edges stay selectable. Stacked
@@ -19161,7 +19388,7 @@ fn fillet_preview(
         ui_state.fillet_shown = Some(r);
         return;
     }
-    let seg = ((r * 6.0).round() as usize).clamp(3, 12);
+    let seg = fillet_segments();
     let rounded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Mesh bevel first (clean corners); CSG round on anything it can't resolve.
         bevel_mesh_selected(&base, r as f64, seg, &edges).or_else(|| round_mesh(&base, r as f64, &edges))
@@ -21150,6 +21377,102 @@ fn ray_tri_hit(o: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
 /// Geometry standing over SOLID (a post being preserved inside a pocket) is kept: the
 /// probe tests several interior points at a few depths below the surface along the cut
 /// direction, and any solid hit keeps the loop/region.
+/// Give a cut tool lateral clearance wherever its wall would land exactly on the body's.
+///
+/// `cut_tol` already pads the tool ALONG the cut — `eps = 0.05 + depth*0.02` at each end — which is
+/// why a cut's floor and top come out clean even when they sit exactly on a face. Nothing did the
+/// same ACROSS the profile, so a circle snapped to an existing cylinder's radius put the tool's
+/// wall exactly on the body's. That is a coincident-face boolean, and it leaves the wall speckled
+/// with needle triangles (areas of 1e-9) and the stray micro-edges drawn over them.
+///
+/// Widening the whole profile would be wrong: a pocket's wall is interior, and moving it changes a
+/// dimension the user typed. The test that separates the two cases is what lies just OUTSIDE the
+/// wall at cutting depth. Where the material has already ended there, the wall is on the body's
+/// silhouette and sweeping a little wider removes nothing extra — it only takes air. Where there
+/// is still material, the wall is interior and is left exactly where it was sketched.
+fn clear_coincident_cut_walls(
+    regs: &mut [hworks_sketch::Region],
+    mesh: &TriMesh,
+    plane: &PlaneRef,
+    into: f32,
+    depth: f32,
+) {
+    if mesh.indices.len() < 3 {
+        return;
+    }
+    let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+    let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+    let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+    let nrm = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+    // Clearance scaled to the model: far above the 1e-5 weld grid the kernels snap on, far below
+    // anything that reads on screen or in a measurement (0.03% of this part's radius).
+    let (lo, hi) = mesh_bbox(mesh);
+    let eps = ((hi - lo).length() * 1.0e-4).max(1.0e-4);
+    let probe = eps * 4.0;
+    // Sample at a few depths: a wall is only "on the silhouette" if the material has ended along
+    // the whole sweep, not merely at the one height a single probe happened to pick.
+    let outside_at = |p: [f64; 2], dir: [f64; 2], dist: f32| -> bool {
+        let q = [p[0] + dir[0] * dist as f64, p[1] + dir[1] * dist as f64];
+        [0.25f32, 0.5, 0.75].iter().all(|f| {
+            let w = o + u * q[0] as f32 + v * q[1] as f32 + nrm * (into * depth * f);
+            !point_inside_mesh(mesh, w)
+        })
+    };
+    let signed_area = |l: &[[f64; 2]]| -> f64 {
+        let m = l.len();
+        (0..m).map(|i| { let (a, b) = (l[i], l[(i + 1) % m]); a[0] * b[1] - b[0] * a[1] }).sum::<f64>() * 0.5
+    };
+    // Per-vertex direction that ENLARGES the cut: away from an outer loop's interior, and into a
+    // hole's (a hole is material the cut leaves behind, so shrinking it widens the cut).
+    let widen_dirs = |l: &[[f64; 2]], is_hole: bool| -> Vec<[f64; 2]> {
+        let m = l.len();
+        let s = if signed_area(l) >= 0.0 { 1.0 } else { -1.0 };
+        let flip = if is_hole { -1.0 } else { 1.0 };
+        (0..m)
+            .map(|i| {
+                let prev = l[(i + m - 1) % m];
+                let next = l[(i + 1) % m];
+                let mut acc = [0.0f64; 2];
+                for (a, b) in [(prev, l[i]), (l[i], next)] {
+                    let d = [b[0] - a[0], b[1] - a[1]];
+                    let n = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                    if n > 1e-12 {
+                        // Right of the directed edge is outward for a CCW loop.
+                        acc[0] += d[1] / n * s * flip;
+                        acc[1] += -d[0] / n * s * flip;
+                    }
+                }
+                let n = (acc[0] * acc[0] + acc[1] * acc[1]).sqrt();
+                if n > 1e-12 { [acc[0] / n, acc[1] / n] } else { [0.0, 0.0] }
+            })
+            .collect()
+    };
+    let mut widened = 0usize;
+    for r in regs.iter_mut() {
+        for (is_hole, loops) in [(false, std::slice::from_mut(&mut r.outer)), (true, r.holes.as_mut_slice())] {
+            for l in loops {
+                let dirs = widen_dirs(l, is_hole);
+                let moved: Vec<[f64; 2]> = l
+                    .iter()
+                    .zip(&dirs)
+                    .map(|(p, d)| {
+                        if *d != [0.0, 0.0] && outside_at(*p, *d, probe) {
+                            widened += 1;
+                            [p[0] + d[0] * eps as f64, p[1] + d[1] * eps as f64]
+                        } else {
+                            *p
+                        }
+                    })
+                    .collect();
+                *l = moved;
+            }
+        }
+    }
+    if widened > 0 {
+        debug!("Cut: gave {widened} profile vertices {eps:.5} of lateral clearance (wall on the body's silhouette)");
+    }
+}
+
 fn prune_void_cut_geometry(regs: &mut Vec<hworks_sketch::Region>, mesh: &TriMesh, plane: &PlaneRef, into: f32) {
     let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
     let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
@@ -26013,7 +26336,7 @@ mod tests {
         let open: Vec<[f64; 3]> = chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect();
         let mut shut = open.clone();
         shut.push(shut[0]); // what toggle_fillet_edge now stores for a closed pick
-        let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         for (label, picked) in [("open (old doc, wrap-healed)", vec![open]), ("closed (new store)", vec![shut])] {
             let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
             // The mesh surgery must TAKE this rim. It used to be refused on the grounds that a
@@ -27434,6 +27757,255 @@ mod tests {
         assert!(z.is_finite(), "a zero-radius rim produced {z:?}");
     }
 
+    /// A straight slot gets a construction centre line, and a length on it drives the slot.
+    ///
+    /// A slot is ONE entity, so before this there was nothing to dimension its length on — the
+    /// ends are points, and point-to-point means picking two of them and hoping you catch the
+    /// centres rather than the outline. The line joins the slot's OWN end points, so a distance
+    /// on it moves those points and the slot follows: no new solver rule for the length at all.
+    #[test]
+    fn a_straight_slot_gets_a_dimensionable_centre_line() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 2.0)); // width
+
+        let (sa, sb) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a slot");
+        // A construction line on the slot's own end points — not a copy of them.
+        let axis = s.sketch.entities.iter().position(|e| {
+            matches!(e, SketchEntity::Line { a, b, construction: true, .. }
+                if (*a == sa && *b == sb) || (*a == sb && *b == sa))
+        });
+        assert!(axis.is_some(), "a straight slot should carry a construction centre line");
+
+        // Dimension it, and the slot's length follows the value.
+        let ci = add_distance_dim(&mut s.sketch, sa, sb).expect("a length on the centre line");
+        if let Some(Constraint::Distance { value, .. }) = s.sketch.constraints.get_mut(ci) {
+            *value = 25.0;
+        }
+        s.sketch.solve();
+        let pt = |i: usize| Vec2::new(s.sketch.points[i].x as f32, s.sketch.points[i].y as f32);
+        let got = (pt(sb) - pt(sa)).length();
+        assert!((got - 25.0).abs() < 1e-3, "the centre line was dimensioned to 25, the slot is {got:.4} long");
+
+        // ...and it must not become a profile: construction geometry guides only.
+        let regions = s.sketch.regions();
+        assert!(!regions.is_empty(), "the slot itself should still form a region");
+    }
+
+    /// An ARC slot gets no straight centre line. A line between its ends measures a chord, which
+    /// is not its length, and dimensioning that would fight the bend.
+    #[test]
+    fn an_arc_slot_gets_no_straight_centre_line() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Arc;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 4.0)); // bend
+        place_point(&mut s, Vec2::new(5.0, 6.0)); // width
+
+        let has_mid = s.sketch.entities.iter().any(|e| matches!(e, SketchEntity::Slot { mid: Some(_), .. }));
+        assert!(has_mid, "expected an arc slot");
+        let lines = s.sketch.entities.iter().filter(|e| matches!(e, SketchEntity::Line { .. })).count();
+        assert_eq!(lines, 0, "an arc slot must not get a straight centre line");
+    }
+
+    /// Thickness can be given as the END RADIUS as well as the width across, so whichever the
+    /// drawing uses can be typed straight in. Both drive the same half-width.
+    #[test]
+    fn a_slot_takes_its_thickness_as_a_radius_too() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 2.0));
+
+        let (sa, _sb) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a slot");
+        // A radius on one END CENTRE — 1.5 means a 3.0-thick slot.
+        let ci = add_radius_dim(&mut s.sketch, sa, 2.0).expect("a radius on the slot's end");
+        if let Some(Constraint::Radius { value, diameter, .. }) = s.sketch.constraints.get_mut(ci) {
+            *value = 1.5;
+            *diameter = false;
+        }
+        s.sketch.solve();
+        let r = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { radius, .. } => Some(*radius),
+                _ => None,
+            })
+            .expect("a slot");
+        assert!((r - 1.5).abs() < 1e-6, "a radius of 1.5 should give a half-width of 1.5, got {r}");
+    }
+
+    /// A circle too small to tessellate must not be able to break the body.
+    ///
+    /// pinch.hcad's shape: a ⌀12 disc with a stray r=0.01 circle inside it, left by a click that
+    /// never moved. Read as a hole it is a 0.02 shaft through a 25.5 tall part — thinner than the
+    /// tolerances the kernel welds at — and the extrude came out NON-MANIFOLD before any cut, with
+    /// every boolean after inheriting the damage: the finished part was 62,517 triangles and
+    /// broken, against 1,244 and sound without it.
+    #[test]
+    fn a_needle_circle_cannot_break_the_body() {
+        let mut doc = Document::with_default_planes();
+        let mut sk = Sketch::default();
+        let c0 = sk.add_point(0.0, 0.0);
+        sk.add_circle(c0, 6.0);
+        let c1 = sk.add_point(4.177_728_176_116_943, 4.016_993_522_644_043);
+        sk.add_circle(c1, 0.01);
+        // It is reported, so it can be pointed out rather than silently dropped.
+        assert_eq!(sk.needle_circles(), vec![0.01], "the needle should be findable for a warning");
+        doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 25.514, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        assert!(hworks_geometry::is_manifold(&mesh), "a needle circle left the body non-manifold");
+        // The hole is skipped, so this is the plain disc — its own area, not one shy of it.
+        let want = std::f64::consts::PI * 36.0 * 25.514;
+        assert!((tri_vol(&mesh) - want).abs() < want * 0.01, "volume {:.3}, expected about {want:.3}", tri_vol(&mesh));
+        // And nothing exploded: a disc is a few hundred triangles, not tens of thousands.
+        assert!(mesh.indices.len() / 3 < 2000, "{} triangles for a plain disc", mesh.indices.len() / 3);
+    }
+
+    /// A click that never moved draws no circle at all.
+    ///
+    /// The clamp it replaces (`radius.max(0.01)`) turned "no size given" into the smallest circle
+    /// it would allow, which is how a stray click became a permanent ⌀0.02 hole. Both floors are
+    /// needed: the zoom-relative one catches the mis-click at any scale, and the absolute one
+    /// refuses to draw what the profile builder would later have to skip.
+    #[test]
+    fn a_click_that_never_moved_draws_no_circle() {
+        let mut s = session_on_a_face(&[]);
+        s.snap_dist = 0.4; // a normal working zoom
+
+        assert!(!circle_is_drawable(&s, 0.0), "a zero radius is a mis-click");
+        assert!(!circle_is_drawable(&s, 0.01), "the old clamp's value must no longer draw");
+        assert!(!circle_is_drawable(&s, 0.05), "below a quarter of the snap distance is a mis-click");
+        assert!(circle_is_drawable(&s, 3.0), "an ordinary circle must still draw");
+
+        // Zoomed right in, the snap distance shrinks and a genuinely small circle becomes
+        // drawable again — the gesture is what is being judged, not the millimetres. Whether such
+        // a circle can be BUILT is answered separately, against the sketch's own size.
+        s.snap_dist = 0.02;
+        assert!(circle_is_drawable(&s, 0.05), "zoomed in, a small circle is a real gesture");
+        assert!(!circle_is_drawable(&s, 0.004), "still nothing for a press that never moved");
+    }
+
+    /// A Centerpoint slot keeps the centre the user clicked, held between the two ends.
+    ///
+    /// Without it that click was consumed working out where the ends go and then thrown away, so
+    /// the one point the user actually placed — the one they drew the slot around — left nothing
+    /// behind to snap to, dimension from, or drag the slot by.
+    #[test]
+    fn a_centrepoint_slot_keeps_its_centre() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Centerpoint;
+        place_point(&mut s, Vec2::new(5.0, 0.0)); // centre
+        place_point(&mut s, Vec2::new(11.0, 0.0)); // one end
+        place_point(&mut s, Vec2::new(8.0, 2.0)); // width
+
+        let (sa, sb) = s
+            .sketch
+            .entities
+            .iter()
+            .find_map(|e| match e {
+                SketchEntity::Slot { a, b, .. } => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("a slot");
+        let mid = s
+            .sketch
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                Constraint::Midpoint { mid, a, b } if (*a == sa && *b == sb) || (*a == sb && *b == sa) => Some(*mid),
+                _ => None,
+            })
+            .expect("the clicked centre, held between the ends");
+        assert!(
+            s.sketch.entities.iter().any(|e| matches!(e, SketchEntity::Point { at } if *at == mid)),
+            "the centre should be a real point, not just a constraint"
+        );
+        let pt = |sk: &Sketch, i: usize| Vec2::new(sk.points[i].x as f32, sk.points[i].y as f32);
+        assert!((pt(&s.sketch, mid) - Vec2::new(5.0, 0.0)).length() < 1e-4, "the centre moved off where it was clicked");
+
+        // It is the MIDDLE, not merely a point that started there: lengthen the slot and it
+        // stays centred rather than drifting to one end.
+        let ci = add_distance_dim(&mut s.sketch, sa, sb).expect("a length");
+        if let Some(Constraint::Distance { value, .. }) = s.sketch.constraints.get_mut(ci) {
+            *value = 20.0;
+        }
+        s.sketch.solve();
+        let off = (pt(&s.sketch, mid) - (pt(&s.sketch, sa) + pt(&s.sketch, sb)) * 0.5).length();
+        assert!(off < 1e-3, "after lengthening, the centre sits {off:.4} off the middle");
+    }
+
+    /// The other slot modes designate no centre, so they get no stray point.
+    #[test]
+    fn a_straight_slot_invents_no_centre_point() {
+        let mut s = session_on_a_face(&[]);
+        s.tool = Tool::Slot;
+        s.slot_mode = SlotMode::Straight;
+        place_point(&mut s, Vec2::new(0.0, 0.0));
+        place_point(&mut s, Vec2::new(10.0, 0.0));
+        place_point(&mut s, Vec2::new(5.0, 2.0));
+        assert!(
+            !s.sketch.constraints.iter().any(|c| matches!(c, Constraint::Midpoint { .. })),
+            "a straight slot should not invent a centre the user never placed"
+        );
+    }
+
+    /// Picking a slot's two SIDES is the line-to-line way of asking for its thickness.
+    ///
+    /// A slot is one entity, so both sides are picks of the same thing — and the same-slot case
+    /// was filtered out before it was considered, so picking one side and then the other threw
+    /// away the width dimension the first pick had already made.
+    #[test]
+    fn two_picks_on_one_slot_dimension_its_thickness() {
+        // Same slot twice — its two sides — is its width.
+        assert_eq!(dim_pair_action(None, Some(7), None, Some(7)), Some(DimPair::SlotWidth(7)));
+        // ...and that still holds when the second click also finds the slot's own construction
+        // centre line, which is exactly what a click on the far side can do.
+        assert_eq!(dim_pair_action(None, Some(7), Some(9), Some(7)), Some(DimPair::SlotWidth(7)));
+
+        // Two DIFFERENT slots are not a width — that pair means nothing, and must not silently
+        // dimension one of them.
+        assert_eq!(dim_pair_action(None, Some(7), None, Some(8)), None);
+
+        // The pairs that already worked, unchanged.
+        assert_eq!(dim_pair_action(None, Some(7), Some(3), None), Some(DimPair::SlotLine(7, 3)));
+        assert_eq!(dim_pair_action(Some(3), None, None, Some(7)), Some(DimPair::SlotLine(7, 3)));
+        assert_eq!(dim_pair_action(Some(1), None, Some(2), None), Some(DimPair::LineLine(1, 2)));
+        // One line picked twice is not a pair.
+        assert_eq!(dim_pair_action(Some(1), None, Some(1), None), None);
+        // Nothing under the second click: nothing to make.
+        assert_eq!(dim_pair_action(Some(1), None, None, None), None);
+        assert_eq!(dim_pair_action(None, None, None, None), None);
+    }
+
     /// A slot butted up against existing geometry must LOCK its end centres to the body
     /// features they were snapped to. Unpinned they keep a degree of freedom, and a later
     /// solve slides them a fraction off the edge - which is where the small ledges come from.
@@ -27754,7 +28326,7 @@ mod tests {
         let (chain, closed) = edge_loop(&tess0.edges, rim_seed);
         eprintln!("picked rim: {} pts, closed={closed}", chain.len());
         let picked: Vec<Vec<[f64; 3]>> = vec![chain.iter().map(|p| [p.x as f64, p.y as f64, p.z as f64]).collect()];
-        let seg = ((fr * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         for round in 0..10 {
             let (beveled, fe) = bevel_mesh_and_edges(&cyl, fr, seg, &picked);
             let path = if round >= 5 || beveled.is_none() { "CSG-fallback" } else { "surgery" };
@@ -28848,6 +29420,43 @@ mod tests {
         let ray = Ray3d { origin: Vec3::new(0.0, 100.0, 0.0), direction: Dir3::NEG_Y };
         let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
         assert!(ap.origin.distance(Vec3::new(0.0, Y, 0.0)) < 0.05, "face origin drifted to {:?}", ap.origin);
+    }
+
+    /// A sketch plane picked on a face lands EXACTLY on it, at whatever untidy height the face
+    /// happens to sit at — never rounded to something neater.
+    ///
+    /// "bad extrude cut.hcad" stores a cut plane at 5.03125 over a face at 5.025900. 5.03125 is
+    /// 5 + 1/32, which reads like a grid snap of the face's real height, and a sketch half a
+    /// hundredth off the face it looks attached to is worth pinning down. The plane in that file
+    /// turns out to predate the current code — this holds today's `pick_face` to the exact height,
+    /// so it cannot start rounding again.
+    #[test]
+    fn a_sketch_plane_picked_on_a_face_lands_exactly_on_it() {
+        // The awkward height from that file: nowhere near a grid line, and not representable as
+        // a tidy fraction — if anything rounds, it shows.
+        const Y: f32 = 5.025_900_4;
+        const R: f32 = 4.721_335;
+        const N: usize = 64;
+        let mut positions: Vec<[f32; 3]> = vec![[0.0, Y, 0.0]];
+        for k in 0..=N {
+            let a = std::f32::consts::TAU * k as f32 / N as f32;
+            positions.push([R * a.cos(), Y, R * a.sin()]);
+        }
+        let mut indices: Vec<u32> = Vec::new();
+        for k in 1..=N {
+            indices.extend([0u32, (k + 1) as u32, k as u32]);
+        }
+        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices };
+        let ray = Ray3d { origin: Vec3::new(1.5, 100.0, -0.75), direction: Dir3::NEG_Y };
+        let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
+        let off = (ap.origin.y - Y).abs();
+        assert!(off < 1.0e-5, "the plane sits {off:.6} off the face (origin y={}, face y={Y})", ap.origin.y);
+        // ...and it is not merely close to the face but sitting on a rounder number nearby.
+        let sixteenth = (Y * 32.0).round() / 32.0;
+        assert!(
+            (ap.origin.y - sixteenth).abs() > 1.0e-4,
+            "the plane landed on {sixteenth}, a 1/32 grid value, rather than the face's own height"
+        );
     }
 
     #[test]
@@ -32237,7 +32846,7 @@ mod tests {
         let (pre, _) = regenerate_mesh(&before).expect("body before the fillet");
         eprintln!("before: {} tris, manifold={}", pre.indices.len() / 3, hworks_geometry::is_manifold(&pre));
 
-        let seg = ((radius * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         let (surgery, _) = hworks_geometry::bevel_mesh_and_edges(&pre, *radius, seg, edges);
         eprintln!("mesh-surgery bevel: {}", match &surgery {
             Some(m) => format!("OK, {} tris, manifold={}", m.indices.len() / 3, hworks_geometry::is_manifold(m)),
@@ -32417,6 +33026,602 @@ mod tests {
                     Some(m) => eprintln!("  CSG round: {} tris, manifold={}, volume {:.3}", m.indices.len() / 3, hworks_geometry::is_manifold(&m), vol(&m)),
                     None => eprintln!("  CSG round FAILED too"),
                 },
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_leftover_walls -- --ignored --nocapture
+    fn diag_fillet_leftover_walls() {
+        // Where a rim fillet RUNS OUT — here because a cut took away part of the face the rim sat
+        // on — does material stay standing inside the fillet's own surface? Probes the ideal
+        // rolling-ball torus and reports what is left, bucketed by angle so a run-out end shows up
+        // as a cluster rather than a total.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let fil = doc.features.iter().find_map(|f| match &f.kind {
+            FeatureKind::Fillet { radius, edges } => Some((*radius, edges.clone())),
+            _ => None,
+        });
+        let Some((fr, edges)) = fil else { eprintln!("no Fillet"); return };
+        let chain = &edges[0];
+        // The rim: its plane height and radius, straight off the picked chain.
+        let ys: Vec<f64> = chain.iter().map(|p| p[1]).collect();
+        let top = ys.iter().cloned().fold(f64::MIN, f64::max);
+        let rim_r = chain.iter().map(|p| (p[0] * p[0] + p[2] * p[2]).sqrt()).sum::<f64>() / chain.len() as f64;
+        // Which angles does the pick actually cover?
+        let mut covered: Vec<f64> = chain.iter().map(|p| p[2].atan2(p[0]).to_degrees()).collect();
+        covered.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("fillet r={fr:.3} on a rim of radius {rim_r:.3} at height {top:.4}, {} pts", chain.len());
+        // A convex rim fillet's rolling ball runs on a circle of radius rim+r, dropped r below the
+        // face; anything still solid within r of THAT circle was not taken off.
+        let axis_r = rim_r + fr;
+        let axis_y = top - fr;
+        let (mut solid, mut total) = (0usize, 0usize);
+        let mut by_angle: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        eprintln!("body: {} tris, manifold={}", mesh.indices.len() / 3, hworks_geometry::is_manifold(&mesh));
+        for adeg in 0..360 {
+            let a = (adeg as f64).to_radians();
+            for ri in 0..=14 {
+                for hi in 0..=14 {
+                    // Sample the fillet's cross-section quadrant, strictly inside the tube.
+                    // The region a convex rim fillet REMOVES: cornerward of the rolling ball —
+                    // inside the corner box, but outside the ball itself. (Inside the ball is
+                    // material the fillet keeps; probing there measures nothing.)
+                    let rr = rim_r + (axis_r - rim_r) * (ri as f64 / 14.0);
+                    let yy = axis_y + (top - axis_y) * (hi as f64 / 14.0);
+                    let (du, dv) = (rr - axis_r, yy - axis_y);
+                    if (du * du + dv * dv).sqrt() < fr * 1.05 {
+                        continue; // inside the ball: kept material
+                    }
+                    if rr < rim_r + 0.05 || yy > top - 0.05 {
+                        continue; // hard against the hole wall or the face; leave the seam alone
+                    }
+                    let p = Vec3::new((rr * a.cos()) as f32, yy as f32, (rr * a.sin()) as f32);
+                    total += 1;
+                    if point_inside_mesh(&mesh, p) {
+                        solid += 1;
+                        *by_angle.entry(adeg / 10 * 10).or_default() += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("material still standing inside the fillet: {solid} of {total} probes");
+        let hot: Vec<(i32, usize)> = by_angle.iter().filter(|(_, &c)| c > 0).map(|(&a, &c)| (a, c)).collect();
+        eprintln!("by angle (10° buckets, only non-empty): {hot:?}");
+        // Where does the PICK stop? The run-out ends are the gap in its angular coverage.
+        let mut gaps: Vec<(f64, f64)> = Vec::new();
+        for w in covered.windows(2) {
+            if w[1] - w[0] > 15.0 {
+                gaps.push((w[0], w[1]));
+            }
+        }
+        eprintln!("picked-rim angular gaps (the run-out ends): {gaps:?}");
+        // The walls in question stand at the run-out ends. Measure how THICK they are: sweep the
+        // angle across each end and find the material's angular extent at a grid of (radius,
+        // height). A legitimate cut wall is bounded by its neighbours; a knife-edge left by two
+        // features meeting is thin enough to read as an error even though the body is manifold.
+        for (label, end) in gaps.iter().flat_map(|(a, b)| [("gap start", *a), ("gap end", *b)]) {
+            let mut thinnest = f64::MAX;
+            let mut at = (0.0f64, 0.0f64, 0.0f64);
+            let mut sampled = 0usize;
+            for ri in 0..=20 {
+                let rr = rim_r + (4.7 - rim_r) * (ri as f64 / 20.0);
+                for hi in 0..=20 {
+                    let yy = (top - fr - 0.2) + (fr + 0.2) * (hi as f64 / 20.0);
+                    // Walk out from the wall plane in both angular directions.
+                    let solid_at = |deg: f64| {
+                        let a = deg.to_radians();
+                        point_inside_mesh(&mesh, Vec3::new((rr * a.cos()) as f32, yy as f32, (rr * a.sin()) as f32))
+                    };
+                    if !solid_at(end) {
+                        continue; // no material on the wall here
+                    }
+                    sampled += 1;
+                    let mut span = 0.0;
+                    for s in [-1.0f64, 1.0] {
+                        let mut d = 0.0;
+                        while d < 12.0 && solid_at(end + s * (d + 0.25)) {
+                            d += 0.25;
+                        }
+                        span += d;
+                    }
+                    let arc = span.to_radians() * rr; // angular span as a real thickness
+                    if arc < thinnest {
+                        thinnest = arc;
+                        at = (rr, yy, end);
+                    }
+                }
+            }
+            if sampled > 0 {
+                eprintln!("{label} {end:.2}°: thinnest standing material {thinnest:.4} at r={:.3} y={:.3} ({sampled} probes on the wall)", at.0, at.1);
+            } else {
+                eprintln!("{label} {end:.2}°: no material standing on this plane");
+            }
+        }
+    }
+
+    /// At what radius does a hole stop being buildable? Sweeps a small circle inside a ⌀12 disc
+    /// (pinch.hcad's shape) and reports where the extrude turns non-manifold, so the floor that
+    /// rejects one is measured rather than picked.
+    #[test]
+    #[ignore]
+    fn diag_needle_hole_threshold() {
+        for r in [0.02f64, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05] {
+            let mut doc = Document::with_default_planes();
+            let mut sk = Sketch::default();
+            let c0 = sk.add_point(0.0, 0.0);
+            sk.add_circle(c0, 6.0);
+            let c1 = sk.add_point(4.177_728_176_116_943, 4.016_993_522_644_043);
+            sk.add_circle(c1, r);
+            doc.add_feature(FeatureKind::Extrude { sketch: sk, regions: vec![], region_pts: vec![], plane: xy(), distance: 25.514, back: 0.0, thin: 0.0, thin_side: 0 });
+            doc.rollback = doc.features.len();
+            match regenerate_mesh(&doc) {
+                Some((m, _)) => {
+                    // A ⌀12 x 25.514 disc less the hole.
+                    let want = std::f64::consts::PI * (36.0 - r * r) * 25.514;
+                    eprintln!(
+                        "hole r={r:<6}: {:>6} tris, manifold={:<5}, vol {:.3} (want {:.3}), segment {:.5}",
+                        m.indices.len() / 3,
+                        hworks_geometry::is_manifold(&m),
+                        tri_vol(&m),
+                        want,
+                        std::f64::consts::TAU * r / 128.0
+                    );
+                }
+                None => eprintln!("hole r={r:<6}: NO BODY"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_body_health -- --ignored --nocapture
+    fn diag_body_health() {
+        // What does a document actually build, feature by feature? Reports each step's size,
+        // manifoldness and volume, so a step that loses the body — or grows a needle — is
+        // attributable to the operation that did it rather than to the finished shape.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        for (i, f) in doc.features.iter().enumerate() {
+            let kind = match &f.kind {
+                FeatureKind::Plane(_) => continue,
+                FeatureKind::Extrude { distance, .. } => format!("Extrude {distance:.3}"),
+                FeatureKind::Cut { distance, .. } => format!("Cut {distance:.3}"),
+                other => format!("{other:?}").chars().take(24).collect(),
+            };
+            let mut upto = doc.clone();
+            upto.rollback = i + 1;
+            match regenerate_mesh(&upto) {
+                Some((m, _)) if !m.positions.is_empty() => {
+                    let (lo, hi) = mesh_bbox(&m);
+                    // Shells: weld and flood-fill across shared edges. More than one means the
+                    // body has come apart into pieces.
+                    let shells = {
+                        use std::collections::HashMap;
+                        let key = |p: [f32; 3]| ((p[0] * 1e4) as i64, (p[1] * 1e4) as i64, (p[2] * 1e4) as i64);
+                        let mut id: HashMap<(i64, i64, i64), usize> = HashMap::new();
+                        let mut next = 0usize;
+                        let mut vid = |p: [f32; 3]| *id.entry(key(p)).or_insert_with(|| { next += 1; next - 1 });
+                        let tris: Vec<[usize; 3]> = m.indices.chunks_exact(3)
+                            .map(|t| [vid(m.positions[t[0] as usize]), vid(m.positions[t[1] as usize]), vid(m.positions[t[2] as usize])])
+                            .collect();
+                        let mut uf: Vec<usize> = (0..next).collect();
+                        fn find(uf: &mut [usize], mut x: usize) -> usize { while uf[x] != x { uf[x] = uf[uf[x]]; x = uf[x]; } x }
+                        for t in &tris {
+                            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                                let (ra, rb) = (find(&mut uf, a), find(&mut uf, b));
+                                if ra != rb { uf[ra] = rb; }
+                            }
+                        }
+                        let mut roots: Vec<usize> = (0..next).map(|i| find(&mut uf, i)).collect();
+                        roots.sort_unstable();
+                        roots.dedup();
+                        roots.len()
+                    };
+                    eprintln!(
+                        "#{i} {kind}: {} tris, manifold={}, vol {:.3}, bbox {:.2}x{:.2}x{:.2}, {shells} shell(s)",
+                        m.indices.len() / 3, hworks_geometry::is_manifold(&m), tri_vol(&m),
+                        hi.x - lo.x, hi.y - lo.y, hi.z - lo.z
+                    );
+                }
+                Some(_) | None => eprintln!("#{i} {kind}: NO BODY"),
+            }
+        }
+        // Needle circles: a stray click can leave a circle far below anything the tessellation can
+        // represent, and as a hole in a profile it is a shaft narrower than the mesh's own weld
+        // tolerance. Report them, then rebuild without them to see what they cost.
+        let mut tiny: Vec<(usize, f64, [f64; 2])> = Vec::new();
+        for (i, f) in doc.features.iter().enumerate() {
+            let sk = match &f.kind {
+                FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } => sketch,
+                _ => continue,
+            };
+            for e in &sk.entities {
+                if let SketchEntity::Circle { center, radius, construction: false } = e {
+                    if *radius < 0.05 {
+                        let c = sk.points.get(*center).map(|p| [p.x, p.y]).unwrap_or([0.0; 2]);
+                        tiny.push((i, *radius, c));
+                    }
+                }
+            }
+        }
+        eprintln!("needle circles (r < 0.05): {tiny:?}");
+        if !tiny.is_empty() {
+            let mut clean = doc.clone();
+            for f in clean.features.iter_mut() {
+                if let FeatureKind::Extrude { sketch, .. } | FeatureKind::Cut { sketch, .. } = &mut f.kind {
+                    sketch.entities.retain(|e| !matches!(e, SketchEntity::Circle { radius, construction: false, .. } if *radius < 0.05));
+                }
+            }
+            clean.rollback = clean.features.len();
+            match regenerate_mesh(&clean) {
+                Some((m, _)) => eprintln!(
+                    "WITHOUT them: {} tris, manifold={}, vol {:.3}",
+                    m.indices.len() / 3,
+                    hworks_geometry::is_manifold(&m),
+                    tri_vol(&m)
+                ),
+                None => eprintln!("WITHOUT them: NO BODY"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_membrane_origin -- --ignored --nocapture
+    fn diag_membrane_origin() {
+        // Which feature first tears the surface? A sheet floating inside the body is not a solid
+        // boundary, so its rim edges cannot carry exactly two faces. Counting edges by how many
+        // faces meet along them is O(n) and names the step that introduced the tear, which volume
+        // and bounding boxes cannot see.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        for (i, f) in doc.features.iter().enumerate() {
+            let kind = match &f.kind {
+                FeatureKind::Plane(_) => continue,
+                FeatureKind::Extrude { distance, .. } => format!("Extrude {distance:.3}"),
+                FeatureKind::Cut { distance, .. } => format!("Cut {distance:.3}"),
+                other => format!("{other:?}").chars().take(24).collect(),
+            };
+            let mut upto = doc.clone();
+            upto.rollback = i + 1;
+            let Some((m, _)) = regenerate_mesh(&upto) else {
+                eprintln!("#{i} {kind}: NO BODY");
+                continue;
+            };
+            use std::collections::HashMap;
+            let key = |p: [f32; 3]| ((p[0] * 1e4) as i64, (p[1] * 1e4) as i64, (p[2] * 1e4) as i64);
+            let mut id: HashMap<(i64, i64, i64), usize> = HashMap::new();
+            let mut pos: Vec<Vec3> = Vec::new();
+            let mut vid = |p: [f32; 3]| {
+                *id.entry(key(p)).or_insert_with(|| {
+                    pos.push(Vec3::from_array(p));
+                    pos.len() - 1
+                })
+            };
+            let mut edges: HashMap<(usize, usize), usize> = HashMap::new();
+            for t in m.indices.chunks_exact(3) {
+                let v = [
+                    vid(m.positions[t[0] as usize]),
+                    vid(m.positions[t[1] as usize]),
+                    vid(m.positions[t[2] as usize]),
+                ];
+                for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                    *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
+            }
+            let open: Vec<&(usize, usize)> = edges.iter().filter(|(_, &c)| c == 1).map(|(e, _)| e).collect();
+            let extra: Vec<&(usize, usize)> = edges.iter().filter(|(_, &c)| c > 2).map(|(e, _)| e).collect();
+            let span = |es: &[&(usize, usize)]| -> String {
+                if es.is_empty() {
+                    return String::new();
+                }
+                let ys: Vec<f32> = es.iter().flat_map(|(a, b)| [pos[*a].y, pos[*b].y]).collect();
+                let lo = ys.iter().copied().fold(f32::MAX, f32::min);
+                let hi = ys.iter().copied().fold(f32::MIN, f32::max);
+                format!(" (y {lo:.3}..{hi:.3})")
+            };
+            eprintln!(
+                "#{i} {kind}: {} tris, {} open edges{}, {} over-used edges{}",
+                m.indices.len() / 3,
+                open.len(),
+                span(&open),
+                extra.len(),
+                span(&extra)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_last_cut_leftovers -- --ignored --nocapture
+    fn diag_last_cut_leftovers() {
+        // What survives inside the LAST cut's swept volume? Walks the cut direction at a grid of
+        // points across its profile and reports every span of material still standing, so a sheet
+        // left behind shows up with its thickness and where it is.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let last = doc.features.iter().enumerate().filter(|(_, f)| matches!(f.kind, FeatureKind::Cut { .. })).next_back();
+        let Some((fi, feat)) = last else { eprintln!("no Cut"); return };
+        let FeatureKind::Cut { plane, distance, sketch, .. } = &feat.kind else { return };
+        let rad = sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Circle { radius, .. } => Some(*radius),
+            _ => None,
+        }).unwrap_or(0.0);
+        let ctr = sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Circle { center, .. } => sketch.points.get(*center).map(|p| (p.x, p.y)),
+            _ => None,
+        }).unwrap_or((0.0, 0.0));
+        let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+        eprintln!("last cut is #{fi}: circle r={rad:.3} at sketch ({:.3},{:.3}), depth {distance:.3}", ctr.0, ctr.1);
+        eprintln!("  plane {o:?} normal {n:?}");
+
+        // Did any boolean fall back to the lossy BSP path? Manifold guarantees a 2-manifold
+        // result; the fallback does not, and a survived internal face is exactly what it leaves.
+        let _ = take_fallback_count();
+        let (before, _) = { let mut d = doc.clone(); d.rollback = fi; regenerate_mesh(&d).expect("body before the cut") };
+        eprintln!("  BSP fallbacks building up to the cut: {}", take_fallback_count());
+        let (after, _) = { let mut d = doc.clone(); d.rollback = fi + 1; regenerate_mesh(&d).expect("body after") };
+        eprintln!("  volume {:.3} → {:.3} (removed {:.3})", tri_vol(&before), tri_vol(&after), tri_vol(&before) - tri_vol(&after));
+
+        // Which TRIANGLES ended up inside the cut's own swept volume?
+        //
+        // Ray-marching a grid misses exactly the thing being looked for: a thin sheet standing
+        // parallel to the rays slips between them, and at a radius of 6.9 a 13x13 grid leaves 1.0
+        // between neighbours. Testing the mesh directly cannot miss it — anything with a centroid
+        // inside the cylinder the cut swept is material the cut should have taken.
+        let depth = *distance as f32;
+        let ctr_w = o + u * ctr.0 as f32 + v * ctr.1 as f32;
+        let inside_cut = |p: Vec3| -> Option<(f32, f32)> {
+            let d = p - ctr_w;
+            let along = -d.dot(n); // the cut bites along -n from the plane
+            let radial = (d - n * d.dot(n)).length();
+            (along > 0.02 && along < depth - 0.02 && radial < rad as f32 - 0.02).then_some((along, radial))
+        };
+        let mut inside: Vec<(Vec3, f32, f32)> = Vec::new();
+        for t in after.indices.chunks_exact(3) {
+            let a = Vec3::from_array(after.positions[t[0] as usize]);
+            let b = Vec3::from_array(after.positions[t[1] as usize]);
+            let c = Vec3::from_array(after.positions[t[2] as usize]);
+            let mid = (a + b + c) / 3.0;
+            if let Some((along, radial)) = inside_cut(mid) {
+                inside.push((mid, along, radial));
+            }
+        }
+        if inside.is_empty() {
+            eprintln!("  no triangles inside the cut's swept volume — it went right through");
+            return;
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for (p, _, _) in &inside {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        eprintln!(
+            "  {} triangles STILL INSIDE the cut, spanning {:.3} x {:.3} x {:.3}",
+            inside.len(),
+            hi.x - lo.x,
+            hi.y - lo.y,
+            hi.z - lo.z
+        );
+        eprintln!("    from ({:.3},{:.3},{:.3}) to ({:.3},{:.3},{:.3})", lo.x, lo.y, lo.z, hi.x, hi.y, hi.z);
+        let (amin, amax) = inside.iter().fold((f32::MAX, f32::MIN), |(x, y), (_, a, _)| (x.min(*a), y.max(*a)));
+        eprintln!("    {amin:.3} to {amax:.3} along the cut (of {depth:.3})");
+        // Is it MATERIAL, or a bare face standing in the void? A sheet with nothing behind it is
+        // an internal face the boolean failed to remove, not a piece of the part.
+        let mut solid_behind = 0;
+        let mut in_void = 0;
+        let mut buried = 0;
+        for t in after.indices.chunks_exact(3) {
+            let a = Vec3::from_array(after.positions[t[0] as usize]);
+            let b = Vec3::from_array(after.positions[t[1] as usize]);
+            let c = Vec3::from_array(after.positions[t[2] as usize]);
+            let mid = (a + b + c) / 3.0;
+            if inside_cut(mid).is_none() {
+                continue;
+            }
+            let fnorm = (b - a).cross(c - a);
+            if fnorm.length() < 1e-9 {
+                continue;
+            }
+            let fnorm = fnorm.normalize();
+            let eps = 0.02;
+            // A face on a real solid has material on exactly one side.
+            let front = point_inside_mesh(&after, mid + fnorm * eps);
+            let back = point_inside_mesh(&after, mid - fnorm * eps);
+            match (front, back) {
+                (true, true) => buried += 1,   // material on BOTH sides: an internal face
+                (false, false) => in_void += 1, // void on both: a sheet floating in a cavity
+                _ => solid_behind += 1,         // an ordinary boundary face
+            }
+        }
+        eprintln!("    of these: {solid_behind} ordinary boundary, {buried} BURIED (material both sides), {in_void} floating in void");
+        // Which planes do they lie in?
+        let mut planes: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        for (p, _, _) in &inside {
+            *planes.entry((p.y * 1000.0).round() as i64).or_default() += 1;
+        }
+        let mut top: Vec<(i64, usize)> = planes.into_iter().collect();
+        top.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        eprintln!("    heights (y x1000 → count): {:?}", &top[..top.len().min(6)]);
+        for (p, along, radial) in inside.iter().take(4) {
+            eprintln!("      ({:.3},{:.3},{:.3})  {along:.3} in, {radial:.3} out from the axis", p.x, p.y, p.z);
+        }
+    }
+
+    #[test]
+    #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_cut_slivers -- --ignored --nocapture
+    fn diag_cut_slivers() {
+        // What is left behind by a Cut? Probes the void the cut should have opened and reports any
+        // material still standing in it, plus the thinnest triangles in the body.
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        // The cut's own parameters, straight from the document.
+        let cut = doc.features.iter().find_map(|f| match &f.kind {
+            FeatureKind::Cut { plane, distance, sketch, region_pts, .. } => Some((plane.clone(), *distance, sketch.clone(), region_pts.clone())),
+            _ => None,
+        });
+        let Some((plane, depth, sketch, region_pts)) = cut else { eprintln!("no Cut feature"); return };
+        let rad = sketch.entities.iter().find_map(|e| match e {
+            SketchEntity::Circle { radius, .. } => Some(*radius),
+            _ => None,
+        }).unwrap_or(0.0);
+        let o = Vec3::new(plane.origin[0] as f32, plane.origin[1] as f32, plane.origin[2] as f32);
+        let u = Vec3::new(plane.u[0] as f32, plane.u[1] as f32, plane.u[2] as f32);
+        let v = Vec3::new(plane.v[0] as f32, plane.v[1] as f32, plane.v[2] as f32);
+        let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
+        eprintln!("cut plane origin {o:?} normal {n:?} depth {depth} circle r={rad}");
+        eprintln!("region_pts {region_pts:?}");
+        // Does the STORED plane get used, or is it reprojected onto the face at regen? Probe down
+        // the cut's own quadrant and find where material actually starts and stops.
+        {
+            let (m0, _) = regenerate_mesh(&doc).expect("body");
+            let probe = |world: Vec3| point_inside_mesh(&m0, world);
+            if let Some(rp) = region_pts.first() {
+                let s = o + u * (rp[0] as f32) + v * (rp[1] as f32);
+                // Walk along the cut direction from well above the plane to well below it.
+                let mut floor = None;
+                let mut roof = None;
+                let mut prev = false;
+                for k in -4000..=8000 {
+                    let d = k as f32 * 0.0005;
+                    let solid = probe(s - n * d);
+                    if solid && !prev {
+                        roof.get_or_insert(d);
+                    }
+                    if !solid && prev {
+                        floor = Some(d);
+                    }
+                    prev = solid;
+                }
+                let at = |d: f32| (s - n * d).y;
+                eprintln!(
+                    "along the cut from the STORED plane (y={:.5}): material starts {:?} and ends {:?}",
+                    s.y,
+                    roof.map(|d| format!("{:.4} in (y={:.5})", d, at(d))),
+                    floor.map(|d| format!("{:.4} in (y={:.5})", d, at(d)))
+                );
+            }
+        }
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        eprintln!("body: {} tris, manifold={}", mesh.indices.len() / 3, hworks_geometry::is_manifold(&mesh));
+        let vol = tri_vol(&mesh);
+        eprintln!("volume {vol:.3}");
+
+        // Probe the void: the sketch region swept `depth` along -normal. Sample in sketch
+        // coordinates around the region point so the quadrant comes from the document.
+        let Some(rp) = region_pts.first() else { return };
+        let (rx, ry) = (rp[0] as f32, rp[1] as f32);
+        let (mut solid, mut total) = (0usize, 0usize);
+        let mut worst: Option<(Vec3, f32)> = None;
+        let steps = 60;
+        for i in 0..=steps {
+            for j in 0..=steps {
+                // Sample the quarter's sketch-space box, keeping points inside the circle and on
+                // the region point's side of both axes.
+                // Strictly INSIDE: a probe sitting exactly on the cut's own boundary plane reads as
+                // inside the mesh whichever way the boolean went, so it measures nothing at all.
+                let inset = rad as f32 * 0.015;
+                let sx = (inset + (rad as f32 - inset) * (i as f32 / steps as f32)) * rx.signum();
+                let sy = (inset + (rad as f32 - inset) * (j as f32 / steps as f32)) * ry.signum();
+                if (sx * sx + sy * sy).sqrt() > rad as f32 * 0.985f32 {
+                    continue; // stay off the wall itself
+                }
+                for k in 1..10 {
+                    // Depth fractions, skipping the very ends so the probe is unambiguous.
+                    let d = depth as f32 * (k as f32 / 10.0);
+                    let p = o + u * sx + v * sy - n * d;
+                    total += 1;
+                    if point_inside_mesh(&mesh, p) {
+                        solid += 1;
+                        let from_axis = ((p - o).dot(u).powi(2) + (p - o).dot(v).powi(2)).sqrt();
+                        let key = rad as f32 - from_axis; // how far in from the wall it stands
+                        if worst.map_or(true, |(_, w)| key > w) {
+                            worst = Some((p, key));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("LEFTOVER material in the cut void: {solid} of {total} probes");
+        if let Some((p, k)) = worst {
+            eprintln!("   deepest leftover at ({:.4},{:.4},{:.4}) — {k:.4} in from the wall", p.x, p.y, p.z);
+        }
+        // WHERE are they? Two candidates look alike in a total: a skin left against the coincident
+        // wall, or a wedge standing along the region's straight edges. Bucket by distance from the
+        // axis and by depth to tell them apart.
+        {
+            let mut by_depth = vec![0usize; 10];
+            let mut by_ring = vec![0usize; 10];
+            let (mut rmin, mut rmax) = (f32::MAX, 0.0f32);
+            let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+            let mut near_axis = 0usize;
+            for i in 0..=steps {
+                for j in 0..=steps {
+                    let inset = rad as f32 * 0.015;
+                    let sx = (inset + (rad as f32 - inset) * (i as f32 / steps as f32)) * rx.signum();
+                    let sy = (inset + (rad as f32 - inset) * (j as f32 / steps as f32)) * ry.signum();
+                    let fr = (sx * sx + sy * sy).sqrt();
+                    if fr > rad as f32 * 0.985f32 {
+                        continue;
+                    }
+                    for k in 1..10 {
+                        let d = depth as f32 * (k as f32 / 10.0);
+                        let p = o + u * sx + v * sy - n * d;
+                        if point_inside_mesh(&mesh, p) {
+                            by_depth[k] += 1;
+                            by_ring[((fr / rad as f32) * 9.99) as usize] += 1;
+                            rmin = rmin.min(fr);
+                            rmax = rmax.max(fr);
+                            ymin = ymin.min(p.y);
+                            ymax = ymax.max(p.y);
+                            // "Along the straight edges" = close to one of the two sketch axes.
+                            if sx.abs().min(sy.abs()) < rad as f32 * 0.06 {
+                                near_axis += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("   spread: radius {rmin:.3}..{rmax:.3} of {rad:.3}, height {ymin:.4}..{ymax:.4}");
+            eprintln!("   by depth below the cut plane (0.2 .. 1.8): {by_depth:?}");
+            eprintln!("   by ring, axis → wall:                      {by_ring:?}");
+            eprintln!("   hugging one of the region's straight edges: {near_axis} of {solid}");
+        }
+        // Thinnest triangles: a sliver shows up as a long, near-zero-area face.
+        let mut slivers: Vec<(f32, Vec3)> = Vec::new();
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            let area = (b - a).cross(c - a).length() * 0.5;
+            let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+            if longest > 1e-4 && area / longest < 1e-3 {
+                slivers.push((area, (a + b + c) / 3.0));
+            }
+        }
+        slivers.sort_by(|x, y| x.0.total_cmp(&y.0));
+        eprintln!("needle triangles (height under 1e-3): {}", slivers.len());
+        for (a, m) in slivers.iter().take(6) {
+            eprintln!("   area {a:.3e} at ({:.4},{:.4},{:.4})", m.x, m.y, m.z);
+        }
+        // A sub-pixel triangle is invisible as a surface — what would SHOW is the lines it makes
+        // the edge detector draw. Compare the body's drawn edges against the same body without
+        // the cut, and report anything short or stranded.
+        {
+            let tess = mesh_tessellation(mesh.clone());
+            let mut before = doc.clone();
+            before.rollback = doc.features.iter().position(|f| matches!(f.kind, FeatureKind::Cut { .. })).unwrap_or(0);
+            let base = regenerate_mesh(&before).map(|(m, _)| mesh_tessellation(m).edges.len()).unwrap_or(0);
+            let elen = |e: &[[f32; 3]; 2]| Vec3::from_array(e[0]).distance(Vec3::from_array(e[1]));
+            let mut short: Vec<&[[f32; 3]; 2]> = tess.edges.iter().filter(|e| elen(e) < 0.05).collect();
+            short.sort_by(|a, b| elen(a).total_cmp(&elen(b)));
+            eprintln!("drawn edges: {} (uncut body had {base}); {} shorter than 0.05", tess.edges.len(), short.len());
+            for e in short.iter().take(6) {
+                let m = (Vec3::from_array(e[0]) + Vec3::from_array(e[1])) * 0.5;
+                eprintln!("   len {:.2e} at ({:.4},{:.4},{:.4})  r={:.4}", elen(e), m.x, m.y, m.z, (m.x * m.x + m.z * m.z).sqrt());
             }
         }
     }
@@ -32733,7 +33938,7 @@ mod tests {
                 eprintln!("  corner-line vertex y={y:.4} off-line={dr:.5}");
             }
         }
-        let seg = ((radius * 6.0).round() as usize).clamp(3, 12);
+        let seg = fillet_segments();
         let (surg, _) = bevel_mesh_and_edges(&pre, radius, seg, &edges);
         match surg {
             Some(m) => eprintln!("surgery: SUCCEEDED, flaps {}", count_flaps(&m)),
@@ -33016,6 +34221,63 @@ mod tests {
         // floor, or it is a hang waiting to happen.
         assert!(ROBUST_TOL >= ARC_BOOL_MIN_TOL, "the ladders' loosest rung must still be able to use exact arcs");
         assert!(COINCIDENT_TOL < ARC_BOOL_MIN_TOL, "the tight rung must run faceted");
+    }
+
+    /// A cut whose wall lands exactly on the body's leaves no degenerate geometry behind.
+    ///
+    /// From "bad extrude cut.hcad": a cylinder, then a quarter notch cut with a circle SNAPPED to
+    /// the same radius — so the tool's wall sits exactly on the body's. The snap is doing what it
+    /// should; what it exposes is a coincident-face boolean, which left the wall carrying needle
+    /// triangles of 4e-9 and 1e-7 and drew stray micro-edges over them. Nothing caught it because
+    /// the cut is otherwise perfect: manifold, right volume, and the void genuinely empty.
+    ///
+    /// `clear_coincident_cut_walls` widens the profile off the coincidence, but only where the
+    /// material has already ended just outside it, so a pocket's interior wall keeps its dimension.
+    #[test]
+    fn a_cut_flush_with_the_wall_leaves_no_needles() {
+        // The real file's numbers exactly: the plane sits 0.0053 ABOVE the top face (it snapped to
+        // a 1/32 grid, not onto the face), and the two radii carry the sketch solver's residue.
+        let r = 4.721334934234619_f64;
+        let h = 5.025900363922119_f64;
+        let plane_z = 5.03125_f64;
+        let mut doc = Document::with_default_planes();
+        let mut base = Sketch::default();
+        let bc = base.add_point(0.0, 0.0);
+        base.add_circle(bc, r);
+        doc.add_feature(FeatureKind::Extrude { sketch: base, regions: vec![], region_pts: vec![], plane: xy(), distance: h, back: 0.0, thin: 0.0, thin_side: 0 });
+        // The quarter: the SAME circle, plus the two radii bounding it.
+        let mut cs = Sketch::default();
+        let c0 = cs.add_point(0.0, 0.0);
+        cs.add_circle(c0, r);
+        let p1 = cs.add_point(-0.00000005999614671736708, r);
+        let p2 = cs.add_point(r, 0.00000011427722057533174);
+        cs.add_line(p1, c0, false);
+        cs.add_line(c0, p2, false);
+        let top = PlaneRef { origin: [0.0, 0.0, plane_z], u: [1.0, 0.0, 0.0], v: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0], datum: false };
+        doc.add_feature(FeatureKind::Cut { sketch: cs, regions: vec![0], region_pts: vec![[r * 0.61, r * 0.61]], plane: top, distance: 2.0, back: 0.0, thin: 0.0, thin_side: 0 });
+        doc.rollback = doc.features.len();
+        let (mesh, _) = regenerate_mesh(&doc).expect("body");
+        assert!(hworks_geometry::is_manifold(&mesh), "the flush cut is not manifold");
+
+        // Still the right cut: a 32-gon prism less a quarter of it over the cut depth.
+        let vol = tri_vol(&mesh);
+        let poly = 16.0 * r * r * (std::f64::consts::TAU / 32.0).sin(); // 32-gon area
+        let want = poly * h - poly * 0.25 * 2.0;
+        assert!((vol - want).abs() < want * 0.02, "volume {vol:.3}, expected about {want:.3}");
+
+        // The point of the exercise: no needles. A degenerate triangle is one with no HEIGHT —
+        // area over its longest side. Before the clearance this held two at 9e-8 and 2e-6.
+        let mut thinnest = f32::MAX;
+        for t in mesh.indices.chunks_exact(3) {
+            let a = Vec3::from_array(mesh.positions[t[0] as usize]);
+            let b = Vec3::from_array(mesh.positions[t[1] as usize]);
+            let c = Vec3::from_array(mesh.positions[t[2] as usize]);
+            let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+            if longest > 1e-4 {
+                thinnest = thinnest.min((b - a).cross(c - a).length() * 0.5 / longest);
+            }
+        }
+        assert!(thinnest > 1e-5, "a triangle only {thinnest:.2e} tall survives on the flush wall");
     }
 
     #[test]

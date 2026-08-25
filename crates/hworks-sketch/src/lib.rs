@@ -304,6 +304,20 @@ impl Region {
 }
 
 /// A 2D sketch bound to a plane (or, from M5, a planar face of a solid).
+/// How small a circle may be, as a fraction of the sketch's own size, before it cannot be built.
+///
+/// A FRACTION, not a fixed length. Everything here is scale-free by design — the weld grid is a
+/// fraction of the bounding diagonal precisely so a sketch works whether it is drawn in microns
+/// or metres — and an absolute floor breaks that: a 0.002 hole is a needle in a 12 wide part and
+/// a perfectly ordinary one in a part 0.01 across.
+///
+/// The value is measured (`diag_needle_hole_threshold`). On a ⌀12 disc the extrude comes out
+/// non-manifold at hole radius 0.025 and sound at 0.03 — 0.0025 of the part's own extent — because
+/// a circle is tessellated into a fixed number of segments, so shrinking it eventually pushes them
+/// under the tolerances the mesh kernel welds and triangulates at. Below this a hole is not a small
+/// hole but a broken body.
+pub const MIN_BUILDABLE_RADIUS_FRACTION: f64 = 0.0025;
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Sketch {
     pub points: Vec<Point2>,
@@ -599,6 +613,44 @@ impl Sketch {
     /// own selectable disk, so a loop fully inside another (e.g. a circle within a
     /// circle) can still be picked. Nested regions are excluded from the "all contours"
     /// default (they'd double-cover their owner), but are individually selectable.
+    /// The smallest radius a circle in THIS sketch may have and still be buildable.
+    ///
+    /// Scaled to the sketch's own bounding diagonal — see [`MIN_BUILDABLE_RADIUS_FRACTION`].
+    pub fn needle_radius(&self) -> f64 {
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for p in &self.points {
+            lo[0] = lo[0].min(p.x);
+            lo[1] = lo[1].min(p.y);
+            hi[0] = hi[0].max(p.x);
+            hi[1] = hi[1].max(p.y);
+        }
+        // Points alone can be one spot (a lone circle's centre); fall back to the circles.
+        let mut diag = if lo[0].is_finite() { ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt() } else { 0.0 };
+        for e in &self.entities {
+            if let SketchEntity::Circle { radius, .. } = e {
+                diag = diag.max(*radius * 2.0);
+            }
+        }
+        diag * MIN_BUILDABLE_RADIUS_FRACTION
+    }
+
+    /// Circles too small to build with — the radius of each, for reporting to the user.
+    ///
+    /// These are skipped when a profile is built, so without this they would vanish silently: the
+    /// part would come out right while the sketch still showed a feature that isn't there. A file
+    /// made before the draw-time guard can carry one, and the user has no way to spot a ⌀0.02
+    /// circle on screen.
+    pub fn needle_circles(&self) -> Vec<f64> {
+        let floor = self.needle_radius();
+        self.entities
+            .iter()
+            .filter_map(|e| match e {
+                SketchEntity::Circle { radius, construction: false, .. } if *radius < floor => Some(*radius),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn regions(&self) -> Vec<Region> {
         let faces = self.arrangement_faces();
         let n = faces.len();
@@ -644,6 +696,7 @@ impl Sketch {
     /// returned with a per-edge tag saying which circle/arc entity (if any) that
     /// edge was sampled from — the raw material for [`ArcSpan`] annotations.
     fn arrangement_faces(&self) -> Vec<(Vec<[f64; 2]>, Vec<Option<CurveTag>>)> {
+        let needle_floor = self.needle_radius();
         let mut segs: Vec<TagSeg> = Vec::new();
         for (ei, e) in self.entities.iter().enumerate() {
             match e {
@@ -653,6 +706,23 @@ impl Sketch {
                     }
                 }
                 SketchEntity::Circle { center, radius, construction: false } => {
+                    // A circle too small to tessellate cannot be part of a profile.
+                    //
+                    // Every circle becomes SEG segments; below a certain size those are shorter
+                    // than the tolerances the mesh kernel welds and triangulates at, and the
+                    // result is not a small hole but a BROKEN body — non-manifold from the
+                    // extrude onwards, with every boolean after it inheriting the damage. In
+                    // pinch.hcad a stray r=0.01 circle did exactly that: the finished part came
+                    // out non-manifold at 62,517 triangles where the same shape without it is
+                    // sound at 1,244.
+                    //
+                    // The floor is measured, not chosen (`diag_needle_hole_threshold`): on a ⌀12
+                    // disc, r=0.025 gives a non-manifold body and r=0.03 a sound one. Skipping is
+                    // the only safe reading — such a hole cannot be built at any tolerance this
+                    // kernel works at, so honouring it means shipping a corrupt solid.
+                    if *radius < needle_floor {
+                        continue;
+                    }
                     if let Some(c) = self.points.get(*center) {
                         let tag = Some(CurveTag { id: ei, center: [c.x, c.y], radius: *radius });
                         // Finer than the rendering tessellation: a circular profile becomes a
@@ -1822,6 +1892,37 @@ impl Sketch {
                 if let SketchEntity::Slot { a, b, radius, .. } = e {
                     if (*a == sa && *b == sb) || (*a == sb && *b == sa) {
                         *radius = (value * 0.5).max(1e-4);
+                    }
+                }
+            }
+        }
+        // A Radius/Diameter on one of a slot's END CENTRES drives the same half-width, so the
+        // thickness can be given either way round: across the slot as a width, or on the round
+        // end as the radius it actually is. Machinists reach for whichever the drawing uses, and
+        // an end cap IS a semicircle — there is no reason to make them convert it by hand.
+        //
+        // Keyed on the end point, exactly as SlotWidth is keyed on the pair, so nothing has to
+        // know which of the two ends was clicked.
+        let end_radii: Vec<(usize, f64)> = self
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::Radius { center, value, diameter, .. } => {
+                    Some((*center, if *diameter { *value * 0.5 } else { *value }))
+                }
+                _ => None,
+            })
+            .collect();
+        for (center, r) in end_radii {
+            // Only when that point is a slot end and NOT a circle's centre — a real circle owns
+            // its radius, and a point serving both would otherwise be read twice.
+            if self.entities.iter().any(|e| matches!(e, SketchEntity::Circle { center: c, .. } if *c == center)) {
+                continue;
+            }
+            for e in self.entities.iter_mut() {
+                if let SketchEntity::Slot { a, b, radius, .. } = e {
+                    if *a == center || *b == center {
+                        *radius = r.max(1e-4);
                     }
                 }
             }

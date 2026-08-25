@@ -1374,6 +1374,120 @@ fn fillet_swept(mesh: &TriMesh, radius: f64, chain: &[[f64; 3]]) -> Option<(TriM
         p.push((r, pad)); // above the cap (air)
         p
     };
+    // An open pick's tool is capped square where the pick stops. That is right whenever the rim
+    // stops because the USER stopped picking — the fillet must not run past what was asked for.
+    // It is wrong where the rim stops because the FACE it sat on has been cut away: there the tool
+    // ends flush against the cut's wall, and the material caught between the tool and the cut is
+    // left as a sheet of nothing. On filletrwallerror.hcad — a hole rim filleted after a quarter of
+    // the top was cut off — that sheet stands 402 probes deep and measures 0.0000 thick.
+    //
+    // So a SUBTRACTIVE tool runs on past the end, one rim station at a time, for as long as the
+    // corner it is filleting has ceased to exist. Where the rim genuinely continues, the corner is
+    // still there at the next station and the overrun stops at once, so a partial pick on an
+    // uncut rim is capped exactly where it always was. Where the face has gone, every probe is
+    // air and the extra sweep removes nothing that was there — it only clears the remnant.
+    //
+    // Additive tools get no overrun. Running one into air does not clear anything, it deposits a
+    // fin of material in the void.
+    let extended: Vec<V3>;
+    let chain = if closed || concave {
+        chain
+    } else {
+        // Rotation about the rim's own axis, so the overrun follows the arc instead of flying off
+        // its tangent (this rim's radius is 1.5 against a 1.85 fillet — a straight extension would
+        // leave the rim almost immediately).
+        //
+        // About the RIM's centre, which is not the chain's centroid: the centroid of a partial arc
+        // sits well inside it, and rotating about that walks the stations off the rim and down into
+        // the material, where every probe reads solid and the overrun never stops. Fit the centre
+        // from three stations instead (circumcentre, first/middle/last).
+        let circumcentre = {
+            let (a, b, c) = (chain[0], chain[nn / 2], chain[nn - 1]);
+            let (ab, ac) = (sub(b, a), sub(c, a));
+            let nv = cross(ab, ac);
+            let n2 = dot(nv, nv);
+            if n2 < 1e-12 {
+                None // the three are collinear: not an arc, so nothing to follow
+            } else {
+                let t1 = scale(cross(nv, ab), dot(ac, ac));
+                let t2 = scale(cross(ac, nv), dot(ab, ab));
+                Some(add(a, scale(add(t1, t2), 1.0 / (2.0 * n2))))
+            }
+        };
+        let Some(center) = circumcentre else { return sweep_profile(&profile, chain, axis, w_sign, closed).map(|t| (t, concave)) };
+        let rot = |p: V3, ang: f64| -> V3 {
+            let v = sub(p, center);
+            let (c, s) = (ang.cos(), ang.sin());
+            add(center, add(add(scale(v, c), scale(cross(axis0, v), s)), scale(axis0, dot(axis0, v) * (1.0 - c))))
+        };
+        let step_between = |a: V3, b: V3| -> f64 {
+            let flat = |p: V3| { let d = sub(p, center); sub(d, scale(axis0, dot(d, axis0))) };
+            let (pa, pb) = (flat(a), flat(b));
+            dot(cross(pa, pb), axis0).atan2(dot(pa, pb))
+        };
+        // May the sweep run through this station? Only if it would take nothing: the quadrant the
+        // tool bites into must already be air.
+        //
+        // "Has the corner stopped being a corner" is the tempting test and it is not safe. Where
+        // this rim passes under the sector boss the wall runs straight through, so the corner is
+        // indeed gone — but the material is still there, and sweeping on cuts a groove into a
+        // flush wall (measured: 0.577 removed where the pick's own fillet takes 0.084). What
+        // matters is not whether there is a corner but whether there is anything left to remove.
+        let takes_nothing = |p: V3, fwd: V3| -> bool {
+            let u = norm(cross(fwd, axis0));
+            if len(u) < 0.5 {
+                return false; // degenerate frame: refuse to extend
+            }
+            !inside(add(p, add(scale(axis0, sa * e), scale(u, su * e))))
+        };
+        let radius_at = {
+            let d = sub(chain[0], center);
+            len(sub(d, scale(axis0, dot(d, axis0)))).max(1e-9)
+        };
+        let max_steps = 24usize;
+        let mut head: Vec<V3> = Vec::new(); // grows backwards off chain[0]
+        let mut tail: Vec<V3> = Vec::new();
+        // `head` walks backwards off chain[0], so its FORWARD tangent (the one the frame that
+        // chose (sa, su) was read in) points from the new station back toward the chain.
+        for (from, to, backwards, out) in [
+            (chain[1], chain[0], true, &mut head),
+            (chain[nn - 2], chain[nn - 1], false, &mut tail),
+        ] {
+            let step = step_between(from, to);
+            if step.abs() < 1e-9 {
+                continue;
+            }
+            let mut last = to;
+            let mut run = 0.0;
+            for _ in 0..max_steps {
+                if run >= radius {
+                    break; // a fillet cannot reach further than its own radius past the end
+                }
+                let next = rot(last, step);
+                let fwd = if backwards { norm(sub(last, next)) } else { norm(sub(next, last)) };
+                let free = takes_nothing(next, fwd);
+                if std::env::var("HCAD_OVERRUN_DEBUG").is_ok() {
+                    eprintln!("  overrun probe at ({:.3},{:.3},{:.3}): {}",
+                        next[0], next[1], next[2], if free { "air — extend" } else { "material — STOP" });
+                }
+                if !free {
+                    break; // there is still material here: stop where the pick stopped
+                }
+                run += step.abs() * radius_at;
+                out.push(next);
+                last = next;
+            }
+        }
+        if head.is_empty() && tail.is_empty() {
+            chain
+        } else {
+            head.reverse();
+            head.extend_from_slice(chain);
+            head.extend(tail);
+            extended = head;
+            &extended[..]
+        }
+    };
     let tool = sweep_profile(&profile, chain, axis, w_sign, closed)?;
     Some((tool, concave))
 }
