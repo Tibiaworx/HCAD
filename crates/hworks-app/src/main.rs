@@ -33626,6 +33626,84 @@ mod tests {
         }
     }
 
+    /// sliver.hcad, checked in: a tube, two sector cuts, and three fillets whose stored
+    /// polylines and flush contacts found three separate engine bugs (2026-08-25). Every
+    /// fillet must MOVE material — the cut lateral-clearance work tilts the cut walls ~0.1
+    /// degrees, and the old face-finding then mis-paired faces for the pre-tilt polylines and
+    /// silently dropped fillet 5 — and the finished body must carry no hair-thin walls and no
+    /// zero-thickness folds: the flush films and the cantilevered fill wedge measured 7.97 of
+    /// thin area before the fixes ("very thin sliver coming from the fillet").
+    #[test]
+    fn sliver_hcad_fillets_all_apply_and_leave_no_thin_walls() {
+        let path = format!("{}/testdata/sliver.hcad", env!("CARGO_MANIFEST_DIR"));
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+            }
+            v.abs()
+        };
+        let mut prev = None;
+        for stop in 4..=doc.features.len() {
+            let mut d = doc.clone();
+            d.rollback = stop;
+            let (m, _) = regenerate_mesh(&d).expect("regen");
+            let v = vol(&m);
+            if let (Some(pv), Some(f)) = (prev, doc.features.get(stop - 1)) {
+                if matches!(f.kind, FeatureKind::Fillet { .. }) {
+                    let moved: f64 = v - pv;
+                    assert!(
+                        moved.abs() > 0.5,
+                        "fillet (feature {}) moved only {moved:+.4} — it silently did nothing",
+                        stop - 1
+                    );
+                }
+            }
+            prev = Some(v);
+        }
+        let (m, _) = regenerate_mesh(&doc).expect("full regen");
+        assert!(hworks_geometry::is_manifold(&m), "final body not manifold");
+        // No standing hair-thin material, no zero-thickness folds. Micro seam debris from the
+        // booleans measures ~0.01; the films and the blade measured 7.97.
+        let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+        let tris: Vec<[[f64; 3]; 3]> = m.indices.chunks_exact(3).map(|t| [g(t[0]), g(t[1]), g(t[2])]).collect();
+        let sub3 = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let cross3 = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let dot3 = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        use std::collections::HashMap as HM;
+        let key = |q: [f64; 3]| ((q[0] * 1e4).round() as i64, (q[1] * 1e4).round() as i64, (q[2] * 1e4).round() as i64);
+        let mut owners: HM<((i64, i64, i64), (i64, i64, i64)), Vec<[f64; 3]>> = HM::new();
+        for t in &tris {
+            let n = cross3(sub3(t[1], t[0]), sub3(t[2], t[0]));
+            let nl = dot3(n, n).sqrt();
+            let longest = [sub3(t[1], t[0]), sub3(t[2], t[1]), sub3(t[0], t[2])]
+                .iter().map(|d| dot3(*d, *d).sqrt()).fold(0.0f64, f64::max);
+            if nl < 1e-12 || longest < 1e-9 || nl / longest < 1e-2 {
+                continue;
+            }
+            let nrm = [n[0] / nl, n[1] / nl, n[2] / nl];
+            for (u, v2) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (ku, kv) = (key(u), key(v2));
+                let e = if ku <= kv { (ku, kv) } else { (kv, ku) };
+                owners.entry(e).or_default().push(nrm);
+            }
+        }
+        let mut folds = 0;
+        for own in owners.values() {
+            for i in 0..own.len() {
+                for j in i + 1..own.len() {
+                    if dot3(own[i], own[j]) < -0.87 {
+                        folds += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(folds, 0, "{folds} zero-thickness fold(s) stand on the finished body");
+    }
+
     #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_sticks_out -- --ignored --nocapture
     fn diag_sliver_hunt() {
@@ -33636,6 +33714,59 @@ mod tests {
         let Ok(path) = std::env::var("HCAD_FILE") else { return };
         let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
         let nfeat = doc.features.len();
+        // Per-feature volume deltas first: a feature whose delta is ~0 silently did nothing.
+        {
+            let mut prev = 0.0f64;
+            for stop in 4..=nfeat {
+                let mut d = doc.clone();
+                d.rollback = stop;
+                let (m, _) = regenerate_mesh(&d).expect("regen");
+                let mut v = 0.0f64;
+                for t in m.indices.chunks_exact(3) {
+                    let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                    let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+                }
+                let v = v.abs();
+                let kind = doc.features.get(stop - 1).map(|f| format!("{:?}", std::mem::discriminant(&f.kind))).unwrap_or_default();
+                eprintln!("  after feature {} ({kind}): vol {v:.4} (delta {:+.4})", stop - 1, v - prev);
+                prev = v;
+            }
+        }
+        // Which engine loses fillet 5? Rebuild to just before it and run both by hand.
+        {
+            let mut d = doc.clone();
+            d.rollback = 5; // planes + extrude + cut 4
+            let (body, _) = regenerate_mesh(&d).expect("regen to cut 4");
+            let vol = |m: &TriMesh| {
+                let mut v = 0.0f64;
+                for t in m.indices.chunks_exact(3) {
+                    let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                    let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                    v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+                }
+                v.abs()
+            };
+            let v0 = vol(&body);
+            if let Some(FeatureKind::Fillet { radius, edges }) = doc.features.get(5).map(|f| &f.kind) {
+                let seg = hworks_geometry::fillet_segments();
+                match hworks_geometry::bevel_mesh_selected(&body, *radius, seg, edges) {
+                    Some(m) => eprintln!("  fillet5 surgery: Some, delta {:+.4}, manifold {}", vol(&m) - v0, hworks_geometry::is_manifold(&m)),
+                    None => eprintln!("  fillet5 surgery: DECLINED"),
+                }
+                match hworks_geometry::round_mesh(&body, *radius, edges) {
+                    Some(m) => eprintln!("  fillet5 csg round: Some, delta {:+.4}, manifold {}", vol(&m) - v0, hworks_geometry::is_manifold(&m)),
+                    None => eprintln!("  fillet5 csg round: DECLINED"),
+                }
+                // ...and each edge alone, to see if one side works.
+                for (i, ch) in edges.iter().enumerate() {
+                    match hworks_geometry::round_mesh(&body, *radius, std::slice::from_ref(ch)) {
+                        Some(m) => eprintln!("    edge {i} alone csg: Some, delta {:+.4}", vol(&m) - v0),
+                        None => eprintln!("    edge {i} alone csg: DECLINED"),
+                    }
+                }
+            }
+        }
         for stop in [nfeat - 2, nfeat] {
             let mut d = doc.clone();
             d.rollback = stop;
@@ -33673,9 +33804,12 @@ mod tests {
                         let ang = d0.acos().to_degrees();
                         if ang > 150.0 && own[i].1.min(own[j].1) > 0.01 {
                             if fins < 8 {
-                                eprintln!("  FIN {ang:.0}deg alt {:.3}/{:.3} at ({:.3},{:.3},{:.3})",
+                                eprintln!("  FIN {ang:.0}deg alt {:.3}/{:.3} at ({:.3},{:.3},{:.3}) n1=({:.2},{:.2},{:.2}) n2=({:.2},{:.2},{:.2}) edge ({:.4},{:.4},{:.4})-({:.4},{:.4},{:.4})",
                                     own[i].1, own[j].1,
-                                    (e.0.0 + e.1.0) as f64 * 0.5e-4, (e.0.1 + e.1.1) as f64 * 0.5e-4, (e.0.2 + e.1.2) as f64 * 0.5e-4);
+                                    (e.0.0 + e.1.0) as f64 * 0.5e-4, (e.0.1 + e.1.1) as f64 * 0.5e-4, (e.0.2 + e.1.2) as f64 * 0.5e-4,
+                                    own[i].0[0], own[i].0[1], own[i].0[2], own[j].0[0], own[j].0[1], own[j].0[2],
+                                    e.0.0 as f64 * 1e-4, e.0.1 as f64 * 1e-4, e.0.2 as f64 * 1e-4,
+                                    e.1.0 as f64 * 1e-4, e.1.1 as f64 * 1e-4, e.1.2 as f64 * 1e-4);
                             }
                             fins += 1;
                         }
@@ -33721,6 +33855,90 @@ mod tests {
                             e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2],
                             (((e[1][0]-e[0][0]).powi(2) + (e[1][1]-e[0][1]).powi(2) + (e[1][2]-e[0][2]).powi(2)) as f32).sqrt());
                     }
+                }
+            }
+            // Thin REAL walls: material whose local thickness is far below anything sketched.
+            // From each triangle's centroid, march inward along -normal to the nearest opposite
+            // surface; cluster hits under 0.25 (the tube wall itself is 0.78 thick).
+            {
+                let tris: Vec<[[f64; 3]; 3]> = mesh
+                    .indices
+                    .chunks_exact(3)
+                    .map(|t| [g(t[0]), g(t[1]), g(t[2])])
+                    .collect();
+                let ray_hit = |o: [f64; 3], dir: [f64; 3], skip: usize| -> f64 {
+                    let mut best = f64::MAX;
+                    for (ti, t) in tris.iter().enumerate() {
+                        if ti == skip { continue; }
+                        let (a, b, c) = (t[0], t[1], t[2]);
+                        let e1 = sub(b, a);
+                        let e2 = sub(c, a);
+                        let pv = cross(dir, e2);
+                        let det = dot(e1, pv);
+                        if det.abs() < 1e-12 { continue; }
+                        let inv = 1.0 / det;
+                        let tv = sub(o, a);
+                        let u = dot(tv, pv) * inv;
+                        if !(-1e-9..=1.0 + 1e-9).contains(&u) { continue; }
+                        let qv = cross(tv, e1);
+                        let v = dot(dir, qv) * inv;
+                        if v < -1e-9 || u + v > 1.0 + 1e-9 { continue; }
+                        let tt = dot(e2, qv) * inv;
+                        if tt > 1e-6 && tt < best { best = tt; }
+                    }
+                    best
+                };
+                let mut thin: Vec<([f64; 3], f64, f64)> = Vec::new(); // centroid, thickness, area
+                for (ti, t) in tris.iter().enumerate() {
+                    let (a, b, c) = (t[0], t[1], t[2]);
+                    let n = cross(sub(b, a), sub(c, a));
+                    let nl = len(n);
+                    if nl < 1e-12 { continue; }
+                    let nrm = [n[0] / nl, n[1] / nl, n[2] / nl];
+                    let cen = [(a[0]+b[0]+c[0])/3.0, (a[1]+b[1]+c[1])/3.0, (a[2]+b[2]+c[2])/3.0];
+                    let th = ray_hit(cen, [-nrm[0], -nrm[1], -nrm[2]], ti);
+                    if th < 0.25 {
+                        thin.push((cen, th, nl * 0.5));
+                    }
+                }
+                let total_area: f64 = thin.iter().map(|(_, _, ar)| ar).sum();
+                eprintln!("  thin-wall triangles (<0.25 thick): {} covering area {total_area:.4}", thin.len());
+                thin.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+                for (cen, th, ar) in thin.iter().take(16) {
+                    let rad = (cen[0]*cen[0] + cen[2]*cen[2]).sqrt();
+                    let ang = cen[2].atan2(cen[0]).to_degrees();
+                    eprintln!("    thick {th:.4} area {ar:.4} at ({:.3},{:.3},{:.3}) rad {rad:.3} ang {ang:.1}", cen[0], cen[1], cen[2]);
+                }
+            }
+            // Cross-section profile at ang 0 (the x+ radial plane): at mid-wall radius, probe
+            // solidity on a (z, y) grid to see the material's outline near the z=0 plane.
+            {
+                let tris: Vec<[[f64; 3]; 3]> = mesh
+                    .indices
+                    .chunks_exact(3)
+                    .map(|t| [g(t[0]), g(t[1]), g(t[2])])
+                    .collect();
+                let inside = |p: [f64; 3]| -> bool {
+                    let mut w = 0.0f64;
+                    for t in &tris {
+                        let (u, v2, c) = (sub(t[0], p), sub(t[1], p), sub(t[2], p));
+                        let (lu, lv, lc) = (len(u), len(v2), len(c));
+                        let den = lu * lv * lc + dot(u, v2) * lc + dot(v2, c) * lu + dot(c, u) * lv;
+                        w += 2.0 * dot(u, cross(v2, c)).atan2(den);
+                    }
+                    (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+                };
+                eprintln!("  profile at x=6.0 (rows y 6.99..4.0, cols z -0.6..+0.6 step 0.04; S=solid):");
+                let mut yy = 6.99;
+                while yy > 4.0 {
+                    let mut row = String::new();
+                    let mut z = -0.6;
+                    while z < 0.6 {
+                        row.push(if inside([6.0, yy, z]) { 'S' } else { '.' });
+                        z += 0.04;
+                    }
+                    eprintln!("    y={yy:5.2} {row}");
+                    yy -= 0.15;
                 }
             }
             // Where do the flat floors actually sit? Histogram of vertex y values.

@@ -663,3 +663,144 @@ fn stadium_slot_rim_fillets_as_one_tube() {
     assert!(crease < 20.0, "stadium rim [{engine}]: {crease:.1} degree crease along the tube");
     assert_no_sharp_edges_in(&m, pred, &format!("stadium rim [{engine}]"));
 }
+
+/// The area of material thinner than `max_thick` in the mesh, plus the area of exactly
+/// coincident fold-back sheets (zero thickness — invisible to a ray with a self-hit guard).
+/// This is what "a very thin sliver coming from the fillet" is made of.
+fn thin_area(m: &TriMesh, max_thick: f64) -> f64 {
+    let g = |i: u32| {
+        let q = m.positions[i as usize];
+        [q[0] as f64, q[1] as f64, q[2] as f64]
+    };
+    let tris: Vec<[[f64; 3]; 3]> = m.indices.chunks_exact(3).map(|t| [g(t[0]), g(t[1]), g(t[2])]).collect();
+    let geom = |t: &[[f64; 3]; 3]| {
+        let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+        let nl = len(n);
+        (nl, [n[0] / nl.max(1e-30), n[1] / nl.max(1e-30), n[2] / nl.max(1e-30)])
+    };
+    let mut area = 0.0f64;
+    for (ti, t) in tris.iter().enumerate() {
+        let (nl, nrm) = geom(t);
+        let longest = len(sub(t[1], t[0])).max(len(sub(t[2], t[1]))).max(len(sub(t[0], t[2])));
+        if nl < 1e-12 || longest < 1e-9 || nl / longest < 1e-3 {
+            continue;
+        }
+        let cen = [
+            (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+            (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+            (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+        ];
+        let dir = [-nrm[0], -nrm[1], -nrm[2]];
+        let mut thin = false;
+        for (ui, u) in tris.iter().enumerate() {
+            if ui == ti {
+                continue;
+            }
+            let (unl, un) = geom(u);
+            if unl < 1e-12 {
+                continue;
+            }
+            // A real-but-hair-thin wall: a ray along -normal meets an opposing face close by.
+            // (Exactly coincident zero-thickness folds are invisible to this ray — its self-hit
+            // guard rejects the opposite face at distance ~0 — so the caller pairs this with a
+            // fold check via max_band_crease.)
+            let e1 = sub(u[1], u[0]);
+            let e2 = sub(u[2], u[0]);
+            let pv = cross(dir, e2);
+            let det = dot(e1, pv);
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let tv = sub(cen, u[0]);
+            let uu = dot(tv, pv) * inv;
+            if !(-1e-9..=1.0 + 1e-9).contains(&uu) {
+                continue;
+            }
+            let qv = cross(tv, e1);
+            let vv = dot(dir, qv) * inv;
+            if vv < -1e-9 || uu + vv > 1.0 + 1e-9 {
+                continue;
+            }
+            let tt = dot(e2, qv) * inv;
+            if tt > 1e-6 && tt < max_thick && dot(un, dir) > 0.7 {
+                thin = true;
+                break;
+            }
+        }
+        if thin {
+            area += nl * 0.5;
+        }
+    }
+    area
+}
+
+/// sliver.hcad's disease, synthetically: a tube loses a quadrant to a cut; a CONCAVE fillet
+/// fills the corner where the cut floor meets a radial wall, leaning its tangent wedge on
+/// that wall; then a CONVEX fillet rounds the same wall's top rim — cutting away the wall
+/// the wedge leans on. Three things went wrong here once: the fill's flush union left
+/// 180-degree fins, the convex tool's flush difference left a 1.5e-4 film of wall over its
+/// whole band, and the fill's wedge stood as a cantilevered blade — 7.97 of thin area in
+/// all, "the thin walls on the fillets". The fix set: embedded fill flanks, the boolean
+/// judge measuring film area across both signs of every nudge, and the blade-gated slab
+/// that truncates the wedge at the band's foot.
+#[test]
+fn a_fillet_on_a_wall_a_fill_leans_on_leaves_no_blade() {
+    let n = 96usize;
+    let (ro, ri, h) = (6.4f64, 5.6f64, 7.0f64);
+    let ring = |rad: f64| -> Vec<[f64; 2]> {
+        (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [rad * a.cos(), rad * a.sin()]
+            })
+            .collect()
+    };
+    let bore: Vec<[f64; 2]> = ring(ri).iter().rev().copied().collect();
+    let tube = extrude_tool_mesh(&ring(ro), &[bore], &xy(), 0.0, h).unwrap();
+    // Cut the x>0, y<0 quadrant away from z=4 up.
+    let tool = extrude_tool_mesh(&[[0.0, 0.0], [10.0, 0.0], [10.0, -10.0], [0.0, -10.0]], &[], &xy(), 4.0, 4.0).unwrap();
+    let body = hworks_geometry::mesh_difference(&tube, &tool);
+    let vol = |m: &TriMesh| {
+        let mut v = 0.0f64;
+        for t in m.indices.chunks_exact(3) {
+            let g = |i: u32| {
+                let q = m.positions[i as usize];
+                [q[0] as f64, q[1] as f64, q[2] as f64]
+            };
+            v += dot(g(t[0]), cross(g(t[1]), g(t[2]))) / 6.0;
+        }
+        v.abs()
+    };
+    // Concave fillet on the floor edge under the y=0 radial wall.
+    let (r_fill, r_rim) = (2.4f64, 2.0f64);
+    let fill_edge = vec![vec![[ri, 0.0, 4.0], [ro, 0.0, 4.0]]];
+    let filled = round_mesh(&body, r_fill, &fill_edge).expect("the concave fill applies");
+    let added = vol(&filled) - vol(&body);
+    let want_fill = (1.0 - std::f64::consts::PI / 4.0) * r_fill * r_fill * (ro - ri);
+    assert!(
+        (added - want_fill).abs() < want_fill * 0.1,
+        "the fill added {added:.4}, a fillet adds {want_fill:.4}"
+    );
+    // Convex fillet on the same wall's top rim — the cut that used to expose the blade.
+    let rim_edge = vec![vec![[ri, 0.0, h], [ro, 0.0, h]]];
+    let (m, engine) = app_fillet(&filled, r_rim, &rim_edge);
+    assert!(is_manifold(&m), "[{engine}] result not manifold");
+    let removed = vol(&filled) - vol(&m);
+    assert!(
+        removed > 0.5 * (1.0 - std::f64::consts::PI / 4.0) * r_rim * r_rim * (ro - ri),
+        "[{engine}] the rim fillet barely cut ({removed:.4})"
+    );
+    // The point: no blade, no film, no folds. Seam debris measures ~0.01; the blade alone
+    // was 3, the flush films 5 more, and the doubled-membrane fins read as 180-degree folds.
+    let thin = thin_area(&m, 0.05);
+    assert!(
+        thin < 0.1,
+        "[{engine}] {thin:.4} of hair-thin material stands on the body — the blade or a film is back"
+    );
+    let crease = max_band_crease(&m, |_| true, 0.02);
+    assert!(
+        crease < 150.0,
+        "[{engine}] a {crease:.0}-degree fold stands on the body — a zero-thickness membrane is back"
+    );
+}

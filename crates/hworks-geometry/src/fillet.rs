@@ -159,30 +159,48 @@ fn adjacent_normals(tris: &[[V3; 3]], a: V3, b: V3, tol: f64) -> Option<(V3, V3)
         let proj = add(a, scale(dir, t.clamp(0.0, span)));
         len(sub(p, proj)) < tol
     };
-    let mut normals: Vec<V3> = Vec::new();
+    // Group candidate triangles into faces (by normal) and measure each face's SUPPORT: how
+    // much of the segment its on-segment vertices span. The edge's two true faces border the
+    // whole segment; a face that merely touches one endpoint — an outer wall whose seam vertex
+    // lands there, common after a boolean has moved geometry by a hair — supports none of it.
+    // Choosing "the two most divergent normals" over ALL candidates let such an interloper win
+    // the tie-break, and one skew pick here silently un-fillets the edge (measured on
+    // sliver.hcad: a cut wall tilted 0.1 degrees by lateral clearance put an outer-wall facet
+    // into the candidates, the floor lost, and the fillet became a no-op).
+    let mut groups: Vec<(V3, f64, f64)> = Vec::new(); // normal, min t, max t
     for t in tris {
-        if t.iter().filter(|&&v| on_seg(v)).count() >= 2 {
+        let on: Vec<f64> = t.iter().filter(|&&v| on_seg(v)).map(|&v| dot(sub(v, a), dir)).collect();
+        if on.len() >= 2 {
             let n = tri_normal(t[0], t[1], t[2]);
-            if normals.iter().all(|m| dot(*m, n) < 0.999) {
-                normals.push(n);
+            let (lo, hi) = on.iter().fold((f64::MAX, f64::MIN), |(l, h), &t| (l.min(t), h.max(t)));
+            match groups.iter_mut().find(|(m, _, _)| dot(*m, n) >= 0.999) {
+                Some((_, glo, ghi)) => {
+                    *glo = glo.min(lo);
+                    *ghi = ghi.max(hi);
+                }
+                None => groups.push((n, lo, hi)),
             }
         }
     }
-    if normals.len() >= 2 {
-        // The two most divergent normals (a feature edge can touch >2 coplanar tris).
+    let pick = |cands: &[(V3, f64, f64)]| -> Option<(V3, V3)> {
+        if cands.len() < 2 {
+            return None;
+        }
         let mut best = (0, 1, 2.0);
-        for i in 0..normals.len() {
-            for j in i + 1..normals.len() {
-                let d = dot(normals[i], normals[j]);
+        for i in 0..cands.len() {
+            for j in i + 1..cands.len() {
+                let d = dot(cands[i].0, cands[j].0);
                 if d < best.2 {
                     best = (i, j, d);
                 }
             }
         }
-        Some((normals[best.0], normals[best.1]))
-    } else {
-        None
-    }
+        Some((cands[best.0].0, cands[best.1].0))
+    };
+    // Faces bordering a real stretch of the edge first; the old any-candidate behaviour only
+    // if fewer than two such faces exist (very short segments of a subdivided chain).
+    let supported: Vec<(V3, f64, f64)> = groups.iter().copied().filter(|(_, lo, hi)| hi - lo > span * 0.3).collect();
+    pick(&supported).or_else(|| pick(&groups))
 }
 
 /// Extrude a planar polygon `cross` (in order) along `axis` (unit) by `length`, starting
@@ -772,11 +790,18 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                 continue;
             }
             let axis = norm(d);
+            let dbg = std::env::var("HCAD_FILLET_DEBUG").is_ok();
             let Some((n1, n2)) = adjacent_normals(&tris, a, b, tol.max(1e-3)) else {
+                if dbg {
+                    eprintln!("    fillet_boolean: no adjacent normals at seg ({a:?})-({b:?}), tol {:.5}", tol.max(1e-3));
+                }
                 continue;
             };
             let c = dot(n1, n2);
             if (1.0 + c).abs() < 1e-3 {
+                if dbg {
+                    eprintln!("    fillet_boolean: faces nearly opposite (c={c:.4}) at seg ({a:?})-({b:?})");
+                }
                 continue; // faces nearly opposite → no corner to round
             }
             // Convex vs concave: probe the four (n1, n2) quadrants at the edge midpoint and
@@ -795,6 +820,9 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                     }
                 }
             }
+            if dbg {
+                eprintln!("    fillet_boolean: seg ({a:?})-({b:?}) n1={n1:?} n2={n2:?} solid={solid}");
+            }
             // A small overrun past the edge ends so adjacent fillets meet at a corner,
             // but not so much that the cut's flat end shows on the neighbouring face.
             let margin = radius * 0.5;
@@ -804,11 +832,68 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
 
             if solid == 1 {
                 // Convex ridge: subtract the corner sliver (corner-prism − tangent cylinder).
+                //
                 let c0 = add(a, scale(add(n1, n2), -radius / (1.0 + c))); // centre, in material
                 let t1 = add(c0, scale(n1, radius));
                 let t2 = add(c0, scale(n2, radius));
                 let cross = [add(a, start_shift), add(t1, start_shift), add(t2, start_shift)];
                 let prism = extrude_prism(&cross, axis, total_len);
+                // A BLADE check per face: an earlier concave fill can lean on this very face
+                // from the far side, and cutting the face away leaves the fill's tangent wedge
+                // cantilevered — real material, 0.66 thick at the band's foot tapering to
+                // nothing at the fill's seam, the "thin wall coming from the fillet" on
+                // sliver.hcad (3.1 of blade area). A blade reads as material a HAIR beyond the
+                // face at mid-band with AIR at depth; a wall continuing flush past this one, or
+                // a boss standing against it, is material at depth too and is left alone. Only
+                // when a blade is present does a second tool run: a slab through the face over
+                // exactly the band and the segment — no end overrun, which on a curved rim
+                // would gouge whatever the next facet carries — truncating the fill square at
+                // the band's foot: a small honest step where two fillets collide, not a blade.
+                let blade_beyond = |n_out: V3, n_other: V3| -> bool {
+                    let stations = [0.25f64, 0.5, 0.75];
+                    let hair = (tol * 2.0).max(1e-4);
+                    let near_hit = stations.iter().any(|&f| {
+                        let s0 = add(add(a, scale(axis, f * l)), scale(n_other, -0.5 * radius));
+                        inside(add(s0, scale(n_out, hair)))
+                    });
+                    near_hit
+                        && stations.iter().all(|&f| {
+                            let s0 = add(add(a, scale(axis, f * l)), scale(n_other, -0.5 * radius));
+                            !inside(add(s0, scale(n_out, 0.5 * radius)))
+                        })
+                };
+                let mut slabs: Vec<TriMesh> = Vec::new();
+                for &(n_out, n_other, t_far) in &[(n1, n2, t1), (n2, n1, t2)] {
+                    if blade_beyond(n_out, n_other) {
+                        // Same end overrun as the main tool: the blade ends where the segment
+                        // does — on a wall — and a slab stopping flush there leaves a film of
+                        // that wall behind. Past the wall is air (that is what the far probe
+                        // established about this whole side), so the overrun takes nothing.
+                        // The slab's top and bottom faces are TILTED: exact at the wall plane
+                        // (P1 = the corner, P4 = the band foot, so the truncation meets the
+                        // band's tangent line without a step) and splayed 0.15r outward at the
+                        // far side, so neither face is parallel to the body's own planes. Flat
+                        // ends coincided with the band foot and the corner line and left
+                        // 180-degree seams there; a splayed face crosses the leaning material
+                        // transversally and coincides with nothing.
+                        // ...and its INNER face is sunk a fraction BEHIND the face plane, into
+                        // the region the main tool has already emptied. Stopping exactly at the
+                        // plane leaves a zero-thickness interface between the two cuts — the
+                        // main tool's flank meets the slab's face in the very plane, and the
+                        // nothing between them survives as a doubled membrane (all five
+                        // remaining fins on sliver.hcad were exactly that, +-x sheets lying in
+                        // the tilted wall plane).
+                        let splay = scale(n_other, 0.15 * radius);
+                        let sink = scale(n_out, -0.05 * radius);
+                        let rect = [
+                            add(add(a, sink), start_shift),
+                            add(add(add(a, scale(n_out, radius)), splay), start_shift),
+                            add(sub(add(t_far, scale(n_out, radius)), splay), start_shift),
+                            add(add(t_far, sink), start_shift),
+                        ];
+                        slabs.push(extrude_prism(&rect, axis, total_len));
+                    }
+                }
                 let uu = u(c0);
                 let w = norm(cross_perp(axis, uu));
                 let cyl = make_cylinder(add(c0, start_shift), axis, uu, w, radius, total_len, 48);
@@ -816,6 +901,12 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                 if tool.indices.len() >= 3 {
                     body = crate::mesh_difference(&body, &tool);
                     any = true;
+                }
+                for slab in &slabs {
+                    if slab.indices.len() >= 3 {
+                        body = crate::mesh_difference(&body, slab);
+                        any = true;
+                    }
                 }
                 // Record this convex edge's faces at both endpoints, for corner blending.
                 for &v in &[a, b] {
@@ -836,17 +927,29 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                 let t1 = add(c0, scale(n1, -radius)); // contact on face 1
                 let t2 = add(c0, scale(n2, -radius)); // contact on face 2
                 // Minimal fill: the notch corner bounded by the two faces (a→t1, t2→a) and
-                // the arc. Those side edges sit ON the existing faces (a coplanar union),
-                // so the fill never reaches past a wall the way a "dig into material"
-                // extension would (which pokes out a thin wall at a large radius).
-                let mut cross: Vec<V3> = vec![a, t1];
+                // the arc — with those side edges EMBEDDED a tolerance into the faces rather
+                // than lying on them. A coplanar union is a flush join, and a flush join that
+                // resolves through the tangency nudge leaves the nudge's offset as a film
+                // between fill and face (the old build's 180-degree fins at this very fill's
+                // seams). Translation is right HERE and wrong for the convex subtract above:
+                // an additive tool's tapering flank is inside material, where the union
+                // dissolves it, while a subtractive tool's taper faces air and sheds slivers
+                // finer than the weld grid. Rotating the fill about its contacts instead was
+                // tried and films at the tangent lines (3.1 of thin wall on sliver.hcad). The
+                // overlap adds no volume a fillet doesn't own — that sliver was material
+                // already — and the footprint prisms sink their base 10x this pad, so the
+                // clip keeps the embedded flanks.
+                let ae = sub(a, scale(add(n1, n2), tol));
+                let t1e = sub(t1, scale(n1, tol));
+                let t2e = sub(t2, scale(n2, tol));
+                let mut cross: Vec<V3> = vec![ae, t1e];
                 const ARC: usize = 16;
                 for k in 1..ARC {
                     let f = k as f64 / ARC as f64;
                     let dir = norm(add(scale(sub(t1, c0), 1.0 - f), scale(sub(t2, c0), f)));
                     cross.push(add(c0, scale(dir, radius)));
                 }
-                cross.push(t2);
+                cross.push(t2e);
                 // Swept LONG at both ends on purpose, then trimmed to the two faces it rests in.
                 // The old fill spanned exactly the edge, on the reasoning that a union past the
                 // end adds a stray tab — true, and it does, but stopping square to the edge is

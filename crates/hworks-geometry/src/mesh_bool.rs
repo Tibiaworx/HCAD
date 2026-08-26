@@ -542,23 +542,282 @@ fn enclosed_volume(m: &TriMesh) -> f64 {
 /// under a plate with the same bores through both and the two shared faces both survive, sealing a
 /// sheet inside the part. So a result is judged, not just accepted: a torn one is treated exactly
 /// like a failure and sent round the same retries.
+/// Cheap screen: does the mesh anywhere FOLD BACK on itself — two real-sized triangles on
+/// one edge with strongly opposed normals? Every film (a wall of thickness ~the nudge scale
+/// left by a flush boolean) has such a rim somewhere; so do a few legitimate shapes (a
+/// knife-edge wedge, a pinch), which is why this only SCREENS — the verdict comes from
+/// measuring actual thin material, which costs more.
+fn fold_screen(m: &TriMesh) -> bool {
+    let ids = weld_ids(m);
+    let p = |i: u32| {
+        let q = m.positions[i as usize];
+        [q[0] as f64, q[1] as f64, q[2] as f64]
+    };
+    let mut owners: HashMap<(usize, usize), Vec<[f64; 3]>> = HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        let n = [
+            (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+            (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
+        ];
+        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let e = |x: [f64; 3], y: [f64; 3]| {
+            let d = [y[0] - x[0], y[1] - x[1], y[2] - x[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let longest = e(a, b).max(e(b, c)).max(e(c, a));
+        if nl < 1e-12 || longest < 1e-9 || nl / longest < 1e-3 {
+            continue; // a needle
+        }
+        let nrm = [n[0] / nl, n[1] / nl, n[2] / nl];
+        let (ia, ib, ic) = (ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]);
+        for (u, v) in [(ia, ib), (ib, ic), (ic, ia)] {
+            let k = if u <= v { (u, v) } else { (v, u) };
+            owners.entry(k).or_default().push(nrm);
+        }
+    }
+    for own in owners.values() {
+        for i in 0..own.len() {
+            for j in i + 1..own.len() {
+                let d = own[i][0] * own[j][0] + own[i][1] * own[j][1] + own[i][2] * own[j][2];
+                if d < -0.85 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Total area of FILM in `m` near the zone `[zone_lo, zone_hi]`: triangles whose centroid,
+/// marched inward along -normal, meets the opposite surface within `max_thick`. A film is
+/// the nudge-scale wall a flush boolean can leave standing (both its sides count, so the
+/// area overstates by 2x — fine, it is only compared against itself). Restricted to the
+/// zone the other operand touched, because that is the only place this boolean can have
+/// created one, and a full-mesh scan would cost O(n^2) on every retry.
+fn thin_film_area(m: &TriMesh, zone_lo: [f32; 3], zone_hi: [f32; 3], max_thick: f64) -> f64 {
+    let p = |i: u32| {
+        let q = m.positions[i as usize];
+        [q[0] as f64, q[1] as f64, q[2] as f64]
+    };
+    let tris: Vec<[[f64; 3]; 3]> = m.indices.chunks_exact(3).map(|t| [p(t[0]), p(t[1]), p(t[2])]).collect();
+    let margin = 0.05f64;
+    let mut area = 0.0f64;
+    // EXACT folds first: a sheet of literally zero thickness — two real-sized triangles on one
+    // welded edge with opposed normals — is invisible to the ray march below, whose self-hit
+    // guard (t > 1e-6) rejects the opposite face at distance ~0. Count the area of every
+    // in-zone triangle participating in such a fold, and remember it so the ray pass does not
+    // count it twice.
+    let ids = weld_ids(m);
+    let mut edge_tris: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (ti, t) in m.indices.chunks_exact(3).enumerate() {
+        let (ia, ib, ic) = (ids[t[0] as usize], ids[t[1] as usize], ids[t[2] as usize]);
+        for (u, v) in [(ia, ib), (ib, ic), (ic, ia)] {
+            let k = if u <= v { (u, v) } else { (v, u) };
+            edge_tris.entry(k).or_default().push(ti);
+        }
+    }
+    let tri_geom = |ti: usize| -> Option<([f64; 3], [f64; 3], f64)> {
+        let t = &tris[ti];
+        let n = [
+            (t[1][1] - t[0][1]) * (t[2][2] - t[0][2]) - (t[1][2] - t[0][2]) * (t[2][1] - t[0][1]),
+            (t[1][2] - t[0][2]) * (t[2][0] - t[0][0]) - (t[1][0] - t[0][0]) * (t[2][2] - t[0][2]),
+            (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]),
+        ];
+        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let e = |x: [f64; 3], y: [f64; 3]| {
+            let d = [y[0] - x[0], y[1] - x[1], y[2] - x[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let longest = e(t[0], t[1]).max(e(t[1], t[2])).max(e(t[2], t[0]));
+        if nl < 1e-12 || longest < 1e-9 || nl / longest < 1e-3 {
+            return None; // a needle
+        }
+        Some(([n[0] / nl, n[1] / nl, n[2] / nl], n, nl))
+    };
+    let mut folded: Vec<bool> = vec![false; tris.len()];
+    for own in edge_tris.values() {
+        if own.len() != 2 {
+            continue;
+        }
+        let (Some((na, _, _)), Some((nb, _, _))) = (tri_geom(own[0]), tri_geom(own[1])) else { continue };
+        if na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2] >= -0.95 {
+            continue;
+        }
+        // Opposed normals alone also describe a legitimate KNIFE WEDGE — a corner-sliver
+        // fillet tool tapers to exactly that at its tangent lines. A film's two sides are
+        // COINCIDENT sheets: every vertex of each triangle lies within film thickness of the
+        // other's plane. A wedge's faces separate away from the shared edge and fail this.
+        let coincident = |ti: usize, tj: usize| -> bool {
+            let (nj, _, _) = tri_geom(tj).unwrap();
+            let q0 = tris[tj][0];
+            tris[ti].iter().all(|v| {
+                let d = (v[0] - q0[0]) * nj[0] + (v[1] - q0[1]) * nj[1] + (v[2] - q0[2]) * nj[2];
+                d.abs() < max_thick
+            })
+        };
+        if coincident(own[0], own[1]) && coincident(own[1], own[0]) {
+            folded[own[0]] = true;
+            folded[own[1]] = true;
+        }
+    }
+    for (ti, t) in tris.iter().enumerate() {
+        if !folded[ti] {
+            continue;
+        }
+        let cen = [
+            (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+            (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+            (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+        ];
+        if (0..3).any(|k| cen[k] < zone_lo[k] as f64 - margin || cen[k] > zone_hi[k] as f64 + margin) {
+            continue;
+        }
+        if let Some((_, _, nl)) = tri_geom(ti) {
+            area += nl * 0.5;
+        }
+    }
+    for (ti, t) in tris.iter().enumerate() {
+        if folded[ti] {
+            continue; // already counted by the fold pass
+        }
+        let cen = [
+            (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+            (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+            (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+        ];
+        if (0..3).any(|k| cen[k] < zone_lo[k] as f64 - margin || cen[k] > zone_hi[k] as f64 + margin) {
+            continue;
+        }
+        let n = [
+            (t[1][1] - t[0][1]) * (t[2][2] - t[0][2]) - (t[1][2] - t[0][2]) * (t[2][1] - t[0][1]),
+            (t[1][2] - t[0][2]) * (t[2][0] - t[0][0]) - (t[1][0] - t[0][0]) * (t[2][2] - t[0][2]),
+            (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]),
+        ];
+        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if nl < 1e-12 {
+            continue;
+        }
+        let dir = [-n[0] / nl, -n[1] / nl, -n[2] / nl];
+        let mut best = f64::MAX;
+        for (ui, u) in tris.iter().enumerate() {
+            if ui == ti {
+                continue;
+            }
+            let e1 = [u[1][0] - u[0][0], u[1][1] - u[0][1], u[1][2] - u[0][2]];
+            let e2 = [u[2][0] - u[0][0], u[2][1] - u[0][1], u[2][2] - u[0][2]];
+            let pv = [
+                dir[1] * e2[2] - dir[2] * e2[1],
+                dir[2] * e2[0] - dir[0] * e2[2],
+                dir[0] * e2[1] - dir[1] * e2[0],
+            ];
+            let det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let inv = 1.0 / det;
+            let tv = [cen[0] - u[0][0], cen[1] - u[0][1], cen[2] - u[0][2]];
+            let uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+            if !(-1e-9..=1.0 + 1e-9).contains(&uu) {
+                continue;
+            }
+            let qv = [
+                tv[1] * e1[2] - tv[2] * e1[1],
+                tv[2] * e1[0] - tv[0] * e1[2],
+                tv[0] * e1[1] - tv[1] * e1[0],
+            ];
+            let vv = (dir[0] * qv[0] + dir[1] * qv[1] + dir[2] * qv[2]) * inv;
+            if vv < -1e-9 || uu + vv > 1.0 + 1e-9 {
+                continue;
+            }
+            let tt = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+            if tt > 1e-6 && tt < best {
+                // Only an OPPOSING surface makes a film: the far side of a thin wall faces
+                // back along the ray. A ray grazing into a perpendicular neighbouring face —
+                // a band facet next to its own tangent line passes within a sagitta of it —
+                // is geometry meeting, not a wall standing.
+                let un = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let ul = (un[0] * un[0] + un[1] * un[1] + un[2] * un[2]).sqrt();
+                if ul > 1e-12 && (un[0] * dir[0] + un[1] * dir[1] + un[2] * dir[2]) / ul > 0.7 {
+                    best = tt;
+                }
+            }
+        }
+        if best < max_thick {
+            area += nl * 0.5;
+        }
+    }
+    area
+}
+
 fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     let first = manifold_try(a, b, op);
+    let bbox = |m: &TriMesh| {
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &m.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        (lo, hi)
+    };
+    // Anything this boolean created lives where operand b was; a film is offset-scale, so
+    // anything under 8e-4 across is not a wall anyone drew.
+    let (zlo, zhi) = bbox(b);
+    const FILM: f64 = 8.0e-4;
+    let dbg = std::env::var("HCAD_BOOL_DEBUG").is_ok();
     if let Some(m) = &first {
         if !seals_a_sheet(m) {
+            // Success is still judged for FILM: a flush difference can succeed with the
+            // coincident wall left standing at offset thickness (sliver.hcad: a 1.5e-4 sheet
+            // over a fillet's whole band — "the thin wall on the fillet"). The fold screen is
+            // O(n) and almost always clean; only a hit pays for the thickness measure, and
+            // only measured film sends a success into the retries.
+            if !fold_screen(m) {
+                return first;
+            }
+            if fold_screen(a) || fold_screen(b) {
+                return first; // damage (or a knife-edge shape) carried in — not repairable here
+            }
+            let fa = thin_film_area(m, zlo, zhi, FILM);
+            if dbg {
+                eprintln!("BOOL first ok, folds, film {fa:.5}, torn {}", torn_edges(m));
+            }
+            if fa < 1.0e-4 {
+                return first;
+            }
+        } else if seals_a_sheet(a) || seals_a_sheet(b) {
+            // A sheet already carried by an operand comes back out of every attempt, so nudging
+            // only trades one damaged mesh for another. Hand back what the caller would have had.
             return first;
         }
-        // A sheet already carried by an operand comes back out of every attempt, so nudging only
-        // trades one damaged mesh for another. Hand back what the caller would have had.
-        if seals_a_sheet(a) || seals_a_sheet(b) {
-            return first;
-        }
+    } else if dbg {
+        eprintln!("BOOL first FAILED to ingest/run");
     }
     let joined = first.as_ref().map(shell_count);
     let held = first.as_ref().map(enclosed_volume);
-    let (mut repaired, mut fallback) = (None, None);
-    // Asymmetric, irrational-ish nudges so no offset lands back on another coincidence.
-    for d in [[1.7e-4, 1.1e-4, 1.3e-4], [-2.3e-4, 1.9e-4, -1.5e-4], [3.1e-4, -2.7e-4, 2.1e-4]] {
+    let first_film = first.as_ref().map(|m| thin_film_area(m, zlo, zhi, FILM));
+    let first_torn = first.as_ref().map(|m| torn_edges(m));
+    let mut best: Option<(f64, usize, TriMesh)> = None; // (film area, torn edges, mesh)
+    let mut fallback = None;
+    // Asymmetric, irrational-ish nudges so no offset lands back on another coincidence — and
+    // BOTH signs of each, because for a flush face the sign decides what the offset leaves
+    // behind: nudged off the face, the offset stands as a film of wall; nudged into it, the
+    // same offset is a sub-tolerance overcut that shows nothing. Which sign is which depends
+    // on the face's orientation, so offer the pair and let the film measure pick.
+    let base: [[f32; 3]; 3] = [[1.7e-4, 1.1e-4, 1.3e-4], [-2.3e-4, 1.9e-4, -1.5e-4], [3.1e-4, -2.7e-4, 2.1e-4]];
+    let negated: [[f32; 3]; 3] = [[-1.7e-4, -1.1e-4, -1.3e-4], [2.3e-4, -1.9e-4, 1.5e-4], [-3.1e-4, 2.7e-4, -2.1e-4]];
+    let mut queue: Vec<[f32; 3]> = base.to_vec();
+    let mut qi = 0;
+    while qi < queue.len() {
+        let d = queue[qi];
+        qi += 1;
         let Some(m) = manifold_try(a, &nudged(b, d), op) else { continue };
         let sound = !seals_a_sheet(&m)
             // A nudge big enough to part two solids that were touching also comes back sound — as
@@ -569,18 +828,53 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
             // arrangement, and what the caller asked for is the un-nudged result.
             && !matches!(held, Some(v) if (enclosed_volume(&m) - v).abs() > v * 1.0e-3);
         if sound {
-            // A sound result can still pinch — two walls meeting exactly along a line, which is a
-            // real shape and not the damage being repaired. Take one without even that if an
-            // offset offers it, since every later boolean has an easier time of it.
-            if torn_edges(&m) == 0 {
+            let film = thin_film_area(&m, zlo, zhi, FILM);
+            let torn = torn_edges(&m);
+            // Film-free and pinch-free is as good as it gets — stop looking. (A sound result
+            // can still pinch — two walls meeting exactly along a line, which is a real shape
+            // and not the damage being repaired.)
+            if film < 1.0e-4 && torn == 0 {
+                if dbg {
+                    eprintln!("BOOL nudge {d:?} clean (film {film:.5}) — taken");
+                }
                 return Some(m);
             }
-            repaired.get_or_insert(m);
+            if dbg {
+                eprintln!("BOOL nudge {d:?}: film {film:.5} torn {torn}");
+            }
+            // A candidate may not buy its film reduction by TEARING: an offset that overlaps a
+            // flush face sheds slivers finer than the weld and the surface stops being closed —
+            // a worse defect than the film (it is what makes an export invalid). Anything that
+            // pinches more than the un-nudged result is out.
+            if matches!(first_torn, Some(ft) if torn > ft) {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((bf, bt, _)) => film < *bf || (film == *bf && torn < *bt),
+            };
+            if better {
+                best = Some((film, torn, m));
+            }
+            // Still chasing a film after the base offsets: for a flush face the SIGN of the
+            // offset decides film-or-clean, so queue the negations — but only when there is a
+            // film to beat, so the failure path (a mesh Manifold will not ingest at all, e.g.
+            // the dense-sheet guard) keeps its original three fast attempts.
+            if qi == queue.len() && queue.len() == base.len() && matches!(&best, Some((bf, _, _)) if *bf >= 1.0e-4) {
+                queue.extend_from_slice(&negated);
+            }
         } else if fallback.is_none() {
             fallback = Some(m);
         }
     }
-    repaired.or(first).or(fallback)
+    // The least-film candidate wins, but only if it beats what the un-nudged attempt already
+    // had — an offset the caller never asked for has to buy something.
+    match (best, first, first_film) {
+        (Some((bf, _, m)), Some(f), Some(ff)) => Some(if bf < ff { m } else { f }),
+        (Some((_, _, m)), Some(f), None) => Some(if seals_a_sheet(&f) { m } else { f }),
+        (Some((_, _, m)), None, _) => Some(m),
+        (None, f, _) => f.or(fallback),
+    }
 }
 
 /// Above this combined triangle count, the O(n²)-ish BSP CSG fallback is a multi-minute
