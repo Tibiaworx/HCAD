@@ -720,6 +720,269 @@ fn trim_fill_to_walls(fill: &TriMesh, tris: &[[V3; 3]], ends: [V3; 2], n1: V3, n
     out
 }
 
+/// The 2D cross-section of a fillet BLENDED onto a curved support: what a rolling ball does
+/// when the face it should rest on ends partway down and an earlier fillet's surface leans
+/// there instead. Everything is measured in the cross-plane of the edge — (w, v) coordinates
+/// along `n_out` (off the leaned-on face, positive into the void) and `n_other` (out through
+/// the rolling face) — because in every case met so far both fillets run along the SAME
+/// direction, which collapses the blend to a single circle-tangency:
+///
+///   the blend circle sits at distance r from the rolling face (centre v = −r) and rolls
+///   externally tangent to the support circle F,R:  |C − F| = R + r.
+///
+/// Returns the blend centre's w, the fitted support circle, the tangency point and the
+/// support's wall crossing — everything both the TOOL and the SEAMS need. `None` when the
+/// profile does not fit a circle leaning on the wall (caller falls back to the slab).
+#[derive(Clone)]
+pub(crate) struct BlendProfile {
+    pub bw: f64,           // blend circle centre, w (its v is −r by construction)
+    pub pf: (f64, f64),    // tangency point on the support, (w, v)
+    pub seam: (f64, f64),  // where the support meets the wall plane, (w=0, v)
+    pub support: ((f64, f64), f64), // fitted support circle: centre (w, v), radius
+}
+
+/// The cheap gate in front of [`blend_profile`]: is there material leaning a HAIR past this
+/// face (with air at depth) along the middle of the segment? Winding probes only — callers
+/// run the expensive profile fit just when this says so.
+pub(crate) fn blade_beyond(
+    tris: &[[V3; 3]],
+    a: V3,
+    axis: V3,
+    l: f64,
+    n_out: V3,
+    n_other: V3,
+    r: f64,
+    tol: f64,
+) -> bool {
+    let inside = |p: V3| {
+        let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+        (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+    };
+    let stations = [0.25f64, 0.5, 0.75];
+    let hair = (tol * 2.0).max(1e-4);
+    let near_hit = stations.iter().any(|&f| {
+        let s0 = add(add(a, scale(axis, f * l)), scale(n_other, -0.5 * r));
+        inside(add(s0, scale(n_out, hair)))
+    });
+    near_hit
+        && stations.iter().all(|&f| {
+            let s0 = add(add(a, scale(axis, f * l)), scale(n_other, -0.5 * r));
+            !inside(add(s0, scale(n_out, 0.5 * r)))
+        })
+}
+
+pub(crate) fn blend_profile(
+    tris: &[[V3; 3]],
+    a: V3,
+    axis: V3,
+    l: f64,
+    n_out: V3,
+    n_other: V3,
+    r: f64,
+    tol: f64,
+) -> Option<BlendProfile> {
+    let inside = |p: V3| {
+        let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
+        (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
+    };
+    // Sample the support profile at the mid station: for each height v below the rolling
+    // face, cast from out in the void back toward the wall and record where the surface is.
+    let station = add(a, scale(axis, 0.5 * l));
+    let w_start = 3.0 * r;
+    let mut wall_end = 0.0f64; // deepest v that still reads as the wall
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    let rows = 16usize;
+    for k in 1..=rows {
+        let v = -2.5 * r * k as f64 / rows as f64;
+        let o = add(add(station, scale(n_out, w_start)), scale(n_other, v));
+        if inside(o) {
+            break; // below the void's floor — nothing to roll on further down
+        }
+        let dir = scale(n_out, -1.0);
+        let mut best = f64::MAX;
+        let mut hit_n = [0.0f64; 3];
+        for t in tris {
+            if let Some(t_hit) = ray_tri(o, dir, t[0], t[1], t[2]) {
+                if t_hit < best {
+                    best = t_hit;
+                    hit_n = norm(cross(sub(t[1], t[0]), sub(t[2], t[0])));
+                }
+            }
+        }
+        if best == f64::MAX || best > w_start + r {
+            continue; // open air at this height
+        }
+        // The support must RUN ALONG the edge (a prism-like surface, normal in the cross
+        // plane) — a hit facing along the axis is some other wall entirely. On sliver.hcad
+        // the rows below the void's floor hit the tube's OUTER wall, whose w read nearly
+        // continuous with the fill's arc and poisoned the fit; its normal points mostly
+        // along this edge's axis and gives it away.
+        if dot(hit_n, axis).abs() > 0.3 {
+            break;
+        }
+        let w = w_start - best;
+        if let Some(&(wp, _)) = pts.last() {
+            if (w - wp).abs() > 0.6 * r {
+                break; // a jump — a different surface has taken over
+            }
+        }
+        if w.abs() < 3.0 * tol {
+            wall_end = v; // still the wall plane
+        } else if w > 0.0 {
+            pts.push((w, v)); // the support, leaning past the wall
+        }
+    }
+    let dbg = std::env::var("HCAD_BLEND_DEBUG").is_ok();
+    if pts.len() < 5 || wall_end.abs() >= 0.98 * r {
+        if dbg {
+            eprintln!("    blend: bail — {} support pts, wall_end {wall_end:.3} vs r {r:.3}", pts.len());
+        }
+        return None; // no support to blend onto, or the wall is long enough after all
+    }
+    // Kasa circle fit: minimise (w² + v² − 2·cw·w − 2·cv·v − c0)².
+    let (mut sw, mut sv, mut sww, mut svv, mut swv, mut sz, mut szw, mut szv) =
+        (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let n = pts.len() as f64;
+    for &(w, v) in &pts {
+        let z = w * w + v * v;
+        sw += w;
+        sv += v;
+        sww += w * w;
+        svv += v * v;
+        swv += w * v;
+        sz += z;
+        szw += z * w;
+        szv += z * v;
+    }
+    // Normal equations for [2cw, 2cv, c0]:
+    let m = [[sww, swv, sw], [swv, svv, sv], [sw, sv, n]];
+    let rhs = [szw, szv, sz];
+    let det3 = |m: &[[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d0 = det3(&m);
+    if d0.abs() < 1e-12 {
+        return None;
+    }
+    let col = |i: usize| {
+        let mut mm = m;
+        for row in 0..3 {
+            mm[row][i] = rhs[row];
+        }
+        det3(&mm) / d0
+    };
+    let (fw, fv) = (col(0) / 2.0, col(1) / 2.0);
+    let rr2 = col(2) + fw * fw + fv * fv;
+    if rr2 <= 0.0 {
+        return None;
+    }
+    let big_r = rr2.sqrt();
+    // The fit must actually BE the profile, and be a concave support leaning off the wall.
+    let resid = pts
+        .iter()
+        .map(|&(w, v)| ((((w - fw).powi(2) + (v - fv).powi(2)).sqrt()) - big_r).abs())
+        .fold(0.0f64, f64::max);
+    if resid > 6.0 * tol || fw <= 0.0 || big_r < r * 0.05 {
+        if dbg {
+            eprintln!("    blend: bail — fit resid {resid:.4} (tol {tol:.4}), F=({fw:.3},{fv:.3}) R={big_r:.3}");
+        }
+        return None;
+    }
+    // Roll the ball: centre at v = −r, externally tangent to the support.
+    let dv = -r - fv;
+    let disc = (big_r + r).powi(2) - dv * dv;
+    if disc <= 0.0 {
+        if dbg {
+            eprintln!("    blend: bail — no tangency, F=({fw:.3},{fv:.3}) R={big_r:.3}");
+        }
+        return None;
+    }
+    let bw = fw - disc.sqrt();
+    if bw > 0.0 {
+        if dbg {
+            eprintln!("    blend: bail — bw {bw:.3} past the corner, F=({fw:.3},{fv:.3}) R={big_r:.3}");
+        }
+        return None; // the ball would rest past the corner, off the face — not a blend
+    }
+    if dbg {
+        eprintln!("    blend: OK bw {bw:.3}, F=({fw:.3},{fv:.3}) R={big_r:.3}, pf=({:.3},{:.3})", 
+            fw - (fw - bw) * big_r / (big_r + r), 0.0);
+    }
+    let c = (bw, -r);
+    let scale2 = r / (big_r + r);
+    let pf = (c.0 + (fw - c.0) * scale2, c.1 + (fv - c.1) * scale2);
+    // Where the support crosses the wall plane (its own tangent seam with what is left of
+    // the wall). The upper crossing, nearest the rolling face.
+    let seam_v = if big_r * big_r >= fw * fw {
+        fv + (big_r * big_r - fw * fw).sqrt()
+    } else {
+        wall_end
+    };
+    Some(BlendProfile { bw, pf, seam: (0.0, seam_v), support: ((fw, fv), big_r) })
+}
+
+/// The blend TOOL: the corner region bounded by the rolling face, the blend arc, the support
+/// arc and the wall — one prism, replacing the plain (prism − cylinder) tool for a segment
+/// whose corner blends onto a support. Cutting with this lands the fillet tangent on the
+/// earlier fillet's surface: no blade, no step.
+fn blend_corner_tool(
+    bp: &BlendProfile,
+    a: V3,
+    axis: V3,
+    n_out: V3,
+    n_other: V3,
+    r: f64,
+    start_shift: V3,
+    total_len: f64,
+) -> Option<TriMesh> {
+    let to3 = |w: f64, v: f64| add(add(a, scale(n_out, w)), scale(n_other, v));
+    // Both arcs are swept the SHORT way round: raw atan2 interpolation walked the support
+    // arc 341 degrees the long way, ballooning the cross-section out into the void — which
+    // happened to contain only air on the bodies at hand, the worst kind of passing test.
+    let wrap = |d: f64| {
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let m = d.rem_euclid(two_pi);
+        if m > std::f64::consts::PI { m - two_pi } else { m }
+    };
+    let mut cross: Vec<V3> = Vec::new();
+    // Top tangent point, then the blend arc down to the tangency with the support.
+    let c = (bp.bw, -r);
+    let a0 = (0.0f64 - c.1).atan2(bp.bw - c.0); // angle of T_top about C — straight up
+    let da = wrap((bp.pf.1 - c.1).atan2(bp.pf.0 - c.0) - a0);
+    const ARC: usize = 18;
+    for k in 0..=ARC {
+        let t = a0 + da * k as f64 / ARC as f64;
+        cross.push(to3(c.0 + r * t.cos(), c.1 + r * t.sin()));
+    }
+    // The support arc from the tangency up to its wall seam, pushed PAST the surface into the
+    // material it is consuming. The fitted circle matches the real (tessellated) support only
+    // to a sagitta or so, and a tool boundary running that close to a surface for a whole
+    // strip is a flush cut by another name: it left a skin of fill standing along the cusp
+    // (0.9 of thin area on the synthetic tube). The push is a plain +w shift — the void's
+    // direction everywhere on this strip; padding the RADIUS instead was tried and dives
+    // behind the wall plane near the seam, leaving a 0.1 wall standing. Ramped in from zero
+    // at the tangency so the fillet's landing line is exact and the kept fill is not nicked.
+    let (f, big_r) = bp.support;
+    let pad = (0.02 * big_r).max(0.05 * r);
+    let b0 = (bp.pf.1 - f.1).atan2(bp.pf.0 - f.0);
+    let db = wrap((bp.seam.1 - f.1).atan2(bp.seam.0 - f.0) - b0);
+    for k in 1..=ARC {
+        let t = b0 + db * k as f64 / ARC as f64;
+        let ramp = pad * (k as f64 / (0.25 * ARC as f64)).min(1.0);
+        cross.push(to3(f.0 + big_r * t.cos() + ramp, f.1 + big_r * t.sin()));
+    }
+    // Off the wall by the pad, up past the seam, and close along the rolling face to T_top.
+    cross.push(to3(pad, bp.seam.1.min(-1e-6)));
+    cross.push(to3(pad, 0.0));
+    cross.dedup_by(|x, y| len(sub(*x, *y)) < 1e-9);
+    if cross.len() < 3 {
+        return None;
+    }
+    let shifted: Vec<V3> = cross.iter().map(|&p| add(p, start_shift)).collect();
+    Some(extrude_prism(&shifted, axis, total_len))
+}
+
 fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     let tris: Vec<[V3; 3]> = mesh
         .indices
@@ -831,58 +1094,55 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             let u = |c0: V3| norm(sub(add(c0, scale(n1, radius)), c0));
 
             if solid == 1 {
+                // Convex ridge. FIRST: does either face's support end partway down, with an
+                // earlier fillet's surface leaning there instead? Then the honest cut is the
+                // BLEND — the ball rolls on the rolling face and lands tangent on that
+                // surface (see `blend_profile`). One prism replaces the plain tool entirely;
+                // running the plain tool as well would gouge deeper than the blend near the
+                // corner, since its cylinder assumes the full-depth wall.
+                let blade_beyond = |n_out: V3, n_other: V3| -> bool {
+                    crate::fillet::blade_beyond(&tris, a, axis, l, n_out, n_other, radius, tol)
+                };
+                let mut blended = false;
+                for &(n_out, n_other) in &[(n1, n2), (n2, n1)] {
+                    if !blade_beyond(n_out, n_other) {
+                        continue;
+                    }
+                    if let Some(bp) = blend_profile(&tris, a, axis, l, n_out, n_other, radius, tol) {
+                        if let Some(tool) = blend_corner_tool(&bp, a, axis, n_out, n_other, radius, start_shift, total_len) {
+                            if tool.indices.len() >= 3 {
+                                body = crate::mesh_difference(&body, &tool);
+                                any = true;
+                                blended = true;
+                            }
+                        }
+                    }
+                    break; // material can only lean past one of a convex corner's two faces
+                }
+                if !blended {
                 // Convex ridge: subtract the corner sliver (corner-prism − tangent cylinder).
-                //
+                // The prism's flanks lie IN the two faces — a flush difference. When Manifold
+                // declines the exact coincidence, the boolean's nudge retry resolves it, and a
+                // nudge pointing off the face leaves its offset standing as a film of wall
+                // (measured on sliver.hcad: a 1.5e-4 sheet over the whole band). That is the
+                // judge's problem, not this tool's: manifold_boolean tries both signs of every
+                // offset and refuses candidates that fold back on themselves, so the
+                // into-the-face resolution wins.
                 let c0 = add(a, scale(add(n1, n2), -radius / (1.0 + c))); // centre, in material
                 let t1 = add(c0, scale(n1, radius));
                 let t2 = add(c0, scale(n2, radius));
                 let cross = [add(a, start_shift), add(t1, start_shift), add(t2, start_shift)];
                 let prism = extrude_prism(&cross, axis, total_len);
-                // A BLADE check per face: an earlier concave fill can lean on this very face
-                // from the far side, and cutting the face away leaves the fill's tangent wedge
-                // cantilevered — real material, 0.66 thick at the band's foot tapering to
-                // nothing at the fill's seam, the "thin wall coming from the fillet" on
-                // sliver.hcad (3.1 of blade area). A blade reads as material a HAIR beyond the
-                // face at mid-band with AIR at depth; a wall continuing flush past this one, or
-                // a boss standing against it, is material at depth too and is left alone. Only
-                // when a blade is present does a second tool run: a slab through the face over
-                // exactly the band and the segment — no end overrun, which on a curved rim
-                // would gouge whatever the next facet carries — truncating the fill square at
-                // the band's foot: a small honest step where two fillets collide, not a blade.
-                let blade_beyond = |n_out: V3, n_other: V3| -> bool {
-                    let stations = [0.25f64, 0.5, 0.75];
-                    let hair = (tol * 2.0).max(1e-4);
-                    let near_hit = stations.iter().any(|&f| {
-                        let s0 = add(add(a, scale(axis, f * l)), scale(n_other, -0.5 * radius));
-                        inside(add(s0, scale(n_out, hair)))
-                    });
-                    near_hit
-                        && stations.iter().all(|&f| {
-                            let s0 = add(add(a, scale(axis, f * l)), scale(n_other, -0.5 * radius));
-                            !inside(add(s0, scale(n_out, 0.5 * radius)))
-                        })
-                };
+                // A BLADE that would not blend (the support fits no circle — a freeform or
+                // perpendicular neighbour) is still truncated by the slab: material at a
+                // hair's depth with air behind it cannot be left standing.
                 let mut slabs: Vec<TriMesh> = Vec::new();
                 for &(n_out, n_other, t_far) in &[(n1, n2, t1), (n2, n1, t2)] {
                     if blade_beyond(n_out, n_other) {
-                        // Same end overrun as the main tool: the blade ends where the segment
-                        // does — on a wall — and a slab stopping flush there leaves a film of
-                        // that wall behind. Past the wall is air (that is what the far probe
-                        // established about this whole side), so the overrun takes nothing.
-                        // The slab's top and bottom faces are TILTED: exact at the wall plane
-                        // (P1 = the corner, P4 = the band foot, so the truncation meets the
-                        // band's tangent line without a step) and splayed 0.15r outward at the
-                        // far side, so neither face is parallel to the body's own planes. Flat
-                        // ends coincided with the band foot and the corner line and left
-                        // 180-degree seams there; a splayed face crosses the leaning material
-                        // transversally and coincides with nothing.
-                        // ...and its INNER face is sunk a fraction BEHIND the face plane, into
-                        // the region the main tool has already emptied. Stopping exactly at the
-                        // plane leaves a zero-thickness interface between the two cuts — the
-                        // main tool's flank meets the slab's face in the very plane, and the
-                        // nothing between them survives as a doubled membrane (all five
-                        // remaining fins on sliver.hcad were exactly that, +-x sheets lying in
-                        // the tilted wall plane).
+                        // Overrun like the main tool; faces splayed off every body plane; inner
+                        // face sunk into the main cut's void — each learned from a measured
+                        // coincidence (films at slab ends, 180-degree seams at the band foot,
+                        // doubled membranes in the wall plane).
                         let splay = scale(n_other, 0.15 * radius);
                         let sink = scale(n_out, -0.05 * radius);
                         let rect = [
@@ -907,6 +1167,7 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
                         body = crate::mesh_difference(&body, slab);
                         any = true;
                     }
+                }
                 }
                 // Record this convex edge's faces at both endpoints, for corner blending.
                 for &v in &[a, b] {

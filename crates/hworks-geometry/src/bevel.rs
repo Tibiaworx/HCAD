@@ -713,8 +713,25 @@ fn pt_seg_dist2(p: V3, a: V3, b: V3) -> f64 {
 fn edge_is_picked(topo: &Topo, e: &TopoEdge, picked: &[Vec<[f64; 3]>]) -> bool {
     let mid = scale(add(topo.verts[e.a], topo.verts[e.b]), 0.5);
     let tol2 = 1.0e-4; // 0.01 units
+    // An edge is picked when the polyline runs ALONG it, not merely past its midpoint. A cut
+    // whose profile was widened off a coincidence splits its corner into a micro edge (1.4e-3
+    // long, floor-to-outer-wall) sitting exactly at the pick's endpoint; selecting that by
+    // midpoint distance emitted its seam DOWN the outer wall — the floating line r below the
+    // floor on sliver.hcad. Direction agreement rejects it: a real pick's polyline is built
+    // from the model edges themselves, so aligned picks are the only legitimate ones.
+    let ed = sub(topo.verts[e.b], topo.verts[e.a]);
+    let el = dot(ed, ed).sqrt();
+    if el < 1e-9 {
+        return false; // a welded-out degenerate edge selects nothing
+    }
+    let edir = scale(ed, 1.0 / el);
+    let aligned = |w: &[[f64; 3]]| {
+        let d = sub(w[1], w[0]);
+        let l = dot(d, d).sqrt();
+        l > 1e-9 && dot(scale(d, 1.0 / l), edir).abs() > 0.7
+    };
     picked.iter().any(|poly| {
-        if poly.windows(2).any(|w| pt_seg_dist2(mid, w[0], w[1]) < tol2) {
+        if poly.windows(2).any(|w| pt_seg_dist2(mid, w[0], w[1]) < tol2 && aligned(w)) {
             return true;
         }
         // Wrap heal: older documents stored a closed loop WITHOUT repeating its first point, so
@@ -732,7 +749,7 @@ fn edge_is_picked(topo: &Topo, e: &TopoEdge, picked: &[Vec<[f64; 3]>]) -> bool {
                 let med2 = seg2[seg2.len() / 2];
                 // gap ≤ ~1.75× the median segment length (compared squared).
                 if gap2 <= med2 * 3.1 {
-                    return pt_seg_dist2(mid, last, first) < tol2;
+                    return pt_seg_dist2(mid, last, first) < tol2 && aligned(&[last, first]);
                 }
             }
         }
@@ -776,6 +793,21 @@ fn bevel_prep(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Option<BevelP
     let selected: Vec<bool> = topo.edges.iter().map(|e| all || edge_is_picked(&topo, e, picked)).collect();
     if !selected.iter().any(|&s| s) {
         return None;
+    }
+    if !all && std::env::var("HCAD_BEVEL_DEBUG").is_ok() {
+        for (ei, e) in topo.edges.iter().enumerate() {
+            if selected[ei] {
+                let (a, b) = (topo.verts[e.a], topo.verts[e.b]);
+                eprintln!(
+                    "    bevel_prep selected edge ({:.3},{:.3},{:.3})-({:.3},{:.3},{:.3}) faces {:?}",
+                    a[0], a[1], a[2], b[0], b[1], b[2],
+                    e.faces.iter().map(|&fi| {
+                        let n = topo.faces[fi].normal;
+                        format!("n=({:.2},{:.2},{:.2})", n[0], n[1], n[2])
+                    }).collect::<Vec<_>>()
+                );
+            }
+        }
     }
     // corner(v, f): where face f's boundary insets to at vertex v (rolling-ball setback, zero on
     // sharp edges). Single source of truth for flat faces, edge strips, patches AND tangent edges.
@@ -878,7 +910,59 @@ fn clip_seam_to_face(topo: &Topo, fi: usize, p: V3, q: V3) -> Vec<(V3, V3)> {
 /// face. Follows the rounded body and chains up for picking. Each segment carries the normal of
 /// the flat face it borders — the segment is only valid while the final surface UNDER it still
 /// faces that way (a later cut whose wall merely grazes the line must not keep it alive).
-fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, usize), V3>, r: f64) -> Vec<([[f32; 3]; 2], [f32; 3])> {
+fn emit_feature_edges(
+    topo: &Topo,
+    selected: &[bool],
+    corner: &HashMap<(usize, usize), V3>,
+    r: f64,
+    mesh: &TriMesh,
+) -> Vec<([[f32; 3]; 2], [f32; 3])> {
+    // Where a selected edge BLENDS onto an earlier fillet's surface (see
+    // `fillet::blend_profile`), the seams move: the rolling face's tangent line sits at the
+    // blend circle's own offset, not the nominal setback, and the far seam is the tangency
+    // curve ON the support — the setback line there is interior to the fill and would either
+    // float or vanish. Computed lazily per edge, gated by the cheap blade probes.
+    let tris: Vec<[V3; 3]> = mesh
+        .indices
+        .chunks_exact(3)
+        .map(|t| {
+            let g = |i: u32| {
+                let p = mesh.positions[i as usize];
+                [p[0] as f64, p[1] as f64, p[2] as f64]
+            };
+            [g(t[0]), g(t[1]), g(t[2])]
+        })
+        .collect();
+    let mut blend_cache: HashMap<usize, Option<(V3, V3, crate::fillet::BlendProfile)>> = HashMap::new();
+    let mut blend_for = |ei: usize| -> Option<(V3, V3, crate::fillet::BlendProfile)> {
+        blend_cache
+            .entry(ei)
+            .or_insert_with(|| {
+                let e = &topo.edges[ei];
+                if e.faces.len() != 2 {
+                    return None;
+                }
+                let (na, nb) = (topo.faces[e.faces[0]].normal, topo.faces[e.faces[1]].normal);
+                let (a, b) = (topo.verts[e.a], topo.verts[e.b]);
+                let d = sub(b, a);
+                let l = dot(d, d).sqrt();
+                if l < 1e-9 {
+                    return None;
+                }
+                let axis = scale(d, 1.0 / l);
+                let tol = 1.9e-3_f64.max(l * 1e-4);
+                for &(n_out, n_other) in &[(na, nb), (nb, na)] {
+                    if crate::fillet::blade_beyond(&tris, a, axis, l, n_out, n_other, r, tol) {
+                        if let Some(bp) = crate::fillet::blend_profile(&tris, a, axis, l, n_out, n_other, r, tol) {
+                            return Some((n_out, n_other, bp));
+                        }
+                        break;
+                    }
+                }
+                None
+            })
+            .clone()
+    };
     let f32a = |p: V3| [p[0] as f32, p[1] as f32, p[2] as f32];
     let mut out = Vec::new();
     for fi in 0..topo.faces.len() {
@@ -888,6 +972,28 @@ fn emit_feature_edges(topo: &Topo, selected: &[bool], corner: &HashMap<(usize, u
             for k in 0..m {
                 let (a, b) = (lp[k], lp[(k + 1) % m]);
                 if topo.edge_between(a, b).is_some_and(|ei| selected[ei]) {
+                    // A blended edge's seams do not sit at the nominal setback: the rolling
+                    // face's tangent line is at the blend circle's own offset, and the far
+                    // seam is the tangency curve on the SUPPORT (the earlier fillet's
+                    // surface) — drawn raw, since it lies on no flat face to clip against.
+                    let ei = topo.edge_between(a, b).unwrap();
+                    if let Some((n_out, n_other, bp)) = blend_for(ei) {
+                        let (va, vb) = (topo.verts[a], topo.verts[b]);
+                        let this_n = topo.faces[fi].normal;
+                        if dot(this_n, n_other) > 0.9 {
+                            let off = scale(n_out, bp.bw);
+                            out.push(([f32a(add(va, off)), f32a(add(vb, off))], n));
+                        } else if dot(this_n, n_out) > 0.9 {
+                            let off = add(scale(n_out, bp.pf.0), scale(n_other, bp.pf.1));
+                            let ((fw, fv), big_r) = bp.support;
+                            let sn = norm(add(
+                                scale(n_out, (bp.pf.0 - fw) / big_r),
+                                scale(n_other, (bp.pf.1 - fv) / big_r),
+                            ));
+                            out.push(([f32a(add(va, off)), f32a(add(vb, off))], f32a(sn)));
+                        }
+                        continue;
+                    }
                     let pa = corner.get(&(a, fi)).copied().unwrap_or(topo.verts[a]);
                     let pb = corner.get(&(b, fi)).copied().unwrap_or(topo.verts[b]);
                     // Run the line LONG and cut it to the face, exactly as the fill itself is
@@ -1626,7 +1732,9 @@ fn run_surgery(
 /// empty = every edge.
 pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> Vec<[[f32; 3]; 2]> {
     match bevel_prep(mesh, r, picked) {
-        Some((topo, selected, corner)) => emit_feature_edges(&topo, &selected, &corner, r).into_iter().map(|(e, _)| e).collect(),
+        Some((topo, selected, corner)) => {
+            emit_feature_edges(&topo, &selected, &corner, r, mesh).into_iter().map(|(e, _)| e).collect()
+        }
         None => Vec::new(),
     }
 }
@@ -1647,7 +1755,7 @@ pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f6
 pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> (Option<TriMesh>, Vec<([[f32; 3]; 2], [f32; 3])>) {
     match bevel_prep(mesh, r, picked) {
         Some((topo, selected, corner)) => {
-            let edges = emit_feature_edges(&topo, &selected, &corner, r);
+            let edges = emit_feature_edges(&topo, &selected, &corner, r, mesh);
             let out = run_surgery(&topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked));
             (out, edges)
         }

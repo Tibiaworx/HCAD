@@ -729,6 +729,9 @@ fn thin_area(m: &TriMesh, max_thick: f64) -> f64 {
             }
         }
         if thin {
+            if std::env::var("TEST_THIN_DEBUG").is_ok() {
+                eprintln!("    thin tri at ({:.3},{:.3},{:.3}) area {:.4}", cen[0], cen[1], cen[2], nl * 0.5);
+            }
             area += nl * 0.5;
         }
     }
@@ -787,12 +790,15 @@ fn a_fillet_on_a_wall_a_fill_leans_on_leaves_no_blade() {
     let (m, engine) = app_fillet(&filled, r_rim, &rim_edge);
     assert!(is_manifold(&m), "[{engine}] result not manifold");
     let removed = vol(&filled) - vol(&m);
+    // A loose floor only: the BLEND removes less than a full-depth sliver would (its ball
+    // cannot sink to the nominal depth — the fill is in the way). The exact figure is checked
+    // against the blend cross-section below.
     assert!(
-        removed > 0.5 * (1.0 - std::f64::consts::PI / 4.0) * r_rim * r_rim * (ro - ri),
+        removed > 0.3 * (1.0 - std::f64::consts::PI / 4.0) * r_rim * r_rim * (ro - ri),
         "[{engine}] the rim fillet barely cut ({removed:.4})"
     );
-    // The point: no blade, no film, no folds. Seam debris measures ~0.01; the blade alone
-    // was 3, the flush films 5 more, and the doubled-membrane fins read as 180-degree folds.
+    // No blade, no film, no folds. Seam debris measures ~0.01; the blade alone was 3, the
+    // flush films 5 more, and the doubled-membrane fins read as 180-degree folds.
     let thin = thin_area(&m, 0.05);
     assert!(
         thin < 0.1,
@@ -802,5 +808,84 @@ fn a_fillet_on_a_wall_a_fill_leans_on_leaves_no_blade() {
     assert!(
         crease < 150.0,
         "[{engine}] a {crease:.0}-degree fold stands on the body — a zero-thickness membrane is back"
+    );
+
+    // And not merely blade-free: BLENDED. The rim fillet's ball, finding the wall too short,
+    // must land tangent on the fill — the cross-section is a circle at v=-r_rim externally
+    // tangent to the fill's circle. Every check below is against that construction.
+    let (big_r, fw, fv) = (r_fill, r_fill, -(h - 4.0 - r_fill)); // fill circle in (w,v) at the wall
+    let dv = -r_rim - fv;
+    let bw = fw - ((big_r + r_rim).powi(2) - dv * dv).sqrt();
+    let c = (bw, -r_rim);
+    let pf = (
+        c.0 + (fw - c.0) * r_rim / (big_r + r_rim),
+        c.1 + (fv - c.1) * r_rim / (big_r + r_rim),
+    );
+    // (w, v) frame for a body point: w leans past the wall (y<0), v below the top.
+    let wv = |p: [f64; 3]| (-p[1], p[2] - h);
+    // 1) The band lies ON the blend cylinder: vertices in the blend's angular span.
+    let (mut worst, mut cnt) = (0.0f64, 0usize);
+    for q in &m.positions {
+        let p = [q[0] as f64, q[1] as f64, q[2] as f64];
+        // The band's vertices sit where the boolean clipped the blend prism — AT the tube
+        // walls — so the window must include them, not demand interior stations.
+        if p[0] < ri - 0.05 || p[0] > ro + 0.05 {
+            continue;
+        }
+        let (w, v) = wv(p);
+        if v > -0.05 || v < c.1 || w < bw - 0.02 || w > pf.0 - 0.05 {
+            continue;
+        }
+        let d = ((w - c.0).powi(2) + (v - c.1).powi(2)).sqrt();
+        // On the blend arc — or legitimately deeper inside the removed region there is no
+        // material, so any vertex in this window is band or noise.
+        worst = worst.max((d - r_rim).abs());
+        cnt += 1;
+    }
+    assert!(cnt > 20, "[{engine}] only {cnt} vertices in the blend band");
+    assert!(
+        worst < 0.03,
+        "[{engine}] the band strays {worst:.4} from the blend cylinder (centre w {bw:.3})"
+    );
+    // 2) The removal equals the blend cross-section's area times the wall length: shoelace
+    // over the sampled boundary (blend arc, support arc, wall, top).
+    let wrap = |d: f64| {
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let m = d.rem_euclid(two_pi);
+        if m > std::f64::consts::PI { m - two_pi } else { m }
+    };
+    let mut poly: Vec<(f64, f64)> = Vec::new();
+    let a0 = (0.0 - c.1).atan2(bw - c.0);
+    let da = wrap((pf.1 - c.1).atan2(pf.0 - c.0) - a0);
+    for k in 0..=60 {
+        let t = a0 + da * k as f64 / 60.0;
+        poly.push((c.0 + r_rim * t.cos(), c.1 + r_rim * t.sin()));
+    }
+    let seam_v = fv + (big_r * big_r - fw * fw).max(0.0).sqrt();
+    let b0 = (pf.1 - fv).atan2(pf.0 - fw);
+    let db = wrap((seam_v - fv).atan2(0.0 - fw) - b0);
+    for k in 1..=60 {
+        let t = b0 + db * k as f64 / 60.0;
+        poly.push((fw + big_r * t.cos(), fv + big_r * t.sin()));
+    }
+    poly.push((0.0, seam_v));
+    poly.push((0.0, 0.0));
+    let mut area2 = 0.0f64;
+    for i in 0..poly.len() {
+        let (x0, y0) = poly[i];
+        let (x1, y1) = poly[(i + 1) % poly.len()];
+        area2 += x0 * y1 - x1 * y0;
+    }
+    let want_removed = area2.abs() * 0.5 * (ro - ri);
+    assert!(
+        (removed - want_removed).abs() < want_removed * 0.12,
+        "[{engine}] removed {removed:.4}, the blend cross-section takes {want_removed:.4}"
+    );
+    // 3) TANGENT means no drawn edge: the whole collision region — band, tangency, fill top —
+    // shows no sharp display edge. The slab's truncation step drew a line here.
+    assert_no_sharp_edges_in(
+        &m,
+        |p| p[0] > ri + 0.15 && p[0] < ro - 0.15 && p[2] > 4.3 && p[2] < h - 0.1 && p[1] > -2.0 && p[1] < 0.5,
+        &format!("blend collision region [{engine}]"),
     );
 }
