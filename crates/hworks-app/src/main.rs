@@ -33704,6 +33704,42 @@ mod tests {
         assert_eq!(folds, 0, "{folds} zero-thickness fold(s) stand on the finished body");
     }
 
+    /// What is DRAWN near the bottom of a document's body: every display edge (sharp,
+    /// tangent, and clipped bevel seam) with both endpoints below a height cutoff, classified
+    /// by radius and direction. For chasing "strays at the bottom from an extrusion".
+    #[test]
+    #[ignore]
+    fn diag_bottom_strays() {
+        let Ok(path) = std::env::var("HCAD_FILE") else { return };
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        let (mesh, bevel_edges) = regenerate_mesh(&doc).expect("regen");
+        let tess = mesh_tessellation(mesh.clone());
+        let kept = clip_edges_to_mesh(&bevel_edges, &tess.mesh, 0.01);
+        let cutoff: f64 = std::env::var("HCAD_CUTOFF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+        let show = |label: &str, edges: &[[[f32; 3]; 2]]| {
+            let mut low: Vec<&[[f32; 3]; 2]> = edges
+                .iter()
+                .filter(|e| e.iter().all(|p| (p[1] as f64) < cutoff))
+                .collect();
+            low.sort_by(|a, b| a[0][1].partial_cmp(&b[0][1]).unwrap());
+            eprintln!("  {label}: {} of {} below y={cutoff}", low.len(), edges.len());
+            for e in low.iter().take(500) {
+                let r0 = ((e[0][0] * e[0][0] + e[0][2] * e[0][2]) as f64).sqrt();
+                let r1 = ((e[1][0] * e[1][0] + e[1][2] * e[1][2]) as f64).sqrt();
+                let dy = (e[1][1] - e[0][1]).abs();
+                let l = (((e[1][0] - e[0][0]).powi(2) + (e[1][1] - e[0][1]).powi(2) + (e[1][2] - e[0][2]).powi(2)) as f64).sqrt();
+                eprintln!(
+                    "    ({:.3},{:.3},{:.3})-({:.3},{:.3},{:.3}) r {:.3}->{:.3} len {:.4} dy {:.4}",
+                    e[0][0], e[0][1], e[0][2], e[1][0], e[1][1], e[1][2], r0, r1, l, dy
+                );
+            }
+        };
+        show("sharp", &tess.edges);
+        show("tangent", &tess.tangent_edges);
+        let kept_arr: Vec<[[f32; 3]; 2]> = kept.clone();
+        show("bevel(kept)", &kept_arr);
+    }
+
     #[test]
     #[ignore] // diagnostic: HCAD_FILE=path cargo test diag_fillet_sticks_out -- --ignored --nocapture
     fn diag_sliver_hunt() {

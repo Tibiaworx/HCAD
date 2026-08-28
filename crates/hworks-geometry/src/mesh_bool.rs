@@ -206,22 +206,81 @@ pub fn feature_edges_by_face(mesh: &TriMesh, crease_deg: f64, tangent_deg: f64) 
         return None;
     }
     let ntri = tris.len() / 3;
-    let pos = |v: u32| { let b = v as usize * nprop; [vp[b], vp[b + 1], vp[b + 2]] };
+    let pos = |v: u32| {
+        let b = v as usize * nprop;
+        [vp[b], vp[b + 1], vp[b + 2]]
+    };
     let dot = |u: [f32; 3], w: [f32; 3]| u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
-    // Per-triangle normal + dense face-id.
-    let tnorm: Vec<[f32; 3]> = (0..ntri).map(|t| face_normal(pos(tris[t * 3]), pos(tris[t * 3 + 1]), pos(tris[t * 3 + 2]))).collect();
+    // WELD vertices before building adjacency. Manifold shares indices within one clean
+    // solid, but a flush boolean leaves DUPLICATE vertices along its seam — edges there never
+    // pair up by raw index, every unpaired edge read as an open boundary, and the seam was
+    // drawn as a sharp ring around the part (sliver.hcad: a bottom ring boss snapped to the
+    // tube's own radii painted a 202-segment ring at its top). Welded, those edges pair,
+    // their dihedral is zero, and the ring merges away like any coplanar continuation.
+    let nvert = vp.len() / nprop;
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in 0..nvert {
+        let p = pos(v as u32);
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let diag = (((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)) as f64).sqrt();
+    let cell = (diag * 1e-6).max(1e-9);
+    let mut wmap: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut wid: Vec<u32> = Vec::with_capacity(nvert);
+    for v in 0..nvert {
+        let p = pos(v as u32);
+        let key = (
+            (p[0] as f64 / cell).round() as i64,
+            (p[1] as f64 / cell).round() as i64,
+            (p[2] as f64 / cell).round() as i64,
+        );
+        let n = wmap.len() as u32;
+        wid.push(*wmap.entry(key).or_insert(n));
+    }
+    // Per-triangle normal, plus a NEEDLE flag: a hair-thin triangle's normal is numerical
+    // noise, so a needle neither blocks a merge nor gets its edges drawn.
+    let needle_floor = (diag * 1e-5) as f32;
+    let mut tnorm: Vec<[f32; 3]> = Vec::with_capacity(ntri);
+    let mut is_needle: Vec<bool> = Vec::with_capacity(ntri);
+    for t in 0..ntri {
+        let (a, b, c) = (pos(tris[t * 3]), pos(tris[t * 3 + 1]), pos(tris[t * 3 + 2]));
+        tnorm.push(face_normal(a, b, c));
+        let e = |x: [f32; 3], y: [f32; 3]| {
+            ((x[0] - y[0]).powi(2) + (x[1] - y[1]).powi(2) + (x[2] - y[2]).powi(2)).sqrt()
+        };
+        let (ab, bc, ca) = (e(a, b), e(b, c), e(c, a));
+        let longest = ab.max(bc).max(ca);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+        let area2 = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        is_needle.push(longest < 1e-12 || area2 / longest < needle_floor);
+    }
+    // Dense face ids and welded-edge adjacency.
     let mut fmap: HashMap<u32, usize> = HashMap::new();
-    let face_of: Vec<usize> = (0..ntri).map(|t| { let n = fmap.len(); *fmap.entry(fid[t]).or_insert(n) }).collect();
-    // Edge → the (≤2) triangles that share it. Manifold shares vertices, so an index pair is exact.
+    let face_of: Vec<usize> = (0..ntri)
+        .map(|t| {
+            let n = fmap.len();
+            *fmap.entry(fid[t]).or_insert(n)
+        })
+        .collect();
     let mut emap: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for t in 0..ntri {
-        let vs = [tris[t * 3], tris[t * 3 + 1], tris[t * 3 + 2]];
+        let vs = [wid[tris[t * 3] as usize], wid[tris[t * 3 + 1] as usize], wid[tris[t * 3 + 2] as usize]];
         for k in 0..3 {
             let (i, j) = (vs[k], vs[(k + 1) % 3]);
+            if i == j {
+                continue; // an edge the weld collapsed
+            }
             emap.entry(if i < j { (i, j) } else { (j, i) }).or_default().push(t);
         }
     }
-    // Union-find: merge tangent-connected face groups into smooth faces.
+    // Union-find: merge everything smoother than the crease into smooth faces, recording each
+    // distinct group-pair's dihedral — those are the face's curvature STEPS, and the step
+    // statistics are what tells a tangent SEAM from ordinary tessellation later.
     let mut uf: Vec<usize> = (0..fmap.len()).collect();
     fn find(uf: &mut [usize], mut x: usize) -> usize {
         while uf[x] != x {
@@ -232,32 +291,167 @@ pub fn feature_edges_by_face(mesh: &TriMesh, crease_deg: f64, tangent_deg: f64) 
     }
     let cos_crease = crease_deg.to_radians().cos() as f32;
     for ts in emap.values() {
-        if ts.len() == 2 && face_of[ts[0]] != face_of[ts[1]] && dot(tnorm[ts[0]], tnorm[ts[1]]) > cos_crease {
-            let (ra, rb) = (find(&mut uf, face_of[ts[0]]), find(&mut uf, face_of[ts[1]]));
+        if ts.len() != 2 {
+            continue;
+        }
+        let (t0, t1) = (ts[0], ts[1]);
+        let (g0, g1) = (face_of[t0], face_of[t1]);
+        if g0 == g1 {
+            continue;
+        }
+        let d = if is_needle[t0] || is_needle[t1] { 1.0 } else { dot(tnorm[t0], tnorm[t1]) };
+        if d > cos_crease {
+            let (ra, rb) = (find(&mut uf, g0), find(&mut uf, g1));
             if ra != rb {
                 uf[ra] = rb;
             }
         }
     }
-    // Edges = boundaries between different smooth faces.
-    let cos_tan = tangent_deg.to_radians().cos() as f32;
-    let (mut sharp, mut tangent) = (Vec::new(), Vec::new());
+    // Per-triangle neighbour steps, for the DIRECTIONAL rate test below: each triangle's
+    // dihedral to each edge-neighbour, with that shared edge's direction. Group-level rate
+    // statistics were tried and fail on twisted quads — a curved band's quad halves are each
+    // their own coplanar group, so the halves' diagonals masquerade as boundaries and drown
+    // every honest signal (six full rings of false seams on one filleted cylinder).
+    const COPLANAR_DEG: f64 = 0.25;
+    let cos_coplanar = COPLANAR_DEG.to_radians().cos() as f32;
+    let mut rep: Vec<u32> = vec![u32::MAX; wmap.len()];
+    for (raw, &w) in wid.iter().enumerate() {
+        if rep[w as usize] == u32::MAX {
+            rep[w as usize] = raw as u32;
+        }
+    }
+    let wpos = |w: u32| pos(rep[w as usize]);
+    let mut nbrs: Vec<Vec<(f32, [f32; 3])>> = vec![Vec::new(); ntri];
+    let mut tri_adj: Vec<Vec<usize>> = vec![Vec::new(); ntri];
     for ((i, j), ts) in &emap {
-        let edge = [pos(*i), pos(*j)];
-        let boundary = match ts.len() {
-            2 => find(&mut uf, face_of[ts[0]]) != find(&mut uf, face_of[ts[1]]),
-            1 => true, // a true boundary edge (open shell) — keep
-            _ => false,
-        };
-        if !boundary {
+        if ts.len() != 2 {
             continue;
         }
-        // Classify by the dihedral across the boundary: a hard crease vs a gentle (tangent) meeting.
-        let hard = ts.len() != 2 || dot(tnorm[ts[0]], tnorm[ts[1]]) < cos_tan;
-        if hard {
-            sharp.push(edge);
-        } else {
-            tangent.push(edge);
+        let (t0, t1) = (ts[0], ts[1]);
+        if is_needle[t0] || is_needle[t1] {
+            continue;
+        }
+        let pa = wpos(*i);
+        let pb = wpos(*j);
+        let d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if l < 1e-12 {
+            continue;
+        }
+        let dir = [d[0] / l, d[1] / l, d[2] / l];
+        let ang = (dot(tnorm[t0], tnorm[t1]) as f64).clamp(-1.0, 1.0).acos().to_degrees() as f32;
+        nbrs[t0].push((ang, dir));
+        nbrs[t1].push((ang, dir));
+        tri_adj[t0].push(t1);
+        tri_adj[t1].push(t0);
+    }
+    // The step a triangle's surface takes ACROSS an edge of direction `e_dir`: the widest
+    // sub-crease dihedral among the edges of its 2-HOP patch that run parallel to it. Two
+    // hops, because on a band of twisted quads the parallel next-ring edge belongs to the
+    // triangle's diagonal partner, never to the triangle itself (a triangle's own edges are
+    // mutually ~60 degrees — a 1-hop test measures nothing, ctx was 0.0 across the board).
+    // Sub-crease, so a nearby RIM's 90 degrees cannot inflate the budget; and edges at nearly
+    // the candidate's own angle are its own seam continuing sideways, not the surface
+    // stepping, so they do not count either.
+    let crossing = |t: usize, e_dir: [f32; 3], own: f32| -> f32 {
+        let take = |u: usize, best: &mut f32| {
+            for (a, d) in &nbrs[u] {
+                if *a < crease_deg as f32
+                    && dot(*d, e_dir).abs() > 0.8
+                    && (*a - own).abs() > 0.15 * own + 0.05
+                    && *a > *best
+                {
+                    *best = *a;
+                }
+            }
+        };
+        let mut best = 0.0f32;
+        take(t, &mut best);
+        for &u in &tri_adj[t] {
+            take(u, &mut best);
+        }
+        best
+    };
+    // Emit. Boundaries between different smooth faces are edges as before (sharp past the
+    // tangent threshold). NEW: inside one smooth face, an edge whose dihedral is a RATE
+    // BREAK — clearly gentler than the face's own median facet step, yet not merely the
+    // coplanar continuation a flush seam leaves — is a tangent SEAM: the line where a fillet
+    // band lands on the face it blends into. That is the boundary the old detector merged
+    // away, which is why every body reported tangent=0 and fillet seams had to be dragged
+    // through regens as stored polylines.
+    let cos_tan = tangent_deg.to_radians().cos() as f32;
+    let probe: Option<(f32, f32)> = std::env::var("HCAD_EDGE_PROBE")
+        .ok()
+        .and_then(|v| {
+            let mut it = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok());
+            Some((it.next()?, it.next()?))
+        });
+    let (mut sharp, mut tangent) = (Vec::new(), Vec::new());
+    for ((i, j), ts) in &emap {
+        let edge = [wpos(*i), wpos(*j)];
+        if let Some((py, pr)) = probe {
+            let hit = edge.iter().all(|p| {
+                (p[1] - py).abs() < 5e-3 && ((p[0] * p[0] + p[2] * p[2]).sqrt() - pr).abs() < 5e-2
+            });
+            if hit {
+                let d = if ts.len() == 2 { dot(tnorm[ts[0]], tnorm[ts[1]]) } else { f32::NAN };
+                let a = (d as f64).clamp(-1.0, 1.0).acos().to_degrees();
+                let roots: Vec<usize> = ts.iter().map(|&t| find(&mut uf, face_of[t])).collect();
+                let needles = ts.iter().filter(|&&t| is_needle[t]).count();
+                eprintln!(
+                    "  PROBE ({:.3},{:.3},{:.3})-({:.3},{:.3},{:.3}) owners={} needles={needles} dihedral={a:.3} roots={roots:?}",
+                    edge[0][0], edge[0][1], edge[0][2], edge[1][0], edge[1][1], edge[1][2], ts.len()
+                );
+            }
+        }
+        match ts.len() {
+            1 => {
+                if !is_needle[ts[0]] {
+                    sharp.push(edge); // a true open boundary — the weld already paired fakes
+                }
+            }
+            2 => {
+                let (t0, t1) = (ts[0], ts[1]);
+                if is_needle[t0] || is_needle[t1] {
+                    continue;
+                }
+                let (g0, g1) = (face_of[t0], face_of[t1]);
+                if g0 == g1 {
+                    continue;
+                }
+                let d = dot(tnorm[t0], tnorm[t1]);
+                let (r0, r1) = (find(&mut uf, g0), find(&mut uf, g1));
+                if r0 != r1 {
+                    if d < cos_tan {
+                        sharp.push(edge);
+                    } else {
+                        tangent.push(edge);
+                    }
+                } else if d < cos_coplanar && d > cos_tan {
+                    // Inside one smooth face: gentler than the tangent threshold, but NOT the
+                    // dead-flat continuation a welded flush seam leaves. A SEAM where the
+                    // angle breaks the rate either side steps at ACROSS this edge — a fillet
+                    // band meets its face at half the band's own step, while the face beyond
+                    // is flat (or curves some other way) in the crossing direction.
+                    let ed = [edge[1][0] - edge[0][0], edge[1][1] - edge[0][1], edge[1][2] - edge[0][2]];
+                    let el = (ed[0] * ed[0] + ed[1] * ed[1] + ed[2] * ed[2]).sqrt();
+                    if el < 1e-12 {
+                        continue;
+                    }
+                    let e_dir = [ed[0] / el, ed[1] / el, ed[2] / el];
+                    let a = (d as f64).clamp(-1.0, 1.0).acos().to_degrees() as f32;
+                    let ctx = crossing(t0, e_dir, a).max(crossing(t1, e_dir, a));
+                    if std::env::var("HCAD_EDGE_DEBUG").is_ok() {
+                        eprintln!("    cand ({:.2},{:.2},{:.2}) angle {a:.2} ctx {ctx:.2} n0={} n1={} -> {}",
+                            edge[0][0], edge[0][1], edge[0][2], nbrs[t0].len(), nbrs[t1].len(),
+                            if a < 0.6 * ctx { "TANGENT" } else { "no" });
+                    }
+                    if a < 0.6 * ctx {
+                        tangent.push(edge);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Some((sharp, tangent))
@@ -548,6 +742,15 @@ fn enclosed_volume(m: &TriMesh) -> f64 {
 /// knife-edge wedge, a pinch), which is why this only SCREENS — the verdict comes from
 /// measuring actual thin material, which costs more.
 fn fold_screen(m: &TriMesh) -> bool {
+    fold_count(m) > 0
+}
+
+/// How many opposed real-sized pairs `fold_screen` would trip on — countable, so a boolean's
+/// result can be compared against its own operands: damage CARRIED IN is not repairable by
+/// nudging, but a result that folds MORE than its operands did is new damage this boolean
+/// made, however pinched the operands already were (a legitimately pinched body must not
+/// grandfather every later flush join).
+fn fold_count(m: &TriMesh) -> usize {
     let ids = weld_ids(m);
     let p = |i: u32| {
         let q = m.positions[i as usize];
@@ -577,17 +780,18 @@ fn fold_screen(m: &TriMesh) -> bool {
             owners.entry(k).or_default().push(nrm);
         }
     }
+    let mut count = 0usize;
     for own in owners.values() {
         for i in 0..own.len() {
             for j in i + 1..own.len() {
                 let d = own[i][0] * own[j][0] + own[i][1] * own[j][1] + own[i][2] * own[j][2];
                 if d < -0.85 {
-                    return true;
+                    count += 1;
                 }
             }
         }
     }
-    false
+    count
 }
 
 /// Total area of FILM in `m` near the zone `[zone_lo, zone_hi]`: triangles whose centroid,
@@ -650,7 +854,7 @@ fn thin_film_area(m: &TriMesh, zone_lo: [f32; 3], zone_hi: [f32; 3], max_thick: 
         // COINCIDENT sheets: every vertex of each triangle lies within film thickness of the
         // other's plane. A wedge's faces separate away from the shared edge and fail this.
         let coincident = |ti: usize, tj: usize| -> bool {
-            let (nj, _, _) = tri_geom(tj).unwrap();
+            let Some((nj, _, _)) = tri_geom(tj) else { return false };
             let q0 = tris[tj][0];
             tris[ti].iter().all(|v| {
                 let d = (v[0] - q0[0]) * nj[0] + (v[1] - q0[1]) * nj[1] + (v[2] - q0[2]) * nj[2];
@@ -770,9 +974,22 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     // Anything this boolean created lives where operand b was; a film is offset-scale, so
     // anything under 8e-4 across is not a wall anyone drew.
     let (zlo, zhi) = bbox(b);
-    const FILM: f64 = 8.0e-4;
+    // A film is offset-scale; anything under 8e-4 across is not a wall anyone drew. The
+    // clearance-scale doubled sheets a FLUSH NO-OP bakes (1.4e-3 apart — beyond any nudge's
+    // repair) are prevented upstream instead: a boolean that changed nothing returns the
+    // body untouched.
+    let film_t: f64 = 8.0e-4;
     let dbg = std::env::var("HCAD_BOOL_DEBUG").is_ok();
     if let Some(m) = &first {
+        // A boolean that did not change the body returns the body — bit for bit. A flush
+        // no-op (a boss drawn over material that is already there, its walls snapped to the
+        // body's own) still re-tessellates through Manifold and bakes doubled sheets along
+        // every coincident wall: sliver.hcad's bottom ring boss added 121 zero-thickness fold
+        // pairs while changing the volume by nothing. No sub-micron nudge can repair sheets a
+        // clearance-scale gap apart; not building them is the fix.
+        if (enclosed_volume(m) - enclosed_volume(a)).abs() < enclosed_volume(a).max(1e-9) * 1e-6 {
+            return Some(a.clone());
+        }
         if !seals_a_sheet(m) {
             // Success is still judged for FILM: a flush difference can succeed with the
             // coincident wall left standing at offset thickness (sliver.hcad: a 1.5e-4 sheet
@@ -785,7 +1002,7 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
             if fold_screen(a) || fold_screen(b) {
                 return first; // damage (or a knife-edge shape) carried in — not repairable here
             }
-            let fa = thin_film_area(m, zlo, zhi, FILM);
+            let fa = thin_film_area(m, zlo, zhi, film_t);
             if dbg {
                 eprintln!("BOOL first ok, folds, film {fa:.5}, torn {}", torn_edges(m));
             }
@@ -802,7 +1019,7 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     }
     let joined = first.as_ref().map(shell_count);
     let held = first.as_ref().map(enclosed_volume);
-    let first_film = first.as_ref().map(|m| thin_film_area(m, zlo, zhi, FILM));
+    let first_film = first.as_ref().map(|m| thin_film_area(m, zlo, zhi, film_t));
     let first_torn = first.as_ref().map(|m| torn_edges(m));
     let mut best: Option<(f64, usize, TriMesh)> = None; // (film area, torn edges, mesh)
     let mut fallback = None;
@@ -828,7 +1045,7 @@ fn manifold_boolean(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
             // arrangement, and what the caller asked for is the un-nudged result.
             && !matches!(held, Some(v) if (enclosed_volume(&m) - v).abs() > v * 1.0e-3);
         if sound {
-            let film = thin_film_area(&m, zlo, zhi, FILM);
+            let film = thin_film_area(&m, zlo, zhi, film_t);
             let torn = torn_edges(&m);
             // Film-free and pinch-free is as good as it gets — stop looking. (A sound result
             // can still pinch — two walls meeting exactly along a line, which is a real shape

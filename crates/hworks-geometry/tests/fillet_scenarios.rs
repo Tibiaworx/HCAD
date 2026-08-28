@@ -889,3 +889,78 @@ fn a_fillet_on_a_wall_a_fill_leans_on_leaves_no_blade() {
         &format!("blend collision region [{engine}]"),
     );
 }
+
+/// The display detector, on the two stray classes users actually reported. A boss whose
+/// walls land flush ON the body's own walls (circles snapped to the tube's radii — the
+/// bottom extrusion on sliver.hcad) used to paint a sharp ring right around the part at the
+/// boss's top: the flush union leaves DUPLICATE vertices along its seam, edges there never
+/// paired by raw index, and every unpaired edge was drawn as an open boundary. The detector
+/// welds before building adjacency now, so the seam merges away like any coplanar
+/// continuation. And a fillet's tangent seams are DETECTED (a rate break against the face's
+/// own median facet step) instead of merged into silence — tangent=0 on every body is what
+/// made stored seam polylines necessary in the first place.
+#[test]
+fn flush_boss_paints_no_ring_and_fillet_seams_are_detected()  {
+    let n = 96usize;
+    let (ro, ri, h) = (6.4f64, 5.6f64, 7.0f64);
+    let ring = |rad: f64| -> Vec<[f64; 2]> {
+        (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                [rad * a.cos(), rad * a.sin()]
+            })
+            .collect()
+    };
+    let bore: Vec<[f64; 2]> = ring(ri).iter().rev().copied().collect();
+    let tube = extrude_tool_mesh(&ring(ro), &[bore.clone()], &xy(), 0.0, h).unwrap();
+    // A ring boss over z 0..2 with walls EXACTLY on the tube's own — adds no material at all,
+    // but the flush union re-tessellates and used to bake the phantom ring at z=2.
+    let boss = extrude_tool_mesh(&ring(ro), &[bore], &xy(), 0.0, 2.0).unwrap();
+    let body = mesh_union(&tube, &boss);
+    let tess = mesh_tessellation(body.clone());
+    let ring_edges = tess
+        .edges
+        .iter()
+        .filter(|e| e.iter().all(|p| (p[2] as f64 - 2.0).abs() < 0.02))
+        .count();
+    assert!(
+        ring_edges <= 8,
+        "{ring_edges} sharp display edges ring the part at the flush boss top — the phantom is back"
+    );
+
+    // Fillet the tube's top rim: the band's two tangent seams must come out of the DETECTOR.
+    let mut rim: Vec<[f64; 3]> = ring(ro).iter().map(|p| [p[0], p[1], h]).collect();
+    rim.push(rim[0]);
+    let (m, engine) = app_fillet(&body, 0.8, &vec![rim]);
+    let tess = mesh_tessellation(m.clone());
+    let near_seam = |p: &[f32; 3], rad: f64, z: f64| {
+        let d = ((p[0] * p[0] + p[1] * p[1]) as f64).sqrt();
+        (d - rad).abs() < 0.05 && (p[2] as f64 - z).abs() < 0.05
+    };
+    // The WALL-side seam is a rate break (the band lands at half its own step against a wall
+    // whose curvature runs the other way) and must be detected natively. The CAP-side seam is
+    // deliberately NOT asserted: the surgery tessellates its band so the first facet steps at
+    // the full ring rate — the cap seam is geometrically indistinguishable from the band's
+    // own stepping, no angle heuristic can see it, and that seam's display comes from the
+    // stored bevel_edges channel instead. (Chasing it with looser thresholds was tried and
+    // painted six rings of false seams down the band's quad diagonals.)
+    let _ = near_seam(&[0.0f32; 3], ro - 0.8, h);
+    let wall_seam = tess
+        .tangent_edges
+        .iter()
+        .filter(|e| e.iter().all(|p| near_seam(p, ro, h - 0.8)))
+        .count();
+    assert!(
+        wall_seam > n / 2,
+        "[{engine}] the fillet's wall-side tangent seam is not detected: {wall_seam} segments (want ~{n})"
+    );
+    // And the band itself still draws no sharp edge.
+    assert_no_sharp_edges_in(
+        &m,
+        |p| {
+            let d = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            p[2] > h - 0.8 + 0.05 && d > ro - 0.8 + 0.05
+        },
+        &format!("filleted rim band [{engine}]"),
+    );
+}

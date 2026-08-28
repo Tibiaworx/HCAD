@@ -306,7 +306,69 @@
             ),
             hidden: false,
         ),
+        (
+            id: (9),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: -4.1103515625,
+                            y: -4.671875,
+                            fixed: true,
+                        ),
+                        (
+                            x: -4.1103515625,
+                            y: -4.671875,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 6.395233154296875,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 2,
+                            radius: 5.611487865447998,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Coincident(2, 1),
+                    ],
+                ),
+                regions: [
+                    0,
+                    1,
+                ],
+                region_pts: [
+                    (1.6453582763671877, -4.671875),
+                    (-4.110351562500001, -4.671874999999999),
+                ],
+                plane: (
+                    origin: (4.1103515625, 0.0, 4.671875),
+                    u: (1.0, 0.0, 0.0),
+                    v: (-0.0, 0.0, 1.0),
+                    normal: (0.0, -1.0, 0.0),
+                    datum: false,
+                ),
+                distance: -2.0,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
     ],
-    rollback: 9,
-    next_id: 9,
+    rollback: 10,
+    next_id: 10,
 )
