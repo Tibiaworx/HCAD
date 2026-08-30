@@ -1,0 +1,207 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 4.177728176116943,
+                            y: 4.016993522644043,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 6.0,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 0.01,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Radius(
+                            center: 0,
+                            value: 6.0,
+                            diameter: true,
+                            label: (0.0, 0.0),
+                        ),
+                    ],
+                ),
+                regions: [],
+                region_pts: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 25.51388168334961,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+        (
+            id: (4),
+            kind: Cut(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.000011676155736495275,
+                            y: 6.000010967254639,
+                            fixed: true,
+                        ),
+                        (
+                            x: 6.000011444091797,
+                            y: 0.000011156763321196195,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 6.0,
+                            construction: false,
+                        ),
+                        Line(
+                            a: 1,
+                            b: 0,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 0,
+                            b: 2,
+                            construction: false,
+                            reference: false,
+                        ),
+                    ],
+                    constraints: [
+                        Vertical(1, 0),
+                        Horizontal(0, 2),
+                    ],
+                ),
+                regions: [
+                    0,
+                ],
+                region_pts: [
+                    (3.6825433746028655, 3.682543345301996),
+                ],
+                plane: (
+                    origin: (-0.000011676155736495275, 25.515625, 0.000011156763321196195),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: false,
+                ),
+                distance: 6.6167826652526855,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+        (
+            id: (5),
+            kind: Cut(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 11.807792663574219,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 3.75872540473938,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                regions: [],
+                region_pts: [],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 1.0, 0.0),
+                    normal: (0.0, 0.0, 1.0),
+                    datum: true,
+                ),
+                distance: 12.869939804077148,
+                back: 11.35278034210205,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 6,
+    next_id: 6,
+)

@@ -17865,9 +17865,11 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
                     // centroid past the cut plane; a single probe either side of one point then
                     // fixed that but still read nothing when that point sat over a hole.
                     let tessm = tessellate(b, 0.06).mesh;
-                    let into: f64 = match footprint_cut_vote(&tessm, &resolved, std::slice::from_ref(&merged[ri]), distance.abs() as f32) {
-                        Some(v) => v as f64,
-                        None => {
+                    let into: f64 = match footprint_cut_side(&tessm, &resolved, std::slice::from_ref(&merged[ri]), *distance, *back) {
+                        CutSide::Toward(v) => v,
+                        // Either way removes the same material, so take a side and say nothing.
+                        CutSide::Immaterial => -1.0,
+                        CutSide::Unknown => {
                             CUT_DIRECTION_GUESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!("Cut: couldn't tell which side is material — guessing from the body centroid.");
                             if (mesh_centroid(&tessm) - origin).dot(n) < 0.0 { -1.0 } else { 1.0 }
@@ -18473,7 +18475,6 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 // mesh path) cuts from the stale stored plane and comes out shallow. Test under
                 // the footprint centroid so it lands on the face the sketch actually sits on.
                 let mut cut_regs = merge_regions(&chosen_regions_pts(&all, regions, region_pts));
-                let ref_world = sketch_footprint_world(plane, cut_regs.iter().flat_map(|r| r.outer.iter()));
                 let samples = sketch_footprint_samples(plane, &cut_regs);
                 let plane = reproject_plane_on_mesh(plane, cur0, &samples);
                 let basis = basis_from_ref(&plane);
@@ -18484,9 +18485,11 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 // first region is what left blocker.hcad guessing — both its counterbores sit on
                 // through-holes, so neither region's middle touches material and the answer is in
                 // the ring around them.
-                let into = match footprint_cut_vote(cur0, &plane, &cut_regs, *distance as f32) {
-                    Some(v) => v as f64,
-                    None => {
+                let into = match footprint_cut_side(cur0, &plane, &cut_regs, *distance, *back) {
+                    CutSide::Toward(v) => v,
+                    // Either way removes the same material, so take a side and say nothing.
+                    CutSide::Immaterial => -1.0,
+                    CutSide::Unknown => {
                         CUT_DIRECTION_GUESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!("Cut: couldn't tell which side is material — guessing from the body centroid.");
                         if (mesh_centroid(cur0) - origin).dot(n) < 0.0 { -1.0 } else { 1.0 }
@@ -18943,24 +18946,35 @@ fn solid_span(crossings: &[f32], lo: f32, hi: f32) -> f32 {
     total
 }
 
-/// Which side of a cut's plane holds the material it is meant to remove.
+/// What polling a cut's footprint settled about which way it faces.
+enum CutSide {
+    /// Material clearly on one side: `-1` toward `-n`, `+1` toward `+n`.
+    Toward(f64),
+    /// The tool reaches clean through everything under the footprint WHICHEVER way it faces, so
+    /// the direction cannot change what the cut removes. Either will do, and there is nothing to
+    /// warn the user about.
+    Immaterial,
+    /// Genuinely undecided. The caller has to guess, and should say so.
+    Unknown,
+}
+
+/// Which side of a cut's plane holds the material it is there to remove.
 ///
 /// Measured rather than guessed: over a grid spanning the footprint's area, how much solid lies
-/// within the cut's own depth on each side of the plane. That is the physical question — a cut
-/// removes material, so it faces whichever side has some — and it settles the two cases a probe at
+/// within the cut's own depth on each side of the plane. That is the physical question - a cut
+/// removes material, so it faces whichever side has some - and it settles the two cases a probe at
 /// a single point either side cannot:
 ///
-/// * a footprint whose middle is over a hole (blocker.hcad's counterbores sit on the through-holes),
-///   where the samples over the surrounding material carry it;
+/// * a footprint whose middle is over a hole (blocker.hcad's counterbores sit on the through-
+///   holes), where the samples over the surrounding material carry it;
 /// * a sketch standing off the body on a datum plane, where nothing is solid AT the plane but the
 ///   material a little further along still counts.
 ///
 /// Depth is the weight, not sample count, so a handful of samples over 5 mm of material outvote
-/// fifty over a void — those contribute nothing either way rather than diluting the answer.
-/// `None` only when both sides come back empty, or too close to call.
-fn footprint_cut_vote(mesh: &TriMesh, plane: &PlaneRef, regs: &[hworks_sketch::Region], reach: f32) -> Option<f32> {
+/// fifty over a void - those contribute nothing either way rather than diluting the answer.
+fn footprint_cut_side(mesh: &TriMesh, plane: &PlaneRef, regs: &[hworks_sketch::Region], distance: f64, back: f64) -> CutSide {
     let n = Vec3::new(plane.normal[0] as f32, plane.normal[1] as f32, plane.normal[2] as f32);
-    let reach = reach.abs().max(1.0e-3);
+    let reach = (distance.abs() as f32).max(1.0e-3);
     // Far enough behind every sample to start in open air, whatever the body.
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for q in &mesh.positions {
@@ -18970,6 +18984,8 @@ fn footprint_cut_vote(mesh: &TriMesh, plane: &PlaneRef, regs: &[hworks_sketch::R
     }
     let span = (hi - lo).length().max(reach) + 1.0;
     let (mut neg, mut pos) = (0.0f32, 0.0f32);
+    // ...and how far the material under the footprint reaches either way, for the question below.
+    let (mut mat_lo, mut mat_hi) = (f32::MAX, f32::MIN);
     for w in footprint_area_samples(plane, regs, 100) {
         let ts = surface_crossings_along(mesh, w, n, span);
         if ts.len() < 2 {
@@ -18977,23 +18993,35 @@ fn footprint_cut_vote(mesh: &TriMesh, plane: &PlaneRef, regs: &[hworks_sketch::R
         }
         neg += solid_span(&ts, -reach, 0.0);
         pos += solid_span(&ts, 0.0, reach);
-    }
-    if neg <= 0.0 && pos <= 0.0 {
-        return None; // the footprint reaches no material at all, either way
+        mat_lo = mat_lo.min(ts[0]);
+        mat_hi = mat_hi.max(ts[ts.len() - 1]);
     }
     // The side with more material wins, by a margin. A plane buried IN the body has material both
     // ways and the honest answer is the side with more of it under the footprint - measured over
     // ~100 samples, 260 against 165 is a real asymmetry, not noise, and demanding twice as much
-    // (staleedge.hcad) threw away an answer the part depends on. What the margin still refuses is
-    // the genuine tie: a plane bisecting a symmetric block, where only the user knows.
+    // (staleedge.hcad) threw away an answer the part depends on.
     const MARGIN: f32 = 1.25;
-    if neg > pos * MARGIN {
-        Some(-1.0)
-    } else if pos > neg * MARGIN {
-        Some(1.0)
-    } else {
-        None
+    if neg > 0.0 && neg > pos * MARGIN {
+        return CutSide::Toward(-1.0);
     }
+    if pos > 0.0 && pos > neg * MARGIN {
+        return CutSide::Toward(1.0);
+    }
+    // Too close to call, or nothing found. Before admitting to a guess, ask whether the answer
+    // could matter: a two-sided cut deep enough BOTH ways swallows everything under its footprint
+    // whichever way round it goes, and flipping it changes nothing. pinch.hcad is exactly that - a
+    // sketch on the Front datum, 12.87 forward and 11.35 back through a part 12 thick - and it
+    // reported a guess on every rebuild about a choice with no consequence.
+    if mat_lo <= mat_hi {
+        let eps = 0.05 + distance.abs() * 0.02;
+        let b = back.max(0.0);
+        let (fwd, rev) = ((-(eps + b), distance.abs() + eps), (-(distance.abs() + eps), eps + b));
+        let covers = |s: (f64, f64)| s.0 as f32 <= mat_lo && s.1 as f32 >= mat_hi;
+        if covers(fwd) && covers(rev) {
+            return CutSide::Immaterial;
+        }
+    }
+    CutSide::Unknown
 }
 
 fn sweep_sections(
@@ -29329,7 +29357,7 @@ mod tests {
         let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
         let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         for (fi, f) in doc.features.iter().enumerate() {
-            let FeatureKind::Cut { sketch, regions, region_pts, plane, distance, .. } = &f.kind else { continue };
+            let FeatureKind::Cut { sketch, regions, region_pts, plane, distance, back, .. } = &f.kind else { continue };
             let mut upto = doc.clone();
             upto.rollback = fi; // the body as it stands just before this cut
             let Some((cur0, _)) = regenerate_mesh(&upto) else {
@@ -29361,9 +29389,10 @@ mod tests {
             }
             eprintln!("   {} area sample(s), {touching} of them reach material", pts.len());
             eprintln!("   solid within depth:  -n side {neg:.3}   +n side {pos:.3}");
-            match footprint_cut_vote(&cur0, &rp, &cut_regs, reach) {
-                Some(v) => eprintln!("   -> cuts toward {} (measured)", if v < 0.0 { "-n" } else { "+n" }),
-                None => eprintln!("   -> NO ANSWER — falls back to the whole-body centroid guess"),
+            match footprint_cut_side(&cur0, &rp, &cut_regs, *distance, *back) {
+                CutSide::Toward(v) => eprintln!("   -> cuts toward {} (measured)", if v < 0.0 { "-n" } else { "+n" }),
+                CutSide::Immaterial => eprintln!("   -> EITHER WAY is the same cut (reaches through everything under the footprint)"),
+                CutSide::Unknown => eprintln!("   -> NO ANSWER — falls back to the whole-body centroid guess"),
             }
         }
     }
@@ -29407,6 +29436,26 @@ mod tests {
                 "feature {fi} is a Cut but the body went {before:.3} -> {after:.3} — it cut air, so it faced the wrong way"
             );
         }
+    }
+
+    /// A cut that reaches clean through everything under its footprint whichever way it faces must
+    /// NOT report a guess: the choice has no consequence, and saying so is noise the user cannot
+    /// act on. `pinch.hcad` is that case — a sketch on the Front datum plane cutting 12.87 forward
+    /// and 11.35 back through a part 12 thick, sitting so symmetrically that the two sides measure
+    /// 454.975 against 454.946. It warned on every rebuild about a choice that changes nothing.
+    #[test]
+    fn a_cut_that_goes_clean_through_both_ways_does_not_warn() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/pinch.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/pinch.hcad is a fixture — force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse pinch.hcad");
+        let _ = take_cut_direction_guesses();
+        let (m, _) = regenerate_mesh(&doc).expect("pinch.hcad builds");
+        let guesses = take_cut_direction_guesses();
+        assert_eq!(guesses, 0, "{guesses} cut(s) warned about a direction that cannot change the result");
+        // ...and it is genuinely immaterial: the part is what it was either way.
+        let vol = hworks_geometry::signed_mesh_volume(&m).abs();
+        assert!((vol - 2187.43).abs() < 0.1, "pinch.hcad built {vol:.3}, expected 2187.43");
     }
 
     /// Type a number into a value box and the box must take THAT number.
