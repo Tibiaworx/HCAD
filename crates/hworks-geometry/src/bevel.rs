@@ -197,14 +197,19 @@ pub fn build_topo(mesh: &TriMesh) -> Topo {
             }
         }
         // A directed edge is on the boundary when its opposite is absent (interior shared edges
-        // appear in both directions and cancel).
-        for &(a, b) in &present {
-            if !present.contains(&(b, a)) {
-                dir.entry(a).or_default().push(b);
-            }
+        // appear in both directions and cancel). Sorted, because at a pinch vertex one `a` has
+        // several outgoing boundary edges and the walk below pops one of them: in hash order it
+        // popped a different one each run and split the face into different loops.
+        let mut half: Vec<(usize, usize)> = present.iter().copied().filter(|&(a, b)| !present.contains(&(b, a))).collect();
+        half.sort_unstable();
+        for (a, b) in half {
+            dir.entry(a).or_default().push(b);
         }
-        // Walk chains until all boundary half-edges are consumed.
-        while let Some((&start, _)) = dir.iter().find(|(_, v)| !v.is_empty()) {
+        // Walk chains until all boundary half-edges are consumed. The start is the LOWEST
+        // remaining vertex, not whichever the hash offered first — a ring started at a different
+        // vertex is the same ring rotated, and the triangulator hands back a different (still
+        // correct) fan for each rotation. Same document, different mesh.
+        while let Some(start) = dir.iter().filter(|(_, v)| !v.is_empty()).map(|(&k, _)| k).min() {
             let mut loop_v = vec![start];
             let mut cur = start;
             loop {
@@ -226,9 +231,14 @@ pub fn build_topo(mesh: &TriMesh) -> Topo {
         }
     }
 
-    // Model edges: welded mesh edges whose two triangles belong to *different* faces.
+    // Model edges: welded mesh edges whose two triangles belong to *different* faces. Walked in
+    // sorted key order — this list's order is the order the bevel visits and emits model edges,
+    // so taking it from the hash gave a differently-ordered (though same-shaped) body each run.
+    let mut edge_keys: Vec<(usize, usize)> = edge_tris.keys().copied().collect();
+    edge_keys.sort_unstable();
     let mut edges: Vec<TopoEdge> = Vec::new();
-    for (&(a, b), ts) in &edge_tris {
+    for (a, b) in edge_keys {
+        let ts = &edge_tris[&(a, b)];
         let mut fs: Vec<usize> = ts.iter().map(|&t| tri_face[t]).collect();
         fs.sort_unstable();
         fs.dedup();

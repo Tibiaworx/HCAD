@@ -3960,6 +3960,27 @@ fn flyout_menu_icon<R>(
     inner
 }
 
+/// Select the whole of a value box’s text at the moment it is given focus, so the first thing
+/// typed replaces the number instead of landing on the end of it.
+///
+/// egui selects a `DragValue`’s contents only on the frame focus is *gained*, and a focus asked
+/// for at the END of the frame the box appears has already missed that moment: by the time the
+/// widget renders as a text field, egui counts it as having held focus all along. The box opened
+/// with the caret parked after the value it was showing, so typing 50 into a dimension reading 7.0
+/// gave the sketch 7.050 — which reads as the box refusing to take a number at all.
+///
+/// Pre-loading a select-all range under the widget’s own id puts the selection back. The end index
+/// is deliberately past the end: egui clamps a stored range to the text when it applies it, so this
+/// needs no guess about how the number will be formatted.
+fn select_all_on_focus(ctx: &egui::Context, id: egui::Id) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::default(),
+        egui::text::CCursor::new(usize::MAX),
+    )));
+    state.store(ctx, id);
+}
+
 fn ui_system(
     mut contexts: EguiContexts,
     mut session: ResMut<SketchSession>,
@@ -7060,6 +7081,7 @@ fn ui_system(
                             );
                             if focus_now {
                                 resp.request_focus();
+                                select_all_on_focus(ui.ctx(), resp.id);
                                 focus_now = false;
                             }
                             if !resp.has_focus() {
@@ -7090,6 +7112,7 @@ fn ui_system(
                             }
                             if focus_now {
                                 resp.request_focus();
+                                select_all_on_focus(ui.ctx(), resp.id);
                                 focus_now = false;
                             }
                             if !resp.has_focus() {
@@ -9372,7 +9395,13 @@ fn ui_system(
                                         egui::DragValue::new(&mut disp).speed(0.1 * f as f64).range((0.001 * f)..=(1_000_000.0 * f)).max_decimals(if unit == Unit::Inch { 4 } else { 2 }).suffix(unit.suffix()),
                                     );
                                     buf = disp / f;
-                                    resp.request_focus();
+                                    // Only while it does NOT hold focus: asking every frame both re-stole
+                                    // focus from anything else and re-ran the select, which would wipe each
+                                    // keystroke as it landed.
+                                    if !resp.has_focus() {
+                                        resp.request_focus();
+                                        select_all_on_focus(ctx, resp.id);
+                                    }
                                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                                     if ui.button("OK").clicked() || enter {
                                         close = true;
@@ -9536,6 +9565,7 @@ fn ui_system(
                             );
                             if session.dim_edit_focus {
                                 resp.request_focus();
+                                select_all_on_focus(ctx, resp.id);
                                 session.dim_edit_focus = false;
                             }
                             if resp.changed() {
@@ -21930,12 +21960,129 @@ fn arcs_safe_at<'a>(
     }
 }
 
+/// A region's holes have to be *disjoint* loops. The sketch's arrangement can hand back a face
+/// whose hole list is several loops that TOUCH — the neighbouring faces, each traced on its own —
+/// and whose union is really one hole. On blocker.hcad the annulus between the two bores comes
+/// back with three: the bore, the part of a box tab inside the bore, and the part of the same tab
+/// outside it. Their union is one bore-with-a-bulge, and they meet at the two points where the
+/// tab's edges cross the bore.
+///
+/// Left alone those meeting points are PINCHES in the prism built from the region — three walls
+/// sharing one edge — and `is_manifold` does not see them, because every edge still carries two
+/// faces. The next boolean has to resolve the pinch, and on blocker.hcad Manifold resolved it by
+/// wiring a top-cap vertex to the floor: one facet sloping 2 mm down into a 5 mm plate, which
+/// reads as a notch bitten out of the top face beside the tab.
+///
+/// Cancelling the shared directed edges and re-tracing gives the single loop those faces really
+/// bound. The faces are disjoint, so the union's area is exactly the sum of theirs — which is the
+/// check below, and it is exact rather than approximate. Nothing about the solid changes; only the
+/// pinch goes.
+fn merge_touching_holes(r: &hworks_sketch::Region) -> hworks_sketch::Region {
+    use std::collections::HashMap;
+    if r.holes.len() < 2 {
+        return r.clone();
+    }
+    let key = |p: [f64; 2]| ((p[0] * 1.0e6).round() as i64, (p[1] * 1.0e6).round() as i64);
+    let mut pos: HashMap<(i64, i64), [f64; 2]> = HashMap::new();
+    let mut edges: Vec<((i64, i64), (i64, i64))> = Vec::new();
+    for h in &r.holes {
+        if h.len() < 3 {
+            return r.clone();
+        }
+        for k in 0..h.len() {
+            let (a, b) = (key(h[k]), key(h[(k + 1) % h.len()]));
+            pos.insert(a, h[k]);
+            pos.insert(b, h[(k + 1) % h.len()]);
+            edges.push((a, b));
+        }
+    }
+    let present: std::collections::HashSet<_> = edges.iter().copied().collect();
+    // No shared edge ⇒ the holes are already disjoint ⇒ leave them exactly as they are.
+    if !edges.iter().any(|&(a, b)| present.contains(&(b, a))) {
+        return r.clone();
+    }
+    let mut kept: Vec<((i64, i64), (i64, i64))> = edges.iter().copied().filter(|&(a, b)| !present.contains(&(b, a))).collect();
+    kept.sort_unstable();
+    kept.dedup();
+    if kept.is_empty() {
+        return r.clone();
+    }
+    // Sorted, so the walk is reproducible — see the same note on `merge_regions`.
+    let mut out_edges: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, &(a, _)) in kept.iter().enumerate() {
+        out_edges.entry(a).or_default().push(i);
+    }
+    let dir_angle = |from: (i64, i64), to: (i64, i64)| {
+        let (p, q) = (pos[&from], pos[&to]);
+        (q[1] - p[1]).atan2(q[0] - p[0])
+    };
+    let tau = std::f64::consts::TAU;
+    let mut used = vec![false; kept.len()];
+    let mut loops: Vec<Vec<[f64; 2]>> = Vec::new();
+    for first in 0..kept.len() {
+        if used[first] {
+            continue;
+        }
+        let mut loop_pts: Vec<[f64; 2]> = Vec::new();
+        let mut e = first;
+        for _ in 0..=kept.len() {
+            used[e] = true;
+            let (a, b) = kept[e];
+            loop_pts.push(pos[&a]);
+            let back = dir_angle(b, a);
+            let mut best: Option<(f64, usize)> = None;
+            if let Some(cands) = out_edges.get(&b) {
+                for &ni in cands {
+                    if used[ni] && ni != first {
+                        continue;
+                    }
+                    let turn = (back - dir_angle(kept[ni].0, kept[ni].1)).rem_euclid(tau);
+                    let turn = if turn <= 1.0e-12 { tau } else { turn };
+                    if best.is_none_or(|(bt, _)| turn < bt) {
+                        best = Some((turn, ni));
+                    }
+                }
+            }
+            match best {
+                Some((_, ni)) if ni != first => e = ni,
+                _ => break,
+            }
+        }
+        if loop_pts.len() >= 3 {
+            loops.push(loop_pts);
+        }
+    }
+    let area_of = |poly: &[[f64; 2]]| {
+        let m = poly.len();
+        let mut a = 0.0;
+        for i in 0..m {
+            let (p, q) = (poly[i], poly[(i + 1) % m]);
+            a += p[0] * q[1] - q[0] * p[1];
+        }
+        (a * 0.5).abs()
+    };
+    let want: f64 = r.holes.iter().map(|h| area_of(h)).sum();
+    let got: f64 = loops.iter().map(|l| area_of(l)).sum();
+    if loops.is_empty() || (got - want).abs() > want * 1.0e-3 {
+        return r.clone(); // the re-trace lost or gained area — keep what we were given
+    }
+    hworks_sketch::Region { outer: r.outer.clone(), holes: loops, ..Default::default() }
+}
+
 /// Union a set of sketch regions in 2D into merged outline(s) by cancelling the
 /// edges shared between adjacent regions. Adjacent contours collapse into a single
 /// profile — so the extrude is one solid and never needs the fragile coincident-
 /// face 3D boolean — while disjoint contours stay separate. Falls back to the
 /// inputs if a clean merge can't be traced.
 fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Region> {
+    // Whatever route the merge takes below — a real re-trace, or handing the inputs back
+    // untouched — every region that comes out has to have disjoint holes, or the prism
+    // built from it pinches. See `merge_touching_holes`.
+    merge_regions_traced(regions).iter().map(merge_touching_holes).collect()
+}
+
+/// The union re-trace itself. Call `merge_regions`, not this.
+fn merge_regions_traced(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Region> {
     use std::collections::{HashMap, HashSet};
     // A single region has nothing to merge with — and its outline must NOT be re-traced:
     // a crossing-heavy arrangement region can weave through pinch vertices that read as
@@ -21949,34 +22096,54 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
     let mut ids: HashMap<(i64, i64), usize> = HashMap::new();
     let mut pos: Vec<[f64; 2]> = Vec::new();
     let mut edges: Vec<(usize, usize)> = Vec::new();
+    // Wound so the face is on the LEFT of every directed edge: outer loops counter-clockwise,
+    // holes clockwise. The sketch does NOT hand them over that way — on blocker.hcad the annulus
+    // and all three of its holes came back counter-clockwise — and without this a hole and the
+    // selected face that fills it run the same way round, so their shared boundary never cancels
+    // and the trace keeps an internal edge as though it were the outline.
     for r in regions {
-        for loop_pts in std::iter::once(&r.outer).chain(r.holes.iter()) {
+        for (is_outer, loop_pts) in std::iter::once((true, &r.outer)).chain(r.holes.iter().map(|h| (false, h))) {
             let m = loop_pts.len();
             if m < 3 {
                 continue;
             }
-            let vids: Vec<usize> = loop_pts
+            let mut vids: Vec<usize> = loop_pts
                 .iter()
                 .map(|p| *ids.entry(key(*p)).or_insert_with(|| {
                     pos.push(*p);
                     pos.len() - 1
                 }))
                 .collect();
+            let mut twice_area = 0.0;
+            for k in 0..m {
+                let (p, q) = (loop_pts[k], loop_pts[(k + 1) % m]);
+                twice_area += p[0] * q[1] - q[0] * p[1];
+            }
+            if (twice_area > 0.0) != is_outer {
+                vids.reverse();
+            }
             for k in 0..m {
                 edges.push((vids[k], vids[(k + 1) % m]));
             }
         }
     }
-    // A directed edge whose reverse also appears is internal (between two selected
-    // faces, or an out-and-back stub inside one) → drop it. The survivors are the
-    // union boundary. (The single-region guard above keeps this re-trace away from
-    // a lone weaving outline, where it reconstructed the wrong profile.)
-    let present: HashSet<(usize, usize)> = edges.iter().copied().collect();
-    let cancels = |a: usize, b: usize| present.contains(&(b, a));
+    // An edge with the same edge reversed against it is internal (between two selected faces, or
+    // an out-and-back stub inside one) and cancels; what is left is the union boundary.
+    //
+    // Cancel by COUNT, not by presence. The same edge can arrive more than once from one side —
+    // a face lists it, and so does the neighbouring face that appears in ITS hole list — and a
+    // set-based test threw all copies away the moment one reversed copy existed anywhere. On
+    // blocker.hcad that deleted the box tab from the merged profile: two copies forward, one
+    // back, all three dropped, and the trace closed the outline straight across the tab. Netting
+    // the counts leaves the one copy that is really boundary.
+    let mut count: HashMap<(usize, usize), i32> = HashMap::new();
+    for &e in &edges {
+        *count.entry(e).or_default() += 1;
+    }
     // Nothing cancels ⇒ no two regions are adjacent ⇒ nothing to merge. Return
     // the inputs as-is (keeping their exact-arc annotations, which re-tracing
     // the loops below would discard).
-    if !edges.iter().any(|&(a, b)| cancels(a, b)) {
+    if !count.keys().any(|&(a, b)| count.contains_key(&(b, a))) {
         return regions.iter().map(|r| (*r).clone()).collect();
     }
     // Trace the surviving edges into loops.
@@ -21992,9 +22159,24 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
     // at each vertex take the first outgoing edge met sweeping CLOCKWISE from the direction you
     // came in on. That keeps the interior on the left the whole way round, so it traces the
     // correct face whatever the vertex degree.
-    let mut kept: Vec<(usize, usize)> = edges.iter().copied().filter(|&(a, b)| !cancels(a, b)).collect();
+    // Sorted first, so which representative of a cancelling pair is examined is the model’s
+    // business and not the hash’s. No dedup: multiplicity is the whole point above.
+    let mut pairs: Vec<(usize, usize)> = count.keys().copied().collect();
+    pairs.sort_unstable();
+    let mut settled: HashSet<(usize, usize)> = HashSet::new();
+    let mut kept: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in pairs {
+        if settled.contains(&(a, b)) || settled.contains(&(b, a)) {
+            continue;
+        }
+        settled.insert((a, b));
+        let net = count[&(a, b)] - count.get(&(b, a)).copied().unwrap_or(0);
+        let survivor = if net > 0 { (a, b) } else { (b, a) };
+        for _ in 0..net.unsigned_abs() {
+            kept.push(survivor);
+        }
+    }
     kept.sort_unstable();
-    kept.dedup();
     if kept.is_empty() {
         return regions.iter().map(|r| (*r).clone()).collect();
     }
@@ -22069,6 +22251,10 @@ fn merge_regions(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch::Regio
         .map(|r| area_of(&r.outer).abs() - r.holes.iter().map(|h| area_of(h).abs()).sum::<f64>())
         .sum();
     // Signed areas: outer loops come out positive, holes negative, so the sum is the net area.
+    // That holds only because the edges above were wound with the face on the left; while the
+    // loops were fed in as the sketch gave them, every traced loop came back positive and this
+    // sum ADDED the holes — 4234 against an expected 1448 on blocker.hcad, which read as a
+    // catastrophic trace and threw away a merge that was only mildly wrong.
     let got: f64 = loops.iter().map(|l| area_of(l)).sum::<f64>().abs();
     if want > 1.0e-9 && (got - want).abs() > want * 0.02 {
         warn!("Region merge: traced area {got:.3} vs {want:.3} expected — keeping the unmerged profiles.");
@@ -28986,6 +29172,268 @@ mod tests {
             hworks_geometry::is_manifold(&trimmed),
             hworks_geometry::signed_mesh_volume(&trimmed)
         );
+    }
+
+
+    /// An extrude is a PRISM, so every triangle in it is either a flat cap or a vertical wall, and
+    /// the body is its full thickness everywhere under the footprint.
+    ///
+    /// `blocker.hcad` — a plate whose central bore has a box tab crossing its rim — used to come
+    /// back with one triangle wired from the top cap down to the floor. That facet sloped 2 mm
+    /// into a 5 mm plate and read, on screen, as a notch bitten out of the top face beside the
+    /// tab. It came from the two points where the tab's edges cross the bore, where three of the
+    /// annulus region's hole loops met: the prism built there had a pinch, `is_manifold` could not
+    /// see it (every edge still carried two faces), and the next boolean resolved it by dragging a
+    /// top-cap vertex to the floor. See `merge_touching_holes`.
+    #[test]
+    fn an_extrude_comes_out_a_prism() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/blocker.hcad");
+        // No `else { return }` here. `saved files/` is gitignored and its fixtures are
+        // force-added one by one, so a test that skips when the part is missing is a test that
+        // passes for the wrong reason — which is exactly what this one did until the fixture
+        // was added.
+        let text = std::fs::read_to_string(&path).expect("saved files/blocker.hcad is a fixture for this test — it must be force-added to git");
+        let doc: Document = ron::from_str(&text).expect("parse blocker.hcad");
+        let (m, _) = regenerate_mesh(&doc).expect("blocker.hcad builds");
+        let g = |i: u32| { let q = m.positions[i as usize]; Vec3::new(q[0], q[1], q[2]) };
+        // The extrude runs along +Y, so a cap has |ny| = 1 and a wall has |ny| = 0.
+        //
+        // Needles are exempt. A boolean leaves the odd triangle with two vertices a micron
+        // apart, and the cross product of a sliver that thin is rounding noise — it reports
+        // whatever tilt it likes while covering no surface at all. The floor is six orders
+        // below the model, which still leaves three orders between it and the notch this
+        // test is here for (5e-4 mm² of needle against 2.67 mm² of notch).
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for q in &m.positions {
+            let v = Vec3::from_array(*q);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let floor = (hi - lo).length_squared() * 1.0e-6;
+        let mut worst: Option<(f32, [Vec3; 3])> = None;
+        for t in m.indices.chunks_exact(3) {
+            let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+            let n = (b - a).cross(c - a);
+            if n.length() * 0.5 < floor {
+                continue;
+            }
+            let ny = (n.normalize().y).abs();
+            let off = ny.min(1.0 - ny); // 0 for a clean cap or wall
+            if off > 0.02 && worst.is_none_or(|(w, _)| off > w) {
+                worst = Some((off, [a, b, c]));
+            }
+        }
+        assert!(
+            worst.is_none(),
+            "an extrude produced a triangle that is neither cap nor wall — {:?}",
+            worst.map(|(_, t)| t)
+        );
+        // ...and the plate really is 5 mm thick at the corner the notch used to eat. Shoot a ray
+        // up through it and read where it enters and leaves the solid.
+        let (u, v) = (17.30_f32, 9.05_f32); // sketch coords, just inside the tab's outer corner
+        let (x, z) = (u, -v);
+        let mut ys: Vec<f32> = Vec::new();
+        for t in m.indices.chunks_exact(3) {
+            let (p0, p1, p2) = (g(t[0]), g(t[1]), g(t[2]));
+            let d = (p1.z - p2.z) * (p0.x - p2.x) + (p2.x - p1.x) * (p0.z - p2.z);
+            if d.abs() < 1e-12 {
+                continue;
+            }
+            let a = ((p1.z - p2.z) * (x - p2.x) + (p2.x - p1.x) * (z - p2.z)) / d;
+            let b = ((p2.z - p0.z) * (x - p2.x) + (p0.x - p2.x) * (z - p2.z)) / d;
+            let c = 1.0 - a - b;
+            if a < -1e-6 || b < -1e-6 || c < -1e-6 {
+                continue;
+            }
+            ys.push(a * p0.y + b * p1.y + c * p2.y);
+        }
+        ys.sort_by(f32::total_cmp);
+        let thick = ys.last().copied().unwrap_or(0.0) - ys.first().copied().unwrap_or(0.0);
+        assert!(
+            (thick - 5.0).abs() < 0.01,
+            "the plate is {thick:.4} thick at the tab corner, not 5.0 — the top face is notched (crossings at y = {ys:?})"
+        );
+    }
+
+    /// Type a number into a value box and the box must take THAT number.
+    ///
+    /// The Modify box opens with `request_focus()` at the end of the frame it first appears, and
+    /// that one frame of delay is enough for egui to stop counting the focus as newly gained — so
+    /// it never selected the text it was showing. The box read 7.0, you typed 50, and the sketch
+    /// got 7.050: the digits were appended to the old value instead of replacing it. Drives a real
+    /// egui context over the same widget stack the Modify box builds (a Foreground `Area`, a popup
+    /// `Frame`, an `add_sized` `DragValue`) and types at it.
+    #[test]
+    fn a_typed_number_replaces_the_value_in_a_modify_box() {
+        let ctx = egui::Context::default();
+        let mut value: f64 = 7.0;
+        let mut want_focus = true;
+        let mut frame = |events: Vec<egui::Event>, value: &mut f64, want_focus: &mut bool| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::Area::new(egui::Id::new(("dim_modify", 3usize, 1u64)))
+                    .fixed_pos(egui::pos2(200.0, 200.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                            ui.horizontal(|ui| {
+                                let resp = ui.add_sized(
+                                    egui::vec2(78.0, ui.spacing().interact_size.y),
+                                    egui::DragValue::new(value).speed(0.1).range(0.001..=1_000_000.0).max_decimals(2).suffix(" mm"),
+                                );
+                                if *want_focus {
+                                    resp.request_focus();
+                                    select_all_on_focus(ui.ctx(), resp.id);
+                                    *want_focus = false;
+                                }
+                            });
+                        });
+                    });
+            });
+        };
+        frame(vec![], &mut value, &mut want_focus); // opens, asks for focus
+        frame(vec![], &mut value, &mut want_focus); // now a text field, contents selected
+        frame(vec![egui::Event::Text("5".into()), egui::Event::Text("0".into())], &mut value, &mut want_focus);
+        assert!(
+            (value - 50.0).abs() < 1e-9,
+            "typed 50 into a box showing 7 and got {value} — the box is appending to the old value instead of replacing it"
+        );
+    }
+
+    /// A rebuild must be a pure function of the document. `fillererror3.hcad` used to come back
+    /// with a different volume and triangle count on every regen, which meant the fillet path was
+    /// letting hash order (or a tie between equally-good candidates) pick the answer. Regenerate
+    /// the same document several times and demand the exact same mesh each time.
+    #[test]
+    fn rebuild_is_deterministic() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../saved files/fillererror3.hcad");
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let doc: Document = ron::from_str(&text).expect("parse fillererror3.hcad");
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+            }
+            v.abs()
+        };
+        let mut seen: Vec<(usize, f64)> = Vec::new();
+        for _ in 0..8 {
+            let (m, _) = regenerate_mesh(&doc).expect("regen");
+            seen.push((m.indices.len() / 3, vol(&m)));
+        }
+        let first = seen[0];
+        for (i, s) in seen.iter().enumerate() {
+            assert!(
+                s.0 == first.0 && (s.1 - first.1).abs() < 1e-9,
+                "rebuild {i} differs: {} tris vol {:.6} vs {} tris vol {:.6} — all runs: {seen:?}",
+                s.0, s.1, first.0, first.1
+            );
+        }
+    }
+
+    /// Rebuild determinism across the whole saved-files corpus: regenerate each document three
+    /// times and report any whose volume or triangle count moves. A rebuild is supposed to be a
+    /// pure function of the document, so anything listed here is a bug — usually a geometry
+    /// decision reading hash order, or a "best candidate" chosen by a comparison that can tie.
+    ///   HCAD_DIR="...\saved files" cargo test -p hworks-app diag_sweep_volumes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_sweep_volumes() {
+        let _guard = counter_lock();
+        let dir = std::env::var("HCAD_DIR").expect("set HCAD_DIR");
+        let runs: usize = std::env::var("HCAD_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad")))
+            .collect();
+        entries.sort();
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+            }
+            v.abs()
+        };
+        let (mut stable, mut drifted) = (0usize, Vec::new());
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(doc) = ron::from_str::<Document>(&text) else { continue };
+            let mut seen: Vec<(usize, f64)> = Vec::new();
+            for _ in 0..runs {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc))) {
+                    Ok(Some((m, _))) => seen.push((m.indices.len() / 3, vol(&m))),
+                    Ok(None) => seen.push((0, 0.0)),
+                    Err(_) => seen.push((usize::MAX, f64::NAN)),
+                }
+            }
+            let same = seen.windows(2).all(|w| w[0].0 == w[1].0 && (w[0].1 - w[1].1).abs() < 1e-9);
+            if same {
+                stable += 1;
+                eprintln!("  {name}: {} tris vol {:.6}", seen[0].0, seen[0].1);
+            } else {
+                drifted.push(format!("{name}: {seen:?}"));
+            }
+        }
+        eprintln!("\n=== {stable} stable, {} NONDETERMINISTIC ===", drifted.len());
+        for d in &drifted {
+            eprintln!("  {d}");
+        }
+        assert!(drifted.is_empty(), "{} document(s) rebuild differently run to run", drifted.len());
+    }
+
+    /// Names the FEATURE that rebuilds differently run to run. Regenerates one document at each
+    /// rollback step several times and counts the distinct meshes (bitwise on positions and
+    /// indices, so a reordered-but-identical mesh still counts as distinct). The first step whose
+    /// count exceeds 1 is the feature reading run-to-run state — almost always hash iteration
+    /// order, or a "best candidate" settled by a comparison that can tie.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_rebuild_drift -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_rebuild_drift() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let fp = |m: &TriMesh| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for p in &m.positions { for k in 0..3 { p[k].to_bits().hash(&mut h); } }
+            m.indices.hash(&mut h);
+            h.finish()
+        };
+        let vol = |m: &TriMesh| {
+            let mut v = 0.0f64;
+            for t in m.indices.chunks_exact(3) {
+                let g = |i: u32| { let q = m.positions[i as usize]; [q[0] as f64, q[1] as f64, q[2] as f64] };
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                v += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+            }
+            v.abs()
+        };
+        for stop in 1..=doc.features.len() {
+            let mut d = doc.clone();
+            d.rollback = stop;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut tris = 0;
+            for _ in 0..6 {
+                if let Some((m, _)) = regenerate_mesh(&d) {
+                    tris = m.indices.len() / 3;
+                    seen.insert((fp(&m), format!("{:.12}", vol(&m))));
+                }
+            }
+            let kind = doc.features.get(stop - 1).map(|f| format!("{:?}", f.kind).chars().take(20).collect::<String>()).unwrap_or_default();
+            eprintln!("  through feature {} ({kind}): {tris} tris, {} distinct mesh(es)", stop - 1, seen.len());
+            if seen.len() > 1 {
+                for s in &seen {
+                    eprintln!("      {s:?}");
+                }
+            }
+        }
     }
 
     /// Rebuild EVERY document in a directory and report anything wrong with the result: a

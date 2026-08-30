@@ -1,0 +1,360 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.000000000000000000000000000000000037757151383237245,
+                            y: -0.00000000000000000000000000000000006072567386453752,
+                            fixed: false,
+                        ),
+                        (
+                            x: -35.0,
+                            y: -0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011689433239234776,
+                            fixed: false,
+                        ),
+                        (
+                            x: 35.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                        (
+                            x: -35.0,
+                            y: 11.5,
+                            fixed: false,
+                        ),
+                        (
+                            x: -7.388729232878084,
+                            y: 20.722130207177372,
+                            fixed: false,
+                        ),
+                        (
+                            x: -35.0,
+                            y: -11.5,
+                            fixed: false,
+                        ),
+                        (
+                            x: -7.820920552436355,
+                            y: -20.56290839624781,
+                            fixed: false,
+                        ),
+                        (
+                            x: 35.0,
+                            y: 11.5,
+                            fixed: false,
+                        ),
+                        (
+                            x: 8.072187274852121,
+                            y: 20.46557579448268,
+                            fixed: false,
+                        ),
+                        (
+                            x: 35.0,
+                            y: -11.5,
+                            fixed: false,
+                        ),
+                        (
+                            x: 8.24026088542761,
+                            y: -20.39848279995578,
+                            fixed: false,
+                        ),
+                        (
+                            x: -35.0,
+                            y: -0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000015230400606166607,
+                            fixed: false,
+                        ),
+                        (
+                            x: 35.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 19.0,
+                            fixed: false,
+                        ),
+                        (
+                            x: 12.529729843139648,
+                            y: 6.53849983215332,
+                            fixed: false,
+                        ),
+                        (
+                            x: 17.77471530491907,
+                            y: 9.275537420754235,
+                            fixed: false,
+                        ),
+                        (
+                            x: 19.39137093109528,
+                            y: 6.538499836021248,
+                            fixed: false,
+                        ),
+                        (
+                            x: 14.486844023690237,
+                            y: 3.6415973371881405,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 19.0,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 22.0,
+                            construction: false,
+                        ),
+                        Line(
+                            a: 0,
+                            b: 2,
+                            construction: true,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 0,
+                            b: 3,
+                            construction: true,
+                            reference: false,
+                        ),
+                        Circle(
+                            center: 2,
+                            radius: 11.5,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 3,
+                            radius: 11.5,
+                            construction: false,
+                        ),
+                        Line(
+                            a: 4,
+                            b: 5,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 6,
+                            b: 7,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 8,
+                            b: 9,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 10,
+                            b: 11,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Circle(
+                            center: 12,
+                            radius: 6.5,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 13,
+                            radius: 6.5,
+                            construction: false,
+                        ),
+                        Line(
+                            a: 14,
+                            b: 0,
+                            construction: true,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 0,
+                            b: 15,
+                            construction: true,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 15,
+                            b: 16,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 16,
+                            b: 17,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 17,
+                            b: 18,
+                            construction: false,
+                            reference: false,
+                        ),
+                        Line(
+                            a: 18,
+                            b: 15,
+                            construction: false,
+                            reference: false,
+                        ),
+                    ],
+                    constraints: [
+                        Radius(
+                            center: 0,
+                            value: 19.0,
+                            diameter: true,
+                            label: (0.7871298789978027, 4.004403591156006),
+                        ),
+                        Coincident(1, 0),
+                        CircleDistance(
+                            a: 0,
+                            b: 1,
+                            value: 3.0,
+                            mode: 2,
+                            offset: 0.27920350432395935,
+                        ),
+                        Horizontal(0, 2),
+                        Horizontal(0, 3),
+                        Distance(
+                            a: 0,
+                            b: 2,
+                            value: 35.0,
+                            offset: -2.90625,
+                            axis: Aligned,
+                        ),
+                        Equal(0, 2, 0, 3),
+                        Radius(
+                            center: 2,
+                            value: 11.5,
+                            diameter: true,
+                            label: (1.190062165260315, 9.555331230163574),
+                        ),
+                        EqualRadius(
+                            a: 2,
+                            b: 3,
+                        ),
+                        PointOnCircle(
+                            p: 4,
+                            center: 2,
+                        ),
+                        PointOnCircle(
+                            p: 5,
+                            center: 1,
+                        ),
+                        PointOnCircle(
+                            p: 6,
+                            center: 2,
+                        ),
+                        PointOnCircle(
+                            p: 7,
+                            center: 1,
+                        ),
+                        PointOnCircle(
+                            p: 8,
+                            center: 3,
+                        ),
+                        PointOnCircle(
+                            p: 9,
+                            center: 1,
+                        ),
+                        PointOnCircle(
+                            p: 10,
+                            center: 3,
+                        ),
+                        PointOnCircle(
+                            p: 11,
+                            center: 1,
+                        ),
+                        Coincident(12, 2),
+                        Coincident(13, 3),
+                        EqualRadius(
+                            a: 12,
+                            b: 13,
+                        ),
+                        PointOnCircle(
+                            p: 14,
+                            center: 0,
+                        ),
+                        Vertical(14, 0),
+                        Perpendicular(17, 18, 16, 17),
+                    ],
+                ),
+                regions: [
+                    2,
+                    3,
+                    0,
+                    1,
+                    4,
+                    7,
+                    6,
+                ],
+                region_pts: [
+                    (-22.91494462317533, 0.0013726018183587544),
+                    (-26.375000000000004, 0.00000000000000007979727989493313),
+                    (19.79354752257793, -0.015881902812845072),
+                    (23.178932488063513, 0.0005885350397092331),
+                    (43.62499999999999, 0.00000000000000007979727989493313),
+                    (17.81751776378757, 7.453077317673716),
+                    (16.367587425332648, 6.6482287337545705),
+                ],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 5.0,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 4,
+    next_id: 4,
+)

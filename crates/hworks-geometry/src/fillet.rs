@@ -577,6 +577,10 @@ fn face_footprint_prism(tris: &[[V3; 3]], n: V3, off: f64, height: f64, tol: f64
             e.0 += 1;
         }
     }
+    // Sorted: this soup is a boolean operand, and Manifold's tessellation of the result follows
+    // the order the triangles arrive in. Emitted in hash order the prism differed run to run.
+    let mut count: Vec<(([i64; 3], [i64; 3]), (usize, V3, V3))> = count.into_iter().collect();
+    count.sort_by_key(|(k, _)| *k);
     for (_, (c, p, q)) in count {
         if c != 1 {
             continue; // interior edge
@@ -1273,6 +1277,13 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
         let w: f64 = tris.iter().map(|t| solid_angle(p, t[0], t[1], t[2])).sum();
         (w / (4.0 * std::f64::consts::PI)).abs() > 0.5
     };
+    // Sorted, because the blends run one boolean at a time on a body the last one grew: in
+    // hash order the same four corners of a box rim arrived differently every rebuild, and
+    // `fillererror3.hcad` came back with 692, 1120 or 1606 triangles and three different
+    // volumes from one unchanged document. The key is the quantised vertex, so the order is
+    // the model's, not the run's.
+    let mut corners: Vec<([i64; 3], (V3, Vec<V3>))> = corners.into_iter().collect();
+    corners.sort_by_key(|(k, _)| *k);
     for (_, (corner, normals)) in corners {
         if normals.len() >= 3 {
             let (n1, n2, n3) = (normals[0], normals[1], normals[2]);
@@ -1299,8 +1310,24 @@ fn fillet_boolean(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Optio
             };
             if let Some(tool) = corner_sphere_tool(corner, n1, n2, n3, radius, concave) {
                 let cand = if concave { crate::mesh_union(&body, &tool) } else { crate::mesh_difference(&body, &tool) };
-                let n0 = body.indices.len();
-                if cand.indices.len() >= n0 / 2 && cand.indices.len() <= n0 * 4 {
+                // Keep the blend only if it did a corner's worth of work, and judge that by
+                // VOLUME. The old guard compared the candidate's triangle count to the body as
+                // it stood — which is not a fact about this corner at all: the first blend met
+                // a 108-triangle body and its 466 new triangles read as a runaway, while the
+                // identical sphere arriving second (body now 400) sailed through. So the answer
+                // depended on arrival order, and arrival order was hash order.
+                //
+                // A blend can only move what lies in the corner block: r³ at the very most, and
+                // r³(2/3 − π/6) ≈ 0.14·r³ in the clean orthogonal case, the rest having gone
+                // already to the two edge fillets. Twice the block leaves room for corners whose
+                // faces are not square to each other; a boolean that moves more than that went
+                // somewhere other than the corner, and no blend is better than a gouge. The sign
+                // is checked too — a subtract that ADDS material is not a rounded corner.
+                let dv = mesh_volume(&cand) - mesh_volume(&body);
+                let bound = 2.0 * radius * radius * radius;
+                let slack = bound * 1e-6;
+                let sane = if concave { dv > -slack && dv < bound } else { dv < slack && dv > -bound };
+                if sane {
                     body = cand;
                 }
                 any = true;
