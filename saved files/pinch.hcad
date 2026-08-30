@@ -43,11 +43,6 @@
                             y: 0.0,
                             fixed: true,
                         ),
-                        (
-                            x: 4.177728176116943,
-                            y: 4.016993522644043,
-                            fixed: false,
-                        ),
                     ],
                     entities: [
                         Point(
@@ -56,11 +51,6 @@
                         Circle(
                             center: 0,
                             radius: 6.0,
-                            construction: false,
-                        ),
-                        Circle(
-                            center: 1,
-                            radius: 0.01,
                             construction: false,
                         ),
                     ],
