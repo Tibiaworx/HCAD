@@ -2250,6 +2250,11 @@ struct UiState {
     /// The last operation failure to surface to the user (shown as a banner until
     /// dismissed or a clean regenerate clears it). Set by `do_regenerate`.
     last_error: Option<String>,
+    /// Something worth reading that is NOT a failure — an export that succeeded but came out
+    /// faceted, say. It gets the same banner treatment as an error because it deserves to be
+    /// seen, but not the red and the warning triangle: a user told that a finished export was
+    /// an error reasonably believes the export failed.
+    last_notice: Option<String>,
     /// Build the whole model with the robust **mesh** kernel (Manifold) instead of the
     /// exact B-rep kernel. This fuses coincident/coplanar faces — so adjacent features
     /// with shared walls merge *seamlessly* — at the cost of triangulated (mesh) faces.
@@ -9690,6 +9695,37 @@ fn ui_system(
         }
     }
 
+    // Same banner as the error one, in blue rather than red and with an information mark: a
+    // finished export is not a failure, and saying so in the failure colours had a user report a
+    // successful STEP as an error. Sits below the error banner so both can show at once.
+    if let Some(msg) = ui_state.last_notice.clone() {
+        let mut dismiss = false;
+        let screen = ctx.content_rect();
+        let drop = if ui_state.last_error.is_some() { 96.0 } else { 48.0 };
+        egui::Area::new(egui::Id::new("notice_banner"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(screen.center().x - 300.0, screen.top() + drop))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgb(22, 40, 66))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 150, 220)))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_max_width(600.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("i").size(18.0).strong().color(egui::Color32::from_rgb(120, 180, 255)));
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 232, 250)));
+                            if ui.small_button("x").on_hover_text("Dismiss").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+            });
+        if dismiss {
+            ui_state.last_notice = None;
+        }
+    }
     if let Some(msg) = ui_state.last_error.clone() {
         let mut dismiss = false;
         let screen = ctx.content_rect();
@@ -17044,7 +17080,11 @@ fn handle_file_io(
                             ui_state.toasts.push((format!("Exported {name}"), 2.5));
                             info!("Exported STEP {} ({})", path.display(), if faceted { "faceted from mesh" } else { "exact B-rep" });
                             if faceted {
-                                ui_state.last_error = Some("Exported a FACETED STEP (this body has no exact B-rep — built with the mesh kernel). Geometry is correct but flat-faced; for smooth surfaces, build with Seamless off and no loft/fillet.".into());
+                                let why = why_no_exact_brep(&doc.0, ui_state.seamless)
+                                    .unwrap_or_else(|| "this body was built by the mesh kernel".into());
+                                ui_state.last_notice = Some(format!(
+                                    "Exported {name}, with FLAT faces. The geometry is exact — {why}, and a mesh body has no curved surfaces to write out, so bores and fillets come across as many-sided facets."
+                                ));
                             }
                         }
                         Err(e) => {
@@ -17766,6 +17806,48 @@ fn doc_has_text(doc: &Document) -> bool {
     })
 }
 
+/// Why this document had to be built by the mesh kernel, phrased for the user. `None` when the
+/// exact B-rep path was available, so a STEP export comes out with real surfaces.
+///
+/// The point is to name the reason THIS part hit, not to recite the list: telling someone whose
+/// part has a fillet to "build with Seamless off and no fillet" is telling them to delete their
+/// fillet, and telling someone whose only problem is the Seamless tick that they cannot have
+/// smooth surfaces is wrong.
+fn why_no_exact_brep(doc: &Document, seamless: bool) -> Option<String> {
+    let mut kinds: Vec<&str> = Vec::new();
+    for f in &doc.features {
+        let k = match f.kind {
+            FeatureKind::Fillet { .. } => "a fillet",
+            FeatureKind::Chamfer { .. } => "a chamfer",
+            FeatureKind::Mirror { .. } => "a mirror",
+            FeatureKind::Thread { .. } => "a thread",
+            FeatureKind::Pattern { .. } => "a pattern",
+            FeatureKind::Shell { .. } => "a shell",
+            FeatureKind::Sweep { .. } => "a sweep",
+            FeatureKind::ImportMesh { .. } => "an imported mesh",
+            FeatureKind::Gear { .. } => "a gear",
+            FeatureKind::Loft { .. } => "a loft",
+            _ => continue,
+        };
+        if !kinds.contains(&k) {
+            kinds.push(k);
+        }
+    }
+    if doc_has_thin(doc) && !kinds.contains(&"a thin feature") {
+        kinds.push("a thin feature");
+    }
+    if doc_has_text(doc) && !kinds.contains(&"sketch text") {
+        kinds.push("sketch text");
+    }
+    if !kinds.is_empty() {
+        let list = match kinds.len() {
+            1 => kinds[0].to_string(),
+            n => format!("{} and {}", kinds[..n - 1].join(", "), kinds[n - 1]),
+        };
+        return Some(format!("this part has {list}, which only the mesh kernel can build"));
+    }
+    seamless.then(|| "Seamless is on, which builds every part with the mesh kernel — turn it off in the toolbar and export again for smooth surfaces".to_string())
+}
 /// True if the model has a fillet feature — those are mesh-only (truck can't fillet).
 fn doc_has_fillet(doc: &Document) -> bool {
     doc.features
