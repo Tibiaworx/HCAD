@@ -4136,6 +4136,108 @@ mod tests {
         assert!((got - want).abs() <= want * 1.0e-3, "solid encloses {got:.4}, mesh {want:.4}");
     }
 
+    /// A face tagged on the way into Manifold is still identifiable on the way out, through a
+    /// CHAIN of booleans.
+    ///
+    /// This is the keystone of carrying surfaces rather than recovering them. HCAD never needs to
+    /// reverse-engineer a cylinder out of triangles — it knows a bore is a cylinder when it builds
+    /// the tool. What it lacks is a way to say so through the booleans, and Manifold has one:
+    /// `reserve_ids` allocates original IDs, `MeshGLOptions::runs` attaches a block of triangles to
+    /// each, and `run_original_id` reads them back on the far side. Then a STEP export can emit one
+    /// real surface per tagged face instead of a ring of flat strips, with no fitting, no
+    /// segmentation and no tolerance to guess at.
+    ///
+    /// Three things had to be true, and are: the tags attach at all, they survive a boolean, and
+    /// they survive a SEQUENCE of them — the real timeline is extrude, cut, extrude, cut, and tags
+    /// that only lasted one operation would be useless. Measured here: six faces tagged on box A
+    /// are all still traceable after difference, union, difference.
+    ///
+    /// Vertices must be WELDED before Manifold sees them, or it refuses the mesh as not a solid and
+    /// the tags never get a chance.
+    #[test]
+    fn manifold_carries_face_tags_through_a_chain_of_booleans() {
+        use manifold3d::{Manifold, MeshGL};
+        let boxes = |x0: f64, y0: f64, x1: f64, y1: f64, z0: f64, h: f64| {
+            crate::extrude_tool_mesh(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1]], &[], &xy_plane(), z0, h)
+        };
+        let a = boxes(0.0, 0.0, 10.0, 10.0, 0.0, 10.0).expect("box a");
+        let b = boxes(5.0, 5.0, 15.0, 15.0, 2.0, 12.0).expect("box b");
+        let c = boxes(2.0, 2.0, 4.0, 4.0, 8.0, 6.0).expect("box c");
+        let d = boxes(7.0, 1.0, 9.0, 3.0, -1.0, 5.0).expect("box d");
+
+        // Tag every coplanar face of a mesh with its own original ID. Runs index into the FLAT
+        // tri_verts array and carry one ID each, with a sentinel at the end.
+        let tag = |m: &TriMesh| -> (Manifold, std::ops::Range<u32>) {
+            let ntri = m.indices.len() / 3;
+            let plane_of = |t: usize| {
+                let g = |i: usize| m.positions[m.indices[t * 3 + i] as usize];
+                let (p, q, r) = (g(0), g(1), g(2));
+                let (e1, e2) = (
+                    [q[0] - p[0], q[1] - p[1], q[2] - p[2]],
+                    [r[0] - p[0], r[1] - p[1], r[2] - p[2]],
+                );
+                let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+                let n = [n[0] / l, n[1] / l, n[2] / l];
+                let d = n[0] * p[0] + n[1] * p[1] + n[2] * p[2];
+                [(n[0] * 1e4) as i64, (n[1] * 1e4) as i64, (n[2] * 1e4) as i64, (d * 1e4) as i64]
+            };
+            let mut order: Vec<usize> = (0..ntri).collect();
+            order.sort_by_key(|&t| plane_of(t));
+            let (mut verts, mut tris) = (Vec::<f32>::new(), Vec::<u32>::new());
+            let (mut run_index, mut run_ids) = (Vec::<u32>::new(), Vec::<u32>::new());
+            let mut weld: std::collections::HashMap<(i64, i64, i64), u32> = Default::default();
+            let base = manifold3d::reserve_ids(ntri as u32);
+            let (mut last, mut nfaces) = (None, 0u32);
+            for &t in &order {
+                let pl = plane_of(t);
+                if last != Some(pl) {
+                    run_index.push(tris.len() as u32);
+                    run_ids.push(base + nfaces);
+                    nfaces += 1;
+                    last = Some(pl);
+                }
+                for i in 0..3 {
+                    let p = m.positions[m.indices[t * 3 + i] as usize];
+                    let k = ((p[0] * 1e4) as i64, (p[1] * 1e4) as i64, (p[2] * 1e4) as i64);
+                    let id = *weld.entry(k).or_insert_with(|| {
+                        verts.extend_from_slice(&p);
+                        (verts.len() / 3 - 1) as u32
+                    });
+                    tris.push(id);
+                }
+            }
+            run_index.push(tris.len() as u32); // sentinel
+            let opts = manifold3d::MeshGLOptions::new().runs(&run_index, &run_ids);
+            let mgl = MeshGL::new_with_options(&verts, 3, &tris, opts).expect("tagged MeshGL");
+            (Manifold::from_meshgl(&mgl).expect("tagged Manifold"), base..base + nfaces)
+        };
+
+        let (ma, a_ids) = tag(&a);
+        let (mb, _) = tag(&b);
+        let (mc, _) = tag(&c);
+        let (md, _) = tag(&d);
+        let a_ids: std::collections::BTreeSet<u32> = a_ids.collect();
+        assert_eq!(a_ids.len(), 6, "a box has six faces to tag");
+
+        let mut man = ma.difference(&mb);
+        for (label, other, is_cut) in [("union C", &mc, false), ("difference D", &md, true)] {
+            let ids: std::collections::BTreeSet<u32> = man.to_meshgl().run_original_id().into_iter().collect();
+            assert!(
+                ids.is_superset(&a_ids),
+                "before {label}, only {} of A's 6 faces are still traceable",
+                ids.intersection(&a_ids).count()
+            );
+            man = if is_cut { man.difference(other) } else { man.union(other) };
+        }
+        let ids: std::collections::BTreeSet<u32> = man.to_meshgl().run_original_id().into_iter().collect();
+        assert!(
+            ids.is_superset(&a_ids),
+            "after three booleans only {} of A's 6 faces trace back — ids present: {ids:?}",
+            ids.intersection(&a_ids).count()
+        );
+    }
+
     #[test]
     fn mesh_to_solid_exports_faceted_step() {
         // A mesh-only body (here a loft, which has no exact B-rep) → faceted solid → STEP.
