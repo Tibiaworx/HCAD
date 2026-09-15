@@ -22290,7 +22290,15 @@ fn merge_touching_holes(r: &hworks_sketch::Region) -> hworks_sketch::Region {
     if loops.is_empty() || (got - want).abs() > want * 1.0e-3 {
         return r.clone(); // the re-trace lost or gained area — keep what we were given
     }
-    hworks_sketch::Region { outer: r.outer.clone(), holes: loops, ..Default::default() }
+    // The outer loop is untouched, so its arcs stand. The holes were re-traced from several
+    // loops into one, and which circle each of their edges came off is not tracked here — so they
+    // go without, rather than carrying a span that points at the wrong edges.
+    hworks_sketch::Region {
+        outer: r.outer.clone(),
+        holes: loops,
+        outer_arcs: r.outer_arcs.clone(),
+        ..Default::default()
+    }
 }
 
 /// Union a set of sketch regions in 2D into merged outline(s) by cancelling the
@@ -22325,8 +22333,17 @@ fn merge_regions_traced(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch
     // and all three of its holes came back counter-clockwise — and without this a hole and the
     // selected face that fills it run the same way round, so their shared boundary never cancels
     // and the trace keeps an internal edge as though it were the outline.
+    // Which circle each boundary edge came off, by welded vertex pair. Carried rather than
+    // re-fitted: the sketch already knows the exact centre and radius, and the merge only ever
+    // re-orders and drops edges, never bends them. Keyed undirected, so it survives the winding
+    // flip below and the direction the trace happens to take.
+    let mut edge_arc: HashMap<(usize, usize), ([f64; 2], f64)> = HashMap::new();
     for r in regions {
-        for (is_outer, loop_pts) in std::iter::once((true, &r.outer)).chain(r.holes.iter().map(|h| (false, h))) {
+        let loops = std::iter::once((true, &r.outer, r.outer_arcs.as_slice()))
+            .chain(r.holes.iter().enumerate().map(|(hi, h)| {
+                (false, h, r.hole_arcs.get(hi).map(|v| v.as_slice()).unwrap_or(&[]))
+            }));
+        for (is_outer, loop_pts, loop_arcs) in loops {
             let m = loop_pts.len();
             if m < 3 {
                 continue;
@@ -22338,6 +22355,14 @@ fn merge_regions_traced(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch
                     pos.len() - 1
                 }))
                 .collect();
+            // Record the arcs against the ORIGINAL edge order, before any reversal.
+            for s in loop_arcs {
+                for t in 0..s.count.min(m) {
+                    let e = (s.first_edge + t) % m;
+                    let (a, c) = (vids[e], vids[(e + 1) % m]);
+                    edge_arc.insert(if a < c { (a, c) } else { (c, a) }, (s.center, s.radius));
+                }
+            }
             let mut twice_area = 0.0;
             for k in 0..m {
                 let (p, q) = (loop_pts[k], loop_pts[(k + 1) % m]);
@@ -22484,12 +22509,74 @@ fn merge_regions_traced(regions: &[&hworks_sketch::Region]) -> Vec<hworks_sketch
         warn!("Region merge: traced area {got:.3} vs {want:.3} expected — keeping the unmerged profiles.");
         return regions.iter().map(|r| (*r).clone()).collect();
     }
-    nest_loops(loops)
+    // Re-annotate: walk each traced loop and group consecutive edges that came off the same
+    // circle back into spans. Without this the merge silently straightens every arc it touches —
+    // `nest_loops` used to build its regions with the arc lists empty — so a bore reached the
+    // exact kernel as a polygon and was built as flat strips.
+    let arcs: Vec<Vec<hworks_sketch::ArcSpan>> = loops.iter().map(|l| spans_of_loop(l, &ids, &key, &edge_arc)).collect();
+    nest_loops(loops, arcs)
 }
 
+/// Group a traced loop's edges back into [`ArcSpan`]s, using the circle each edge was recorded
+/// against on the way in. Runs that wrap the end of the loop are joined to the run at its start,
+/// so a full circle comes back as ONE span rather than two halves.
+fn spans_of_loop(
+    loop_pts: &[[f64; 2]],
+    ids: &std::collections::HashMap<(i64, i64), usize>,
+    key: &impl Fn([f64; 2]) -> (i64, i64),
+    edge_arc: &std::collections::HashMap<(usize, usize), ([f64; 2], f64)>,
+) -> Vec<hworks_sketch::ArcSpan> {
+    let n = loop_pts.len();
+    if n < 3 || edge_arc.is_empty() {
+        return Vec::new();
+    }
+    let vid = |p: [f64; 2]| ids.get(&key(p)).copied();
+    // The circle behind each edge, or None where it is a straight line.
+    let per_edge: Vec<Option<([f64; 2], f64)>> = (0..n)
+        .map(|e| {
+            let (a, c) = (vid(loop_pts[e])?, vid(loop_pts[(e + 1) % n])?);
+            edge_arc.get(&if a < c { (a, c) } else { (c, a) }).copied()
+        })
+        .collect();
+    let same = |x: &Option<([f64; 2], f64)>, y: &Option<([f64; 2], f64)>| match (x, y) {
+        (Some((c1, r1)), Some((c2, r2))) => {
+            (c1[0] - c2[0]).abs() < 1.0e-9 && (c1[1] - c2[1]).abs() < 1.0e-9 && (r1 - r2).abs() < 1.0e-9
+        }
+        _ => false,
+    };
+    let mut spans: Vec<hworks_sketch::ArcSpan> = Vec::new();
+    let mut e = 0usize;
+    while e < n {
+        let Some((center, radius)) = per_edge[e] else {
+            e += 1;
+            continue;
+        };
+        let mut len = 1;
+        while e + len < n && same(&per_edge[e + len], &per_edge[e]) {
+            len += 1;
+        }
+        spans.push(hworks_sketch::ArcSpan { first_edge: e, count: len, center, radius });
+        e += len;
+    }
+    // A run that ends at the last edge and one that starts at the first are the same run seen
+    // either side of the seam; a full circle is otherwise reported as two arcs that do not close.
+    if spans.len() > 1 {
+        let (first, last) = (spans[0], spans[spans.len() - 1]);
+        if last.first_edge + last.count == n
+            && first.first_edge == 0
+            && same(&Some((first.center, first.radius)), &Some((last.center, last.radius)))
+        {
+            let joined = hworks_sketch::ArcSpan { first_edge: last.first_edge, count: last.count + first.count, center: first.center, radius: first.radius };
+            spans.remove(0);
+            let n_last = spans.len() - 1;
+            spans[n_last] = joined;
+        }
+    }
+    spans
+}
 /// Classify a set of closed loops into regions (outer + holes) by even/odd
 /// containment — the same nesting rule the sketcher uses.
-fn nest_loops(loops: Vec<Vec<[f64; 2]>>) -> Vec<hworks_sketch::Region> {
+fn nest_loops(loops: Vec<Vec<[f64; 2]>>, arcs: Vec<Vec<hworks_sketch::ArcSpan>>) -> Vec<hworks_sketch::Region> {
     let n = loops.len();
     let area = |poly: &[[f64; 2]]| {
         let m = poly.len();
@@ -22519,13 +22606,19 @@ fn nest_loops(loops: Vec<Vec<[f64; 2]>>) -> Vec<hworks_sketch::Region> {
         if !depth[i].is_multiple_of(2) {
             continue;
         }
-        let holes = (0..n)
-            .filter(|&k| depth[k] == depth[i] + 1 && contains(i, k))
-            .map(|k| loops[k].clone())
-            .collect();
-        // Merged outlines re-trace the loops, so per-edge arc annotations no
-        // longer apply — leave them empty (the kernel then uses line edges).
-        out.push(hworks_sketch::Region { outer: loops[i].clone(), holes, ..Default::default() });
+        let hole_ix: Vec<usize> = (0..n).filter(|&k| depth[k] == depth[i] + 1 && contains(i, k)).collect();
+        let holes = hole_ix.iter().map(|&k| loops[k].clone()).collect();
+        // The arc runs travel with their loop. Re-traced outlines used to arrive here with the
+        // annotations dropped — "no longer apply" — and that is what turned every merged bore
+        // into a polygon for the exact kernel to build as flat strips.
+        let hole_arcs = hole_ix.iter().map(|&k| arcs.get(k).cloned().unwrap_or_default()).collect();
+        out.push(hworks_sketch::Region {
+            outer: loops[i].clone(),
+            holes,
+            outer_arcs: arcs.get(i).cloned().unwrap_or_default(),
+            hole_arcs,
+            ..Default::default()
+        });
     }
     out
 }
@@ -29720,6 +29813,97 @@ mod tests {
         eprintln!(
             "  EXACT {:>5} faces {:>9} bytes   |   faceted {:>6} faces {:>9} bytes   ({} tris)",
             es.matches("FACE_SURFACE").count(), es.len(), ff, fb, m.indices.len() / 3
+        );
+    }
+
+    /// Do the sketch's arcs survive the region merge, and does `gate_arcs` then keep them?
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_arc_survival -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_arc_survival() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let is_solid = |k: &FeatureKind| matches!(k, FeatureKind::Extrude { .. } | FeatureKind::Cut { .. } | FeatureKind::Revolve { .. });
+        let last_solid = doc.features.iter().rposition(|f| is_solid(&f.kind));
+        for (fi, f) in doc.features.iter().enumerate() {
+            let (sketch, regions, region_pts) = match &f.kind {
+                FeatureKind::Extrude { sketch, regions, region_pts, .. } => (sketch, regions, region_pts),
+                FeatureKind::Cut { sketch, regions, region_pts, .. } => (sketch, regions, region_pts),
+                _ => continue,
+            };
+            let all = sketch.regions();
+            let picked = chosen_regions_pts(&all, regions, region_pts);
+            let before: usize = picked.iter().map(|r| r.outer_arcs.len() + r.hole_arcs.iter().map(|h| h.len()).sum::<usize>()).sum();
+            let merged = merge_regions(&picked);
+            let after: usize = merged.iter().map(|r| r.outer_arcs.len() + r.hole_arcs.iter().map(|h| h.len()).sum::<usize>()).sum();
+            let gated = Some(fi) == last_solid && merged.len() == 1;
+            eprintln!(
+                "  feature {fi}: {} region(s) in -> {} merged | arc spans {before} -> {after} | gate_arcs {}",
+                picked.len(), merged.len(),
+                if gated { "KEEPS them" } else { "STRIPS them" }
+            );
+        }
+    }
+
+    /// Merging regions must not straighten their arcs.
+    ///
+    /// `nest_loops` built its merged regions with `..Default::default()`, which left `outer_arcs`
+    /// and `hole_arcs` empty — the comment said the annotations "no longer apply" after a re-trace.
+    /// They do: the merge re-orders and drops edges, it never bends one, so an edge that came off a
+    /// circle is still on that circle afterwards. Dropping them sent every merged bore to the exact
+    /// kernel as a polygon, to be built as flat strips.
+    ///
+    /// blocker.hcad's first extrude is the case: seven regions with fourteen arc runs between them,
+    /// merged into one outline. The runs that survive are the ones still on the union's boundary.
+    #[test]
+    fn merging_regions_keeps_their_arcs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/blocker.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/blocker.hcad is a fixture — force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse blocker.hcad");
+        let FeatureKind::Extrude { sketch, regions, region_pts, .. } = &doc.features[3].kind else {
+            panic!("feature 3 of blocker.hcad should be the plate extrude");
+        };
+        let all = sketch.regions();
+        let picked = chosen_regions_pts(&all, regions, region_pts);
+        let before: usize = picked.iter().map(|r| r.outer_arcs.len() + r.hole_arcs.iter().map(|h| h.len()).sum::<usize>()).sum();
+        assert!(picked.len() > 1, "this test needs a real merge; got {} region(s)", picked.len());
+        assert!(before > 0, "the sketch should have arcs to lose");
+
+        let merged = merge_regions(&picked);
+        let after: usize = merged.iter().map(|r| r.outer_arcs.len() + r.hole_arcs.iter().map(|h| h.len()).sum::<usize>()).sum();
+        assert!(after > 0, "the merge straightened all {before} arc runs");
+
+        // Every surviving span must still describe the edges it points at — a span whose indices
+        // slipped is worse than no span, because the kernel would bulge a profile that is straight.
+        //
+        // Measured as "no worse than what came in" rather than against an absolute tolerance. The
+        // sketch's own spans are not perfectly circular: where the box tab crosses the bore, the
+        // crossing is solved against the TESSELLATED rim, so that point lands ~0.005 inside a
+        // circle of 19 and the input span already covers it. The merge must not add to that.
+        let worst = |rs: &[hworks_sketch::Region]| -> f64 {
+            let mut w = 0.0f64;
+            for r in rs {
+                for (loop_pts, spans) in std::iter::once((&r.outer, &r.outer_arcs))
+                    .chain(r.holes.iter().zip(r.hole_arcs.iter()))
+                {
+                    let n = loop_pts.len();
+                    for s in spans {
+                        assert!(s.count > 0 && s.count <= n, "span covers {} of {n} edges", s.count);
+                        for t in 0..=s.count {
+                            let p = loop_pts[(s.first_edge + t) % n];
+                            let d = ((p[0] - s.center[0]).powi(2) + (p[1] - s.center[1]).powi(2)).sqrt();
+                            w = w.max((d - s.radius).abs() / s.radius.max(1.0e-9));
+                        }
+                    }
+                }
+            }
+            w
+        };
+        let owned: Vec<hworks_sketch::Region> = picked.iter().map(|r| (*r).clone()).collect();
+        let (win, wout) = (worst(&owned), worst(&merged));
+        assert!(
+            wout <= win + 1.0e-12,
+            "the merge made its spans less circular: worst point was {win:.3e} off the radius, now {wout:.3e}"
         );
     }
 
