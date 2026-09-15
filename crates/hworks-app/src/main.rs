@@ -17070,7 +17070,13 @@ fn handle_file_io(
         // in `saved files` that could take it.
         let mut exact = part.solid.clone();
         if exact.is_none() && why_no_exact_brep(&doc.0).is_none() {
-            exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_reported(&doc.0).0)).unwrap_or(None);
+            // Keep what it SAID as well as what it built. pardt.hcad comes back with a solid and
+            // "the kernel could not union this boss" — 227.8 where the mesh has 377.3, a third of
+            // the part missing. The rebuild the user is looking at raises that as a banner; an
+            // export must not quietly write the wreckage out as a file.
+            let (built, failures) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_reported(&doc.0)))
+                .unwrap_or((None, Vec::new()));
+            exact = failures.is_empty().then_some(built).flatten();
             // Drain whatever that rebuild counted. These are read by the NEXT regenerate to
             // raise its banners, and an export quietly adding to them would put a warning on a
             // rebuild that never earned it.
@@ -17096,6 +17102,18 @@ fn handle_file_io(
                 || s.contains("TOROIDAL_SURFACE");
             (curved, std::cmp::Reverse(s.len()))
         };
+        // ...but only if the exact solid is actually RIGHT. pardt.hcad builds 39.6% short through
+        // the exact kernel (227.8 against the mesh's 377.3) and says nothing about it, so "which
+        // file is smaller" would happily ship the wrong part the day the smaller one is also the
+        // broken one. The mesh build is the reference — it is what the user has been looking at.
+        let exact = exact.filter(|s| match part.mesh.as_ref() {
+            None => true,
+            Some(m) => {
+                let want = hworks_geometry::signed_mesh_volume(m).abs();
+                let got = hworks_geometry::signed_mesh_volume(&tessellate(s, 0.02).mesh).abs();
+                want <= 1.0e-9 || (got - want).abs() <= want * 1.0e-3
+            }
+        });
         let exact_step = exact.as_ref().and_then(|s| export_step(s));
         let mesh_step = part.mesh.as_ref().and_then(mesh_to_solid).as_ref().and_then(|s| export_step(s));
         let (chosen, faceted) = match (exact_step, mesh_step) {
@@ -17931,6 +17949,16 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
     // Strip the exact-arc annotations unless this is the last solid feature with a
     // single profile (multiple profiles boolean against each other in sequence, so
     // all but the final result would become a NURBS base).
+    // MEASURED, 2026-09-15, so it does not get re-litigated: taking this gate away makes truck
+    // hang. Letting every feature keep its arcs put squarehelper (two extrudes, 538 triangles)
+    // and pinch past 150 SECONDS with no result, against 244 ms and 1.5 s with the gate on;
+    // usercylinder was still going after ten minutes. A NURBS base really does defeat the exact
+    // booleans, exactly as the note above says.
+    //
+    // The escape hatch delivers nothing either. Where a part IS the last solid feature with one
+    // profile, so its arcs survive, the exported STEP still shows ZERO curved surfaces — see
+    // `diag_exact_build`. Something downstream of here is dropping them, and finding it is the
+    // open question, not whether to remove this gate.
     let gate_arcs = |merged: &mut Vec<hworks_sketch::Region>, fi: usize| {
         if Some(fi) != last_solid || merged.len() != 1 {
             for r in merged.iter_mut() {
@@ -29905,6 +29933,45 @@ mod tests {
             wout <= win + 1.0e-12,
             "the merge made its spans less circular: worst point was {win:.3e} off the radius, now {wout:.3e}"
         );
+    }
+
+    /// How the EXACT kernel copes with one part: whether the B-rep survives at all, how long it
+    /// takes, what it encloses against the mesh build, and whether any curved surfaces reach the
+    /// STEP. Two things it has already turned up — that no corpus part gets a curved surface even
+    /// when `gate_arcs` lets its arcs through, and that pardt.hcad builds 39.6% short.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_exact_build -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_exact_build() {
+        let _guard = counter_lock();
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (m, _) = regenerate_mesh(&doc).expect("mesh reference");
+        let mesh_vol = hworks_geometry::signed_mesh_volume(&m).abs();
+        let _ = take_fallback_count();
+        let t0 = std::time::Instant::now();
+        let (exact, failures) = regenerate_reported(&doc);
+        let ms = t0.elapsed().as_millis();
+        let fallbacks = take_fallback_count();
+        let _ = take_cut_direction_guesses();
+        let _ = take_gear_failures();
+        let _ = take_nonmanifold_bodies();
+        let _ = hworks_geometry::take_loft_hole_mismatch_count();
+        match exact {
+            None => eprintln!("  EXACT BUILD FAILED  ({ms}ms, {} failure msg(s)): {failures:?}", failures.len()),
+            Some(s) => {
+                let step = hworks_geometry::export_step(&s).unwrap_or_default();
+                let curved = step.matches("B_SPLINE_SURFACE").count()
+                    + step.matches("SURFACE_OF_REVOLUTION").count()
+                    + step.matches("CYLINDRICAL_SURFACE").count();
+                let v = hworks_geometry::signed_mesh_volume(&hworks_geometry::tessellate(&s, 0.02).mesh).abs();
+                eprintln!(
+                    "  built in {ms:>5}ms | vol {v:>12.3} vs mesh {mesh_vol:>12.3} ({:+.3}%) | {:>5} faces, {curved:>4} curved | {} bsp fallback(s), {} msg(s)",
+                    100.0 * (v - mesh_vol) / mesh_vol.max(1e-9),
+                    step.matches("FACE_SURFACE").count(), fallbacks, failures.len()
+                );
+            }
+        }
     }
 
     /// Type a number into a value box and the box must take THAT number.
