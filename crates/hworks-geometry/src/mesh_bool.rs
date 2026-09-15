@@ -22,12 +22,12 @@ use std::collections::HashMap;
 /// open seam → NotManifold → the lossy BSP CSG (torn surface, or an OOM on dense meshes). Scaling
 /// the tolerance with the model and searching the 27 neighbour cells fuses the seam at any size
 /// without merging genuinely distinct (mm-scale) geometry.
-fn weld(m: &TriMesh) -> (Vec<f32>, Vec<u32>) {
+fn weld(m: &TriMesh) -> (Vec<f32>, Vec<u32>, Vec<usize>) {
     weld_tol(m, 3.0e-5)
 }
 
 /// `weld` with a caller-chosen bbox-relative tolerance factor (exposed for diagnostics).
-fn weld_tol(m: &TriMesh, rel: f32) -> (Vec<f32>, Vec<u32>) {
+fn weld_tol(m: &TriMesh, rel: f32) -> (Vec<f32>, Vec<u32>, Vec<usize>) {
     let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
     for p in &m.positions {
         for k in 0..3 {
@@ -91,14 +91,20 @@ fn weld_tol(m: &TriMesh, rel: f32) -> (Vec<f32>, Vec<u32>) {
     // Drop triangles the weld made degenerate (two corners merged): Manifold rejects a
     // MeshGL containing them, so a dense mesh with edges shorter than the weld tolerance
     // (e.g. marching-cubes output slivers) would spuriously read as "not manifold".
+    //
+    // Dropping them breaks the 1:1 correspondence with the source, so `from` records which
+    // source triangle each survivor came from. A caller that carries per-triangle data — the
+    // surface tags — has no other way to keep it attached to the right triangle.
     let mut tris: Vec<u32> = Vec::with_capacity(m.indices.len());
-    for t in m.indices.chunks_exact(3) {
-        let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+    let mut from: Vec<usize> = Vec::with_capacity(m.indices.len() / 3);
+    for (t, v) in m.indices.chunks_exact(3).enumerate() {
+        let (a, b, c) = (remap[v[0] as usize], remap[v[1] as usize], remap[v[2] as usize]);
         if a != b && b != c && a != c {
             tris.extend([a, b, c]);
+            from.push(t);
         }
     }
-    (props, tris)
+    (props, tris, from)
 }
 
 /// True if `m` can be ingested as a valid 2-manifold solid (welds coincident verts first).
@@ -118,7 +124,7 @@ pub fn manifold_difference_only(a: &TriMesh, b: &TriMesh) -> Option<TriMesh> {
 /// edges [used >2×]). A watertight 2-manifold has every edge used exactly twice → both 0.
 #[cfg(test)]
 pub fn weld_edge_stats_tol(m: &TriMesh, rel: f32) -> (usize, usize, usize, usize) {
-    let (props, tris) = weld_tol(m, rel);
+    let (props, tris, _) = weld_tol(m, rel);
     let mut edge: HashMap<(u32, u32), i32> = HashMap::new();
     for t in tris.chunks_exact(3) {
         for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
@@ -133,7 +139,7 @@ pub fn weld_edge_stats_tol(m: &TriMesh, rel: f32) -> (usize, usize, usize, usize
 
 #[cfg(test)]
 pub fn weld_edge_stats(m: &TriMesh) -> (usize, usize, usize, usize) {
-    let (props, tris) = weld(m);
+    let (props, tris, _) = weld(m);
     let mut edge: HashMap<(u32, u32), i32> = HashMap::new();
     for t in tris.chunks_exact(3) {
         for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
@@ -151,7 +157,7 @@ fn to_manifold(m: &TriMesh) -> Option<Manifold> {
     if m.indices.len() < 3 {
         return None;
     }
-    let (props, tris) = weld(m);
+    let (props, tris, _) = weld(m);
     let meshgl = MeshGL::new(&props, 3, &tris).ok()?;
     Manifold::from_meshgl(&meshgl).ok()
 }
@@ -526,17 +532,22 @@ fn to_manifold_tagged(m: &TriMesh, reg: &mut HashMap<u32, crate::Surf>) -> Optio
     if m.tri_surf.len() != ntri || m.surfaces.is_empty() {
         return to_manifold(m);
     }
-    let (props, tris) = weld(m);
-    // Group triangles by tag, untagged last. `sort_by_key` is stable, so triangles keep their
-    // relative order within a face and a re-run gives the same mesh.
-    let mut order: Vec<usize> = (0..ntri).collect();
-    order.sort_by_key(|&t| m.tri_surf[t]);
+    let (props, tris, from) = weld(m);
+    // Walk the WELDED triangles, not the source ones: the weld drops any it made degenerate, so
+    // source triangle t is not welded triangle t. `from` maps each survivor back to the source it
+    // came from, which is where its tag is. Indexing the welded list by a source index instead ran
+    // off its end and took eight parts' rebuilds down with it.
+    //
+    // Group by tag, untagged last. `sort_by_key` is stable, so triangles keep their relative order
+    // within a face and a re-run gives the same mesh.
+    let mut order: Vec<usize> = (0..from.len()).collect();
+    order.sort_by_key(|&j| m.tri_surf[from[j]]);
     let base = manifold3d::reserve_ids(m.surfaces.len() as u32 + 1);
     let mut grouped: Vec<u32> = Vec::with_capacity(tris.len());
     let (mut run_index, mut run_ids) = (Vec::<u32>::new(), Vec::<u32>::new());
     let mut last: Option<u32> = None;
-    for &t in &order {
-        let tag = m.tri_surf[t];
+    for &j in &order {
+        let tag = m.tri_surf[from[j]];
         if last != Some(tag) {
             run_index.push(grouped.len() as u32);
             // NO_SURF gets an id too — Manifold wants every triangle inside a run — it just never
@@ -548,7 +559,7 @@ fn to_manifold_tagged(m: &TriMesh, reg: &mut HashMap<u32, crate::Surf>) -> Optio
             }
             last = Some(tag);
         }
-        grouped.extend_from_slice(&tris[t * 3..t * 3 + 3]);
+        grouped.extend_from_slice(&tris[j * 3..j * 3 + 3]);
     }
     run_index.push(grouped.len() as u32); // sentinel
     let opts = manifold3d::MeshGLOptions::new().runs(&run_index, &run_ids);

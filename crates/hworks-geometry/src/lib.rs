@@ -53,10 +53,15 @@ pub struct TriMesh {
 
 impl TriMesh {
     /// The surface triangle `t` lies on, if anything recorded one.
+    ///
+    /// Answers "nobody said" for the whole mesh when the tag array has fallen out of step with the
+    /// triangles, rather than reading it anyway. Plenty of code rebuilds a mesh's triangles
+    /// without knowing tags exist, and a tag array off by even one triangle doesn't degrade —
+    /// every answer after the slip names the wrong surface, which is worse than no answer at all.
     pub fn surf_of(&self, t: usize) -> Option<Surf> {
         // Indexed rather than `.get()`: a glob import in this crate shadows the slice method with
         // one that returns by value, and the borrow checker errors read as nonsense.
-        if t >= self.tri_surf.len() {
+        if self.tri_surf.len() != self.indices.len() / 3 || t >= self.tri_surf.len() {
             return None;
         }
         let s = self.tri_surf[t] as usize;
@@ -562,6 +567,231 @@ pub fn extrude_tool_mesh(
     direct_prism_mesh(outer, holes, basis, start_offset, length)
 }
 
+/// One boundary edge of a prism profile and the surface its wall lies on.
+struct Wall {
+    a: [f64; 2],
+    b: [f64; 2],
+    surf: u32,
+}
+
+/// Work out every surface a straight prism over this profile has, and which profile edge each
+/// wall belongs to: the two cap planes, one cylinder per annotated arc run, and one plane per
+/// remaining edge.
+///
+/// Nothing here is fitted. The sketch already knows a bore is a circle — [`ArcSpan`] says which
+/// run of edges lies on it — so the cylinder is *read off* the profile, not recovered from
+/// triangles afterwards. That is the whole point of carrying surfaces instead of guessing them.
+///
+/// The one thing not taken at face value is the arc's radius: a cut profile can be nudged off
+/// its nominal circle before it is built (`clear_coincident_cut_walls` widens a wall that would
+/// otherwise land exactly on a face), and a cylinder whose radius disagreed with its own
+/// triangles would be worse than no cylinder at all. Widening is radial, so the centre survives
+/// it and the radius is re-measured from the points actually being built.
+fn prism_surface_plan(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    w_lo: f64,
+    w_hi: f64,
+) -> (Vec<Surf>, Vec<Wall>) {
+    let o = Vector3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+    let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+    let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+    let n = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
+    let to3 = |p: [f64; 2], w: f64| {
+        let q = o + u * p[0] + v * p[1] + n * w;
+        [q.x, q.y, q.z]
+    };
+    let axis = [n.x, n.y, n.z];
+    // Slots 0 and 1 are always the two caps, so the tagger can name them without a search.
+    let mut surfaces = vec![
+        Surf::Plane { origin: to3([0.0, 0.0], w_hi), normal: axis },
+        Surf::Plane { origin: to3([0.0, 0.0], w_lo), normal: [-axis[0], -axis[1], -axis[2]] },
+    ];
+    let mut walls: Vec<Wall> = Vec::new();
+    let loops = std::iter::once((outer, outer_arcs)).chain(
+        holes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.as_slice(), hole_arcs.get(i).map(|s| s.as_slice()).unwrap_or(&[]))),
+    );
+    for (pts, spans) in loops {
+        let m = pts.len();
+        if m < 3 {
+            continue;
+        }
+        // Which edges an arc run claims, and the slot of the cylinder they share.
+        let mut claimed: Vec<Option<u32>> = vec![None; m];
+        for s in spans {
+            if s.count == 0 || s.count > m {
+                continue;
+            }
+            let edges: Vec<usize> = (0..s.count).map(|t| (s.first_edge + t) % m).collect();
+            // Re-measure the radius from the points the run actually covers (its edges' two
+            // endpoints), so a widened profile still gets a cylinder its own walls sit on.
+            let mut sum = 0.0;
+            let mut cnt = 0.0;
+            for &e in &edges {
+                for p in [pts[e], pts[(e + 1) % m]] {
+                    sum += ((p[0] - s.center[0]).powi(2) + (p[1] - s.center[1]).powi(2)).sqrt();
+                    cnt += 1.0;
+                }
+            }
+            if cnt == 0.0 || sum / cnt < 1.0e-9 {
+                continue;
+            }
+            surfaces.push(Surf::Cylinder { origin: to3(s.center, w_lo), axis, radius: sum / cnt });
+            let slot = (surfaces.len() - 1) as u32;
+            for e in edges {
+                claimed[e] = Some(slot);
+            }
+        }
+        for (k, claim) in claimed.iter().enumerate() {
+            let (a, b) = (pts[k], pts[(k + 1) % m]);
+            let surf = match *claim {
+                Some(s) => s,
+                None => {
+                    let d = [b[0] - a[0], b[1] - a[1]];
+                    let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                    if l < 1.0e-12 {
+                        continue; // a zero-length edge has no wall
+                    }
+                    // Across the edge and across the sweep. Which way it points doesn't matter:
+                    // the tagger matches a triangle to a wall by WHERE it is, not by its facing.
+                    let nrm2 = [d[1] / l, -d[0] / l];
+                    let nrm = u * nrm2[0] + v * nrm2[1];
+                    surfaces.push(Surf::Plane { origin: to3(a, w_lo), normal: [nrm.x, nrm.y, nrm.z] });
+                    (surfaces.len() - 1) as u32
+                }
+            };
+            walls.push(Wall { a, b, surf });
+        }
+    }
+    (surfaces, walls)
+}
+
+/// Record on every triangle of a built prism which surface of [`prism_surface_plan`] it lies on.
+///
+/// Each triangle is placed by POSITION, not by fitting anything: projected into the sketch plane,
+/// a cap triangle sits at one of the two sweep ends, and a wall triangle's centroid falls on
+/// exactly one profile edge — whichever built the mesh, and however finely it chose to subdivide.
+///
+/// Position is what makes an annotated arc trustworthy. Geometry alone cannot tell one facet of a
+/// polygonal circle from a flat chord across the same circle (both have their endpoints at the
+/// radius, and both face along it), so a radius test would tag the flat of a D-shaped bore as part
+/// of the bore. Which edges belong to the arc is something only the sketch knows, and it said.
+fn tag_prism_walls(mesh: &mut TriMesh, surfaces: Vec<Surf>, walls: &[Wall], basis: &PlaneBasis, w_lo: f64, w_hi: f64) {
+    mesh.clear_tags();
+    let ntri = mesh.indices.len() / 3;
+    if ntri == 0 || walls.is_empty() {
+        return;
+    }
+    let o = Point3::new(basis.origin[0], basis.origin[1], basis.origin[2]);
+    let u = Vector3::new(basis.u[0], basis.u[1], basis.u[2]);
+    let v = Vector3::new(basis.v[0], basis.v[1], basis.v[2]);
+    let n = Vector3::new(basis.normal[0], basis.normal[1], basis.normal[2]);
+    // Positions are f32; a point 100mm out carries ~1e-5 of rounding before anything else. Scale
+    // the tolerance to the part so a big model isn't judged by a small one's precision.
+    let span = walls
+        .iter()
+        .flat_map(|w| [w.a, w.b])
+        .fold(0.0f64, |acc, p| acc.max(p[0].abs()).max(p[1].abs()))
+        .max((w_hi - w_lo).abs());
+    let tol = (span * 1.0e-5).max(1.0e-4);
+    let mut tri_surf = vec![NO_SURF; ntri];
+    let mut used: Vec<u32> = vec![NO_SURF; surfaces.len()];
+    let mut kept: Vec<Surf> = Vec::new();
+    let mut claim = |tri_surf: &mut Vec<u32>, kept: &mut Vec<Surf>, t: usize, slot: u32| {
+        let s = slot as usize;
+        if used[s] == NO_SURF {
+            kept.push(surfaces[s]);
+            used[s] = (kept.len() - 1) as u32;
+        }
+        tri_surf[t] = used[s];
+    };
+    for t in 0..ntri {
+        let p = |i: usize| {
+            let q = mesh.positions[mesh.indices[t * 3 + i] as usize];
+            Point3::new(q[0] as f64, q[1] as f64, q[2] as f64)
+        };
+        let (a, b, c) = (p(0), p(1), p(2));
+        let fnrm = (b - a).cross(c - a);
+        let fl = fnrm.magnitude();
+        if fl < 1.0e-16 {
+            continue; // a needle has no meaningful facing; leave it for nobody
+        }
+        let along = fnrm.dot(n) / fl;
+        let cen = ((a - o) + (b - o) + (c - o)) / 3.0;
+        let w = cen.dot(n);
+        if along.abs() > 0.99 {
+            // A cap: flat to the sweep and at one of its two ends.
+            if (w - w_hi).abs() < tol {
+                claim(&mut tri_surf, &mut kept, t, 0);
+            } else if (w - w_lo).abs() < tol {
+                claim(&mut tri_surf, &mut kept, t, 1);
+            }
+            continue;
+        }
+        // A wall: its centroid projects onto the profile edge that swept it.
+        let q = [cen.dot(u), cen.dot(v)];
+        let mut best = (f64::MAX, NO_SURF);
+        for wall in walls {
+            let d = [wall.b[0] - wall.a[0], wall.b[1] - wall.a[1]];
+            let ll = d[0] * d[0] + d[1] * d[1];
+            let s = if ll > 1.0e-18 {
+                (((q[0] - wall.a[0]) * d[0] + (q[1] - wall.a[1]) * d[1]) / ll).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (dx, dy) = (q[0] - (wall.a[0] + d[0] * s), q[1] - (wall.a[1] + d[1] * s));
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < best.0 {
+                best = (dist, wall.surf);
+            }
+        }
+        if best.0 < tol && best.1 != NO_SURF {
+            claim(&mut tri_surf, &mut kept, t, best.1);
+        }
+    }
+    if kept.is_empty() {
+        return;
+    }
+    mesh.surfaces = kept;
+    mesh.tri_surf = tri_surf;
+}
+
+/// [`extrude_tool_mesh`], with the profile's exact-arc annotations carried onto the result: a bore
+/// comes back recorded as ONE cylinder, not a ring of unrelated flat strips.
+///
+/// Tagging has to happen HERE rather than inside a builder. On real parts every prism comes back
+/// from truck's triangulation — measured across usercylinder, blocker and motormount, the direct
+/// builder ran for none of their 83 prisms — so tags written inside `direct_prism_mesh` would
+/// never be seen. Placing triangles afterwards works whichever builder answered.
+///
+/// Across the saved corpus that is 36 of 50 buildable parts carrying at least one real cylinder
+/// through to the finished body (`diag_surface_tags`), with every part's volume unchanged and
+/// every rebuild still deterministic. Nothing reads the cylinders yet — the exporter is next.
+pub fn extrude_tool_mesh_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    start_offset: f64,
+    length: f64,
+) -> Option<TriMesh> {
+    let mut m = extrude_tool_mesh(outer, holes, basis, start_offset, length)?;
+    let (w_lo, w_hi) = (
+        start_offset.min(start_offset + length),
+        start_offset.max(start_offset + length),
+    );
+    let (surfaces, walls) = prism_surface_plan(outer, holes, outer_arcs, hole_arcs, basis, w_lo, w_hi);
+    tag_prism_walls(&mut m, surfaces, &walls, basis, w_lo, w_hi);
+    Some(m)
+}
+
 /// Shoelace area of a 2D polygon (absolute).
 fn poly_area_2d(l: &[[f64; 2]]) -> f64 {
     let mut a = 0.0;
@@ -585,22 +815,43 @@ fn poly_area_2d(l: &[[f64; 2]]) -> f64 {
 /// one-segment strips, and wherever the two ends already agree, half the strip collapses to
 /// exactly this shape.
 pub fn drop_duplicate_vertex_triangles(mesh: &mut TriMesh) -> usize {
+    retain_triangles(mesh, |m, t| {
+        let q = |i: u32| m.positions[i as usize];
+        let same = |a: [f32; 3], b: [f32; 3]| {
+            (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9 && (a[2] - b[2]).abs() < 1e-9
+        };
+        let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
+        !(t[0] == t[1] || t[1] == t[2] || t[0] == t[2] || same(a, b) || same(b, c) || same(a, c))
+    })
+}
+
+/// Keep the triangles `pred` accepts, dropping the rest, and return how many went.
+///
+/// Carries the surface tags along with the triangles they describe. Dropping triangles out from
+/// under the tag array is not a small error: every tag after the first gap names a different
+/// triangle's surface, so an exporter would confidently put a bore's cylinder somewhere on a flat
+/// face. [`TriMesh::surf_of`] catches a mismatched array and stops trusting it, but that throws
+/// away every tag on the mesh — keeping them in step keeps them usable.
+fn retain_triangles(mesh: &mut TriMesh, pred: impl Fn(&TriMesh, &[u32]) -> bool) -> usize {
     let before = mesh.indices.len() / 3;
-    let keep: Vec<u32> = mesh
-        .indices
-        .chunks_exact(3)
-        .filter(|t| {
-            let q = |i: u32| mesh.positions[i as usize];
-            let same = |a: [f32; 3], b: [f32; 3]| {
-                (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9 && (a[2] - b[2]).abs() < 1e-9
-            };
-            let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
-            !(t[0] == t[1] || t[1] == t[2] || t[0] == t[2] || same(a, b) || same(b, c) || same(a, c))
-        })
-        .flatten()
-        .copied()
-        .collect();
+    let tagged = mesh.tri_surf.len() == before;
+    let mut keep: Vec<u32> = Vec::with_capacity(mesh.indices.len());
+    let mut tags: Vec<u32> = Vec::with_capacity(mesh.tri_surf.len());
+    for (t, v) in mesh.indices.chunks_exact(3).enumerate() {
+        if pred(mesh, v) {
+            keep.extend_from_slice(v);
+            if tagged {
+                tags.push(mesh.tri_surf[t]);
+            }
+        }
+    }
     mesh.indices = keep;
+    if tagged {
+        mesh.tri_surf = tags;
+    } else {
+        // The array was already out of step with the triangles, so there is nothing to carry.
+        mesh.clear_tags();
+    }
     before - mesh.indices.len() / 3
 }
 
@@ -615,25 +866,16 @@ pub fn drop_duplicate_vertex_triangles(mesh: &mut TriMesh) -> usize {
 /// boundary edge is opened, the volume is unchanged to six decimals, and the count of edges
 /// shared by more than two faces drops sharply (612 to 363 on the worst case).
 pub fn drop_degenerate_triangles(mesh: &mut TriMesh) -> usize {
-    let before = mesh.indices.len() / 3;
-    let keep: Vec<u32> = mesh
-        .indices
-        .chunks_exact(3)
-        .filter(|t| {
-            let q = |i: u32| {
-                let p = mesh.positions[i as usize];
-                [p[0] as f64, p[1] as f64, p[2] as f64]
-            };
-            let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
-            let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
-            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-            (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() > 1e-12
-        })
-        .flatten()
-        .copied()
-        .collect();
-    mesh.indices = keep;
-    before - mesh.indices.len() / 3
+    retain_triangles(mesh, |m, t| {
+        let q = |i: u32| {
+            let p = m.positions[i as usize];
+            [p[0] as f64, p[1] as f64, p[2] as f64]
+        };
+        let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
+        let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() > 1e-12
+    })
 }
 
 /// Signed volume of a triangle mesh (divergence theorem).
@@ -1191,6 +1433,17 @@ pub fn cut_tool_mesh(
     distance: f64,
     back: f64,
 ) -> Option<TriMesh> {
+    let (start, length) = cut_tool_span(distance, back)?;
+    extrude_tool_mesh(outer, holes, basis, start, length)
+}
+
+/// The sweep a cut of this signed `distance` (plus Direction 2 `back`) needs: where it starts
+/// relative to the sketch plane and how far it runs, overshooting both ends so neither cap can
+/// land coplanar with the body. `None` for a cut of no depth.
+///
+/// Shared so the tagged and untagged cut tools cannot drift apart — a tool tagged over a span
+/// other than the one it was built over would put its surfaces in the wrong place.
+fn cut_tool_span(distance: f64, back: f64) -> Option<(f64, f64)> {
     let depth = distance.abs();
     if depth < 1e-9 {
         return None;
@@ -1198,12 +1451,26 @@ pub fn cut_tool_mesh(
     let eps = 0.05 + depth * 0.02;
     // `back` (Direction 2) extends the cut the opposite way from `distance`.
     let b = back.max(0.0);
-    let (start, length) = if distance >= 0.0 {
+    Some(if distance >= 0.0 {
         (-(eps + b), depth + 2.0 * eps + b)
     } else {
         (-(depth + eps), depth + 2.0 * eps + b)
-    };
-    extrude_tool_mesh(outer, holes, basis, start, length)
+    })
+}
+
+/// [`cut_tool_mesh`] carrying the profile's exact-arc annotations, so the bore a cut leaves behind
+/// is recorded as a cylinder rather than as the ring of flat strips that actually got built.
+pub fn cut_tool_mesh_arcs(
+    outer: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+    outer_arcs: &[ArcSpan],
+    hole_arcs: &[Vec<ArcSpan>],
+    basis: &PlaneBasis,
+    distance: f64,
+    back: f64,
+) -> Option<TriMesh> {
+    let (start, length) = cut_tool_span(distance, back)?;
+    extrude_tool_mesh_arcs(outer, holes, outer_arcs, hole_arcs, basis, start, length)
 }
 
 /// Serialize a triangle mesh as a **binary STL** blob (for 3D printing / mesh interchange).
@@ -4312,6 +4579,257 @@ mod tests {
                 assert!(d.abs() < 1.0e-4, "after the boolean, triangle {t} sits {d:.2e} off its plane");
             }
         }
+    }
+
+
+    /// A 48-gon approximating the circle at `c` with radius `r`, plus the annotation saying so.
+    fn arc_loop(c: [f64; 2], r: f64, n: usize) -> (Vec<[f64; 2]>, ArcSpan) {
+        let pts = (0..n)
+            .map(|i| {
+                let a = i as f64 / n as f64 * std::f64::consts::TAU;
+                [c[0] + r * a.cos(), c[1] + r * a.sin()]
+            })
+            .collect();
+        (pts, ArcSpan { first_edge: 0, count: n, center: c, radius: r })
+    }
+
+    /// Every triangle carrying `s`, and the radial distance of their vertices from its axis.
+    fn tris_on(m: &TriMesh, s: Surf) -> (usize, f64, f64) {
+        let (mut n, mut lo, mut hi) = (0usize, f64::MAX, f64::MIN);
+        for t in 0..m.indices.len() / 3 {
+            if m.surf_of(t) != Some(s) {
+                continue;
+            }
+            n += 1;
+            let Surf::Cylinder { origin, axis, .. } = s else { continue };
+            for i in 0..3 {
+                let p = m.positions[m.indices[t * 3 + i] as usize];
+                let d = [p[0] as f64 - origin[0], p[1] as f64 - origin[1], p[2] as f64 - origin[2]];
+                let al = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+                let rad = [d[0] - axis[0] * al, d[1] - axis[1] * al, d[2] - axis[2] * al];
+                let rr = (rad[0] * rad[0] + rad[1] * rad[1] + rad[2] * rad[2]).sqrt();
+                lo = lo.min(rr);
+                hi = hi.max(rr);
+            }
+        }
+        (n, lo, hi)
+    }
+
+    /// The one cylinder a mesh records, if it records exactly one.
+    fn sole_cylinder(m: &TriMesh) -> Surf {
+        let cyls: Vec<Surf> = m.surfaces.iter().copied().filter(|s| matches!(s, Surf::Cylinder { .. })).collect();
+        assert_eq!(cyls.len(), 1, "expected exactly one cylinder, got {cyls:?}");
+        cyls[0]
+    }
+
+    /// An extrude carries its sketch's arcs onto the mesh: a bore comes back as ONE cylinder, and
+    /// the booleans that follow keep it.
+    ///
+    /// This is the step that makes the surface registry worth anything. Until now a mesh could
+    /// record surfaces but nothing put a curved one there, so the best an exporter could do with a
+    /// bore was the ring of flat strips it was handed. The sketch knew all along — an [`ArcSpan`]
+    /// says which edges lie on which circle — and this is that knowledge surviving the build.
+    ///
+    /// The tagging happens at the mesh entry point, not inside a prism builder, because on real
+    /// parts truck's triangulation answers every time: across usercylinder, blocker and motormount
+    /// not one of 83 prisms reached `direct_prism_mesh`. Tags written in there would be dead code.
+    #[test]
+    fn an_extrudes_bore_is_recorded_as_one_cylinder() {
+        let (bore, span) = arc_loop([20.0, 20.0], 6.0, 48);
+        let plate = extrude_tool_mesh_arcs(
+            &rect(0.0, 0.0, 40.0, 40.0),
+            &[bore.iter().rev().copied().collect()],
+            &[],
+            &[vec![ArcSpan { first_edge: 0, count: 48, center: span.center, radius: span.radius }]],
+            &xy_plane(),
+            0.0,
+            5.0,
+        )
+        .expect("plate with a bore");
+
+        // Two caps, four outer walls, and the bore as a single cylinder — not 48 strips.
+        assert_eq!(
+            plate.surfaces.len(),
+            7,
+            "a plate with one bore has 7 surfaces, got {:?}",
+            plate.surfaces
+        );
+        let cyl = sole_cylinder(&plate);
+        let Surf::Cylinder { origin, axis, radius } = cyl else { unreachable!() };
+        assert!((radius - 6.0).abs() < 1.0e-6, "bore radius came out {radius}");
+        assert!(
+            (origin[0] - 20.0).abs() < 1.0e-9 && (origin[1] - 20.0).abs() < 1.0e-9,
+            "bore axis passes through {origin:?}, not the sketch centre"
+        );
+        assert!(axis[2].abs() > 0.999, "bore axis {axis:?} is not the sweep direction");
+
+        // Every triangle of the bore wall, and nothing else, carries it.
+        let (n, lo, hi) = tris_on(&plate, cyl);
+        assert_eq!(n, 96, "a 48-sided bore wall is 96 triangles, {n} carry the cylinder");
+        // Positions are f32, so "on the cylinder" is judged at that precision, not f64's.
+        assert!(
+            (lo - 6.0).abs() < 1.0e-4 && (hi - 6.0).abs() < 1.0e-4,
+            "triangles claiming the cylinder sit at radius {lo}..{hi}, not 6"
+        );
+        // ...and nothing came out unaccounted for: a prism is all caps and walls.
+        let untagged = plate.tri_surf.iter().filter(|&&s| s == NO_SURF).count();
+        assert_eq!(untagged, 0, "{untagged} triangles of a plain prism went untagged");
+
+        // Through a real boolean, by the app's own entry point: cut a notch in a corner, far from
+        // the bore, and the bore must still be a cylinder of the same size in the same place.
+        let notch = extrude_tool_mesh(&rect(-1.0, -1.0, 5.0, 5.0), &[], &xy_plane(), 2.0, 4.0).expect("notch");
+        let cut = mesh_difference(&plate, &notch);
+        assert!(!cut.indices.is_empty(), "the difference built nothing");
+        let after = sole_cylinder(&cut);
+        assert_eq!(after, cyl, "the boolean changed the bore's surface: {after:?}");
+        let (n2, lo2, hi2) = tris_on(&cut, after);
+        assert!(n2 >= 90, "only {n2} of the bore's 96 triangles came through the boolean tagged");
+        assert!(
+            (lo2 - 6.0).abs() < 1.0e-3 && (hi2 - 6.0).abs() < 1.0e-3,
+            "after the boolean the bore's triangles sit at radius {lo2}..{hi2}"
+        );
+    }
+
+
+    /// A boolean on a tagged mesh survives the weld dropping a triangle, and the tags stay on the
+    /// triangles they describe.
+    ///
+    /// The weld that prepares a mesh for Manifold removes any triangle it collapsed — that is the
+    /// point of it — so the welded list is SHORTER than the source and welded triangle j is no
+    /// longer source triangle j. Reading the source's tag array at a welded index therefore slides
+    /// every tag past the first gap onto the wrong triangle, and then runs off the end.
+    ///
+    /// Not a hypothetical: the moment extrudes started tagging real profiles, this took down the
+    /// rebuild of eight saved parts outright (extruderpart, fillererror3, filletpolygon,
+    /// holegenieupgrade, roundfilleterror, roundfilleterror3, sliver, testpart2) and silently
+    /// misfiled tags on the rest. It was invisible before only because nothing put a tag on a mesh
+    /// that had a sliver in it.
+    #[test]
+    fn a_weld_that_drops_a_triangle_keeps_the_tags_on_the_right_ones() {
+        let (bore, span) = arc_loop([20.0, 20.0], 6.0, 48);
+        let mut plate = extrude_tool_mesh_arcs(
+            &rect(0.0, 0.0, 40.0, 40.0),
+            &[bore.iter().rev().copied().collect()],
+            &[],
+            &[vec![span]],
+            &xy_plane(),
+            0.0,
+            5.0,
+        )
+        .expect("plate with a bore");
+        let cyl = sole_cylinder(&plate);
+        let (before, _, _) = tris_on(&plate, cyl);
+
+        // Slip a collapsed triangle in near the FRONT, so the weld's drop shifts every tag behind
+        // it — the worst case, not a harmless one at the end.
+        let v = plate.indices[0];
+        plate.indices.splice(3..3, [v, v, v]);
+        plate.tri_surf.insert(1, NO_SURF);
+        assert_eq!(plate.tri_surf.len(), plate.indices.len() / 3, "the test's own mesh is out of step");
+
+        let notch = extrude_tool_mesh(&rect(-1.0, -1.0, 5.0, 5.0), &[], &xy_plane(), 2.0, 4.0).expect("notch");
+        let cut = mesh_difference(&plate, &notch);
+        assert!(!cut.indices.is_empty(), "the difference built nothing");
+
+        let after = sole_cylinder(&cut);
+        assert_eq!(after, cyl, "the bore's surface changed across the boolean: {after:?}");
+        let (n, lo, hi) = tris_on(&cut, after);
+        assert!(n * 10 >= before * 9, "only {n} of the bore's {before} triangles came through tagged");
+        // The real damage of a slipped tag isn't a missing one — it's a confident wrong one, a
+        // triangle on a flat face claiming to be on the bore.
+        assert!(
+            (lo - 6.0).abs() < 1.0e-3 && (hi - 6.0).abs() < 1.0e-3,
+            "triangles claiming the bore sit at radius {lo}..{hi}, so a tag landed on the wrong face"
+        );
+    }
+
+    /// Dropping triangles takes their tags with them, so the survivors keep the right ones.
+    ///
+    /// Same failure as the weld, on the other side of the seam: the cleanup passes rewrite the
+    /// index buffer without knowing tags exist. A tag array left at its old length describes a mesh
+    /// that no longer exists.
+    #[test]
+    fn dropping_triangles_carries_their_tags_along() {
+        let sq = rect(0.0, 0.0, 10.0, 10.0);
+        let mut m = direct_prism_mesh(&sq, &[], &xy_plane(), 0.0, 4.0).expect("prism");
+        let before: Vec<Option<Surf>> = (0..m.indices.len() / 3).map(|t| m.surf_of(t)).collect();
+        assert!(before.iter().all(|s| s.is_some()), "a plain prism should come out fully tagged");
+
+        // A triangle naming one vertex three times: no area, no surface, nothing to keep.
+        let v = m.indices[0];
+        m.indices.splice(3..3, [v, v, v]);
+        m.tri_surf.insert(1, NO_SURF);
+        let dropped = drop_duplicate_vertex_triangles(&mut m);
+        assert_eq!(dropped, 1, "the collapsed triangle should have been the only casualty");
+        assert_eq!(m.tri_surf.len(), m.indices.len() / 3, "the tag array outlived the triangles");
+        let after: Vec<Option<Surf>> = (0..m.indices.len() / 3).map(|t| m.surf_of(t)).collect();
+        assert_eq!(after, before, "the surviving triangles came back on different surfaces");
+    }
+
+    /// A flat across a bore stays flat: the chord is NOT swallowed into the cylinder it cuts.
+    ///
+    /// This is the trap that decides how the tagging has to work. A D-shaped bore's flat has both
+    /// its endpoints exactly on the circle and faces straight along the radius — geometrically it
+    /// is indistinguishable from one facet of the polygon approximating that circle. No radius
+    /// test, however tight, can separate them. Which edges belong to the arc is something only the
+    /// sketch knows, so triangles are placed by WHICH PROFILE EDGE swept them, and the annotation
+    /// is believed about exactly the edges it names.
+    ///
+    /// Get this wrong and the flat exports as part of the round hole — a D-bore silently becomes a
+    /// plain one, and the part no longer keys onto its shaft.
+    #[test]
+    fn a_flat_across_a_bore_is_not_mistaken_for_the_bore() {
+        // A 48-gon with a run of 12 edges replaced by one straight chord: the D-bore.
+        let (full, _) = arc_loop([0.0, 0.0], 6.0, 48);
+        let kept = 36;
+        let mut d_bore: Vec<[f64; 2]> = full[..=kept].to_vec(); // 37 points ⇒ 36 arc edges + 1 chord
+        // Points 0..=36 leave the closing edge 36→0 as the flat.
+        assert_eq!(d_bore.len(), 37);
+        let chord = (
+            d_bore[kept],
+            d_bore[0],
+            ((d_bore[kept][0] - d_bore[0][0]).powi(2) + (d_bore[kept][1] - d_bore[0][1]).powi(2)).sqrt(),
+        );
+        assert!(chord.2 > 5.0, "the flat should be a long chord, it is {}", chord.2);
+        d_bore.reverse(); // holes run the other way round
+        // After reversing, the flat is edge 0 and the arc is edges 1..=36.
+        let spans = vec![ArcSpan { first_edge: 1, count: 36, center: [0.0, 0.0], radius: 6.0 }];
+
+        let part = extrude_tool_mesh_arcs(
+            &rect(-15.0, -15.0, 15.0, 15.0),
+            &[d_bore],
+            &[],
+            &[spans],
+            &xy_plane(),
+            0.0,
+            4.0,
+        )
+        .expect("plate with a D-bore");
+
+        let cyl = sole_cylinder(&part);
+        let (n, _, hi) = tris_on(&part, cyl);
+        assert_eq!(n, 72, "the 36 arc edges are 72 triangles, {n} carry the cylinder");
+        assert!((hi - 6.0).abs() < 1.0e-4, "a triangle on the cylinder reaches radius {hi}");
+
+        // The flat has a plane of its own, and its triangles are on it.
+        let flat: Vec<Surf> = part
+            .surfaces
+            .iter()
+            .copied()
+            .filter(|s| match s {
+                // A wall (not a cap) anchored on the bore's rim: the outer square's walls are
+                // out at radius 21, so only the chord qualifies.
+                Surf::Plane { origin, normal } => {
+                    normal[2].abs() < 0.01 && (origin[0].hypot(origin[1]) - 6.0).abs() < 0.01
+                }
+                _ => false,
+            })
+            .collect();
+        assert!(!flat.is_empty(), "the flat got no plane of its own: {:?}", part.surfaces);
+        let on_flat = (0..part.indices.len() / 3)
+            .filter(|&t| part.surf_of(t).is_some_and(|s| flat.contains(&s)))
+            .count();
+        assert_eq!(on_flat, 2, "the flat is one quad — 2 triangles — but {on_flat} sit on it");
     }
 
     #[test]

@@ -29,9 +29,9 @@ use hworks_geometry::drawing::{
 };
 use hworks_document::{Assembly, Document, FeatureId, FeatureKind, GearType, LoftProfile, Mate, MateRef, Plane, PlaneOffset, PlaneRef, Drawing, ViewDir, Sheet, DrawDim, DimAnchor, DimStyle, SectionSpec as DrawSection, DrawView};
 use hworks_geometry::{
-    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh, difference, extrude_solid_arcs,
+    bevel_mesh_and_edges, bevel_mesh_selected, chamfer_mesh, cut_tol, cut_tol_arcs, cut_tool_mesh_arcs, difference, extrude_solid_arcs,
     extrude_solid_with_overlap, extrude_solid_with_overlap_arcs,
-    export_step, export_stl, extrude_tool_mesh, fillet_segments, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
+    export_step, export_stl, extrude_tool_mesh, extrude_tool_mesh_arcs, fillet_segments, fit_region, fit_section_shapes, import_stl, is_manifold, loft_mesh, mesh_plane_section, remesh_solid, repair_mesh, take_dense_skip_count, RegionFit, SectionShape, mesh_difference, mesh_intersection, mesh_tessellation, mesh_to_solid, mesh_union, mirror_mesh, revolve_solid_arcs, revolve_tool_mesh, rotate_mesh, round_mesh, shell_tool, translate_mesh,
     solid_renderable, take_fallback_count, tessellate, threaded_hole, union, union_tol, KSolid, PlaneBasis, Tessellation, TriMesh,
 };
 
@@ -18553,11 +18553,16 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                 };
                 let basis = basis_from_ref(&plane);
                 // A thin feature sweeps a wall of thickness `thin` instead of the filled region.
-                let make_prism = |outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>], start: f64, length: f64| {
+                // The region's arc annotations ride along: a bore comes out of the prism recorded
+                // as one cylinder instead of a ring of flat strips, and the tags survive the
+                // booleans that follow. A thin wall has no such profile to speak of — it sweeps an
+                // offset of the loop, not the loop — so it stays untagged.
+                let make_prism = |r: &hworks_sketch::Region, start: f64, length: f64| {
                     if *thin > 0.0 {
-                        thin_wall_mesh(outer, holes, &basis, start, length, *thin, *thin_side)
+                        thin_wall_mesh(&r.outer, &r.holes, &basis, start, length, *thin, *thin_side)
                     } else {
-                        extrude_tool_mesh(outer, holes, &basis, start, length)
+                        let (oa, ha) = (kernel_spans(&r.outer_arcs), kernel_hole_spans(r));
+                        extrude_tool_mesh_arcs(&r.outer, &r.holes, &oa, &ha, &basis, start, length)
                     }
                 };
                 for r in &regs {
@@ -18602,7 +18607,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                             } else {
                                 (*distance, -distance + dip)
                             };
-                            match make_prism(&r.outer, &r.holes, start, length) {
+                            match make_prism(r, start, length) {
                                 Some(tool) => {
                                     let joined = mesh_union(&b, &tool);
                                     feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(tool);
@@ -18619,7 +18624,7 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                             } else {
                                 (distance - back, -distance + back)
                             };
-                            let tool = make_prism(&r.outer, &r.holes, start, length);
+                            let tool = make_prism(r, start, length);
                             if let Some(t) = &tool {
                                 feat_tools.entry(fi).or_insert_with(|| (Vec::new(), false)).0.push(t.clone());
                             }
@@ -18676,7 +18681,11 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                         let (start, length) = if signed >= 0.0 { (-(e + bk), depth + 2.0 * e + bk) } else { (-(depth + e), depth + 2.0 * e + bk) };
                         thin_wall_mesh(&r.outer, &r.holes, &basis, start, length, *thin, *thin_side)
                     } else {
-                        cut_tool_mesh(&r.outer, &r.holes, &basis, signed, *back)
+                        // Arc annotations ride along so the bore this cut leaves is recorded as a
+                        // cylinder. They describe the tool, not the tolerance a kernel boolean
+                        // could survive, so there is nothing here for `arcs_safe_at` to gate.
+                        let (oa, ha) = (kernel_spans(&r.outer_arcs), kernel_hole_spans(r));
+                        cut_tool_mesh_arcs(&r.outer, &r.holes, &oa, &ha, &basis, signed, *back)
                     };
                     body = Some(match tool {
                         Some(tool) => {
@@ -30053,6 +30062,60 @@ mod tests {
         }
     }
 
+    /// How much of a rebuilt body still knows what surface it lies on — and how many of those are
+    /// real cylinders rather than rings of flat strips.
+    ///   HCAD_DIR="...\saved files" cargo test -p hworks-app diag_surface_tags -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_surface_tags() {
+        let _guard = counter_lock();
+        let dir = std::env::var("HCAD_DIR").expect("set HCAD_DIR");
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad")))
+            .collect();
+        entries.sort();
+        let (mut with_cyl, mut total) = (0usize, 0usize);
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(doc) = ron::from_str::<Document>(&text) else { continue };
+            let Ok(Some((m, _))) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc))) else {
+                eprintln!("  {name}: builds nothing");
+                continue;
+            };
+            let ntri = m.indices.len() / 3;
+            if ntri == 0 {
+                continue;
+            }
+            total += 1;
+            let tagged = m.tri_surf.iter().filter(|&&s| s != hworks_geometry::NO_SURF).count();
+            let cyls: Vec<f64> = m
+                .surfaces
+                .iter()
+                .filter_map(|s| match s {
+                    hworks_geometry::Surf::Cylinder { radius, .. } => Some(*radius),
+                    _ => None,
+                })
+                .collect();
+            let cyl_tris = (0..ntri)
+                .filter(|&t| matches!(m.surf_of(t), Some(hworks_geometry::Surf::Cylinder { .. })))
+                .count();
+            if !cyls.is_empty() {
+                with_cyl += 1;
+            }
+            eprintln!(
+                "  {name}: {ntri} tris | {tagged} tagged ({:.0}%) | {} surface(s), {} cylinder(s) over {cyl_tris} tris",
+                tagged as f64 / ntri as f64 * 100.0,
+                m.surfaces.len(),
+                cyls.len(),
+            );
+        }
+        eprintln!("
+=== {with_cyl} of {total} parts carry at least one cylinder ===");
+    }
+
     /// Rebuild determinism across the whole saved-files corpus: regenerate each document three
     /// times and report any whose volume or triangle count moves. A rebuild is supposed to be a
     /// pure function of the document, so anything listed here is a bug — usually a geometry
@@ -33620,7 +33683,7 @@ mod tests {
                         eprintln!("    DIRECT {label:10} -> {}", if point_inside_mesh(&d, w) { "COVERS" } else { "clear" });
                     }
                 }
-                if let Some(tool) = cut_tool_mesh(&r.outer, &r.holes, &basis, -2.0, 0.0) {
+                if let Some(tool) = hworks_geometry::cut_tool_mesh(&r.outer, &r.holes, &basis, -2.0, 0.0) {
                     eprintln!("  chosen tool vol {:.1}", hworks_geometry::signed_mesh_volume(&tool).abs());
                     for (label, uv) in [
                         ("band centre", [0.0f32, 2.67]),
