@@ -26595,7 +26595,7 @@ mod tests {
         // "Pick" three points on the placed top face (local z = 20): transform three local
         // face points through the same placement the app uses.
         let place = |local: [f32; 3]| {
-            let m = TriMesh { positions: vec![local], normals: vec![[0.0, 0.0, 1.0]], indices: vec![] };
+            let m = TriMesh { positions: vec![local], normals: vec![[0.0, 0.0, 1.0]], indices: vec![], ..Default::default() };
             let m = {
                 let mut m = m;
                 for (axis_i, deg) in rot0.iter().enumerate() {
@@ -26613,7 +26613,7 @@ mod tests {
         // (z = 0 — CCW picks looking down the +z top face put its outward normal on +Z,
         // i.e. the face becomes the XY plane) with the first pick at the origin.
         let re_place = |local: [f32; 3]| {
-            let m = TriMesh { positions: vec![local], normals: vec![[0.0, 0.0, 1.0]], indices: vec![] };
+            let m = TriMesh { positions: vec![local], normals: vec![[0.0, 0.0, 1.0]], indices: vec![], ..Default::default() };
             let mut m = m;
             for (axis_i, deg) in rot1.iter().enumerate() {
                 let mut axis = [0.0; 3];
@@ -30582,7 +30582,7 @@ mod tests {
         for k in 1..N {
             indices.extend([0u32, (k + 1) as u32, k as u32]);
         }
-        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices };
+        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices, ..Default::default() };
         // Ray straight down at the centre from above.
         let ray = Ray3d { origin: Vec3::new(0.0, 100.0, 0.0), direction: Dir3::NEG_Y };
         let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
@@ -30613,7 +30613,7 @@ mod tests {
         for k in 1..=N {
             indices.extend([0u32, (k + 1) as u32, k as u32]);
         }
-        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices };
+        let mesh = TriMesh { positions, normals: vec![[0.0, 1.0, 0.0]; N + 2], indices, ..Default::default() };
         let ray = Ray3d { origin: Vec3::new(1.5, 100.0, -0.75), direction: Dir3::NEG_Y };
         let (_, ap) = pick_face(&mesh, &ray).expect("face picked");
         let off = (ap.origin.y - Y).abs();

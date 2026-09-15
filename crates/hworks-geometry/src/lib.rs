@@ -21,12 +21,77 @@ pub use bevel::{bevel_feature_edges, bevel_mesh, bevel_mesh_and_edges, bevel_mes
 pub use fillet::{chamfer_mesh, round_mesh, threaded_hole};
 pub use mesh_bool::{feature_edges_by_face, is_manifold, mesh_difference, mesh_intersection, mesh_union, mirror_mesh, remesh_solid, take_dense_skip_count, take_fallback_count};
 
+/// The surface a face of a mesh actually lies on.
+///
+/// CARRIED from the tool that built the face, not recovered from its triangles afterwards. The
+/// extrude that bores a hole knows perfectly well it is making a cylinder; today it throws that
+/// away and the exporter is left guessing at a ring of flat strips. A mesh that remembers can be
+/// written out as one real surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Surf {
+    /// A flat face through `origin` facing `normal`.
+    Plane { origin: [f64; 3], normal: [f64; 3] },
+    /// A cylindrical wall about the line through `origin` along `axis`.
+    Cylinder { origin: [f64; 3], axis: [f64; 3], radius: f64 },
+}
+
+/// `tri_surf` entry for a triangle whose surface nobody recorded.
+pub const NO_SURF: u32 = u32::MAX;
+
 /// A tessellated triangle mesh handed up to the renderer.
 #[derive(Debug, Default, Clone)]
 pub struct TriMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
+    /// The surfaces this mesh's faces lie on, for those a tool bothered to record.
+    pub surfaces: Vec<Surf>,
+    /// Which surface each TRIANGLE lies on — an index into `surfaces`, or [`NO_SURF`]. Empty when
+    /// nothing is tagged at all; otherwise one entry per triangle, so it can be indexed directly.
+    pub tri_surf: Vec<u32>,
+}
+
+impl TriMesh {
+    /// The surface triangle `t` lies on, if anything recorded one.
+    pub fn surf_of(&self, t: usize) -> Option<Surf> {
+        // Indexed rather than `.get()`: a glob import in this crate shadows the slice method with
+        // one that returns by value, and the borrow checker errors read as nonsense.
+        if t >= self.tri_surf.len() {
+            return None;
+        }
+        let s = self.tri_surf[t] as usize;
+        if self.tri_surf[t] == NO_SURF || s >= self.surfaces.len() {
+            return None;
+        }
+        Some(self.surfaces[s])
+    }
+
+    /// Record `s` as the surface of every triangle from `first` to the end — the shape a builder
+    /// wants: note where a face started, emit its triangles, then say what they were.
+    pub fn tag_from(&mut self, first: usize, s: Surf) {
+        let ntri = self.indices.len() / 3;
+        if first >= ntri {
+            return;
+        }
+        let id = match self.surfaces.iter().position(|x| *x == s) {
+            Some(i) => i as u32,
+            None => {
+                self.surfaces.push(s);
+                (self.surfaces.len() - 1) as u32
+            }
+        };
+        self.tri_surf.resize(ntri, NO_SURF);
+        for e in &mut self.tri_surf[first..] {
+            *e = id;
+        }
+    }
+
+    /// Drop tags that no longer describe anything — after a rebuild that changed the triangles
+    /// without updating them, a stale tag is worse than none.
+    pub fn clear_tags(&mut self) {
+        self.surfaces.clear();
+        self.tri_surf.clear();
+    }
 }
 
 /// A plane as a 3D origin and orthonormal in-plane axes (`u`, `v`) plus `normal`.
@@ -778,12 +843,33 @@ pub fn direct_prism_mesh(
         })
         .collect();
     let mut mesh = TriMesh::default();
-    // Caps: triangulate the bridged polygon once, emit both ends with opposite winding.
+    // Each face records the surface it lies on as it is built — see `Surf`. A prism knows all of
+    // them exactly: two cap planes and one plane per profile edge. The normal is read back off the
+    // triangle just pushed rather than derived from the winding, so it is the outward direction
+    // the mesh itself ended up with.
+    fn tag_last(mesh: &mut TriMesh, first: usize, origin: [f64; 3]) {
+        let n = mesh.normals[first * 3];
+        mesh.tag_from(first, Surf::Plane { origin, normal: [n[0] as f64, n[1] as f64, n[2] as f64] });
+    }
+    // Caps: triangulate the bridged polygon once, emit each end as a CONTIGUOUS block so it can
+    // carry one tag (they used to be interleaved, a top and a bottom per earcut triangle).
     let cap_poly = bridge_holes(&outer_n, &holes_n);
-    for t in earcut_simple(&cap_poly) {
+    let fan = earcut_simple(&cap_poly);
+    let first_top = mesh.indices.len() / 3;
+    for t in &fan {
         let (a, b, c) = (cap_poly[t[0]], cap_poly[t[1]], cap_poly[t[2]]);
         push_tri(&mut mesh, to3(a, w1), to3(b, w1), to3(c, w1)); // top (+normal side)
+    }
+    if mesh.indices.len() / 3 > first_top {
+        tag_last(&mut mesh, first_top, to3([0.0, 0.0], w1));
+    }
+    let first_bot = mesh.indices.len() / 3;
+    for t in &fan {
+        let (a, b, c) = (cap_poly[t[0]], cap_poly[t[1]], cap_poly[t[2]]);
         push_tri(&mut mesh, to3(a, w0), to3(c, w0), to3(b, w0)); // bottom (reversed)
+    }
+    if mesh.indices.len() / 3 > first_bot {
+        tag_last(&mut mesh, first_bot, to3([0.0, 0.0], w0));
     }
     // Side walls: every (winding-normalized) loop contributes quads between the two levels.
     for l in std::iter::once(&outer_n).chain(holes_n.iter()) {
@@ -796,8 +882,10 @@ pub fn direct_prism_mesh(
             if (a[0] - b[0]).abs() < 1e-12 && (a[1] - b[1]).abs() < 1e-12 {
                 continue;
             }
+            let first = mesh.indices.len() / 3;
             push_tri(&mut mesh, to3(a, w0), to3(b, w0), to3(b, w1));
             push_tri(&mut mesh, to3(a, w0), to3(b, w1), to3(a, w1));
+            tag_last(&mut mesh, first, to3(a, w0));
         }
     }
     if mesh.indices.is_empty() {
@@ -810,6 +898,11 @@ pub fn direct_prism_mesh(
         }
         for n2 in &mut mesh.normals {
             *n2 = [-n2[0], -n2[1], -n2[2]];
+        }
+        // The recorded surfaces face outward too, so they turn with the mesh.
+        for s in &mut mesh.surfaces {
+            let Surf::Plane { normal, .. } = s else { continue };
+            *normal = [-normal[0], -normal[1], -normal[2]];
         }
     }
     Some(mesh)
@@ -4154,6 +4247,73 @@ mod tests {
     ///
     /// Vertices must be WELDED before Manifold sees them, or it refuses the mesh as not a solid and
     /// the tags never get a chance.
+    /// A prism records the surface of every face it builds, and those records survive the app's own
+    /// booleans — not just a hand-rolled Manifold call.
+    ///
+    /// This is the plumbing the STEP export needs: it can ask a triangle what surface it lies on
+    /// instead of inferring one. Nothing consumes it yet, so the only thing that can go wrong
+    /// silently is the tags quietly disappearing, which is what this watches.
+    #[test]
+    fn a_prism_tags_its_faces_and_the_booleans_keep_them() {
+        let sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let a = direct_prism_mesh(&sq, &[], &xy_plane(), 0.0, 4.0).expect("prism");
+        // Six faces: two caps and four walls, every triangle accounted for.
+        assert_eq!(a.tri_surf.len(), a.indices.len() / 3, "every triangle needs a tag slot");
+        assert_eq!(a.surfaces.len(), 6, "a box has six planes, got {:?}", a.surfaces.len());
+        assert!(a.tri_surf.iter().all(|&s| s != NO_SURF), "some triangle came out untagged");
+
+        // Each tag must actually describe its triangles: every vertex on the recorded plane.
+        for t in 0..a.indices.len() / 3 {
+            let Some(Surf::Plane { origin, normal }) = a.surf_of(t) else {
+                panic!("triangle {t} lost its plane");
+            };
+            for i in 0..3 {
+                let p = a.positions[a.indices[t * 3 + i] as usize];
+                let d = (p[0] as f64 - origin[0]) * normal[0]
+                    + (p[1] as f64 - origin[1]) * normal[1]
+                    + (p[2] as f64 - origin[2]) * normal[2];
+                assert!(d.abs() < 1.0e-6, "triangle {t} sits {d:.2e} off the plane it claims");
+            }
+        }
+        // ...and the normals point OUT: a point just past a face must be outside the solid.
+        let vol = signed_mesh_volume(&a).abs();
+        assert!((vol - 400.0).abs() < 1.0e-6, "prism volume {vol}");
+
+        // Through a real boolean, by the app's own entry point.
+        let b = direct_prism_mesh(&[[3.0, 3.0], [7.0, 3.0], [7.0, 7.0], [3.0, 7.0]], &[], &xy_plane(), 2.0, 4.0)
+            .expect("tool");
+        let cut = mesh_difference(&a, &b);
+        assert!(!cut.indices.is_empty(), "the difference built nothing");
+        assert_eq!(cut.tri_surf.len(), cut.indices.len() / 3, "tags did not survive the difference");
+        let tagged = cut.tri_surf.iter().filter(|&&s| s != NO_SURF).count();
+        assert!(
+            tagged * 4 >= cut.indices.len() / 3,
+            "only {tagged} of {} triangles came back tagged",
+            cut.indices.len() / 3
+        );
+        // The four original side walls are still identifiable in the result.
+        let mut kept: Vec<Surf> = Vec::new();
+        for t in 0..cut.indices.len() / 3 {
+            if let Some(s) = cut.surf_of(t) {
+                if !kept.contains(&s) {
+                    kept.push(s);
+                }
+            }
+        }
+        assert!(kept.len() >= 6, "expected the box's six planes to survive, kept {}", kept.len());
+        // And every surviving tag still describes its triangles after the boolean re-meshed them.
+        for t in 0..cut.indices.len() / 3 {
+            let Some(Surf::Plane { origin, normal }) = cut.surf_of(t) else { continue };
+            for i in 0..3 {
+                let p = cut.positions[cut.indices[t * 3 + i] as usize];
+                let d = (p[0] as f64 - origin[0]) * normal[0]
+                    + (p[1] as f64 - origin[1]) * normal[1]
+                    + (p[2] as f64 - origin[2]) * normal[2];
+                assert!(d.abs() < 1.0e-4, "after the boolean, triangle {t} sits {d:.2e} off its plane");
+            }
+        }
+    }
+
     #[test]
     fn manifold_carries_face_tags_through_a_chain_of_booleans() {
         use manifold3d::{Manifold, MeshGL};

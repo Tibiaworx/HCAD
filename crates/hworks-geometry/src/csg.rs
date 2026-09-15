@@ -353,7 +353,7 @@ fn polys_to_mesh(polys: &[Polygon]) -> TriMesh {
             indices.push(base + k + 1);
         }
     }
-    TriMesh { positions, normals, indices }
+    TriMesh { positions, normals, indices, ..Default::default() }
 }
 
 /// Boolean **union** of two triangle meshes (BSP fallback — see [`crate::mesh_union`]).
@@ -401,7 +401,7 @@ mod tests {
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
         let normals = vec![[0.0, 0.0, 1.0]; positions.len()];
-        TriMesh { positions, normals, indices }
+        TriMesh { positions, normals, indices, ..Default::default() }
     }
 
     fn volume(m: &TriMesh) -> f64 {

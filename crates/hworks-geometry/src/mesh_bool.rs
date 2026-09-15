@@ -488,16 +488,120 @@ pub fn take_fallback_count() -> u32 {
 /// Shift every vertex by `d` — a sub-micron nudge to break exact coincident/tangent faces (e.g. a
 /// revolve grazing a boss wall) that make Manifold's boolean fail.
 fn nudged(m: &TriMesh, d: [f32; 3]) -> TriMesh {
+    // The tags come along, shifted with everything else: a nudge is a translation, so a face that
+    // was a cylinder still is one, a hair further over.
+    let shift = |s: &crate::Surf| match *s {
+        crate::Surf::Plane { origin, normal } => crate::Surf::Plane {
+            origin: [origin[0] + d[0] as f64, origin[1] + d[1] as f64, origin[2] + d[2] as f64],
+            normal,
+        },
+        crate::Surf::Cylinder { origin, axis, radius } => crate::Surf::Cylinder {
+            origin: [origin[0] + d[0] as f64, origin[1] + d[1] as f64, origin[2] + d[2] as f64],
+            axis,
+            radius,
+        },
+    };
     TriMesh {
         positions: m.positions.iter().map(|p| [p[0] + d[0], p[1] + d[1], p[2] + d[2]]).collect(),
         normals: m.normals.clone(),
         indices: m.indices.clone(),
+        surfaces: m.surfaces.iter().map(shift).collect(),
+        tri_surf: m.tri_surf.clone(),
     }
+}
+
+/// Build a `Manifold` from a mesh, attaching one Manifold *original ID* per tagged surface so the
+/// far side of a boolean can still say which surface each triangle came from. `reg` collects the
+/// `id -> Surf` mapping the caller needs to read them back.
+///
+/// Runs must be CONTIGUOUS blocks of the flat index array, so the triangles are re-ordered to group
+/// them by tag. Order carries no meaning in a boolean operand.
+///
+/// Meshes with nothing tagged take the plain path — no runs, no cost.
+fn to_manifold_tagged(m: &TriMesh, reg: &mut HashMap<u32, crate::Surf>) -> Option<Manifold> {
+    if m.indices.len() < 3 {
+        return None;
+    }
+    let ntri = m.indices.len() / 3;
+    if m.tri_surf.len() != ntri || m.surfaces.is_empty() {
+        return to_manifold(m);
+    }
+    let (props, tris) = weld(m);
+    // Group triangles by tag, untagged last. `sort_by_key` is stable, so triangles keep their
+    // relative order within a face and a re-run gives the same mesh.
+    let mut order: Vec<usize> = (0..ntri).collect();
+    order.sort_by_key(|&t| m.tri_surf[t]);
+    let base = manifold3d::reserve_ids(m.surfaces.len() as u32 + 1);
+    let mut grouped: Vec<u32> = Vec::with_capacity(tris.len());
+    let (mut run_index, mut run_ids) = (Vec::<u32>::new(), Vec::<u32>::new());
+    let mut last: Option<u32> = None;
+    for &t in &order {
+        let tag = m.tri_surf[t];
+        if last != Some(tag) {
+            run_index.push(grouped.len() as u32);
+            // NO_SURF gets an id too — Manifold wants every triangle inside a run — it just never
+            // reaches `reg`, so it reads back as "nobody said".
+            let id = if tag == crate::NO_SURF { base + m.surfaces.len() as u32 } else { base + tag };
+            run_ids.push(id);
+            if tag != crate::NO_SURF {
+                reg.insert(id, m.surfaces[tag as usize]);
+            }
+            last = Some(tag);
+        }
+        grouped.extend_from_slice(&tris[t * 3..t * 3 + 3]);
+    }
+    run_index.push(grouped.len() as u32); // sentinel
+    let opts = manifold3d::MeshGLOptions::new().runs(&run_index, &run_ids);
+    let meshgl = MeshGL::new_with_options(&props, 3, &grouped, opts).ok()?;
+    Manifold::from_meshgl(&meshgl).ok()
+}
+
+/// Convert a `Manifold` back to a flat-shaded mesh, restoring the surface tags from the original
+/// IDs `to_manifold_tagged` attached. Triangles the boolean created along an intersection belong to
+/// whichever operand's surface they lie on, which is exactly what Manifold reports.
+fn from_manifold_tagged(man: &Manifold, reg: &HashMap<u32, crate::Surf>) -> TriMesh {
+    let mut out = from_manifold(man);
+    if reg.is_empty() {
+        return out;
+    }
+    let mgl = man.to_meshgl();
+    let (run_index, run_ids) = (mgl.run_index(), mgl.run_original_id());
+    let ntri = out.indices.len() / 3;
+    if run_ids.is_empty() || run_index.len() < run_ids.len() {
+        return out;
+    }
+    // `from_manifold` walks `tri_verts` in order, so triangle t sits at flat offset 3t and the run
+    // it belongs to is the last one starting at or before that.
+    let mut tri_surf = vec![crate::NO_SURF; ntri];
+    let mut surfaces: Vec<crate::Surf> = Vec::new();
+    for (r, &id) in run_ids.iter().enumerate() {
+        let Some(s) = reg.get(&id) else { continue };
+        let slot = match surfaces.iter().position(|x| x == s) {
+            Some(i) => i as u32,
+            None => {
+                surfaces.push(*s);
+                (surfaces.len() - 1) as u32
+            }
+        };
+        let start = run_index[r] as usize / 3;
+        let end = (run_index.get(r + 1).copied().unwrap_or(run_index[r]) as usize / 3).min(ntri);
+        for e in tri_surf.iter_mut().take(end).skip(start) {
+            *e = slot;
+        }
+    }
+    if !surfaces.is_empty() {
+        out.surfaces = surfaces;
+        out.tri_surf = tri_surf;
+    }
+    out
 }
 
 /// Run one Manifold boolean attempt; `None` if an operand won't ingest or the op errors.
 fn manifold_try(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
-    let (ma, mb) = (to_manifold(a)?, to_manifold(b)?);
+    // One registry for both operands: the ids are Manifold's, the surfaces are ours, and the
+    // mapping only has to live as long as this call.
+    let mut reg: HashMap<u32, crate::Surf> = HashMap::new();
+    let (ma, mb) = (to_manifold_tagged(a, &mut reg)?, to_manifold_tagged(b, &mut reg)?);
     let r = match op {
         Op::Union => ma.union(&mb),
         Op::Difference => ma.difference(&mb),
@@ -506,7 +610,7 @@ fn manifold_try(a: &TriMesh, b: &TriMesh, op: Op) -> Option<TriMesh> {
     if r.status().is_err() {
         return None;
     }
-    let mesh = from_manifold(&r);
+    let mesh = from_manifold_tagged(&r, &reg);
     (!mesh.indices.is_empty()).then_some(mesh)
 }
 
@@ -1658,10 +1762,14 @@ pub fn mirror_mesh(mesh: &TriMesh, origin: [f64; 3], normal: [f64; 3]) -> TriMes
             -((m[2] as f64 - 2.0 * dot * n[2]) as f32),
         ]
     };
+    // No tags on the far side. A reflected plane or cylinder is a perfectly good plane or
+    // cylinder, but it is not the one recorded here, and a tag that describes the wrong geometry
+    // is worse than none — the exporter would write a surface the triangles do not lie on.
     let mut out = TriMesh {
         positions: mesh.positions.iter().map(reflect_pt).collect(),
         normals: mesh.normals.iter().map(reflect_nrm).collect(),
         indices: Vec::with_capacity(mesh.indices.len()),
+        ..Default::default()
     };
     for t in mesh.indices.chunks_exact(3) {
         out.indices.extend([t[0], t[2], t[1]]); // swap winding to restore orientation

@@ -244,7 +244,7 @@ fn extrude_prism(cross_in: &[V3], axis: V3, length: f64) -> TriMesh {
         let (a0, b0, a1, b1) = (i as u32, j as u32, (n + i) as u32, (n + j) as u32);
         indices.extend_from_slice(&[a0, b0, b1, a0, b1, a1]);
     }
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     fill_normals(&mut m);
     m
 }
@@ -343,7 +343,7 @@ fn revolve(profile: &[(f64, f64)], center: V3, axis: V3, radial0: V3, angles: &[
             indices.extend_from_slice(&[a, b, c, a, c, d]);
         }
     }
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     orient_outward(&mut m);
     fill_normals(&mut m);
     m
@@ -612,7 +612,7 @@ impl MeshBuild {
                 normals.push([nf[0] as f32, nf[1] as f32, nf[2] as f32]);
             }
         }
-        TriMesh { positions: self.pos, normals, indices: (0..n as u32).collect() }
+        TriMesh { positions: self.pos, normals, indices: (0..n as u32).collect(), ..Default::default() }
     }
 }
 
@@ -1368,7 +1368,7 @@ fn make_sphere(c: V3, radius: f64, nlat: usize, nlong: usize) -> TriMesh {
             indices.extend_from_slice(&[a, b, cc, a, cc, d]);
         }
     }
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     orient_outward(&mut m);
     fill_normals(&mut m);
     m
@@ -1399,7 +1399,7 @@ fn make_box(c: V3, e1: V3, e2: V3, e3: V3, lo: f64, hi: f64) -> TriMesh {
     ] {
         indices.extend_from_slice(&f);
     }
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     orient_outward(&mut m);
     fill_normals(&mut m);
     m
@@ -1422,7 +1422,7 @@ fn make_box_ranges(c: V3, e1: V3, e2: V3, e3: V3, r1: (f64, f64), r2: (f64, f64)
     for f in [q(0, 1, 3, 2), q(4, 6, 7, 5), q(0, 4, 5, 1), q(2, 3, 7, 6), q(0, 2, 6, 4), q(1, 5, 7, 3)] {
         indices.extend_from_slice(&f);
     }
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     orient_outward(&mut m);
     fill_normals(&mut m);
     m
@@ -1599,7 +1599,7 @@ fn sweep_profile(profile: &[(f64, f64)], pts: &[V3], axis: V3, w_sign: f64, clos
             }
         }
     }
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     orient_outward(&mut m);
     fill_normals(&mut m);
     Some(m)
@@ -2717,7 +2717,7 @@ fn sdf_round(mesh: &TriMesh, radius: f64, edges: &[Vec<[f64; 3]>]) -> Option<Tri
             n[2] /= l;
         }
     }
-    Some(TriMesh { positions, normals, indices })
+    Some(TriMesh { positions, normals, indices, ..Default::default() })
 }
 
 // ---------------------------------------------------------------------------
@@ -2788,7 +2788,7 @@ fn thread_coil(o: V3, axis: V3, r_out: f64, r_in: f64, pitch: f64, length: f64, 
     // dropped EVERY thread boolean to the lossy BSP fallback (the "surface may be torn" banner).
     indices.extend_from_slice(&[vi(0, 2), vi(0, 1), vi(0, 0)]); // start cap
     indices.extend_from_slice(&[vi(n, 0), vi(n, 1), vi(n, 2)]); // end cap
-    let mut m = TriMesh { positions, normals: Vec::new(), indices };
+    let mut m = TriMesh { positions, normals: Vec::new(), indices, ..Default::default() };
     orient_outward(&mut m);
     fill_normals(&mut m);
     m

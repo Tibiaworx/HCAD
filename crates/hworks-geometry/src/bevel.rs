@@ -493,7 +493,7 @@ impl Build {
             }
             indices.extend_from_slice(&[base, base + 1, base + 2]);
         }
-        TriMesh { positions, normals, indices }
+        TriMesh { positions, normals, indices, ..Default::default() }
     }
 }
 
