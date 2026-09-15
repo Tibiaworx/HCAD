@@ -30062,6 +30062,53 @@ mod tests {
         }
     }
 
+    /// What reaches the STEP file: how many of a part's bores come out as true cylinders rather
+    /// than as rings of flat strips, and what it costs.
+    ///   HCAD_DIR="...\saved files" cargo test -p hworks-app diag_step_cylinders -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_step_cylinders() {
+        let _guard = counter_lock();
+        let dir = std::env::var("HCAD_DIR").expect("set HCAD_DIR");
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad")))
+            .collect();
+        entries.sort();
+        let (mut with, mut total, mut rounds) = (0usize, 0usize, 0usize);
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(doc) = ron::from_str::<Document>(&text) else { continue };
+            let Ok(Some((m, _))) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc))) else {
+                continue;
+            };
+            if m.indices.is_empty() {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mesh_to_solid(&m).and_then(|s| export_step(&s))
+            }));
+            let ms = t0.elapsed().as_millis();
+            total += 1;
+            match built {
+                Ok(Some(step)) => {
+                    let n = step.matches("SURFACE_OF_REVOLUTION").count();
+                    let planes = step.matches("= PLANE(").count();
+                    if n > 0 {
+                        with += 1;
+                        rounds += n / 3;
+                    }
+                    eprintln!("  {name}: {} tris -> {planes} plane(s) + {} cylinder(s) | {} KB | {ms} ms", m.indices.len() / 3, n / 3, step.len() / 1024);
+                }
+                _ => eprintln!("  {name}: no B-rep"),
+            }
+        }
+        eprintln!("\n=== {with} of {total} parts export at least one true cylinder ({rounds} in all) ===");
+    }
+
     /// How much of a rebuilt body still knows what surface it lies on — and how many of those are
     /// real cylinders rather than rings of flat strips.
     ///   HCAD_DIR="...\saved files" cargo test -p hworks-app diag_surface_tags -- --ignored --nocapture

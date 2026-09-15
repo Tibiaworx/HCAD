@@ -80,11 +80,15 @@ impl Topo {
     }
 }
 
+/// The grid cell a point welds into. Public within the crate so a caller holding a position can
+/// find the welded vertex [`build_topo`] gave it, without a second, subtly different rounding.
+pub(crate) fn weld_key(p: V3) -> (i64, i64, i64) {
+    ((p[0] * 1.0e5).round() as i64, (p[1] * 1.0e5).round() as i64, (p[2] * 1.0e5).round() as i64)
+}
+
 /// Weld coincident vertices on a 1e-5 grid and return welded positions + per-input remap.
 fn weld(mesh: &TriMesh) -> (Vec<V3>, Vec<usize>) {
-    let key = |p: V3| {
-        ((p[0] * 1.0e5).round() as i64, (p[1] * 1.0e5).round() as i64, (p[2] * 1.0e5).round() as i64)
-    };
+    let key = weld_key;
     let mut map: HashMap<(i64, i64, i64), usize> = HashMap::new();
     let mut verts: Vec<V3> = Vec::new();
     let mut remap = vec![0usize; mesh.positions.len()];
