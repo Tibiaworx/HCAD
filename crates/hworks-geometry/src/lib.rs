@@ -2086,51 +2086,205 @@ pub fn fit_section_shapes(segs: &[[[f32; 2]; 2]], tol: f32) -> Vec<SectionShape>
     out
 }
 
-/// Reconstruct a **faceted** B-rep solid from a triangle mesh: weld coincident vertices, share an
-/// edge between adjacent triangles, and make each triangle a planar `Face`, assembled into a Shell
-/// → Solid. This lets a mesh-only body (loft, fillet, seamless boolean) still export to STEP — the
-/// result is faceted (one flat face per triangle), not smooth, but valid B-rep. `None` if it can't
-/// be assembled (panic-guarded). Large meshes make large STEP files.
+/// Rebuild a mesh as a B-rep solid, merging COPLANAR triangles into whole planar faces.
+///
+/// One face per triangle is a valid solid and a useless one: blocker.hcad went out as 11,668
+/// planar faces and 13 MB of STEP, every flat wall shattered into hundreds of slivers, nothing
+/// downstream able to grab a face. `build_topo` already groups coplanar, edge-adjacent triangles
+/// into faces with ordered boundary loops — it is how the bevel finds a model's real faces — so
+/// the same grouping hands the export whole walls instead. Measured: pinch 1,244 triangles → 313
+/// faces, motormount 5,828 → 1,442.
+///
+/// Curved regions still come out faceted: truck's `Surface` is only Plane / B-spline / NURBS /
+/// revolved, with no cylinder to put there, so a bore stays a ring of narrow flat strips. They
+/// shrink anyway, because a strip is one face rather than two triangles.
+///
+/// Merging is *attempted*, never assumed. Each face must cover the area of the triangles it
+/// replaces, and the finished solid must still enclose what the mesh did; whatever fails either
+/// test falls back to the faceted build, which is exact by construction.
 pub fn mesh_to_solid(mesh: &TriMesh) -> Option<KSolid> {
-    use std::collections::HashMap;
-    if mesh.indices.len() < 3 {
+    if mesh.indices.len() < 12 {
+        return None; // fewer than four triangles cannot bound anything
+    }
+    let topo = bevel::build_topo(mesh);
+    if topo.tris.len() < 4 || topo.faces.is_empty() {
         return None;
     }
-    // Weld to unique vertices (truck topology shares Vertex objects; exact-ish merge only fuses
-    // truck/Manifold's duplicated corners, never distinct geometry).
-    let key = |p: [f32; 3]| ((p[0] * 1.0e5).round() as i64, (p[1] * 1.0e5).round() as i64, (p[2] * 1.0e5).round() as i64);
-    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
-    let mut uniq: Vec<[f32; 3]> = Vec::new();
-    let mut remap = vec![0u32; mesh.positions.len()];
-    for (i, p) in mesh.positions.iter().enumerate() {
-        remap[i] = *map.entry(key(*p)).or_insert_with(|| {
-            uniq.push(*p);
-            (uniq.len() - 1) as u32
-        });
+    let want = signed_mesh_volume(mesh).abs();
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in &topo.verts {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
     }
-    guard(|| {
-        let verts: Vec<truck_modeling::Vertex> = uniq.iter().map(|p| builder::vertex(Point3::new(p[0] as f64, p[1] as f64, p[2] as f64))).collect();
-        let mut edges: HashMap<(u32, u32), truck_modeling::Edge> = HashMap::new();
-        let mut faces: Vec<truck_modeling::Face> = Vec::new();
-        for t in mesh.indices.chunks_exact(3) {
-            let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
-            if a == b || b == c || a == c {
-                continue; // degenerate after welding — skip
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt().max(1.0);
+    // Merged, then judged as a whole. truck's triangulator is known to give up on an awkward
+    // planar boundary — `extrude_tool_mesh` guards the same thing — and a face it silently drops
+    // leaves a hole in the shell, which shows up as a wild volume rather than as an error. So
+    // tessellate what we built and demand it still encloses what the mesh did.
+    if want > 1.0e-9 {
+        if let Some(s) = mesh_brep(&topo, true) {
+            let re = tessellate(&s, diag * 1.0e-3).mesh;
+            if !re.indices.is_empty() && (signed_mesh_volume(&re).abs() - want).abs() <= want * 1.0e-3 {
+                return Some(s);
             }
-            // A shared edge is built once (canonical low→high) and reused inverted by the other face.
-            let mut directed = |x: u32, y: u32| -> truck_modeling::Edge {
-                let (lo, hi) = if x < y { (x, y) } else { (y, x) };
-                let e = edges.entry((lo, hi)).or_insert_with(|| builder::line(&verts[lo as usize], &verts[hi as usize])).clone();
-                if x < y { e } else { e.inverse() }
-            };
-            let wire: truck_modeling::Wire = vec![directed(a, b), directed(b, c), directed(c, a)].into_iter().collect();
-            faces.push(builder::try_attach_plane(&[wire]).ok()?);
+        }
+    }
+    mesh_brep(&topo, false)
+}
+
+/// The shell itself: one planar face per coplanar group when `merge`, otherwise one per triangle.
+///
+/// Every face is stitched from ONE `Edge` per undirected vertex pair, shared with whichever face
+/// meets it there — neighbours holding different edge objects give a shell that is not closed,
+/// whatever it looks like.
+fn mesh_brep(topo: &bevel::Topo, merge: bool) -> Option<KSolid> {
+    use std::collections::HashMap;
+    guard(|| {
+        let verts: Vec<truck_modeling::Vertex> =
+            topo.verts.iter().map(|p| builder::vertex(Point3::new(p[0], p[1], p[2]))).collect();
+        let mut edges: HashMap<(usize, usize), truck_modeling::Edge> = HashMap::new();
+        let mut faces: Vec<truck_modeling::Face> = Vec::new();
+        macro_rules! wire {
+            ($lp:expr) => {{
+                let lp: &[usize] = $lp;
+                if lp.len() < 3 {
+                    None
+                } else {
+                    let mut w = truck_modeling::Wire::new();
+                    let mut ok = true;
+                    for k in 0..lp.len() {
+                        let (x, y) = (lp[k], lp[(k + 1) % lp.len()]);
+                        if x == y {
+                            ok = false;
+                            break;
+                        }
+                        let (a, b) = if x < y { (x, y) } else { (y, x) };
+                        let e = edges.entry((a, b)).or_insert_with(|| builder::line(&verts[a], &verts[b])).clone();
+                        w.push_back(if x < y { e } else { e.inverse() });
+                    }
+                    ok.then_some(w)
+                }
+            }};
+        }
+        for f in &topo.faces {
+            let mut merged = None;
+            if merge {
+                // Outer boundary first: truck reads boundary 0 as the one the rest sit inside.
+                let mut lps: Vec<&Vec<usize>> = f.loops.iter().collect();
+                let span = |lp: &Vec<usize>| {
+                    let (mut a, mut b) = ([f64::MAX; 3], [f64::MIN; 3]);
+                    for &v in lp {
+                        for k in 0..3 {
+                            a[k] = a[k].min(topo.verts[v][k]);
+                            b[k] = b[k].max(topo.verts[v][k]);
+                        }
+                    }
+                    (b[0] - a[0]) + (b[1] - a[1]) + (b[2] - a[2])
+                };
+                lps.sort_by(|x, y| span(y).partial_cmp(&span(x)).unwrap_or(std::cmp::Ordering::Equal));
+                // The normal comes from the OUTER LOOP's own winding (Newell), not from the face
+                // record: truck reads a planar face's outside from its boundary, so a plane whose
+                // normal disagrees with the winding gives an inside-out face — that cost 14% of
+                // motormount's volume before this line said it properly.
+                let mut n = [0.0f64; 3];
+                if let Some(outer) = lps.first() {
+                    for k in 0..outer.len() {
+                        let (p, q) = (topo.verts[outer[k]], topo.verts[outer[(k + 1) % outer.len()]]);
+                        n[0] += (p[1] - q[1]) * (p[2] + q[2]);
+                        n[1] += (p[2] - q[2]) * (p[0] + q[0]);
+                        n[2] += (p[0] - q[0]) * (p[1] + q[1]);
+                    }
+                }
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                if len > 1.0e-12 {
+                    let n = [n[0] / len, n[1] / len, n[2] / len];
+                    // Signed loop area about that normal — outer positive, holes negative — must
+                    // come to the triangles' own area. That is what catches a hole promoted to
+                    // outer, a loop dropped, or a "coplanar" group that is quietly curved: the
+                    // flat projection of a bent band is smaller than the band. (build_topo groups
+                    // by the angle between NEIGHBOURING facets, so a long enough chain of small
+                    // steps bends a long way without any pair of them ever disagreeing.)
+                    let loop_area: f64 = lps
+                        .iter()
+                        .map(|lp| {
+                            let mut s = [0.0f64; 3];
+                            for k in 0..lp.len() {
+                                let (p, q) = (topo.verts[lp[k]], topo.verts[lp[(k + 1) % lp.len()]]);
+                                s[0] += p[1] * q[2] - p[2] * q[1];
+                                s[1] += p[2] * q[0] - p[0] * q[2];
+                                s[2] += p[0] * q[1] - p[1] * q[0];
+                            }
+                            0.5 * (s[0] * n[0] + s[1] * n[1] + s[2] * n[2])
+                        })
+                        .sum();
+                    let tri_area: f64 = f
+                        .tris
+                        .iter()
+                        .map(|&ti| {
+                            let t = topo.tris[ti];
+                            let (p, q, r) = (topo.verts[t[0]], topo.verts[t[1]], topo.verts[t[2]]);
+                            let e1 = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+                            let e2 = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
+                            let x = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                            0.5 * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt()
+                        })
+                        .sum();
+                    if (loop_area - tri_area).abs() <= tri_area * 1.0e-6 + 1.0e-9 {
+                        let mut wires = Vec::with_capacity(lps.len());
+                        let mut ok = true;
+                        for lp in &lps {
+                            match wire!(lp.as_slice()) {
+                                Some(w) => wires.push(w),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok && !wires.is_empty() {
+                            let o = topo.verts[lps[0][0]];
+                            let t = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+                            let u = [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]];
+                            let ul = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+                            if ul > 1.0e-12 {
+                                let u = [u[0] / ul, u[1] / ul, u[2] / ul];
+                                // v completes a right-handed frame, so the plane's own normal
+                                // (u x v) comes out as the winding's.
+                                let v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+                                let pl = truck_modeling::Plane::new(
+                                    Point3::new(o[0], o[1], o[2]),
+                                    Point3::new(o[0] + u[0], o[1] + u[1], o[2] + u[2]),
+                                    Point3::new(o[0] + v[0], o[1] + v[1], o[2] + v[2]),
+                                );
+                                merged = truck_modeling::Face::try_new(wires, pl.into()).ok();
+                            }
+                        }
+                    }
+                }
+            }
+            match merged {
+                Some(face) => faces.push(face),
+                None => {
+                    for &ti in &f.tris {
+                        let t = topo.tris[ti];
+                        if let Some(w) = wire!(&t[..]) {
+                            if let Ok(face) = builder::try_attach_plane(&[w]) {
+                                faces.push(face);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if faces.len() < 4 {
             return None;
         }
         let shell: truck_modeling::Shell = faces.into_iter().collect();
-        Some(KSolid(truck_modeling::Solid::new(vec![shell])))
+        // Refuse a shell that is not a closed, oriented boundary rather than writing out a STEP
+        // no one can open.
+        truck_modeling::Solid::try_new(vec![shell]).ok().map(KSolid)
     })
 }
 
@@ -3951,12 +4105,56 @@ mod tests {
     }
 
     #[test]
+    fn a_mesh_exports_as_whole_walls_not_loose_triangles() {
+        // Anything with a fillet is built by the mesh kernel and has no exact B-rep, so its STEP
+        // comes from `mesh_to_solid`. That used to emit one planar face PER TRIANGLE: a box went
+        // out as 12 faces where it has 6, and a real part as ~11,700 faces and 13 MB, with every
+        // flat wall shattered into slivers nothing downstream could grab.
+        let sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0]];
+        let m = extrude_tool_mesh(&sq, &[], &xy_plane(), 0.0, 4.0).expect("box mesh");
+        assert_eq!(m.indices.len() / 3, 12, "a box tessellates to 12 triangles");
+        let solid = mesh_to_solid(&m).expect("box -> solid");
+        let step = export_step(&solid).expect("step");
+        let faces = step.matches("FACE_SURFACE").count();
+        assert_eq!(faces, 6, "a box has six walls; got {faces} faces");
+
+        // ...and the walls are whole even when one is pierced, which is the case that needs the
+        // boundary's holes carried onto the face rather than triangulated away.
+        let bore = circle(5.0, 3.0, 1.5, 24);
+        let m = extrude_tool_mesh(&sq, &[bore], &xy_plane(), 0.0, 4.0).expect("pierced box mesh");
+        let solid = mesh_to_solid(&m).expect("pierced box -> solid");
+        let step = export_step(&solid).expect("step");
+        let faces = step.matches("FACE_SURFACE").count();
+        // 4 outer walls + top + bottom (each with the bore as a hole) + one strip per bore facet.
+        assert!(faces <= 6 + 24 + 2, "pierced box should be ~30 faces, got {faces}");
+        assert!(faces >= 6, "sanity: at least the six walls");
+
+        // Whatever it merged, the solid still has to enclose what the mesh did. A face that lost a
+        // hole, or one truck quietly failed to build, shows up here and nowhere else.
+        let want = mesh_vol(&m);
+        let got = mesh_vol(&tessellate(&solid, 0.01).mesh);
+        assert!((got - want).abs() <= want * 1.0e-3, "solid encloses {got:.4}, mesh {want:.4}");
+    }
+
+    #[test]
     fn mesh_to_solid_exports_faceted_step() {
         // A mesh-only body (here a loft, which has no exact B-rep) → faceted solid → STEP.
         let m = loft_mesh(&[(circle3(0.0, 0.0, 0.0, 5.0, 24), vec![]), (circle3(0.0, 0.0, 10.0, 3.0, 24), vec![])]).unwrap();
         let solid = mesh_to_solid(&m).expect("faceted solid from mesh");
         let step = export_step(&solid).expect("step from faceted solid");
-        assert!(step.contains("ISO-10303-21") && step.matches("FACE").count() > 100, "faceted STEP malformed");
+        assert!(step.contains("ISO-10303-21"), "faceted STEP malformed");
+        // The frustum has 24 facet strips and two caps. It is NOT the ~100 faces this asked for
+        // before: a strip is one face now, not the two triangles it is drawn with, and each flat
+        // cap is one face rather than its whole fan. Still faceted — truck has no cone to put
+        // there — just not shattered.
+        let faces = step.matches("FACE_SURFACE").count();
+        let tris = m.indices.len() / 3;
+        assert!(faces < tris, "{faces} faces from {tris} triangles — nothing merged");
+        assert!(faces >= 24, "a 24-segment frustum needs at least its 24 side strips, got {faces}");
+        // And it still encloses the frustum it came from.
+        let want = mesh_vol(&m);
+        let got = mesh_vol(&tessellate(&solid, 0.01).mesh);
+        assert!((got - want).abs() <= want * 1.0e-3, "solid encloses {got:.4}, mesh {want:.4}");
     }
 
     #[test]

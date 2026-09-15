@@ -29458,6 +29458,45 @@ mod tests {
         assert!((vol - 2187.43).abs() < 0.1, "pinch.hcad built {vol:.3}, expected 2187.43");
     }
 
+    /// What a faceted STEP export costs for one part: how many faces the mesh collapses to, how
+    /// big the file is, and whether the solid still encloses what the mesh did (a merged face
+    /// that lost a hole, or one truck failed to build, shows up in the volume and nowhere else).
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_step_faceted_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_step_faceted_cost() {
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (m, _) = regenerate_mesh(&doc).expect("regen");
+        let tris = m.indices.len() / 3;
+        let t0 = std::time::Instant::now();
+        let Some(solid) = hworks_geometry::mesh_to_solid(&m) else {
+            eprintln!("  {tris} tris -> mesh_to_solid DECLINED");
+            return;
+        };
+        let build_ms = t0.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let step = hworks_geometry::export_step(&solid).expect("step");
+        let step_ms = t1.elapsed().as_millis();
+        // Volume of the re-tessellated B-rep vs the mesh it came from — a merged face that lost
+        // a hole, or a flipped shell, shows up here and nowhere else.
+        let mv = hworks_geometry::signed_mesh_volume(&m).abs();
+        let re = hworks_geometry::tessellate(&solid, 0.05).mesh;
+        let rv = hworks_geometry::signed_mesh_volume(&re).abs();
+        let area = |m: &TriMesh| -> f64 {
+            m.indices.chunks_exact(3).map(|t| {
+                let g = |i: u32| { let q = m.positions[i as usize]; Vec3::new(q[0], q[1], q[2]) };
+                (g(t[1]) - g(t[0])).cross(g(t[2]) - g(t[0])).length() as f64 * 0.5
+            }).sum()
+        };
+        eprintln!("      surface area: mesh {:.3} vs re-tessellated {:.3} ({:+.3}%)   tris {} -> {}",
+            area(&m), area(&re), 100.0 * (area(&re) - area(&m)) / area(&m).max(1e-9), m.indices.len()/3, re.indices.len()/3);
+        eprintln!(
+            "  {tris:>6} tris -> {:>6} FACE_SURFACE, {:>9} bytes  |  vol {mv:.3} vs {rv:.3} ({:+.4}%)  |  build {build_ms}ms step {step_ms}ms",
+            step.matches("FACE_SURFACE").count(), step.len(), 100.0 * (rv - mv) / mv.max(1e-9)
+        );
+    }
+
     /// Type a number into a value box and the box must take THAT number.
     ///
     /// The Modify box opens with `request_focus()` at the end of the frame it first appears, and
