@@ -17061,13 +17061,61 @@ fn handle_file_io(
         }
     }
 
-    // Export STEP — the exact B-rep when available; otherwise a faceted reconstruction from the
-    // mesh (so a loft / fillet / Seamless body still exports, just faceted rather than smooth).
+    // Export STEP — whichever of the two representations is actually better, MEASURED.
     if ui_state.export_step_request {
         ui_state.export_step_request = false;
-        let faceted = part.solid.is_none();
-        let solid = part.solid.clone().or_else(|| part.mesh.as_ref().and_then(mesh_to_solid));
-        match solid.as_ref().and_then(export_step) {
+        // Build the exact B-rep too when nothing in the document needs the mesh kernel. Seamless
+        // is a display choice about how flush unions join and defaults on, which put every part
+        // through the mesh kernel — so the exact path was never even tried on the 16 of 51 parts
+        // in `saved files` that could take it.
+        let mut exact = part.solid.clone();
+        if exact.is_none() && why_no_exact_brep(&doc.0).is_none() {
+            exact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_reported(&doc.0).0)).unwrap_or(None);
+            // Drain whatever that rebuild counted. These are read by the NEXT regenerate to
+            // raise its banners, and an export quietly adding to them would put a warning on a
+            // rebuild that never earned it.
+            let _ = take_fallback_count();
+            let _ = take_cut_direction_guesses();
+            let _ = take_gear_failures();
+            let _ = take_nonmanifold_bodies();
+            let _ = hworks_geometry::take_loft_hole_mismatch_count();
+        }
+        // ...and then COMPARE, rather than assuming the exact kernel wins. On real documents it
+        // frequently emits no curved surfaces at all — the region merge re-traces its outlines and
+        // drops the sketch's arc annotations, so a bore arrives as a polygon and is built as flat
+        // strips — and a polygonal prism carries more STEP per face than the merged mesh does.
+        // Curved surfaces win outright when either has any; past that, the smaller file. Measured
+        // across the parts that are eligible at all: usercylinder 898 KB exact against 1634 KB
+        // faceted (take the exact one, and it is 390 faces against 1548), but tubetest 897
+        // against 692, pardt 857 against 573 and squarehelper 343 against 235 — all of them
+        // bigger for no curvature and a face count within a few percent, so the mesh wins those.
+        let score = |s: &String| {
+            let curved = s.contains("B_SPLINE_SURFACE")
+                || s.contains("SURFACE_OF_REVOLUTION")
+                || s.contains("CYLINDRICAL_SURFACE")
+                || s.contains("TOROIDAL_SURFACE");
+            (curved, std::cmp::Reverse(s.len()))
+        };
+        let exact_step = exact.as_ref().and_then(|s| export_step(s));
+        let mesh_step = part.mesh.as_ref().and_then(mesh_to_solid).as_ref().and_then(|s| export_step(s));
+        let (chosen, faceted) = match (exact_step, mesh_step) {
+            (Some(e), Some(m)) => {
+                if score(&e) >= score(&m) {
+                    (Some(e), false)
+                } else {
+                    (Some(m), true)
+                }
+            }
+            (Some(e), None) => (Some(e), false),
+            (None, m) => (m, true),
+        };
+        // Whether the FILE has curved surfaces is what the user actually cares about, and it is
+        // not the same question as which kernel produced it: the exact path can win the
+        // comparison above and still be all planes.
+        let curved = chosen.as_ref().is_some_and(|s: &String| {
+            s.contains("B_SPLINE_SURFACE") || s.contains("SURFACE_OF_REVOLUTION") || s.contains("CYLINDRICAL_SURFACE") || s.contains("TOROIDAL_SURFACE")
+        });
+        match chosen {
             Some(step) => {
                 let stem = ui_state.current_file.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("part");
                 if let Some(mut path) = rfd::FileDialog::new().add_filter("STEP", &["step", "stp"]).set_file_name(format!("{stem}.step")).save_file() {
@@ -17079,11 +17127,16 @@ fn handle_file_io(
                             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("part.step").to_string();
                             ui_state.toasts.push((format!("Exported {name}"), 2.5));
                             info!("Exported STEP {} ({})", path.display(), if faceted { "faceted from mesh" } else { "exact B-rep" });
-                            if faceted {
-                                let why = why_no_exact_brep(&doc.0, ui_state.seamless)
-                                    .unwrap_or_else(|| "this body was built by the mesh kernel".into());
+                            if !curved {
+                                // Say why THIS part came out flat. A feature that only the mesh
+                                // kernel can build is one reason; the other is that the sketch's
+                                // arcs did not survive to the kernel, which is why a part with
+                                // nothing mesh-only in it can still export as facets.
+                                let why = why_no_exact_brep(&doc.0).unwrap_or_else(|| {
+                                    "its curves reached the kernel as polygons rather than arcs".into()
+                                });
                                 ui_state.last_notice = Some(format!(
-                                    "Exported {name}, with FLAT faces. The geometry is exact — {why}, and a mesh body has no curved surfaces to write out, so bores and fillets come across as many-sided facets."
+                                    "Exported {name}, with FLAT faces. The geometry is exact — {why} — so bores and rounds come across as many-sided facets rather than curved surfaces."
                                 ));
                             }
                         }
@@ -17811,9 +17864,9 @@ fn doc_has_text(doc: &Document) -> bool {
 ///
 /// The point is to name the reason THIS part hit, not to recite the list: telling someone whose
 /// part has a fillet to "build with Seamless off and no fillet" is telling them to delete their
-/// fillet, and telling someone whose only problem is the Seamless tick that they cannot have
-/// smooth surfaces is wrong.
-fn why_no_exact_brep(doc: &Document, seamless: bool) -> Option<String> {
+/// fillet. Seamless is NOT one of the reasons — it is a display choice, and the export rebuilds
+/// around it (see the STEP export), so a `None` here means a true B-rep is reachable.
+fn why_no_exact_brep(doc: &Document) -> Option<String> {
     let mut kinds: Vec<&str> = Vec::new();
     for f in &doc.features {
         let k = match f.kind {
@@ -17846,7 +17899,7 @@ fn why_no_exact_brep(doc: &Document, seamless: bool) -> Option<String> {
         };
         return Some(format!("this part has {list}, which only the mesh kernel can build"));
     }
-    seamless.then(|| "Seamless is on, which builds every part with the mesh kernel — turn it off in the toolbar and export again for smooth surfaces".to_string())
+    None
 }
 /// True if the model has a fillet feature — those are mesh-only (truck can't fillet).
 fn doc_has_fillet(doc: &Document) -> bool {
@@ -29576,6 +29629,97 @@ mod tests {
         eprintln!(
             "  {tris:>6} tris -> {:>6} FACE_SURFACE, {:>9} bytes  |  vol {mv:.3} vs {rv:.3} ({:+.4}%)  |  build {build_ms}ms step {step_ms}ms",
             step.matches("FACE_SURFACE").count(), step.len(), 100.0 * (rv - mv) / mv.max(1e-9)
+        );
+    }
+
+    /// A part that needs nothing from the mesh kernel exports with REAL surfaces, whatever the
+    /// Seamless tick is set to.
+    ///
+    /// Seamless decides how flush unions join in the viewport and defaults on, which put every
+    /// part through the mesh kernel — so a plain extruded plate exported as hundreds of flat
+    /// facets when a true B-rep was one rebuild away. Sixteen of the 51 parts in `saved files`
+    /// were in exactly that position. The export now rebuilds around the setting instead of
+    /// inheriting it.
+    #[test]
+    fn a_part_with_no_mesh_only_features_exports_real_surfaces() {
+        let _guard = counter_lock();
+        // A plate with a bore: nothing here needs the mesh kernel.
+        let mut doc = Document::with_default_planes();
+        let mut sk = Sketch::default();
+        let a = sk.add_point(-10.0, -10.0);
+        let b = sk.add_point(10.0, -10.0);
+        let c = sk.add_point(10.0, 10.0);
+        let d = sk.add_point(-10.0, 10.0);
+        for (p, q) in [(a, b), (b, c), (c, d), (d, a)] {
+            sk.add_line(p, q, false);
+        }
+        let hole = sk.add_point(0.0, 0.0);
+        sk.add_circle(hole, 3.0);
+        doc.add_feature(FeatureKind::Extrude {
+            sketch: sk,
+            regions: vec![],
+            region_pts: vec![],
+            plane: xy(),
+            distance: 5.0,
+            back: 0.0,
+            thin: 0.0,
+            thin_side: 0,
+        });
+        doc.rollback = doc.features.len();
+
+        // Nothing in it forces the mesh kernel, so the export is entitled to the exact path...
+        assert!(why_no_exact_brep(&doc).is_none(), "a plain extrude should not force the mesh kernel");
+        let (solid, _) = regenerate_reported(&doc);
+        let solid = solid.expect("the exact kernel builds a plain extrude");
+        let step = hworks_geometry::export_step(&solid).expect("step");
+        let faces = step.matches("FACE_SURFACE").count();
+        // ...and a plate with a bore is a handful of faces, not the hundreds a faceted one needs.
+        assert!(faces <= 12, "plate with a bore should be ~8 faces, got {faces}");
+
+        // A fillet is a different matter: that one really cannot be built exactly, and the reason
+        // the user is given has to say so rather than blaming a checkbox.
+        let mut filleted = doc.clone();
+        filleted.add_feature(FeatureKind::Fillet { radius: 1.0, edges: vec![] });
+        filleted.rollback = filleted.features.len();
+        let why = why_no_exact_brep(&filleted).expect("a fillet forces the mesh kernel");
+        assert!(why.contains("a fillet"), "the reason should name the fillet, got {why:?}");
+    }
+
+    /// What a STEP export now yields for one part, both ways: the exact B-rep the export will
+    /// reach for when the document allows, against the faceted mesh reconstruction it used to get.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_step_export_route -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_step_export_route() {
+        let _guard = counter_lock();
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        match why_no_exact_brep(&doc) {
+            Some(why) => {
+                eprintln!("  FACETED — {why}");
+                return;
+            }
+            None => eprintln!("  eligible for the exact kernel"),
+        }
+        let (exact, _) = regenerate_reported(&doc);
+        let _ = take_fallback_count();
+        let _ = take_cut_direction_guesses();
+        let _ = take_gear_failures();
+        let _ = take_nonmanifold_bodies();
+        let _ = hworks_geometry::take_loft_hole_mismatch_count();
+        let Some(exact) = exact else {
+            eprintln!("  exact rebuild FAILED — falls back to faceted");
+            return;
+        };
+        let es = hworks_geometry::export_step(&exact).expect("exact step");
+        let (m, _) = regenerate_mesh(&doc).expect("mesh");
+        let fs = mesh_to_solid(&m).and_then(|s| hworks_geometry::export_step(&s));
+        let (ff, fb) = fs.map(|s| (s.matches("FACE_SURFACE").count(), s.len())).unwrap_or((0, 0));
+        let curved = |s: &str| s.matches("B_SPLINE_SURFACE").count() + s.matches("SURFACE_OF_REVOLUTION").count() + s.matches("CYLINDRICAL_SURFACE").count();
+        eprintln!("      curved surfaces in EXACT: {}   (planes {})", curved(&es), es.matches("PLANE(").count());
+        eprintln!(
+            "  EXACT {:>5} faces {:>9} bytes   |   faceted {:>6} faces {:>9} bytes   ({} tris)",
+            es.matches("FACE_SURFACE").count(), es.len(), ff, fb, m.indices.len() / 3
         );
     }
 
