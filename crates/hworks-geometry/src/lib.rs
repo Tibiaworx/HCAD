@@ -2534,16 +2534,25 @@ struct Band {
 /// the twenty-nine patches rejected for their boundary are that case, against five that are a whole
 /// ring with a pinhole in it and two that are two rings still joined.
 ///
-/// Those twenty-two are the biggest thing left, and they are TIDY: seventeen of them have every
-/// boundary vertex at one of the two ends and cross between the ends exactly twice, which is to say
-/// they are a plain strip — round one end, up, back along the other, down. truck sweeps a partial
-/// turn as readily as a whole one, so the geometry is not the obstacle. The obstacle is that a
-/// partial band shares its two straight ends with ordinary flat faces, and truck's topology is
-/// identity-based: a sweep grows its own vertices and edges, and a neighbour built from this
-/// crate's own vertex list would meet them at a seam that looks closed and is not. A whole ring
-/// avoids that entirely, because the only edges it shares are the two rims, and both come from the
-/// sweep. Closing that gap means handing the sweep's vertices back to everything else that touches
-/// them, before any other face is built.
+/// Those twenty-two are the biggest thing left, and they LOOK tidy: seventeen have every boundary
+/// vertex at one of the two ends and cross between the ends exactly twice, which is to say they are
+/// a plain strip — round one end, up, back along the other, down. truck sweeps a partial turn as
+/// readily as a whole one, and handing the sweep's own vertices and edges back to the faces beside
+/// it is straightforward enough. It was built that far, and it does not work.
+///
+/// What stops it is that a strip's four corners are precisely the vertices a BOOLEAN added. A mesh
+/// of a circle is inscribed in it: the vertices the tool laid down are exactly on the circle, but
+/// wherever something cut the wall, the new corner landed on a chord, a sagitta inside. A sweep
+/// starts at one corner and arrives at the far one by exact rotation — and an inscribed corner is
+/// not the rotation of another inscribed corner, so the two ends cannot both be met. Measured over
+/// the corpus: eighteen strips detected, thirty-six rims to splice, FOUR whose corners happened to
+/// be original vertices and matched. Every shell built from the rest failed to close, and the parts
+/// that had good whole-ring cylinders lost them to the fallback.
+///
+/// So it is not a plumbing problem, and the next attempt should start from the geometry: the four
+/// corners would have to be snapped onto the circle first — a move of about one sagitta, the same
+/// order as the chord-to-arc correction this code already makes deliberately, but a change to the
+/// part and therefore a decision, not an implementation detail.
 ///
 /// TORUS bands get this far and no further, as of writing: the corpus has five, and none of them
 /// lands. Three are turned away at the seam, because a fillet's rim meets the WALL it blends into
