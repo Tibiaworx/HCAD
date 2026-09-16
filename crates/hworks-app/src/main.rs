@@ -17086,22 +17086,18 @@ fn handle_file_io(
             let _ = take_nonmanifold_bodies();
             let _ = hworks_geometry::take_loft_hole_mismatch_count();
         }
-        // ...and then COMPARE, rather than assuming the exact kernel wins. On real documents it
-        // frequently emits no curved surfaces at all — the region merge re-traces its outlines and
-        // drops the sketch's arc annotations, so a bore arrives as a polygon and is built as flat
-        // strips — and a polygonal prism carries more STEP per face than the merged mesh does.
-        // Curved surfaces win outright when either has any; past that, the smaller file. Measured
-        // across the parts that are eligible at all: usercylinder 898 KB exact against 1634 KB
-        // faceted (take the exact one, and it is 390 faces against 1548), but tubetest 897
-        // against 692, pardt 857 against 573 and squarehelper 343 against 235 — all of them
-        // bigger for no curvature and a face count within a few percent, so the mesh wins those.
-        let score = |s: &String| {
-            let curved = s.contains("B_SPLINE_SURFACE")
-                || s.contains("SURFACE_OF_REVOLUTION")
-                || s.contains("CYLINDRICAL_SURFACE")
-                || s.contains("TOROIDAL_SURFACE");
-            (curved, std::cmp::Reverse(s.len()))
-        };
+        // ...and then COMPARE, rather than assuming the exact kernel wins. Curved surfaces win
+        // outright when either route has any; past that, the smaller file.
+        //
+        // Which way that falls has REVERSED, and the comparison is what noticed. The exact kernel
+        // used to be the only hope of a curved surface and gave none in practice; now the mesh
+        // route carries the sketch's cylinders through its own booleans and wins nearly everywhere
+        // it is offered — squarehelper 14 faces and 23 KB against 143 and 335 KB, tubetest 13
+        // against 388, pardt 77 against a build that is 39.6% short. The exact route still takes
+        // two parts: badbasicextrude, where it is 4 faces and six curved surfaces against the
+        // mesh's 5 and three, and usercylinder, where neither is curved and it is 390 faces
+        // against 1548. `diag_step_routes` prints the lot.
+        let score = |s: &String| step_route_score(s);
         // ...but only if the exact solid is actually RIGHT. pardt.hcad builds 39.6% short through
         // the exact kernel (227.8 against the mesh's 377.3) and says nothing about it, so "which
         // file is smaller" would happily ship the wrong part the day the smaller one is also the
@@ -17926,6 +17922,19 @@ fn doc_has_fillet(doc: &Document) -> bool {
         .any(|f| matches!(f.kind, FeatureKind::Fillet { .. } | FeatureKind::Chamfer { .. } | FeatureKind::Mirror { .. } | FeatureKind::Thread { .. } | FeatureKind::Pattern { .. } | FeatureKind::Shell { .. } | FeatureKind::Sweep { .. } | FeatureKind::ImportMesh { .. } | FeatureKind::Gear { .. }))
 }
 
+/// How good a STEP file is, for picking between the exact and the mesh route: curved surfaces
+/// beat none outright, and past that the smaller file wins.
+///
+/// Named rather than written inline at the one call site so a diagnostic can ask the same question
+/// the export asks, instead of a copy of it that drifts.
+fn step_route_score(s: &str) -> (bool, std::cmp::Reverse<usize>) {
+    let curved = s.contains("B_SPLINE_SURFACE")
+        || s.contains("SURFACE_OF_REVOLUTION")
+        || s.contains("CYLINDRICAL_SURFACE")
+        || s.contains("TOROIDAL_SURFACE");
+    (curved, std::cmp::Reverse(s.len()))
+}
+
 /// True if any extrude/cut is a **thin feature** (wall thickness > 0). The exact B-rep path
 /// ignores `thin`, so a doc with one must regenerate through the mesh kernel.
 fn doc_has_thin(doc: &Document) -> bool {
@@ -17955,10 +17964,14 @@ fn regenerate_reported(doc: &Document) -> (Option<KSolid>, Vec<String>) {
     // usercylinder was still going after ten minutes. A NURBS base really does defeat the exact
     // booleans, exactly as the note above says.
     //
-    // The escape hatch delivers nothing either. Where a part IS the last solid feature with one
-    // profile, so its arcs survive, the exported STEP still shows ZERO curved surfaces — see
-    // `diag_exact_build`. Something downstream of here is dropping them, and finding it is the
-    // open question, not whether to remove this gate.
+    // The escape hatch does deliver, as of the merge keeping its arcs: badbasicextrude comes out
+    // of the exact kernel as FOUR faces with six curved surfaces, in 1 ms, and that is what the
+    // export ships. It is the only part in the corpus that gets there — everything else either
+    // isn't eligible for the exact kernel at all or has more than one solid feature — and the
+    // question of widening it has since been answered the other way: see `diag_step_routes`, where
+    // the mesh route now beats the exact one almost everywhere it is even offered. squarehelper is
+    // 14 faces and 23 KB through the mesh against 143 faces and 335 KB exact; tubetest 13 against
+    // 388. So this gate is no longer what stands between the corpus and curved surfaces.
     let gate_arcs = |merged: &mut Vec<hworks_sketch::Region>, fi: usize| {
         if Some(fi) != last_solid || merged.len() != 1 {
             for r in merged.iter_mut() {
@@ -29946,8 +29959,9 @@ mod tests {
 
     /// How the EXACT kernel copes with one part: whether the B-rep survives at all, how long it
     /// takes, what it encloses against the mesh build, and whether any curved surfaces reach the
-    /// STEP. Two things it has already turned up — that no corpus part gets a curved surface even
-    /// when `gate_arcs` lets its arcs through, and that pardt.hcad builds 39.6% short.
+    /// STEP. Two things it has turned up — that badbasicextrude is the ONE corpus part the exact
+    /// kernel gets curved surfaces out of (four faces, six curved, 1 ms), and that pardt.hcad
+    /// builds 39.6% short. For the two routes side by side, use `diag_step_routes`.
     ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_exact_build -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -30060,6 +30074,85 @@ mod tests {
                 s.0, s.1, first.0, first.1
             );
         }
+    }
+
+    /// Which STEP each part actually ships, and what the losing route would have given.
+    ///   HCAD_DIR="...\saved files" cargo test -p hworks-app diag_step_routes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_step_routes() {
+        let _guard = counter_lock();
+        let dir = std::env::var("HCAD_DIR").expect("set HCAD_DIR");
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hcad")))
+            .collect();
+        entries.sort();
+        let curved = |s: &str| {
+            s.matches("B_SPLINE_SURFACE").count()
+                + s.matches("SURFACE_OF_REVOLUTION").count()
+                + s.matches("CYLINDRICAL_SURFACE").count()
+                + s.matches("TOROIDAL_SURFACE").count()
+        };
+        let (mut shipped_curved, mut total, mut exact_wins) = (0usize, 0usize, 0usize);
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(doc) = ron::from_str::<Document>(&text) else { continue };
+            let Ok(Some((m, _))) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_mesh(&doc))) else {
+                continue;
+            };
+            if m.indices.is_empty() {
+                continue;
+            }
+            total += 1;
+            let want = hworks_geometry::signed_mesh_volume(&m).abs();
+            // The exact route, judged exactly as the export judges it: only when the document is
+            // eligible, only when nothing failed, and only when it encloses what the mesh does.
+            let exact = if why_no_exact_brep(&doc).is_none() {
+                let (built, failures) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| regenerate_reported(&doc)))
+                        .unwrap_or((None, Vec::new()));
+                let _ = take_fallback_count();
+                let _ = take_cut_direction_guesses();
+                let _ = take_gear_failures();
+                let _ = take_nonmanifold_bodies();
+                let _ = hworks_geometry::take_loft_hole_mismatch_count();
+                failures.is_empty().then_some(built).flatten().filter(|s| {
+                    let got = hworks_geometry::signed_mesh_volume(&tessellate(s, 0.02).mesh).abs();
+                    want <= 1.0e-9 || (got - want).abs() <= want * 1.0e-3
+                })
+            } else {
+                None
+            };
+            let es = exact.as_ref().and_then(hworks_geometry::export_step);
+            let ms = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mesh_to_solid(&m).as_ref().and_then(hworks_geometry::export_step)
+            }))
+            .unwrap_or(None);
+            let say = |s: &Option<String>| match s {
+                None => "     —".to_string(),
+                Some(s) => format!("{:>4} faces {:>3} curved {:>6} KB", s.matches("FACE_SURFACE").count(), curved(s), s.len() / 1024),
+            };
+            let winner = match (&es, &ms) {
+                (Some(e), Some(mm)) => {
+                    if step_route_score(e) >= step_route_score(mm) { "EXACT" } else { "mesh" }
+                }
+                (Some(_), None) => "EXACT",
+                (None, Some(_)) => "mesh",
+                (None, None) => "none",
+            };
+            if winner == "EXACT" {
+                exact_wins += 1;
+            }
+            let shipped = if winner == "EXACT" { &es } else { &ms };
+            if shipped.as_ref().is_some_and(|s| curved(s) > 0) {
+                shipped_curved += 1;
+            }
+            eprintln!("  {name:<26} exact {} | mesh {} | ships {winner}", say(&es), say(&ms));
+        }
+        eprintln!("\n=== {shipped_curved} of {total} parts ship a STEP with curved surfaces ({exact_wins} via the exact kernel) ===");
     }
 
     /// What reaches the STEP file: how many of a part's bores come out as true cylinders rather
