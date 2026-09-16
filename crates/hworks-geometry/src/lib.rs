@@ -2755,7 +2755,32 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
             }
             let verts: HashSet<usize> = tagged.iter().flat_map(|&ti| topo.tris[ti]).collect();
             // Every vertex on the surface the tag names.
-            if verts.iter().any(|&v| off_surface(v).abs() > tol) {
+            // A mesh of a curved surface is INSCRIBED in it. The tool's own vertices sit exactly
+            // on the surface, but every vertex a boolean adds along an intersection lands on the
+            // CHORD between them — a sagitta short, always on the inside. Judging by a flat
+            // tolerance asks the mesh to be something it never was: four vertices of ball's fillet
+            // and twenty of bottomline's sat 1.1 to 1.2 times the tolerance in, which is to say
+            // exactly where an inscribed facet puts them, and cost both parts their torus.
+            //
+            // So allow the inside by what this patch's OWN facets imply — a chord of length L on a
+            // surface curving at `minor` falls short by about L²/8minor — and the outside by
+            // nothing but noise, because there is no mechanism that puts a vertex out there.
+            let sagitta = tagged
+                .iter()
+                .map(|&ti| {
+                    let t = topo.tris[ti];
+                    let e = |a: usize, b: usize| {
+                        let (p, q) = (topo.verts[t[a]], topo.verts[t[b]]);
+                        (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)
+                    };
+                    e(0, 1).max(e(1, 2)).max(e(2, 0))
+                })
+                .fold(0.0f64, f64::max)
+                / (8.0 * minor);
+            if verts.iter().any(|&v| {
+                let d = off_surface(v);
+                d > tol || d < -(tol + sagitta)
+            }) {
                 continue;
             }
             // The patch's BOUNDARY: the edges only one of its triangles holds. A plain ring has
@@ -5545,6 +5570,88 @@ mod tests {
             (got - want).abs() < want * 1.0e-4,
             "volume {got:.4}, want {want:.4} — the tube went in inside out"
         );
+    }
+
+    /// PROBE: can a PARTIAL sweep's own edges be shared with hand-built flat faces?
+    ///
+    /// A whole ring shares only its two rims, and both come from the sweep. A partial one also
+    /// shares two straight ends with ordinary faces — and truck's topology is identity-based, so
+    /// those faces have to be built from the sweep's own vertices, not from equal-looking ones.
+    #[test]
+    #[ignore]
+    fn diag_partial_sweep_sharing() {
+        let (r, h, ang) = (10.0_f64, 4.0_f64, std::f64::consts::FRAC_PI_2);
+        let axis = Vector3::unit_z();
+        let seed = builder::vertex(Point3::new(r, 0.0, 0.0));
+        let rise = builder::tsweep(&seed, Vector3::new(0.0, 0.0, h));
+        let swept = builder::rsweep(&rise, Point3::origin(), axis, truck_modeling::Rad(ang));
+        let wall: Vec<truck_modeling::Face> = swept.iter().cloned().collect();
+        eprintln!("PARTIAL: wall is {} face(s)", wall.len());
+
+        // Its boundary: two arcs (bottom and top) and the two straight ends.
+        let key = |e: &truck_modeling::Edge| {
+            let q = |p: Point3| ((p.x * 1.0e5).round() as i64, (p.y * 1.0e5).round() as i64, (p.z * 1.0e5).round() as i64);
+            let (a, z) = (q(e.front().point()), q(e.back().point()));
+            if a < z { (a, z) } else { (z, a) }
+        };
+        let mut seen: std::collections::HashMap<_, usize> = Default::default();
+        for f in &wall {
+            for w in f.boundaries() {
+                for e in w.iter() {
+                    *seen.entry(key(e)).or_default() += 1;
+                }
+            }
+        }
+        let mut bnd: Vec<truck_modeling::Edge> = Vec::new();
+        for f in &wall {
+            for w in f.boundaries() {
+                for e in w.iter() {
+                    if seen.get(&key(e)).copied().unwrap_or(0) == 1 {
+                        bnd.push(e.clone());
+                    }
+                }
+            }
+        }
+        let flat = |e: &truck_modeling::Edge| (e.front().point().z - e.back().point().z).abs() < 1.0e-9;
+        let (arcs, ends): (Vec<_>, Vec<_>) = bnd.iter().cloned().partition(flat);
+        eprintln!("  boundary: {} arc edge(s), {} straight end(s)", arcs.len(), ends.len());
+        let lo: Vec<_> = arcs.iter().filter(|e| e.front().point().z.abs() < 1.0e-9).cloned().collect();
+        let hi: Vec<_> = arcs.iter().filter(|e| (e.front().point().z - h).abs() < 1.0e-9).cloned().collect();
+
+        // The axis edge both caps share, built from the sweep's OWN end vertices.
+        let (c0, c1) = (builder::vertex(Point3::origin()), builder::vertex(Point3::new(0.0, 0.0, h)));
+        let spine = builder::line(&c0, &c1);
+        // A cap is: axis -> out along one end's bottom vertex -> round the arc -> back to the axis.
+        let cap = |arc: &Vec<truck_modeling::Edge>, at: &truck_modeling::Vertex, inv: bool| {
+            let chain = |es: &Vec<truck_modeling::Edge>| {
+                let q = |p: Point3| ((p.x * 1.0e5).round() as i64, (p.y * 1.0e5).round() as i64, (p.z * 1.0e5).round() as i64);
+                let mut left = es.clone();
+                let mut w = truck_modeling::Wire::new();
+                let first = left.remove(0);
+                let mut cur = q(first.back().point());
+                w.push_back(first);
+                while !left.is_empty() {
+                    let Some(i) = left.iter().position(|e| q(e.front().point()) == cur) else { break };
+                    let e = left.remove(i);
+                    cur = q(e.back().point());
+                    w.push_back(e);
+                }
+                w
+            };
+            let run = chain(arc);
+            let mut w = truck_modeling::Wire::new();
+            w.push_back(builder::line(at, &run.front_vertex().unwrap().clone()));
+            for e in run.iter() {
+                w.push_back(e.clone());
+            }
+            w.push_back(builder::line(&run.back_vertex().unwrap().clone(), at));
+            let _ = inv;
+            builder::try_attach_plane(&[w])
+        };
+        eprintln!("  bottom cap: {:?}", cap(&lo, &c0, false).is_ok());
+        eprintln!("  top cap:    {:?}", cap(&hi, &c1, true).is_ok());
+        eprintln!("  spine + ends available: {} / {}", ends.len(), 2);
+        let _ = spine;
     }
 
     /// Half a bore is not a bore: a wall cut back to a half-pipe stays faceted.
