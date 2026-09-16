@@ -2531,7 +2531,19 @@ struct Band {
 /// That plainness is a real limit, and worth stating rather than discovering. Where a band is
 /// turned away it is nearly always because it is only PART of a ring — a wall cut back, a fillet
 /// that runs out — which a full revolution cannot express; measured over the corpus, twenty-two of
-/// the twenty-nine patches rejected for their boundary are that case.
+/// the twenty-nine patches rejected for their boundary are that case, against five that are a whole
+/// ring with a pinhole in it and two that are two rings still joined.
+///
+/// Those twenty-two are the biggest thing left, and they are TIDY: seventeen of them have every
+/// boundary vertex at one of the two ends and cross between the ends exactly twice, which is to say
+/// they are a plain strip — round one end, up, back along the other, down. truck sweeps a partial
+/// turn as readily as a whole one, so the geometry is not the obstacle. The obstacle is that a
+/// partial band shares its two straight ends with ordinary flat faces, and truck's topology is
+/// identity-based: a sweep grows its own vertices and edges, and a neighbour built from this
+/// crate's own vertex list would meet them at a seam that looks closed and is not. A whole ring
+/// avoids that entirely, because the only edges it shares are the two rims, and both come from the
+/// sweep. Closing that gap means handing the sweep's vertices back to everything else that touches
+/// them, before any other face is built.
 ///
 /// TORUS bands get this far and no further, as of writing: the corpus has five, and none of them
 /// lands. Three are turned away at the seam, because a fillet's rim meets the WALL it blends into
