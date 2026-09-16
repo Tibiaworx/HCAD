@@ -506,6 +506,12 @@ fn nudged(m: &TriMesh, d: [f32; 3]) -> TriMesh {
             axis,
             radius,
         },
+        crate::Surf::Torus { origin, axis, major, minor } => crate::Surf::Torus {
+            origin: [origin[0] + d[0] as f64, origin[1] + d[1] as f64, origin[2] + d[2] as f64],
+            axis,
+            major,
+            minor,
+        },
     };
     TriMesh {
         positions: m.positions.iter().map(|p| [p[0] + d[0], p[1] + d[1], p[2] + d[2]]).collect(),

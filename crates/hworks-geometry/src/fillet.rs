@@ -389,6 +389,46 @@ fn fit_circle(pts: &[[f64; 3]]) -> Option<(V3, V3, f64)> {
     Some((center, axis, radius))
 }
 
+/// Record the torus the rolling ball actually rolls, on the triangles that lie on it.
+///
+/// The fillet tool is a lathed profile, and only one stretch of that profile is the fillet: the
+/// rest runs off into air or buried material so the boolean has something to cut with. So the
+/// surface is carried only on the triangles that sit on the rolling ball's own tube — every vertex
+/// at `minor` from the centre circle — which is exactly the arc, and nothing else.
+///
+/// Nothing is fitted. `fillet_circular` has just worked out the rim's centre, axis and radius in
+/// order to build the tool; this is the same numbers, written down.
+fn tag_torus(mesh: &mut TriMesh, center: V3, axis: V3, major: f64, axial: f64, minor: f64) {
+    let origin = add(center, scale(axis, axial));
+    let surf = crate::Surf::Torus { origin, axis, major, minor };
+    let ntri = mesh.indices.len() / 3;
+    mesh.clear_tags();
+    if ntri == 0 || major <= minor || minor < 1.0e-9 {
+        return; // a self-intersecting tube is not a surface anyone can use
+    }
+    // Distance from the tube's centre circle: out to the circle in the plane, then to the point.
+    let off = |p: [f32; 3]| -> f64 {
+        let d = sub([p[0] as f64, p[1] as f64, p[2] as f64], origin);
+        let al = dot(d, axis);
+        let rad = sub(d, scale(axis, al));
+        let rl = len(rad);
+        ((rl - major).powi(2) + al * al).sqrt()
+    };
+    let tol = minor * 1.0e-3;
+    let mut tri_surf = vec![crate::NO_SURF; ntri];
+    let mut any = false;
+    for t in 0..ntri {
+        if (0..3).all(|i| (off(mesh.positions[mesh.indices[t * 3 + i] as usize]) - minor).abs() < tol) {
+            tri_surf[t] = 0;
+            any = true;
+        }
+    }
+    if any {
+        mesh.surfaces = vec![surf];
+        mesh.tri_surf = tri_surf;
+    }
+}
+
 /// Torus rolling-ball fillet on a circular edge (e.g. a cylinder's rim). Returns the
 /// revolved tool plus whether it should be *unioned* (a concave corner — the fillet adds a
 /// fill) or *subtracted* (a convex rim — it shaves the corner). `None` if the edge isn't a
@@ -510,7 +550,8 @@ fn fillet_circular(tris: &[[V3; 3]], radius: f64, loop_pts: &[[f64; 3]], _tol: f
         profile.push(sz(pad, -r)); // out into air past the wall
         profile.push(sz(pad, pad)); // air
         profile.push(sz(-r, pad)); // back over the cap (air)
-        let tool = revolve(&profile, center, axis, radial0, &angles);
+        let mut tool = revolve(&profile, center, axis, radial0, &angles);
+        tag_torus(&mut tool, center, axis, big_r + sign_w * -r, -r, r);
         Some((tool, false))
     } else {
         // Concave rim (a boss base / counterbore floor): union a rounded fill. The notch is
@@ -525,7 +566,8 @@ fn fillet_circular(tris: &[[V3; 3]], radius: f64, loop_pts: &[[f64; 3]], _tol: f
         profile.push(sz(r, -pad)); // down into material
         profile.push(sz(-pad, -pad)); // deep material
         profile.push(sz(-pad, r)); // up into the wall's material, back to wall contact
-        let tool = revolve(&profile, center, axis, radial0, &angles);
+        let mut tool = revolve(&profile, center, axis, radial0, &angles);
+        tag_torus(&mut tool, center, axis, big_r + sign_w * r, r, r);
         Some((tool, true))
     }
 }

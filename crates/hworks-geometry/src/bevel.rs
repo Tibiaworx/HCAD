@@ -135,12 +135,18 @@ impl Uf {
 /// Rebuild the flat-face topology of a (watertight, flat-shaded) triangle mesh.
 pub fn build_topo(mesh: &TriMesh) -> Topo {
     let (verts, remap) = weld(mesh);
-    let mut tris: Vec<[usize; 3]> = mesh
-        .indices
-        .chunks_exact(3)
-        .map(|t| [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]])
-        .filter(|t| t[0] != t[1] && t[1] != t[2] && t[2] != t[0])
-        .collect();
+    let mut tris: Vec<[usize; 3]> = Vec::with_capacity(mesh.indices.len() / 3);
+    // Which surface each surviving triangle was recorded on, kept in step with `tris` — the filter
+    // below drops collapsed triangles, so the source's own indices stop lining up after the first.
+    let tagged = mesh.tri_surf.len() == mesh.indices.len() / 3 && !mesh.surfaces.is_empty();
+    let mut tsurf: Vec<u32> = Vec::with_capacity(mesh.indices.len() / 3);
+    for (i, t) in mesh.indices.chunks_exact(3).enumerate() {
+        let w = [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]];
+        if w[0] != w[1] && w[1] != w[2] && w[2] != w[0] {
+            tris.push(w);
+            tsurf.push(if tagged { mesh.tri_surf[i] } else { crate::NO_SURF });
+        }
+    }
     // Guarantee outward, consistent winding so face normals point out — `edge_sign` relies on it.
     orient_consistently(&verts, &mut tris);
 
@@ -160,9 +166,26 @@ pub fn build_topo(mesh: &TriMesh) -> Topo {
     }
 
     // Group coplanar, edge-adjacent triangles into faces (union–find).
+    // ...and never across a change of SURFACE. Two triangles recorded on DIFFERENT surfaces are
+    // not one face however parallel they happen to be, and at a fillet they are exactly parallel:
+    // the blend meets the wall it rolls onto tangentially, so the last strip of the fillet and the
+    // first strip of the wall agree to well inside any angle tolerance. Merged, the fillet's band
+    // came out holding a piece of flat wall and could not be written as a torus at all.
+    //
+    // It takes two RECORDS to disagree, though. Where a tag is missing the geometry is all there is
+    // to go on, and two faces recorded as the same plane are one face whichever feature put each
+    // there — refusing those merges cost squarehelper two faces for nothing.
+    let differ = |a: usize, b: usize| match (tsurf[a], tsurf[b]) {
+        (x, y) if x == y => false,
+        (crate::NO_SURF, _) | (_, crate::NO_SURF) => false,
+        (x, y) => match (mesh.surfaces.get(x as usize), mesh.surfaces.get(y as usize)) {
+            (Some(a), Some(b)) => !a.is_same_as(b, 1.0e-4),
+            _ => false,
+        },
+    };
     let mut uf = Uf::new(tris.len());
     for ts in edge_tris.values() {
-        if ts.len() == 2 && dot(tnorm[ts[0]], tnorm[ts[1]]) > 0.9995 {
+        if ts.len() == 2 && dot(tnorm[ts[0]], tnorm[ts[1]]) > 0.9995 && !differ(ts[0], ts[1]) {
             uf.union(ts[0], ts[1]);
         }
     }

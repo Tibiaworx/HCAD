@@ -33,6 +33,53 @@ pub enum Surf {
     Plane { origin: [f64; 3], normal: [f64; 3] },
     /// A cylindrical wall about the line through `origin` along `axis`.
     Cylinder { origin: [f64; 3], axis: [f64; 3], radius: f64 },
+    /// The band a rolling ball leaves round a circular rim: a tube of radius `minor` whose centre
+    /// line is the circle of radius `major` about the axis through `origin` along `axis`.
+    Torus { origin: [f64; 3], axis: [f64; 3], major: f64, minor: f64 },
+}
+
+impl Surf {
+    /// Whether two records describe the SAME surface.
+    ///
+    /// Not the same as being equal. A surface is written down with a point on it, and any point
+    /// will do — so the same flat face picked up a different record from every feature that touched
+    /// it, and the same bore a different one from every height it was cut at. Compared as written,
+    /// one face reads as several unrelated ones.
+    pub fn is_same_as(&self, other: &Surf, tol: f64) -> bool {
+        let par = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        match (*self, *other) {
+            (Surf::Plane { origin: o0, normal: n0 }, Surf::Plane { origin: o1, normal: n1 }) => {
+                // Facing matters: the two sides of a sheet are different faces of the solid.
+                par(n0, n1) > 1.0 - 1.0e-9
+                    && (par([o1[0] - o0[0], o1[1] - o0[1], o1[2] - o0[2]], n0)).abs() < tol
+            }
+            (
+                Surf::Cylinder { origin: o0, axis: a0, radius: r0 },
+                Surf::Cylinder { origin: o1, axis: a1, radius: r1 },
+            ) => (r0 - r1).abs() < tol && par(a0, a1).abs() > 1.0 - 1.0e-9 && axis_gap(o0, a0, o1) < tol,
+            (
+                Surf::Torus { origin: o0, axis: a0, major: m0, minor: r0 },
+                Surf::Torus { origin: o1, axis: a1, major: m1, minor: r1 },
+            ) => {
+                (m0 - m1).abs() < tol
+                    && (r0 - r1).abs() < tol
+                    && par(a0, a1).abs() > 1.0 - 1.0e-9
+                    && axis_gap(o0, a0, o1) < tol
+                    // A torus's origin names the plane its centre circle lies in, so sliding it
+                    // along the axis gives a DIFFERENT torus — unlike a cylinder's.
+                    && par([o1[0] - o0[0], o1[1] - o0[1], o1[2] - o0[2]], a0).abs() < tol
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How far `p` is off the line through `o` along `axis`.
+fn axis_gap(o: [f64; 3], axis: [f64; 3], p: [f64; 3]) -> f64 {
+    let d = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
+    let al = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+    let r = [d[0] - axis[0] * al, d[1] - axis[1] * al, d[2] - axis[2] * al];
+    (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt()
 }
 
 /// `tri_surf` entry for a triangle whose surface nobody recorded.
@@ -2446,62 +2493,53 @@ pub fn fit_section_shapes(segs: &[[[f32; 2]; 2]], tol: f32) -> Vec<SectionShape>
     out
 }
 
-/// A ring of mesh triangles the sketch says lies on one cylinder, checked to be a plain straight
-/// band, so the exporter can rebuild it as a true surface of revolution instead of writing out the
-/// flat strips it was actually built from.
-struct CylBand {
+/// A patch of mesh the sketch (or the fillet) says lies on one surface of revolution, checked to be
+/// a plain complete ring between two circular rims, so the exporter can rebuild it as that surface
+/// instead of the flat strips it was actually built from.
+struct Band {
+    /// The surface itself, as whoever built the patch recorded it.
+    surf: Surf,
     origin: [f64; 3],
     axis: [f64; 3],
-    radius: f64,
-    /// Topo vertices of the two rims in angular order about the axis, `rims[0]` at `w[0]`.
+    /// Topo vertices of the two rims, in order about the axis.
     rims: [Vec<usize>; 2],
-    /// Axial position of each rim, `w[0] < w[1]`.
-    w: [f64; 2],
+    /// Where each rim sits in the half-plane the surface is revolved from: (distance from the
+    /// axis, distance along it). Those two points are the ends of the generatrix.
+    gen: [[f64; 2]; 2],
     /// The topo faces this band is made of — skipped when the flat faces are written.
     faces: Vec<usize>,
     /// For each rim, the face and loop that runs along it. That loop is replaced by the tube's own
-    /// rim circle, walked the other way, so which way the polyline happened to run does not come
-    /// into it.
+    /// rim circle, walked the other way.
     seam: [(usize, usize); 2],
-    /// Area of a rim's polygon. The circle's own area is `πr²`; the gap between them is what the
-    /// mesh kernel could never build.
-    poly_area: f64,
-    /// Material lies away from the axis (a boss) rather than toward it (a bore).
-    outward: bool,
+    /// What the mesh triangles of this patch contribute to the body's volume. The exact tube's own
+    /// contribution is compared against it — see `mesh_to_solid`.
+    patch_volume: f64,
 }
 
-impl CylBand {
-    /// How much the body's volume moves when this band's inscribed polygon becomes the circle it
-    /// was always meant to be.
-    ///
-    /// Not an error to be tolerated — a correction. The mesh kernel can only build a bore as a ring
-    /// of chords, which sits inside the circle the sketch drew, so a part with a 6 mm bore has
-    /// always come out a hair heavy. Writing the true cylinder fixes that, and the exporter's own
-    /// volume check has to expect the fix or it will reject its own good work.
-    fn volume_correction(&self) -> f64 {
-        let gap = std::f64::consts::PI * self.radius * self.radius - self.poly_area;
-        gap * (self.w[1] - self.w[0]) * if self.outward { 1.0 } else { -1.0 }
-    }
-}
-
-/// Find the cylindrical bands of a mesh that can be rebuilt exactly.
+/// Find the patches of a mesh that can be rebuilt as exact surfaces of revolution.
 ///
-/// Reads the surfaces the extrude recorded — a bore is a cylinder because the sketch drew a circle,
-/// not because the triangles look round — then checks the geometry really is the plain case the
-/// exporter can rebuild: a complete tube between two flat rims, meeting the rest of the body only
-/// along them. A bore a later cut has bitten into fails that and stays as strips, which is right:
-/// only what the sketch's circle still describes may be written as one.
-///
-/// That plainness is a real limit, and worth stating rather than discovering. Across the saved
-/// corpus it holds for ten parts and twenty cylinders. Where a band is turned away it is because
-/// the bore breaks out through a chamfer, or meets a face that is itself faceted, or is one wall
-/// shared by two stacked features whose axes have drifted apart — each a tube with something else
-/// going on. Where it does hold, one cylinder replaces 128 flat faces.
+/// Reads the surfaces the tools recorded — a bore is a cylinder because the sketch drew a circle,
+/// and a fillet's band is a torus because that is the tube the rolling ball rolled, neither of them
+/// because the triangles look round — then checks the geometry really is the plain case the
+/// exporter can rebuild: a complete ring between two circular rims, meeting the rest of the body
+/// only along them.
 ///
 /// Every check is a way the substitution would otherwise corrupt the shell, not a matter of taste.
-/// A rim stops being forty-eight vertices and becomes three, so anything else holding those
+/// A rim stops being forty-eight vertices and becomes one circle, so anything else holding those
 /// vertices would be left pointing at geometry that no longer exists.
-fn cylinder_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<CylBand> {
+///
+/// That plainness is a real limit, and worth stating rather than discovering. Where a band is
+/// turned away it is nearly always because it is only PART of a ring — a wall cut back, a fillet
+/// that runs out — which a full revolution cannot express; measured over the corpus, twenty-two of
+/// the twenty-nine patches rejected for their boundary are that case.
+///
+/// TORUS bands get this far and no further, as of writing: the corpus has five, and none of them
+/// lands. Three are turned away at the seam, because a fillet's rim meets the WALL it blends into
+/// rather than a flat face — band against band, which would need the two tubes to share one rim
+/// circle instead of each growing its own. The other two hold triangles that carry the torus tag
+/// but do not sit on it within tolerance. The machinery is here and exercised; those two are what
+/// is left.
+fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
     use std::collections::{HashMap, HashSet};
     let ntri = mesh.indices.len() / 3;
     if mesh.tri_surf.len() != ntri || mesh.surfaces.is_empty() || topo.tris.is_empty() {
@@ -2531,31 +2569,39 @@ fn cylinder_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<CylBand> {
         tmap.insert(k, i);
     }
 
-    // Tags that name the SAME cylinder are one band.
-    //
-    // A surface is recorded with a point on its axis, and any point on the axis will do — so the
-    // same bore picked up a different record from every feature that touched it. Compared as
-    // written, one wall read as three unrelated cylinders, none of them a whole tube, and the
-    // export fell back to strips on parts that were nothing but round. What makes two cylinders
-    // the same is their axis LINE and their radius, which is what this asks.
-    let same = |a: &Surf, b: &Surf| match (*a, *b) {
-        (
-            Surf::Cylinder { origin: o0, axis: n0, radius: r0 },
-            Surf::Cylinder { origin: o1, axis: n1, radius: r1 },
-        ) => {
-            let dot = n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2];
-            let d = [o1[0] - o0[0], o1[1] - o0[1], o1[2] - o0[2]];
-            let al = d[0] * n0[0] + d[1] * n0[1] + d[2] * n0[2];
-            let off = [d[0] - n0[0] * al, d[1] - n0[1] * al, d[2] - n0[2] * al];
-            (r0 - r1).abs() < tol
-                && dot.abs() > 1.0 - 1.0e-9
-                && (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt() < tol
+    // The axis and the "core" each surface is a fixed distance from: the axis line for a cylinder,
+    // the centre circle for a torus.
+    let frame = |s: &Surf| -> Option<([f64; 3], [f64; 3], f64, f64)> {
+        match *s {
+            Surf::Cylinder { origin, axis, radius } => Some((origin, axis, 0.0, radius)),
+            Surf::Torus { origin, axis, major, minor } => Some((origin, axis, major, minor)),
+            Surf::Plane { .. } => None,
         }
-        _ => false,
+    };
+    // Tags that name the SAME surface are one band. A surface is recorded with a point on its axis,
+    // and any point on the axis will do — so the same bore picked up a different record from every
+    // feature that touched it. Compared as written, one wall read as three unrelated cylinders,
+    // none of them a whole tube.
+    let same = |a: &Surf, b: &Surf| {
+        let (Some((o0, n0, m0, r0)), Some((o1, n1, m1, r1))) = (frame(a), frame(b)) else { return false };
+        if std::mem::discriminant(a) != std::mem::discriminant(b) {
+            return false;
+        }
+        let dot = n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2];
+        let d = [o1[0] - o0[0], o1[1] - o0[1], o1[2] - o0[2]];
+        let al = d[0] * n0[0] + d[1] * n0[1] + d[2] * n0[2];
+        let off = [d[0] - n0[0] * al, d[1] - n0[1] * al, d[2] - n0[2] * al];
+        (m0 - m1).abs() < tol
+            && (r0 - r1).abs() < tol
+            && dot.abs() > 1.0 - 1.0e-9
+            && (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt() < tol
+            // A cylinder's origin may sit anywhere along the axis; a torus's names the plane its
+            // centre circle lies in, so that has to agree too.
+            && (matches!(a, Surf::Cylinder { .. }) || al.abs() < tol)
     };
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (si, surf) in mesh.surfaces.iter().enumerate() {
-        if !matches!(surf, Surf::Cylinder { .. }) {
+        if frame(surf).is_none() {
             continue;
         }
         match groups.iter_mut().find(|g| same(&mesh.surfaces[g[0]], surf)) {
@@ -2564,11 +2610,12 @@ fn cylinder_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<CylBand> {
         }
     }
 
-    let mut out: Vec<CylBand> = Vec::new();
+    let mut out: Vec<Band> = Vec::new();
     let mut taken: HashSet<usize> = HashSet::new(); // topo faces already claimed by a band
     for group in &groups {
-        let Surf::Cylinder { origin, axis, radius } = mesh.surfaces[group[0]] else { continue };
-        if radius < tol {
+        let surf = mesh.surfaces[group[0]];
+        let Some((origin, axis, major, minor)) = frame(&surf) else { continue };
+        if minor < tol {
             continue;
         }
         // The topo faces these tags cover.
@@ -2606,16 +2653,11 @@ fn cylinder_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<CylBand> {
         if !ok || faces.is_empty() {
             continue;
         }
-        // Every triangle of every face involved must belong to this band: a face half on the
-        // cylinder and half elsewhere cannot be swapped out as a unit.
         let all: HashSet<usize> = faces.iter().flat_map(|&f| topo.faces[f].tris.iter().copied()).collect();
 
-        // One tag routinely covers SEVERAL separate tubes — a bore through two plates with a gap,
+        // One tag routinely covers SEVERAL separate patches — a bore through two plates with a gap,
         // a ring of identical holes, the same wall revisited by a later feature — so judge each
-        // connected patch on its own rather than the tag as a whole. Taken together they are not a
-        // tube and the lot was being thrown away: measured over the corpus, the commonest failure
-        // was a tag whose boundary came to four loops or six or ten, which is two tubes or three
-        // or five, every one of them perfectly good.
+        // connected patch on its own rather than the tag as a whole.
         let mut comp: HashMap<usize, usize> = HashMap::new();
         let mut order: Vec<usize> = all.iter().copied().collect();
         order.sort_unstable(); // walked in index order so the bands come out the same every run
@@ -2652,6 +2694,43 @@ fn cylinder_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<CylBand> {
             parts.push(part);
         }
 
+        // Where a point sits in the half-plane the surface is revolved from, and how far it is off
+        // the surface itself.
+        let place = |v: usize| -> ([f64; 2], f64, [f64; 3]) {
+            let p = topo.verts[v];
+            let d = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+            let al = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+            let r = [d[0] - axis[0] * al, d[1] - axis[1] * al, d[2] - axis[2] * al];
+            let rl = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            ([rl, al], ((rl - major).powi(2) + (al - 0.0).powi(2) * f64::from(major > 0.0)).sqrt(), r)
+        };
+        // For a cylinder the surface is "radius from the axis", for a torus "minor from the centre
+        // circle"; `place` returns whichever applies.
+        let off_surface = |v: usize| {
+            let (g, o, _) = place(v);
+            if major > 0.0 { o - minor } else { g[0] - minor }
+        };
+        // A frame across the axis, to order each rim.
+        let t0 = if axis[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+        let u = {
+            let c = [
+                axis[1] * t0[2] - axis[2] * t0[1],
+                axis[2] * t0[0] - axis[0] * t0[2],
+                axis[0] * t0[1] - axis[1] * t0[0],
+            ];
+            let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt().max(1.0e-12);
+            [c[0] / l, c[1] / l, c[2] / l]
+        };
+        let vv = [
+            axis[1] * u[2] - axis[2] * u[1],
+            axis[2] * u[0] - axis[0] * u[2],
+            axis[0] * u[1] - axis[1] * u[0],
+        ];
+        let angle = |vtx: usize| {
+            let (_, _, r) = place(vtx);
+            (r[0] * vv[0] + r[1] * vv[1] + r[2] * vv[2]).atan2(r[0] * u[0] + r[1] * u[1] + r[2] * u[2])
+        };
+
         for part in &parts {
             let tagged: HashSet<usize> = part.iter().copied().collect();
             let faces: HashSet<usize> = part.iter().map(|&ti| topo.tri_face[ti]).collect();
@@ -2662,177 +2741,161 @@ fn cylinder_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<CylBand> {
             if faces.iter().any(|&f| topo.faces[f].tris.iter().any(|t| !tagged.contains(t))) {
                 continue;
             }
-        let verts: HashSet<usize> = tagged.iter().flat_map(|&ti| topo.tris[ti]).collect();
-        let n = axis;
-        let radial = |v: usize| {
-            let p = topo.verts[v];
-            let d = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
-            let al = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-            let r = [d[0] - n[0] * al, d[1] - n[1] * al, d[2] - n[2] * al];
-            ((r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt(), al, r)
-        };
-        // Every vertex on the cylinder the tag names.
-        if verts.iter().any(|&v| (radial(v).0 - radius).abs() > tol) {
-            continue;
-        }
-        // The band's BOUNDARY: the edges only one of its triangles holds. A plain tube has exactly
-        // two, one at each end.
-        //
-        // Asking instead that every vertex sit at one of two heights — the obvious reading of
-        // "straight band" — threw away almost everything: fifty of the corpus's bands failed it and
-        // four parts came out round. A boolean subdivides a wall wherever anything else met it, so
-        // a perfectly plain bore routinely carries vertices part way up. Those are interior to the
-        // band and vanish with the strips that hold them; only the two ends have to be circles.
-        let mut ecount: HashMap<(usize, usize), usize> = HashMap::new();
-        for &ti in &tagged {
-            let t = topo.tris[ti];
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                *ecount.entry(if a < b { (a, b) } else { (b, a) }).or_default() += 1;
-            }
-        }
-        let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (&(a, b), &c) in ecount.iter() {
-            if c == 1 {
-                adj.entry(a).or_default().push(b);
-                adj.entry(b).or_default().push(a);
-            }
-        }
-        if adj.is_empty() || adj.values().any(|n| n.len() != 2) {
-            continue; // a torn or branching rim is not a tube
-        }
-        let mut loops: Vec<Vec<usize>> = Vec::new();
-        let mut walked: HashSet<usize> = HashSet::new();
-        let mut starts: Vec<usize> = adj.keys().copied().collect();
-        starts.sort_unstable(); // a hash order here would make the export non-reproducible
-        for s0 in starts {
-            if !walked.insert(s0) {
+            let verts: HashSet<usize> = tagged.iter().flat_map(|&ti| topo.tris[ti]).collect();
+            // Every vertex on the surface the tag names.
+            if verts.iter().any(|&v| off_surface(v).abs() > tol) {
                 continue;
             }
-            let (mut lp, mut prev, mut cur) = (vec![s0], s0, adj[&s0][0]);
-            while cur != s0 && walked.insert(cur) {
-                lp.push(cur);
-                let n = &adj[&cur];
-                let nxt = if n[0] == prev { n[1] } else { n[0] };
-                prev = cur;
-                cur = nxt;
+            // The patch's BOUNDARY: the edges only one of its triangles holds. A plain ring has
+            // exactly two, one at each end.
+            //
+            // Asking instead that every vertex sit at one of two heights — the obvious reading of
+            // "straight band" — threw away almost everything: fifty of the corpus's bands failed it
+            // and four parts came out round. A boolean subdivides a wall wherever anything else met
+            // it, so a perfectly plain bore routinely carries vertices part way along. Those are
+            // interior to the patch and vanish with the strips that hold them; only the two ends
+            // have to be circles.
+            let mut ecount: HashMap<(usize, usize), usize> = HashMap::new();
+            for &ti in &tagged {
+                let t = topo.tris[ti];
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    *ecount.entry(if a < b { (a, b) } else { (b, a) }).or_default() += 1;
+                }
             }
-            loops.push(lp);
-        }
-        if loops.len() != 2 {
-            continue; // two ends is a tube; anything else is not
-        }
-        // Each end flat and at its own height, and the whole band between them.
-        let height = |lp: &Vec<usize>| -> Option<f64> {
-            let h = lp.iter().map(|&v| radial(v).1).sum::<f64>() / lp.len() as f64;
-            lp.iter().all(|&v| (radial(v).1 - h).abs() < tol).then_some(h)
-        };
-        let (Some(h0), Some(h1)) = (height(&loops[0]), height(&loops[1])) else {
-            continue; // a rim running up a slanted or stepped face is no circle
-        };
-        if (h0 - h1).abs() < tol {
-            continue;
-        }
-        if h0 > h1 {
-            loops.swap(0, 1);
-        }
-        let ws = [h0.min(h1), h0.max(h1)];
-        if verts.iter().any(|&v| radial(v).1 < ws[0] - tol || radial(v).1 > ws[1] + tol) {
-            continue; // something of this band lies outside the tube it claims to be
-        }
-        // A frame across the axis, to sort each rim by angle.
-        let t0 = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
-        let u = {
-            let c = [n[1] * t0[2] - n[2] * t0[1], n[2] * t0[0] - n[0] * t0[2], n[0] * t0[1] - n[1] * t0[0]];
-            let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt().max(1.0e-12);
-            [c[0] / l, c[1] / l, c[2] / l]
-        };
-        let vv = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
-        let angle = |vtx: usize| {
-            let (_, _, r) = radial(vtx);
-            (r[0] * vv[0] + r[1] * vv[1] + r[2] * vv[2]).atan2(r[0] * u[0] + r[1] * u[1] + r[2] * u[2])
-        };
-        let mut rims: [Vec<usize>; 2] = [std::mem::take(&mut loops[0]), std::mem::take(&mut loops[1])];
-        if rims.iter().any(|r| r.len() < 8) {
-            continue; // too coarse to be worth calling a circle
-        }
-        for r in rims.iter_mut() {
-            r.sort_by(|&a, &b| angle(a).partial_cmp(&angle(b)).unwrap_or(std::cmp::Ordering::Equal));
-        }
-        // Two flat closed boundary loops is already a COMPLETE ring, so nothing further is asked
-        // here. A partial ring ends in vertical edges, and those join its two rims into a single
-        // loop — a half-pipe comes back with exactly one, which is how this was settled rather than
-        // argued. An explicit no-big-gaps test was carried for a while and never once fired.
-        let step = |r: &Vec<usize>, k: usize| {
-            let d = angle(r[(k + 1) % r.len()]) - angle(r[k]);
-            if d <= 0.0 {
-                d + std::f64::consts::TAU
-            } else {
-                d
+            let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (&(a, b), &c) in ecount.iter() {
+                if c == 1 {
+                    adj.entry(a).or_default().push(b);
+                    adj.entry(b).or_default().push(a);
+                }
             }
-        };
-        // Each rim must be walked by exactly one loop outside the band, and nothing else may hold
-        // a rim vertex — they are about to stop existing.
-        let mut seam: Vec<(usize, usize)> = Vec::new();
-        for r in rims.iter() {
-            let want: HashSet<usize> = r.iter().copied().collect();
-            let mut found = None;
-            let mut clash = false;
-            for (fi, f) in topo.faces.iter().enumerate() {
-                if faces.contains(&fi) {
+            // Sorted, because the walk below starts at each vertex's FIRST neighbour and that
+            // decides which way round the rim it goes — and a rim walked the other way averages its
+            // coordinates in the other order, which moves the tube's vertices in their last bits
+            // and hands out a different STEP file every time.
+            for n in adj.values_mut() {
+                n.sort_unstable();
+            }
+            if adj.is_empty() || adj.values().any(|n| n.len() != 2) {
+                continue;
+            }
+            let mut loops: Vec<Vec<usize>> = Vec::new();
+            let mut walked: HashSet<usize> = HashSet::new();
+            let mut starts: Vec<usize> = adj.keys().copied().collect();
+            starts.sort_unstable(); // a hash order here would make the export non-reproducible
+            for s0 in starts {
+                if !walked.insert(s0) {
                     continue;
                 }
-                for (li, lp) in f.loops.iter().enumerate() {
-                    if lp.len() == want.len() && lp.iter().all(|v| want.contains(v)) {
-                        clash |= found.replace((fi, li)).is_some();
+                let (mut lp, mut prev, mut cur) = (vec![s0], s0, adj[&s0][0]);
+                while cur != s0 && walked.insert(cur) {
+                    lp.push(cur);
+                    let n = &adj[&cur];
+                    let nxt = if n[0] == prev { n[1] } else { n[0] };
+                    prev = cur;
+                    cur = nxt;
+                }
+                loops.push(lp);
+            }
+            if loops.len() != 2 {
+                continue;
+            }
+            // Each end a CIRCLE: one distance from the axis and one along it, all the way round.
+            let ring = |lp: &Vec<usize>| -> Option<[f64; 2]> {
+                let mut c = [0.0f64; 2];
+                for &v in lp {
+                    let g = place(v).0;
+                    c[0] += g[0];
+                    c[1] += g[1];
+                }
+                let c = [c[0] / lp.len() as f64, c[1] / lp.len() as f64];
+                lp.iter()
+                    .all(|&v| {
+                        let g = place(v).0;
+                        (g[0] - c[0]).abs() < tol && (g[1] - c[1]).abs() < tol
+                    })
+                    .then_some(c)
+            };
+            let (Some(g0), Some(g1)) = (ring(&loops[0]), ring(&loops[1])) else {
+                continue;
+            };
+            if ((g0[0] - g1[0]).powi(2) + (g0[1] - g1[1]).powi(2)).sqrt() < tol {
+                continue;
+            }
+            // Order the rims so the generatrix runs the same way every time.
+            let mut rims: [Vec<usize>; 2] = [std::mem::take(&mut loops[0]), std::mem::take(&mut loops[1])];
+            let mut gen = [g0, g1];
+            if (gen[1][1], gen[1][0]) < (gen[0][1], gen[0][0]) {
+                rims.swap(0, 1);
+                gen.swap(0, 1);
+            }
+            if rims.iter().any(|r| r.len() < 8) {
+                continue;
+            }
+            for r in rims.iter_mut() {
+                r.sort_by(|&a, &b| angle(a).partial_cmp(&angle(b)).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            // Each rim must be walked by exactly one loop outside the band, and nothing else may
+            // hold a rim vertex — they are about to stop existing.
+            let mut seam: Vec<(usize, usize)> = Vec::new();
+            for r in rims.iter() {
+                let want: HashSet<usize> = r.iter().copied().collect();
+                let mut found = None;
+                let mut clash = false;
+                for (fi, f) in topo.faces.iter().enumerate() {
+                    if faces.contains(&fi) {
+                        continue;
+                    }
+                    for (li, lp) in f.loops.iter().enumerate() {
+                        if lp.len() == want.len() && lp.iter().all(|v| want.contains(v)) {
+                            clash |= found.replace((fi, li)).is_some();
+                        }
                     }
                 }
+                match found {
+                    Some(s) if !clash => seam.push(s),
+                    _ => break,
+                }
             }
-            match found {
-                Some(s) if !clash => seam.push(s),
-                _ => break,
+            if seam.len() != 2 {
+                continue;
             }
-        }
-        if seam.len() != 2 {
-            continue;
-        }
-        let allowed: HashSet<usize> = faces.iter().copied().chain(seam.iter().map(|s| s.0)).collect();
-        if rims.iter().flatten().any(|&v| topo.vert_faces[v].iter().any(|f| !allowed.contains(f))) {
-            continue;
-        }
-        // Boss or bore: which side of the wall the material is on. Read from the band's own
-        // triangles — a face normal points out of the solid — not assumed from the sketch.
-        let outward = {
-            let ti = tagged.iter().copied().min().unwrap_or(0);
-            let t = topo.tris[ti];
-            let c = [0, 1, 2].map(|k| (topo.verts[t[0]][k] + topo.verts[t[1]][k] + topo.verts[t[2]][k]) / 3.0);
-            let d = [c[0] - origin[0], c[1] - origin[1], c[2] - origin[2]];
-            let al = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-            let rad = [d[0] - n[0] * al, d[1] - n[1] * al, d[2] - n[2] * al];
-            let fnl = topo.faces[topo.tri_face[ti]].normal;
-            rad[0] * fnl[0] + rad[1] * fnl[1] + rad[2] * fnl[2] > 0.0
-        };
-        let poly_area = {
-            let r = &rims[0];
-            0.5 * radius * radius * (0..r.len()).map(|k| step(r, k).sin()).sum::<f64>()
-        };
-        taken.extend(faces.iter().copied());
-        let mut fs: Vec<usize> = faces.into_iter().collect();
-        fs.sort_unstable();
-        out.push(CylBand {
-            origin,
-            axis,
-            radius,
-            rims,
-            w: [ws[0], ws[1]],
-            faces: fs,
-            seam: [seam[0], seam[1]],
-            poly_area,
-            outward,
-        });
+            let allowed: HashSet<usize> = faces.iter().copied().chain(seam.iter().map(|s| s.0)).collect();
+            if rims.iter().flatten().any(|&v| topo.vert_faces[v].iter().any(|f| !allowed.contains(f))) {
+                continue;
+            }
+            // What these triangles contribute to the body's volume, as they stand. The exact tube
+            // has to contribute the same thing, give or take the sagitta it corrects.
+            let mut patch_tris: Vec<usize> = tagged.iter().copied().collect();
+            patch_tris.sort_unstable(); // f64 addition is not associative, so the order is the answer
+            let patch_volume: f64 = patch_tris
+                .iter()
+                .map(|&ti| {
+                    let t = topo.tris[ti];
+                    let (a, b, c) = (topo.verts[t[0]], topo.verts[t[1]], topo.verts[t[2]]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
+                        + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                        / 6.0
+                })
+                .sum();
+            taken.extend(faces.iter().copied());
+            let mut fs: Vec<usize> = faces.into_iter().collect();
+            fs.sort_unstable();
+            out.push(Band {
+                surf,
+                origin,
+                axis,
+                rims,
+                gen,
+                faces: fs,
+                seam: [seam[0], seam[1]],
+                patch_volume,
+            });
         }
     }
     out
 }
+
 
 /// Rebuild a mesh as a B-rep solid, merging COPLANAR triangles into whole planar faces.
 ///
@@ -2881,13 +2944,22 @@ pub fn mesh_to_solid(mesh: &TriMesh) -> Option<KSolid> {
             let re = tessellate(s, tol).mesh;
             !re.indices.is_empty() && (signed_mesh_volume(&re).abs() - want).abs() <= want * 1.0e-3
         };
-        let bands = cylinder_bands(mesh, &topo);
+        let bands = curved_bands(mesh, &topo);
         if !bands.is_empty() {
-            // The circles are wider than the chords that stood in for them, so the body is
-            // legitimately a little different from the mesh — see `volume_correction`. Expect the
-            // correction rather than tolerate it, so a tube built inside out — which still closes
-            // the shell perfectly well — is still caught.
-            let corrected = want + bands.iter().map(CylBand::volume_correction).sum::<f64>();
+            // A true circle is wider than the chords that stood in for it, so the body is
+            // legitimately a little different from the mesh. That is a correction, not drift — the
+            // part always was meant to have a round hole — and the check has to EXPECT it, or it
+            // would reject its own good work.
+            //
+            // The size of it is measured rather than derived: each exact tube contributes to the
+            // body's volume exactly as the triangles it replaces did, so the difference between
+            // those two contributions is the correction, whatever shape the band is. A formula for
+            // the circle-against-polygon case would not have covered a fillet's torus.
+            let corrected = want
+                + bands
+                    .iter()
+                    .filter_map(|b| band_tube(b).map(|(_, _, v)| v - b.patch_volume))
+                    .sum::<f64>();
             if let Some(s) = mesh_brep(&topo, true, &bands) {
                 if corrected > 1.0e-9 && judge(&s, corrected, diag * 1.0e-5) {
                     return Some(s);
@@ -2903,37 +2975,72 @@ pub fn mesh_to_solid(mesh: &TriMesh) -> Option<KSolid> {
     mesh_brep(&topo, false, &[])
 }
 
-/// Build a band as a real tube: a line on the cylinder swept a whole turn about the axis, the way
-/// truck builds one itself. Returns the three faces and, for each rim, the circle as the tube walks
-/// it — the flat face that meets that rim has to walk it the other way.
+/// Build a band as a real surface of revolution: its generatrix — a line for a cylinder, an arc for
+/// the tube a rolling ball left — swept a whole turn about the axis, the way truck builds one
+/// itself. Returns the faces, each rim as the tube walks it, and what the tube contributes to the
+/// body's volume.
 ///
-/// Hand-rolling this was the obvious approach and it does not work. Three arcs through the rim's own
-/// vertices, revolved, gives a shell truck ACCEPTS as a closed solid and then tessellates
+/// Hand-rolling the sweep was the obvious approach and it does not work. Three arcs through the
+/// rim's own vertices, revolved, gives a shell truck ACCEPTS as a closed solid and then tessellates
 /// inside-out — one face of the three, sometimes two, with no pattern to it: a 48-sided rim came out
 /// right, 49 lost 88% of the volume, 50 was right again, 51 lost 44%, 60 lost 89%. The faces are
 /// geometrically identical either way; what differs is that truck has to recover each boundary
 /// curve's parameters on the revolved surface, and for arcs it did not build itself that search
 /// lands on the wrong branch often enough to be useless. Swept truck's own way it is exact to a
 /// thousandth of a percent at every radius, height and start angle tried.
-fn band_tube(b: &CylBand) -> Option<(Vec<truck_modeling::Face>, [truck_modeling::Wire; 2])> {
+fn band_tube(b: &Band) -> Option<(Vec<truck_modeling::Face>, [truck_modeling::Wire; 2], f64)> {
     let origin = Point3::new(b.origin[0], b.origin[1], b.origin[2]);
     let axis = Vector3::new(b.axis[0], b.axis[1], b.axis[2]);
     let across = if b.axis[0].abs() < 0.9 { Vector3::unit_x() } else { Vector3::unit_y() };
     let out = axis.cross(across).normalize();
-    let seed = builder::vertex(origin + axis * b.w[0] + out * b.radius);
-    let rise = builder::tsweep(&seed, axis * (b.w[1] - b.w[0]));
-    let swept = builder::rsweep(&rise, origin, axis, truck_modeling::Rad(std::f64::consts::TAU));
-    // A bore presents the INSIDE of the tube and a boss the outside, and truck's sweep comes out
-    // bore-side already — measured, because the shell closes either way round: the flat face beside
-    // a rim is given whatever direction the tube leaves it, so a tube built inside-out still makes a
-    // perfectly closed solid, just one with its bore filled in and a collar of material where the
-    // hole should be. The volume check is what catches that, which is why it expects the exact
-    // correction rather than a tolerance.
-    let faces: Vec<truck_modeling::Face> =
-        swept.iter().map(|f| if b.outward { f.inverse() } else { f.clone() }).collect();
+    // The half-plane the surface is revolved from: `g[0]` out from the axis, `g[1]` along it.
+    let at = |g: [f64; 2]| origin + out * g[0] + axis * g[1];
+    let (v0, v1) = (builder::vertex(at(b.gen[0])), builder::vertex(at(b.gen[1])));
+    let gen = match b.surf {
+        Surf::Cylinder { .. } | Surf::Plane { .. } => builder::line(&v0, &v1),
+        Surf::Torus { major, minor, .. } => {
+            // Both rims sit on the tube's cross-section circle, centred at (major, 0) in the
+            // half-plane; the arc between them passes through the point half way round.
+            let ang = |g: [f64; 2]| (g[1]).atan2(g[0] - major);
+            let (a0, a1) = (ang(b.gen[0]), ang(b.gen[1]));
+            // Take the short way round: a rolling-ball fillet never spans more than half the tube.
+            let mut d = a1 - a0;
+            if d > std::f64::consts::PI {
+                d -= std::f64::consts::TAU;
+            } else if d < -std::f64::consts::PI {
+                d += std::f64::consts::TAU;
+            }
+            let mid = a0 + d * 0.5;
+            builder::circle_arc(&v0, &v1, at([major + minor * mid.cos(), minor * mid.sin()]))
+        }
+    };
+    let swept = builder::rsweep(&gen, origin, axis, truck_modeling::Rad(std::f64::consts::TAU));
+    let mut faces: Vec<truck_modeling::Face> = swept.iter().cloned().collect();
 
-    // The tube's own boundary is the two rim circles. Take them with the orientation the tube
-    // gives them, so the flat face that shares a rim can simply walk it backwards.
+    // Which side the material is on is NOT something the shell can check: the flat face beside a rim
+    // is given whatever direction the tube leaves it, so a tube threaded in backwards still closes
+    // into a perfectly valid solid — one with a collar of material where the hole should be.
+    // Nothing complains; only the volume tells you, and it went in backwards first time round.
+    //
+    // So ask the volume directly. A patch's contribution to the body it bounds is the same sum that
+    // gives a closed mesh its volume, and the tube is standing in for the mesh triangles it
+    // replaces: if its contribution comes out with the opposite sign, it is facing the wrong way.
+    let contribution = |fs: &[truck_modeling::Face]| -> Option<f64> {
+        let shell: truck_modeling::Shell = fs.iter().cloned().collect();
+        guard(|| {
+            let mut poly = shell.triangulation(b.gen[0][0].abs().max(1.0) * 1.0e-3).to_polygon();
+            poly.triangulate();
+            Some(signed_mesh_volume(&polymesh_to_trimesh(&poly)))
+        })
+    };
+    let mut vol = contribution(&faces)?;
+    if (vol > 0.0) != (b.patch_volume > 0.0) {
+        faces = faces.iter().map(|f| f.inverse()).collect();
+        vol = -vol;
+    }
+
+    // The tube's own boundary is the two rim circles. Take them with the orientation the tube gives
+    // them, so the flat face that shares a rim can simply walk them backwards.
     let key = |e: &truck_modeling::Edge| {
         let q = |p: Point3| ((p.x * 1.0e5).round() as i64, (p.y * 1.0e5).round() as i64, (p.z * 1.0e5).round() as i64);
         let (a, z) = (q(e.front().point()), q(e.back().point()));
@@ -2954,8 +3061,11 @@ fn band_tube(b: &CylBand) -> Option<(Vec<truck_modeling::Face>, [truck_modeling:
                 if seen.get(&key(e)).copied().unwrap_or(0) != 1 {
                     continue;
                 }
-                let h = (e.front().point() - origin).dot(axis);
-                rims[usize::from((h - b.w[0]).abs() > (h - b.w[1]).abs())].push(e.clone());
+                let p = e.front().point() - origin;
+                let al = p.dot(axis);
+                let rl = (p - axis * al).magnitude();
+                let d = |g: [f64; 2]| (rl - g[0]).powi(2) + (al - g[1]).powi(2);
+                rims[usize::from(d(b.gen[1]) < d(b.gen[0]))].push(e.clone());
             }
         }
     }
@@ -2978,15 +3088,16 @@ fn band_tube(b: &CylBand) -> Option<(Vec<truck_modeling::Face>, [truck_modeling:
         }
         w.is_closed().then_some(w)
     };
-    Some((faces, [chained(&rims[0])?, chained(&rims[1])?]))
+    Some((faces, [chained(&rims[0])?, chained(&rims[1])?], vol))
 }
+
 
 /// The shell itself: one planar face per coplanar group when `merge`, otherwise one per triangle.
 ///
 /// Every face is stitched from ONE `Edge` per undirected vertex pair, shared with whichever face
 /// meets it there — neighbours holding different edge objects give a shell that is not closed,
 /// whatever it looks like.
-fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[CylBand]) -> Option<KSolid> {
+fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[Band]) -> Option<KSolid> {
     use std::collections::HashMap;
     guard(|| {
         let verts: Vec<truck_modeling::Vertex> =
@@ -2996,7 +3107,7 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[CylBand]) -> Option<KSoli
         // Each band as a finished tube, built up front because the SAME edges have to appear both
         // in the tube and in the flat face that meets it: two faces holding equal-looking but
         // separate edges give a shell that is not closed, whatever it looks like.
-        let tubes: Vec<(Vec<truck_modeling::Face>, [truck_modeling::Wire; 2])> =
+        let tubes: Vec<(Vec<truck_modeling::Face>, [truck_modeling::Wire; 2], f64)> =
             bands.iter().map(band_tube).collect::<Option<Vec<_>>>()?;
         // Which flat loop each band replaces, and which faces are the band itself.
         let mut seam_of: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
@@ -3014,7 +3125,7 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[CylBand]) -> Option<KSoli
         let rim_wire = |bi: usize, rim: usize| {
             let mut w = truck_modeling::Wire::new();
             for e in tubes[bi].1[rim].iter().rev() {
-                w.push_back(e.inverse());
+                w.push_back(truck_modeling::Edge::inverse(e));
             }
             w
         };
@@ -3161,7 +3272,7 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[CylBand]) -> Option<KSoli
             }
         }
         // The tubes themselves, in place of the rings of flat strips they were built from.
-        for (tube, _) in tubes {
+        for (tube, _, _) in tubes {
             faces.extend(tube);
         }
         if faces.len() < 4 {
