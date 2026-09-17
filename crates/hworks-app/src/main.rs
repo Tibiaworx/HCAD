@@ -18881,7 +18881,25 @@ fn regenerate_mesh(doc: &Document) -> Option<(TriMesh, Vec<([[f32; 3]; 2], [f32;
                     if *cut {
                         extend_loft_caps(&mut secs);
                     }
+                    // Where the tube BEGINS is the profile's own plane, not a slice square to the
+                    // path — a swept boss starts at the face you drew it on, and starts obliquely
+                    // when the path leaves at an angle.
+                    //
+                    // Rotating the first section into that plane would be the obvious way and it
+                    // does not work: the tube would have to twist through the whole tilt inside one
+                    // step, which for badsweep2 is 17.8 degrees across a 1.5 step with the profile
+                    // reaching 12.5 — sections crossing each other, which is the very fault this
+                    // came from. So the tube is run on PAST the plane and then cut back to it,
+                    // which is what a trimmed start face actually is.
+                    let trim = (!*cut).then(|| start_cap_trim(profile, &secs)).flatten();
+                    if let Some((back, _)) = &trim {
+                        secs.insert(0, back.clone());
+                    }
                     if let Some(m) = loft_mesh(&secs) {
+                        let m = match &trim {
+                            Some((_, knife)) => mesh_difference(&m, knife),
+                            None => m,
+                        };
                         body = match body.take() {
                             Some(b) => {
                                 let joined = if *cut { mesh_difference(&b, &m) } else { mesh_union(&b, &m) };
@@ -21718,6 +21736,59 @@ fn loft_profile_loops(p: &LoftProfile) -> Option<(Vec<[f64; 3]>, Vec<Vec<[f64; 3
     let outer = r.outer.iter().map(to3).collect();
     let holes = r.holes.iter().map(|h| h.iter().map(to3).collect()).collect();
     Some((outer, holes))
+}
+
+/// The overshoot section and the knife that together start a sweep on its PROFILE's plane.
+///
+/// `None` when the path already leaves square to that plane (there is nothing to trim, and cutting
+/// along a face the tube is already flush with is exactly the coincident-face boolean the mesh
+/// kernel is worst at), or when it leaves so nearly parallel that there is no sensible start face.
+fn start_cap_trim(
+    profile: &LoftProfile,
+    secs: &[(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)],
+) -> Option<((Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>), TriMesh)> {
+    let (a, b) = (secs.first()?, secs.get(1)?);
+    let cen = |s: &(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)| {
+        let n = s.0.len().max(1) as f64;
+        [0, 1, 2].map(|k| s.0.iter().map(|p| p[k]).sum::<f64>() / n)
+    };
+    let (c0, c1) = (cen(a), cen(b));
+    let dir = {
+        let d = [c1[0] - c0[0], c1[1] - c0[1], c1[2] - c0[2]];
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if l < 1.0e-9 {
+            return None;
+        }
+        [d[0] / l, d[1] / l, d[2] / l]
+    };
+    let n = profile.plane.normal;
+    let along = dir[0] * n[0] + dir[1] * n[1] + dir[2] * n[2];
+    // Square to the plane already, or running along it: leave it alone either way.
+    if along.abs() > 0.9998 || along.abs() < 0.05 {
+        return None;
+    }
+    // How far the plane's slant reaches across the tube, so the overshoot clears it everywhere.
+    let reach = a.0.iter().map(|p| {
+        let d = [p[0] - c0[0], p[1] - c0[1], p[2] - c0[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+    }).fold(0.0f64, f64::max);
+    let tilt = (1.0 - along * along).sqrt() / along.abs(); // tan of the angle off the normal
+    let ext = (reach * tilt).max(reach * 0.05) * 1.5 + 1.0e-3;
+    let back = {
+        let shift = |l: &[[f64; 3]]| -> Vec<[f64; 3]> {
+            l.iter().map(|p| [p[0] - dir[0] * ext, p[1] - dir[1] * ext, p[2] - dir[2] * ext]).collect()
+        };
+        (shift(&a.0), a.1.iter().map(|h| shift(h)).collect())
+    };
+    // The knife: a slab filling the half-space BEHIND the plane, on the side the tube came from.
+    let basis = basis_from_ref(&profile.plane);
+    let w = reach * 4.0 + 1.0;
+    let square = vec![[-w, -w], [w, -w], [w, w], [-w, w]];
+    let depth = ext * 4.0 + reach + 1.0;
+    // `along` says which way the path leaves the plane, so the material to remove is the other way.
+    let (start, len) = if along > 0.0 { (-depth, depth) } else { (0.0, depth) };
+    let knife = extrude_tool_mesh(&square, &[], &basis, start, len)?;
+    Some((back, knife))
 }
 
 /// Extend a loft's end caps outward along the loft direction by a small overshoot, so a loft *cut*
@@ -36390,6 +36461,51 @@ mod tests {
             apart > 1.0,
             "the fallback skinned the same cross-section after all, so this test proves nothing"
         );
+    }
+
+    /// A swept tube starts on the plane its profile was drawn on.
+    ///
+    /// A swept boss begins at the face you drew it on, and begins OBLIQUELY when the path leaves at
+    /// an angle -- the same as a pipe leaving a flange. Starting it square to the path instead
+    /// leaves the cap visibly cocked over relative to the sketch, which is what badsweep2 shows:
+    /// its guide sets off 17.8 degrees away from the profile plane's normal.
+    ///
+    /// Rotating the first section into the plane is the obvious fix and does not work -- the tube
+    /// would twist through the whole tilt inside one step and cross itself. It is run past the
+    /// plane and cut back to it instead, which is what a trimmed start face is.
+    #[test]
+    fn a_swept_tube_starts_on_its_profiles_plane() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/badsweep2.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/badsweep2.hcad is a fixture -- force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse badsweep2.hcad");
+        let sweep = doc
+            .features
+            .iter()
+            .find_map(|f| match &f.kind {
+                FeatureKind::Sweep { profile, .. } => Some(profile.plane.clone()),
+                _ => None,
+            })
+            .expect("badsweep2 has a sweep");
+        let (m, _) = regenerate_mesh(&doc).expect("swept tube");
+
+        // Signed distance from the profile's plane, for every vertex of the body.
+        let (o, n) = (sweep.origin, sweep.normal);
+        let sd = |p: &[f32; 3]| {
+            (p[0] as f64 - o[0]) * n[0] + (p[1] as f64 - o[1]) * n[1] + (p[2] as f64 - o[2]) * n[2]
+        };
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for p in &m.positions {
+            lo = lo.min(sd(p));
+            hi = hi.max(sd(p));
+        }
+        // The path leaves on the +normal side here, so nothing may sit behind the plane...
+        assert!(lo > -1.0e-3, "the tube runs {lo:.4} behind the plane its profile was drawn on");
+        assert!(hi > 1.0, "the tube did not get built at all (it spans {lo:.4}..{hi:.4})");
+        // ...and the start face has to actually BE on it, not merely near it.
+        let on_plane = m.positions.iter().filter(|p| sd(p).abs() < 1.0e-3).count();
+        assert!(on_plane > 20, "only {on_plane} vertices lie on the profile plane -- there is no start face there");
     }
 
     /// A tube that cannot follow its own path says so instead of tying a knot.
