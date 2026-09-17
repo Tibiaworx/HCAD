@@ -30141,6 +30141,7 @@ mod tests {
                 [0, 1, 2].map(|k| s.0.iter().map(|p| p[k]).sum::<f64>() / n)
             };
             let d3 = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            let sub3 = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
             // The profile's reach: how far its outline sits from its own centre.
             let c0 = cen(&secs[0]);
             let reach = secs[0].0.iter().map(|p| d3(*p, c0)).fold(0.0f64, f64::max);
@@ -30229,6 +30230,18 @@ mod tests {
             let smin = steps.iter().cloned().fold(f64::MAX, f64::min);
             let smax = steps.iter().cloned().fold(0.0, f64::max);
             eprintln!("    path steps: {} of them, shortest {smin:.3e}, longest {smax:.3e}", steps.len());
+            let cs: Vec<[f64; 3]> = secs.iter().map(cen).collect();
+            eprintln!("    first 8 path points: {:?}", cs.iter().take(8).map(|c| [(c[0] * 100.0).round() / 100.0, (c[1] * 100.0).round() / 100.0, (c[2] * 100.0).round() / 100.0]).collect::<Vec<_>>());
+            let turn: Vec<f64> = (1..cs.len() - 1)
+                .map(|i| {
+                    let (a, b) = (sub3(cs[i], cs[i - 1]), sub3(cs[i + 1], cs[i]));
+                    let (la, lb) = (d3(cs[i], cs[i - 1]), d3(cs[i], cs[i + 1]));
+                    if la < 1e-9 || lb < 1e-9 { return 0.0; }
+                    let c = ((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb)).clamp(-1.0, 1.0);
+                    c.acos().to_degrees()
+                })
+                .collect();
+            eprintln!("    turn per station (deg): {:?}", turn.iter().take(12).map(|t| (t * 10.0).round() / 10.0).collect::<Vec<_>>());
 
             // And what the skin came out as.
             match hworks_geometry::loft_mesh(&secs) {

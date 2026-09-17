@@ -1001,27 +1001,60 @@ pub fn tessellate_spline(pts: &[[f64; 2]], closed: bool, control: bool) -> Vec<[
             }
         }
     } else {
-        // Catmull-Rom through the points.
+        // CENTRIPETAL Catmull-Rom through the points.
+        //
+        // The uniform version — the classic basis weights, every span given equal parameter
+        // regardless of how long it is — overshoots badly when the spans are unequal, because the
+        // tangent it builds at a junction is the chord between that point's NEIGHBOURS, which is
+        // far too long for a short span next to a long one. A guide drawn through three points
+        // 24.8 and 74.6 apart left its first point heading the right way, got yanked round by the
+        // oversized tangent, and swung back: a curl of radius 5.5 at the very start of a curve
+        // that is otherwise gentle. Swept, that curl is tighter than the tube is wide, so the tube
+        // passed through itself — and it was the spline's doing, not the drawing's.
+        //
+        // Parameterising by the square root of each chord (alpha = 0.5) is the standard cure and
+        // is PROVEN never to cusp or self-intersect, which uniform and chordal both can.
+        let alpha = 0.5f64;
+        // Phantom points beyond the ends by reflection, so an open spline still gets a smooth,
+        // well-conditioned end. (Duplicating the endpoint instead, as the uniform version did,
+        // gives a zero-length span — and centripetal knots cannot divide by that.)
         let get = |i: isize| -> [f64; 2] {
             if closed {
                 pts[(((i % n as isize) + n as isize) % n as isize) as usize]
+            } else if i < 0 {
+                [2.0 * pts[0][0] - pts[1][0], 2.0 * pts[0][1] - pts[1][1]]
+            } else if i as usize >= n {
+                [2.0 * pts[n - 1][0] - pts[n - 2][0], 2.0 * pts[n - 1][1] - pts[n - 2][1]]
             } else {
-                pts[i.clamp(0, n as isize - 1) as usize]
+                pts[i as usize]
             }
+        };
+        let knot = |a: [f64; 2], b: [f64; 2]| {
+            let d = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+            // Coincident points would collapse a span; give them a nominal one so the curve still
+            // evaluates rather than dividing by zero.
+            d.powf(alpha).max(1.0e-9)
         };
         let segs = if closed { n } else { n - 1 };
         for s in 0..segs {
             let q = [get(s as isize - 1), get(s as isize), get(s as isize + 1), get(s as isize + 2)];
-            for t in 0..STEPS {
-                let u = t as f64 / STEPS as f64;
-                let (u2, u3) = (u * u, u * u * u);
-                let w = [
-                    0.5 * (-u + 2.0 * u2 - u3),
-                    0.5 * (2.0 - 5.0 * u2 + 3.0 * u3),
-                    0.5 * (u + 4.0 * u2 - 3.0 * u3),
-                    0.5 * (-u2 + u3),
-                ];
-                out.push(lerp4(w, q));
+            let t0 = 0.0;
+            let t1 = t0 + knot(q[0], q[1]);
+            let t2 = t1 + knot(q[1], q[2]);
+            let t3 = t2 + knot(q[2], q[3]);
+            // Barry-Goldman: three nested lerps over the knot spans.
+            let mix = |a: [f64; 2], b: [f64; 2], ta: f64, tb: f64, t: f64| -> [f64; 2] {
+                let w = (t - ta) / (tb - ta);
+                [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w]
+            };
+            for k in 0..STEPS {
+                let t = t1 + (t2 - t1) * (k as f64 / STEPS as f64);
+                let a1 = mix(q[0], q[1], t0, t1, t);
+                let a2 = mix(q[1], q[2], t1, t2, t);
+                let a3 = mix(q[2], q[3], t2, t3, t);
+                let b1 = mix(a1, a2, t0, t2, t);
+                let b2 = mix(a2, a3, t1, t3, t);
+                out.push(mix(b1, b2, t1, t2, t));
             }
         }
         if !closed {
@@ -2302,6 +2335,61 @@ impl Sketch {
 
 #[cfg(test)]
 mod tests {
+
+    /// A spline through unevenly spaced points does not lurch.
+    ///
+    /// UNIFORM Catmull-Rom gives every span the same slice of parameter however long it is, and
+    /// builds its tangent at a junction from the chord between that point's NEIGHBOURS. Put a short
+    /// span next to a long one and that tangent is far too long for the short span, so the curve
+    /// overshoots and swings back.
+    ///
+    /// badsweep2.hcad is three points 24.8 and 74.6 apart -- a 3:1 ratio, which is nothing unusual
+    /// for a drawn guide. The curve left the first point heading the right way, got yanked round,
+    /// and came back: a curl of radius 5.5 at the very start of a curve that is otherwise gentle.
+    /// Swept as a guide, that curl was tighter than the tube was wide and the tube passed through
+    /// itself, which read as a solver fault rather than a spline one.
+    ///
+    /// Centripetal parameterisation is the standard cure and is proven never to cusp or loop.
+    #[test]
+    fn a_spline_through_uneven_points_does_not_overshoot() {
+        let pts = [[0.0, 0.0], [8.05, 23.433], [68.307, 67.443]];
+        let poly = tessellate_spline(&pts, false, false);
+        assert!(poly.len() > 8, "expected a tessellated curve, got {} point(s)", poly.len());
+
+        // It still passes through every point it was drawn through -- that is what interpolating
+        // means, and centripetal parameterisation must not cost it.
+        for p in &pts {
+            let near = poly
+                .iter()
+                .map(|q| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt())
+                .fold(f64::MAX, f64::min);
+            assert!(near < 1.0e-6, "the curve misses {p:?} by {near:.3e}");
+        }
+
+        // The turn at each step, as a sweep would see it. The overshoot showed as a single spike
+        // near the start -- 8.4 degrees where its neighbours were under 3.
+        let turn: Vec<f64> = (1..poly.len() - 1)
+            .filter_map(|i| {
+                let (a, b) = (
+                    [poly[i][0] - poly[i - 1][0], poly[i][1] - poly[i - 1][1]],
+                    [poly[i + 1][0] - poly[i][0], poly[i + 1][1] - poly[i][1]],
+                );
+                let (la, lb) = ((a[0] * a[0] + a[1] * a[1]).sqrt(), (b[0] * b[0] + b[1] * b[1]).sqrt());
+                (la > 1.0e-9 && lb > 1.0e-9)
+                    .then(|| ((a[0] * b[0] + a[1] * b[1]) / (la * lb)).clamp(-1.0, 1.0).acos().to_degrees())
+            })
+            .collect();
+        let worst = turn.iter().cloned().fold(0.0f64, f64::max);
+        assert!(worst < 5.0, "the curve turns {worst:.1} degrees in one step -- it is overshooting");
+
+        // ...and it leaves the first point heading for the second, rather than off to one side.
+        let start = [poly[1][0] - poly[0][0], poly[1][1] - poly[0][1]];
+        let want = [pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]];
+        let cosang = (start[0] * want[0] + start[1] * want[1])
+            / ((start[0] * start[0] + start[1] * start[1]).sqrt() * (want[0] * want[0] + want[1] * want[1]).sqrt());
+        let off = cosang.clamp(-1.0, 1.0).acos().to_degrees();
+        assert!(off < 3.0, "the curve sets off {off:.1} degrees away from the point it is aimed at");
+    }
     use super::*;
 
     #[test]

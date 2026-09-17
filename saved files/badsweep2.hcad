@@ -1,0 +1,249 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (3),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 12.5,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 9.500000000000275,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Radius(
+                            center: 0,
+                            value: 12.5,
+                            diameter: true,
+                            label: (0.0, 0.0),
+                        ),
+                        Coincident(1, 0),
+                        CircleDistance(
+                            a: 1,
+                            b: 0,
+                            value: 3.0,
+                            mode: 2,
+                            offset: -0.16011428833007813,
+                        ),
+                    ],
+                ),
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+            ),
+            hidden: false,
+        ),
+        (
+            id: (4),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 8.050111770629883,
+                            y: 23.43276596069336,
+                            fixed: false,
+                        ),
+                        (
+                            x: 68.30747985839844,
+                            y: 67.44303894042969,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Spline(
+                            points: [
+                                0,
+                                1,
+                                2,
+                            ],
+                            closed: false,
+                            construction: false,
+                            control: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 1.0, 0.0),
+                    normal: (0.0, 0.0, 1.0),
+                    datum: true,
+                ),
+            ),
+            hidden: false,
+        ),
+        (
+            id: (5),
+            kind: Sweep(
+                profile: (
+                    sketch: (
+                        points: [
+                            (
+                                x: 0.0,
+                                y: 0.0,
+                                fixed: true,
+                            ),
+                            (
+                                x: 0.0,
+                                y: 0.0,
+                                fixed: false,
+                            ),
+                        ],
+                        entities: [
+                            Point(
+                                at: 0,
+                            ),
+                            Circle(
+                                center: 0,
+                                radius: 12.5,
+                                construction: false,
+                            ),
+                            Circle(
+                                center: 1,
+                                radius: 9.500000000000275,
+                                construction: false,
+                            ),
+                        ],
+                        constraints: [
+                            Radius(
+                                center: 0,
+                                value: 12.5,
+                                diameter: true,
+                                label: (0.0, 0.0),
+                            ),
+                            Coincident(1, 0),
+                            CircleDistance(
+                                a: 1,
+                                b: 0,
+                                value: 3.0,
+                                mode: 2,
+                                offset: -0.16011428833007813,
+                            ),
+                        ],
+                    ),
+                    plane: (
+                        origin: (0.0, 0.0, 0.0),
+                        u: (1.0, 0.0, 0.0),
+                        v: (0.0, 0.0, -1.0),
+                        normal: (-0.0, 1.0, 0.0),
+                        datum: true,
+                    ),
+                    region: 0,
+                ),
+                path_sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 8.050111770629883,
+                            y: 23.43276596069336,
+                            fixed: false,
+                        ),
+                        (
+                            x: 68.30747985839844,
+                            y: 67.44303894042969,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Spline(
+                            points: [
+                                0,
+                                1,
+                                2,
+                            ],
+                            closed: false,
+                            construction: false,
+                            control: false,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                path_plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 1.0, 0.0),
+                    normal: (0.0, 0.0, 1.0),
+                    datum: true,
+                ),
+                cut: false,
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 6,
+    next_id: 6,
+)
