@@ -11313,6 +11313,7 @@ fn shell_overlays(
             let _ = take_fallback_count();
             let _ = hworks_geometry::take_loft_hole_mismatch_count();
             let _ = take_sweep_region_fallbacks();
+            let _ = take_loft_region_fallbacks();
             let _ = take_cut_direction_guesses();
             let _ = take_gear_failures();
             match result.filter(|m| !m.positions.is_empty()) {
@@ -17085,6 +17086,10 @@ fn handle_file_io(
             let _ = take_gear_failures();
             let _ = take_nonmanifold_bodies();
             let _ = hworks_geometry::take_loft_hole_mismatch_count();
+            // These two were missing, which is the same fault in the other direction: an export
+            // that fell back would leave the count standing for the next rebuild to blame.
+            let _ = take_sweep_region_fallbacks();
+            let _ = take_loft_region_fallbacks();
         }
         // ...and then COMPARE, rather than assuming the exact kernel wins. Curved surfaces win
         // outright when either route has any; past that, the smaller file.
@@ -19026,6 +19031,8 @@ fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
 /// on the path (its own centroid rides the path points).
 /// Sweeps that fell back to a different profile region because the recorded one was gone.
 static SWEEP_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Loft profiles that fell back to a different region because the recorded one was gone.
+static LOFT_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Rebuilds that left the body non-manifold — pinched, or with a surface touching itself.
 static NONMANIFOLD_BODIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -19038,6 +19045,10 @@ static CUT_DIRECTION_GUESSES: std::sync::atomic::AtomicU32 = std::sync::atomic::
 
 fn take_sweep_region_fallbacks() -> u32 {
     SWEEP_REGION_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn take_loft_region_fallbacks() -> u32 {
+    LOFT_REGION_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn take_cut_direction_guesses() -> u32 {
@@ -19502,6 +19513,7 @@ fn finish_regen_job(
             // result looks perfectly fine and is simply wrong — so they are reported first.
             let loft_holes = hworks_geometry::take_loft_hole_mismatch_count();
             let sweep_regions = take_sweep_region_fallbacks();
+            let loft_regions = take_loft_region_fallbacks();
             let cut_guesses = take_cut_direction_guesses();
             let gear_fails = take_gear_failures();
             let pinched = take_nonmanifold_bodies();
@@ -19525,6 +19537,11 @@ fn finish_regen_job(
                 warn!("{sweep_regions} sweep(s) fell back to a different profile region.");
                 Some(format!(
                     "⚠ {sweep_regions} sweep(s) used the WRONG profile: the region they recorded no longer exists (the profile sketch was edited), so the first one was swept instead. Reopen the sweep and re-pick its profile."
+                ))
+            } else if loft_regions > 0 {
+                warn!("{loft_regions} loft profile(s) fell back to a different region.");
+                Some(format!(
+                    "⚠ {loft_regions} loft profile(s) used the WRONG cross-section: the region they recorded no longer exists (the profile sketch was edited), so the first one was skinned instead. Reopen the loft and re-pick its profiles."
                 ))
             } else if cut_guesses > 0 {
                 warn!("{cut_guesses} cut(s) guessed their direction.");
@@ -21569,7 +21586,22 @@ fn basis_from_ref(p: &PlaneRef) -> PlaneBasis {
 /// through the profile's plane). `None` if the sketch has no usable closed region.
 fn loft_profile_loops(p: &LoftProfile) -> Option<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> {
     let regions = p.sketch.regions();
-    let r = regions.get(p.region).or_else(|| regions.first())?;
+    // A stale region index means the profile sketch was edited after the loft was made. Falling
+    // through to `regions.first()` skins a DIFFERENT cross-section than the feature recorded,
+    // silently — the loft still builds, just not the shape asked for. Count it so the app can say
+    // the profile moved, the same way a sweep does.
+    let r = match regions.get(p.region) {
+        Some(r) => r,
+        None => {
+            LOFT_REGION_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "Loft: profile region {} no longer exists ({} region(s) in the sketch) — using the first.",
+                p.region,
+                regions.len()
+            );
+            regions.first()?
+        }
+    };
     let (o, u, v) = (p.plane.origin, p.plane.u, p.plane.v);
     let to3 = |uv: &[f64; 2]| [o[0] + u[0] * uv[0] + v[0] * uv[1], o[1] + u[1] * uv[0] + v[1] * uv[1], o[2] + u[2] * uv[0] + v[2] * uv[1]];
     let outer = r.outer.iter().map(to3).collect();
@@ -36015,6 +36047,51 @@ mod tests {
     }
 
     #[test]
+    /// A loft whose profile lost the region it recorded says so.
+    ///
+    /// The index is stored, not the shape, so editing a profile sketch can leave it pointing at a
+    /// region that no longer exists. Falling through to the first one skins a DIFFERENT
+    /// cross-section than the feature asked for — and the loft still builds, so the only clue is
+    /// that the part looks wrong. A sweep has counted this since it was found there; a loft did it
+    /// silently, which is the same fault one feature over.
+    #[test]
+    fn a_loft_says_when_its_profile_lost_its_region() {
+        let _guard = counter_lock();
+        let _ = take_loft_region_fallbacks(); // clear anything a previous test left
+        // Two regions, so falling back to the first is a real change of shape, not a no-op.
+        let mut sk = Sketch::default();
+        let a = sk.add_point(0.0, 0.0);
+        sk.add_circle(a, 2.0);
+        let b = sk.add_point(20.0, 0.0);
+        sk.add_circle(b, 5.0);
+        assert_eq!(sk.regions().len(), 2, "this test needs two regions to tell the difference");
+
+        let good = LoftProfile { sketch: sk.clone(), plane: standard_plane_ref(2), region: 1 };
+        assert!(loft_profile_loops(&good).is_some());
+        assert_eq!(take_loft_region_fallbacks(), 0, "a region that exists is not a fallback");
+
+        // The same profile with its region edited out from under it.
+        let stale = LoftProfile { sketch: sk, plane: standard_plane_ref(2), region: 7 };
+        let got = loft_profile_loops(&stale).expect("it still builds, on the first region");
+        assert_eq!(take_loft_region_fallbacks(), 1, "the loft swapped cross-section without a word");
+
+        // ...and it really is a different shape, so the warning is not pedantry. The two circles
+        // sit 20 apart, so where the skinned loop ENDED UP says which one was used — comparing
+        // point counts would not, since both tessellate to the same number.
+        let cen = |l: &[[f64; 3]]| {
+            let n = l.len() as f64;
+            [0, 1, 2].map(|k| l.iter().map(|p| p[k]).sum::<f64>() / n)
+        };
+        let asked = loft_profile_loops(&good).expect("region 1");
+        let _ = take_loft_region_fallbacks();
+        let (g, a) = (cen(&got.0), cen(&asked.0));
+        let apart = ((g[0] - a[0]).powi(2) + (g[1] - a[1]).powi(2) + (g[2] - a[2]).powi(2)).sqrt();
+        assert!(
+            apart > 1.0,
+            "the fallback skinned the same cross-section after all, so this test proves nothing"
+        );
+    }
+
     fn sweep_builds_a_tube_along_an_l_path() {
         // A Ø4 circle swept along an L path (20 along X, then 20 along Y) ≈ π·r²·length.
         let mut doc = Document::with_default_planes();
