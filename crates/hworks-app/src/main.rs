@@ -24099,12 +24099,48 @@ fn draw_feature_previews(
         }
         return;
     }
+    const PICK_PALETTE: [Color; 4] = [
+        Color::srgb(0.95, 0.85, 0.25),
+        Color::srgb(0.25, 0.9, 0.95),
+        Color::srgb(0.9, 0.5, 0.95),
+        Color::srgb(0.4, 0.95, 0.5),
+    ];
     if let Some(profiles) = &ui_state.loft_spec {
-        let palette = [Color::srgb(0.95, 0.85, 0.25), Color::srgb(0.25, 0.9, 0.95), Color::srgb(0.9, 0.5, 0.95), Color::srgb(0.4, 0.95, 0.5)];
         for (n, &(fi, region)) in profiles.iter().enumerate() {
             if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(fi).map(|f| &f.kind) {
-                draw_stored_sketch(&mut gizmos, sketch, plane, palette[n % palette.len()], Some(region));
+                draw_stored_sketch(&mut gizmos, sketch, plane, PICK_PALETTE[n % PICK_PALETTE.len()], Some(region));
             }
+        }
+        return;
+    }
+    // A sweep is picked from two DIFFERENT sketches on two different planes, and picking them from
+    // a list told you nothing about where they were. Both are drawn while the dialog is open, in
+    // the same two colours the loft picker uses for its first two profiles: the profile with its
+    // chosen contour picked out, the path plain.
+    if let Some(spec) = &ui_state.sweep_spec {
+        let show = |gizmos: &mut Gizmos, which: Option<usize>, colour: Color, region: Option<usize>| {
+            let Some(fi) = which else { return };
+            if let Some(FeatureKind::Sketch { sketch, plane }) = doc.0.features.get(fi).map(|f| &f.kind) {
+                draw_stored_sketch(gizmos, sketch, plane, colour, region);
+            }
+        };
+        // Re-opening a sweep leaves both pickers on "(keep stored)", because its sketches are held
+        // by value rather than by reference. Draw the ones it is holding, or editing one would show
+        // nothing at all until you re-picked — the opposite of the point.
+        let stored = ui_state
+            .editing_feature
+            .and_then(|i| doc.0.features.get(i))
+            .and_then(|f| match &f.kind {
+                FeatureKind::Sweep { profile, path_sketch, path_plane, .. } => Some((profile, path_sketch, path_plane)),
+                _ => None,
+            });
+        match (spec.profile, stored) {
+            (None, Some((p, _, _))) => draw_stored_sketch(&mut gizmos, &p.sketch, &p.plane, PICK_PALETTE[0], Some(spec.region)),
+            _ => show(&mut gizmos, spec.profile, PICK_PALETTE[0], Some(spec.region)),
+        }
+        match (spec.path, stored) {
+            (None, Some((_, sk, pl))) => draw_stored_sketch(&mut gizmos, sk, pl, PICK_PALETTE[1], None),
+            _ => show(&mut gizmos, spec.path, PICK_PALETTE[1], None),
         }
         return;
     }
