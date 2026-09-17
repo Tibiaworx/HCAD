@@ -19026,9 +19026,6 @@ fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
     Some(path)
 }
 
-/// Build the sweep's loft sections: the profile region carried along the path with
-/// parallel-transport (rotation-minimising) frames, holes included. The profile is centred
-/// on the path (its own centroid rides the path points).
 /// Sweeps that fell back to a different profile region because the recorded one was gone.
 static SWEEP_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Loft profiles that fell back to a different region because the recorded one was gone.
@@ -19220,30 +19217,63 @@ fn footprint_cut_side(mesh: &TriMesh, plane: &PlaneRef, regs: &[hworks_sketch::R
     CutSide::Unknown
 }
 
+/// Build the sweep's loft sections: the profile region carried along the path with
+/// parallel-transport (rotation-minimising) frames, holes included. The profile is centred
+/// on the path (its own centroid rides the path points).
+///
+/// In f64 throughout, which is not fussiness. A section is mathematically planar however it is
+/// framed — it is two fixed vectors spanning a plane — but computing its points in f32 quantises
+/// them onto a grid about 6e-7 wide at the sizes parts are drawn at, and that fuzz IS the section's
+/// thickness. truck refuses to cap a wire more than 1e-6 thick, so the far end of a sweep came back
+/// open: badsweep.hcad's last section measured 1.46e-6 across, just over, and its cap was silently
+/// dropped while the near one (whose frame happens to land on the axes, where f32 rounding keeps
+/// the points exactly coplanar) capped fine. In f64 the same section is thick to about 1e-15.
 fn sweep_sections(
     profile: &LoftProfile,
     path_sketch: &Sketch,
     path_plane: &PlaneRef,
 ) -> Option<Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)>> {
+    type V = [f64; 3];
+    let sub = |a: V, b: V| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let add = |a: V, b: V| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+    let mul = |a: V, s: f64| [a[0] * s, a[1] * s, a[2] * s];
+    let dot = |a: V, b: V| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross = |a: V, b: V| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let norm = |a: V| {
+        let l = dot(a, a).sqrt();
+        if l > 1.0e-12 { mul(a, 1.0 / l) } else { [0.0; 3] }
+    };
+    let dist2 = |a: V, b: V| dot(sub(a, b), sub(a, b));
+    // Any unit vector across `t`: take the axis it leans on least, so the cross is well conditioned.
+    let across = |t: V| {
+        let a = if t[0].abs() <= t[1].abs() && t[0].abs() <= t[2].abs() {
+            [1.0, 0.0, 0.0]
+        } else if t[1].abs() <= t[2].abs() {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        norm(cross(t, a))
+    };
+
     let path2 = sketch_open_path(path_sketch)?;
     // Path to world through its plane.
-    let po = Vec3::new(path_plane.origin[0] as f32, path_plane.origin[1] as f32, path_plane.origin[2] as f32);
-    let pu = Vec3::new(path_plane.u[0] as f32, path_plane.u[1] as f32, path_plane.u[2] as f32);
-    let pv = Vec3::new(path_plane.v[0] as f32, path_plane.v[1] as f32, path_plane.v[2] as f32);
-    let mut pts: Vec<Vec3> = path2.iter().map(|p| po + pu * p[0] as f32 + pv * p[1] as f32).collect();
-    pts.dedup_by(|a, b| a.distance_squared(*b) < 1e-10);
+    let (po, pu, pv) = (path_plane.origin, path_plane.u, path_plane.v);
+    let mut pts: Vec<V> = path2.iter().map(|p| add(po, add(mul(pu, p[0]), mul(pv, p[1])))).collect();
+    pts.dedup_by(|a, b| dist2(*a, *b) < 1e-10);
     if pts.len() < 2 {
         return None;
     }
     // Split long straight runs so the tube bends smoothly through dense corners elsewhere.
-    let total: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let total: f64 = pts.windows(2).map(|w| dist2(w[0], w[1]).sqrt()).sum();
     let max_seg = (total / 24.0).max(1e-4);
-    let mut dense: Vec<Vec3> = vec![pts[0]];
+    let mut dense: Vec<V> = vec![pts[0]];
     for w in pts.windows(2) {
-        let d = w[0].distance(w[1]);
+        let d = dist2(w[0], w[1]).sqrt();
         let n = (d / max_seg).ceil() as usize;
         for k in 1..=n.max(1) {
-            dense.push(w[0].lerp(w[1], k as f32 / n.max(1) as f32));
+            let t = k as f64 / n.max(1) as f64;
+            dense.push(add(w[0], mul(sub(w[1], w[0]), t)));
         }
     }
     let pts = dense;
@@ -19278,30 +19308,29 @@ fn sweep_sections(
     // Frames: tangents by central difference; initial in-plane axes from the PROFILE plane's
     // own u/v (projected ⊥ the start tangent) so the drawn orientation carries over; then
     // parallel-transport so the section never spins about the path.
-    let tangent = |i: usize| -> Vec3 {
+    let tangent = |i: usize| -> V {
         let a = if i == 0 { pts[0] } else { pts[i - 1] };
         let b = if i + 1 == pts.len() { pts[i] } else { pts[i + 1] };
-        (b - a).normalize_or_zero()
+        norm(sub(b, a))
     };
     let t0 = tangent(0);
-    let prof_u = Vec3::new(profile.plane.u[0] as f32, profile.plane.u[1] as f32, profile.plane.u[2] as f32);
-    let mut fu = (prof_u - t0 * prof_u.dot(t0)).normalize_or_zero();
-    if fu == Vec3::ZERO {
-        fu = t0.any_orthonormal_vector();
+    let prof_u = profile.plane.u;
+    let mut fu = norm(sub(prof_u, mul(t0, dot(prof_u, t0))));
+    if fu == [0.0; 3] {
+        fu = across(t0);
     }
     let mut secs: Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = Vec::with_capacity(pts.len());
     for i in 0..pts.len() {
         let t = tangent(i);
-        if t != Vec3::ZERO {
-            fu = (fu - t * fu.dot(t)).normalize_or_zero();
-            if fu == Vec3::ZERO {
-                fu = t.any_orthonormal_vector();
+        if t != [0.0; 3] {
+            fu = norm(sub(fu, mul(t, dot(fu, t))));
+            if fu == [0.0; 3] {
+                fu = across(t);
             }
         }
-        let fv = t.cross(fu).normalize_or_zero();
+        let fv = norm(cross(t, fu));
         let place = |p: &[f64; 2]| -> [f64; 3] {
-            let w = pts[i] + fu * (p[0] - cen[0]) as f32 + fv * (p[1] - cen[1]) as f32;
-            [w.x as f64, w.y as f64, w.z as f64]
+            add(pts[i], add(mul(fu, p[0] - cen[0]), mul(fv, p[1] - cen[1])))
         };
         let outer: Vec<[f64; 3]> = r.outer.iter().map(&place).collect();
         let holes: Vec<Vec<[f64; 3]>> = r.holes.iter().map(|h| h.iter().map(&place).collect()).collect();
@@ -23900,7 +23929,22 @@ fn draw_feature_previews(
         }
     }
     if session.plane.is_some() {
-        return; // the live sketch already draws itself
+        // The live sketch draws itself — but the OTHERS were drawn by nobody, and a sketch you
+        // cannot see is a sketch you cannot line anything up with. A profile on one plane and a
+        // guide curve on another is the ordinary way to build a swept tube, and it meant drawing
+        // the second one blind and hoping.
+        //
+        // Dim, and behind the live geometry, so it reads as reference rather than as something
+        // you can grab. Per-sketch hide already exists in the tree for when it IS too much.
+        for (i, f) in doc.0.features.iter().enumerate() {
+            if Some(i) == session.editing || f.hidden {
+                continue;
+            }
+            if let FeatureKind::Sketch { sketch, plane } = &f.kind {
+                draw_stored_sketch(&mut gizmos, sketch, plane, Color::srgba(0.45, 0.55, 0.70, 0.5), None);
+            }
+        }
+        return;
     }
     if let Some(profiles) = &ui_state.loft_spec {
         let palette = [Color::srgb(0.95, 0.85, 0.25), Color::srgb(0.25, 0.9, 0.95), Color::srgb(0.9, 0.5, 0.95), Color::srgb(0.4, 0.95, 0.5)];
@@ -29989,6 +30033,168 @@ mod tests {
         );
     }
 
+    /// PROBE: what a sweep actually builds, and where it goes wrong.
+    ///
+    /// Two symptoms have clear signatures. A torn or missing CAP shows as boundary edges — edges
+    /// with only one triangle. A PINCH shows as non-manifold edges, and its usual cause is a path
+    /// that turns tighter than the profile is wide: the sections on the inside of the bend overlap
+    /// each other, so the tube passes through itself.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_sweep_health -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_sweep_health() {
+        let _guard = counter_lock();
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let doc: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for (fi, f) in doc.features.iter().enumerate() {
+            let FeatureKind::Sweep { profile, path_sketch, path_plane, cut } = &f.kind else { continue };
+            let Some(secs) = sweep_sections(profile, path_sketch, path_plane) else {
+                eprintln!("  feature {fi}: sweep_sections returned None");
+                continue;
+            };
+            eprintln!("  feature {fi}: {} section(s), cut={cut}", secs.len());
+            // The path, as the sections' centres.
+            let cen = |s: &(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)| {
+                let n = s.0.len() as f64;
+                [0, 1, 2].map(|k| s.0.iter().map(|p| p[k]).sum::<f64>() / n)
+            };
+            let d3 = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            // The profile's reach: how far its outline sits from its own centre.
+            let c0 = cen(&secs[0]);
+            let reach = secs[0].0.iter().map(|p| d3(*p, c0)).fold(0.0f64, f64::max);
+            // Turn angle at each interior station, and the radius of curvature it implies.
+            let mut worst = (f64::MAX, 0usize, 0.0f64);
+            let span: f64 = (1..secs.len()).map(|i| d3(cen(&secs[i - 1]), cen(&secs[i]))).sum();
+            // A step far shorter than the rest gives a meaningless angle — two nearly coincident
+            // points can subtend anything — so judge curvature only on steps that are really there.
+            let floor = span / secs.len() as f64 * 0.25;
+            for i in 1..secs.len() - 1 {
+                let (a, b, c) = (cen(&secs[i - 1]), cen(&secs[i]), cen(&secs[i + 1]));
+                let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - b[0], c[1] - b[1], c[2] - b[2]]);
+                let (lu, lv) = (d3(a, b), d3(b, c));
+                if lu < floor || lv < floor {
+                    continue;
+                }
+                let dot = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (lu * lv);
+                let ang = dot.clamp(-1.0, 1.0).acos();
+                // Radius of the circle through the three centres.
+                let r = if ang > 1e-9 { (lu + lv) * 0.5 / ang } else { f64::MAX };
+                if r < worst.0 {
+                    worst = (r, i, ang.to_degrees());
+                }
+            }
+            eprintln!(
+                "    profile reach {reach:.3} | tightest turn r={:.3} at station {} ({:.1}° per step)",
+                worst.0, worst.1, worst.2
+            );
+            if worst.0 < reach {
+                eprintln!(
+                    "    ^^ the path turns INSIDE the profile ({:.3} < {reach:.3}): the sections on the \
+                     inside of that bend overlap, which is a self-intersecting tube",
+                    worst.0
+                );
+            }
+            // `loft_mesh` forces every section's winding against ONE global axis: the straight line
+            // from the first centroid to the last. On a path that curves, a section's own normal can
+            // disagree with that straight line, and the loop is then reversed — which skins it to
+            // its neighbours back-to-front. Count the disagreements.
+            let newell = |l: &[[f64; 3]]| {
+                let m = l.len();
+                let mut n = [0.0f64; 3];
+                for i in 0..m {
+                    let (a, b) = (l[i], l[(i + 1) % m]);
+                    n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+                    n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+                    n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+                }
+                n
+            };
+            let (first, lastc) = (cen(&secs[0]), cen(&secs[secs.len() - 1]));
+            let axis = [lastc[0] - first[0], lastc[1] - first[1], lastc[2] - first[2]];
+            let signs: Vec<bool> = secs
+                .iter()
+                .map(|s| {
+                    let n = newell(&s.0);
+                    n[0] * axis[0] + n[1] * axis[1] + n[2] * axis[2] > 0.0
+                })
+                .collect();
+            let pos = signs.iter().filter(|b| **b).count();
+            eprintln!(
+                "    winding vs the global axis: {pos} section(s) agree, {} disagree (and get REVERSED)",
+                signs.len() - pos
+            );
+            // Where it changes, and how nearly perpendicular the section is there — a section
+            // square-on to that straight line has no reliable sign at all.
+            for i in 1..signs.len() {
+                if signs[i] != signs[i - 1] {
+                    eprintln!("      flips between station {} and {i}", i - 1);
+                }
+            }
+            // Are the two ends planar and simple enough to cap?
+            for (what, sec) in [("first", &secs[0]), ("last", &secs[secs.len() - 1])] {
+                let c = cen(sec);
+                let n = newell(&sec.0);
+                let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+                let flat = sec
+                    .0
+                    .iter()
+                    .map(|p| (((p[0] - c[0]) * n[0] + (p[1] - c[1]) * n[1] + (p[2] - c[2]) * n[2]) / nl).abs())
+                    .fold(0.0f64, f64::max);
+                eprintln!("    {what} section: {} pts, out-of-plane {flat:.2e}", sec.0.len());
+            }
+            // Step lengths along the path, to catch a degenerate tail.
+            let steps: Vec<f64> = (1..secs.len()).map(|i| d3(cen(&secs[i - 1]), cen(&secs[i]))).collect();
+            let smin = steps.iter().cloned().fold(f64::MAX, f64::min);
+            let smax = steps.iter().cloned().fold(0.0, f64::max);
+            eprintln!("    path steps: {} of them, shortest {smin:.3e}, longest {smax:.3e}", steps.len());
+
+            // And what the skin came out as.
+            match hworks_geometry::loft_mesh(&secs) {
+                None => eprintln!("    loft_mesh: None"),
+                Some(m) => {
+                    // Welded on the same 1e-5 grid the kernels use, so a seam that is really
+                    // closed does not read as a tear.
+                    let key = |i: u32| {
+                        let p = m.positions[i as usize];
+                        ((p[0] * 1.0e5) as i64, (p[1] * 1.0e5) as i64, (p[2] * 1.0e5) as i64)
+                    };
+                    let mut edge: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), i32> = Default::default();
+                    for t in m.indices.chunks_exact(3) {
+                        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                            let (ka, kb) = (key(a), key(b));
+                            if ka == kb {
+                                continue;
+                            }
+                            *edge.entry(if ka < kb { (ka, kb) } else { (kb, ka) }).or_insert(0) += 1;
+                        }
+                    }
+                    let bnd = edge.values().filter(|&&c| c == 1).count();
+                    let nonman = edge.values().filter(|&&c| c > 2).count();
+                    // Which END the open rim is at: compare it to the two section centroids.
+                    let (c0, cl) = (cen(&secs[0]), cen(&secs[secs.len() - 1]));
+                    let (mut at_start, mut at_end) = (0usize, 0usize);
+                    for (k, _) in edge.iter().filter(|(_, &c)| c == 1) {
+                        let mid = [
+                            (k.0 .0 + k.1 .0) as f64 * 0.5e-5,
+                            (k.0 .1 + k.1 .1) as f64 * 0.5e-5,
+                            (k.0 .2 + k.1 .2) as f64 * 0.5e-5,
+                        ];
+                        if d3(mid, c0) < d3(mid, cl) {
+                            at_start += 1;
+                        } else {
+                            at_end += 1;
+                        }
+                    }
+                    eprintln!(
+                        "    skin: {} tris | boundary edges {bnd} ({at_start} at the START cap, {at_end} at the END cap) | non-manifold edges {nonman} | manifold {}",
+                        m.indices.len() / 3,
+                        hworks_geometry::is_manifold(&m)
+                    );
+                }
+            }
+        }
+    }
+
     /// How the EXACT kernel copes with one part: whether the B-rep survives at all, how long it
     /// takes, what it encloses against the mesh build, and whether any curved surfaces reach the
     /// STEP. Two things it has turned up — that badbasicextrude is the ONE corpus part the exact
@@ -36046,7 +36252,6 @@ mod tests {
         assert!((vol - expect).abs() < expect * 0.01, "the post must survive: {vol:.1} vs {expect:.1}");
     }
 
-    #[test]
     /// A loft whose profile lost the region it recorded says so.
     ///
     /// The index is stored, not the shape, so editing a profile sketch can leave it pointing at a
@@ -36092,6 +36297,63 @@ mod tests {
         );
     }
 
+    /// A sweep closes at BOTH ends, including where the path leaves the axes.
+    ///
+    /// A section is planar however it is framed — two fixed vectors span a plane — but computing
+    /// its points in f32 quantises them onto a grid about 6e-7 wide at the sizes parts are drawn
+    /// at, and that fuzz IS the section's thickness. truck refuses to cap a wire more than 1e-6
+    /// thick, so the far end of a sweep came back OPEN while the near one capped fine: the first
+    /// frame happens to land on the axes, where f32 rounding keeps the points exactly coplanar,
+    /// and every frame after it does not.
+    ///
+    /// badsweep.hcad is the case — its last section measured 1.46e-6 across, just over the line,
+    /// and 96 boundary edges where the cap should have been. The path here turns off the axes
+    /// deliberately, because one that stays on them cannot fail this way.
+    #[test]
+    fn a_swept_tube_closes_at_both_ends() {
+        let mut doc = Document::with_default_planes();
+        let mut profile = Sketch::default();
+        let c = profile.add_point(0.0, 0.0);
+        profile.add_circle(c, 2.0);
+        // Two turns, neither onto an axis, so the frames carry real off-axis components.
+        let mut path = Sketch::default();
+        let a = path.add_point(0.0, 0.0);
+        let b = path.add_point(17.0, 0.0);
+        let d = path.add_point(29.0, 13.0);
+        let e = path.add_point(35.0, 31.0);
+        path.add_line(a, b, false);
+        path.add_line(b, d, false);
+        path.add_line(d, e, false);
+        doc.add_feature(FeatureKind::Sweep {
+            profile: LoftProfile { sketch: profile, plane: standard_plane_ref(2), region: 0 },
+            path_sketch: path,
+            path_plane: xy(),
+            cut: false,
+        });
+        doc.rollback = doc.features.len();
+        let (m, _) = regenerate_mesh(&doc).expect("swept tube");
+
+        // A closed tube has no edge held by only one triangle. Welded on the 1e-5 grid the kernels
+        // use, so a seam that really is closed does not read as a tear.
+        let key = |i: u32| {
+            let p = m.positions[i as usize];
+            ((p[0] * 1.0e5) as i64, (p[1] * 1.0e5) as i64, (p[2] * 1.0e5) as i64)
+        };
+        let mut edge: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), i32> = Default::default();
+        for t in m.indices.chunks_exact(3) {
+            for (x, y) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (kx, ky) = (key(x), key(y));
+                if kx == ky {
+                    continue;
+                }
+                *edge.entry(if kx < ky { (kx, ky) } else { (ky, kx) }).or_insert(0) += 1;
+            }
+        }
+        let open = edge.values().filter(|&&c| c == 1).count();
+        assert_eq!(open, 0, "the tube came back with {open} open edge(s) — a cap is missing");
+    }
+
+    #[test]
     fn sweep_builds_a_tube_along_an_l_path() {
         // A Ø4 circle swept along an L path (20 along X, then 20 along Y) ≈ π·r²·length.
         let mut doc = Document::with_default_planes();

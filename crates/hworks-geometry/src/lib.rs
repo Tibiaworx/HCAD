@@ -3382,6 +3382,9 @@ fn loft_cap_tris(outer: &[[f64; 3]], holes: &[Vec<[f64; 3]>], reverse: bool) -> 
                 wires.push(mk(h));
             }
         }
+        // truck refuses a wire more than TOLERANCE (1e-6) thick, measured across its own fitted
+        // plane — which is why the sections it is handed have to be computed in f64. In f32 a
+        // section is quantised onto a ~6e-7 grid, and that fuzz IS its thickness.
         let face = builder::try_attach_plane(&wires).ok()?;
         let shell: truck_modeling::Shell = std::iter::once(face).collect();
         let mut poly = shell.triangulation(TOL).to_polygon();

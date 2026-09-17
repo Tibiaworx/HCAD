@@ -1,0 +1,227 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (3),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 10.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Radius(
+                            center: 0,
+                            value: 10.0,
+                            diameter: true,
+                            label: (0.7500655055046082, 3.7020151615142822),
+                        ),
+                    ],
+                ),
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+            ),
+            hidden: false,
+        ),
+        (
+            id: (4),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 8.696249008178711,
+                            fixed: false,
+                        ),
+                        (
+                            x: -2.7569727897644043,
+                            y: 11.845893859863281,
+                            fixed: false,
+                        ),
+                        (
+                            x: -9.233963966369629,
+                            y: 15.874920845031738,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Spline(
+                            points: [
+                                0,
+                                1,
+                                2,
+                                3,
+                                3,
+                            ],
+                            closed: false,
+                            construction: false,
+                            control: true,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (0.0, 0.0, -1.0),
+                    v: (0.0, 1.0, 0.0),
+                    normal: (1.0, -0.0, 0.0),
+                    datum: true,
+                ),
+            ),
+            hidden: false,
+        ),
+        (
+            id: (5),
+            kind: Sweep(
+                profile: (
+                    sketch: (
+                        points: [
+                            (
+                                x: 0.0,
+                                y: 0.0,
+                                fixed: true,
+                            ),
+                        ],
+                        entities: [
+                            Point(
+                                at: 0,
+                            ),
+                            Circle(
+                                center: 0,
+                                radius: 10.0,
+                                construction: false,
+                            ),
+                        ],
+                        constraints: [
+                            Radius(
+                                center: 0,
+                                value: 10.0,
+                                diameter: true,
+                                label: (0.7500655055046082, 3.7020151615142822),
+                            ),
+                        ],
+                    ),
+                    plane: (
+                        origin: (0.0, 0.0, 0.0),
+                        u: (1.0, 0.0, 0.0),
+                        v: (0.0, 0.0, -1.0),
+                        normal: (-0.0, 1.0, 0.0),
+                        datum: true,
+                    ),
+                    region: 0,
+                ),
+                path_sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 8.696249008178711,
+                            fixed: false,
+                        ),
+                        (
+                            x: -2.7569727897644043,
+                            y: 11.845893859863281,
+                            fixed: false,
+                        ),
+                        (
+                            x: -9.233963966369629,
+                            y: 15.874920845031738,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Spline(
+                            points: [
+                                0,
+                                1,
+                                2,
+                                3,
+                                3,
+                            ],
+                            closed: false,
+                            construction: false,
+                            control: true,
+                        ),
+                    ],
+                    constraints: [],
+                ),
+                path_plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (0.0, 0.0, -1.0),
+                    v: (0.0, 1.0, 0.0),
+                    normal: (1.0, -0.0, 0.0),
+                    datum: true,
+                ),
+                cut: false,
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 6,
+    next_id: 6,
+)
