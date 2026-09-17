@@ -11314,6 +11314,7 @@ fn shell_overlays(
             let _ = hworks_geometry::take_loft_hole_mismatch_count();
             let _ = take_sweep_region_fallbacks();
             let _ = take_loft_region_fallbacks();
+            let _ = take_sweep_too_tight();
             let _ = take_cut_direction_guesses();
             let _ = take_gear_failures();
             match result.filter(|m| !m.positions.is_empty()) {
@@ -17090,6 +17091,7 @@ fn handle_file_io(
             // that fell back would leave the count standing for the next rebuild to blame.
             let _ = take_sweep_region_fallbacks();
             let _ = take_loft_region_fallbacks();
+            let _ = take_sweep_too_tight();
         }
         // ...and then COMPARE, rather than assuming the exact kernel wins. Curved surfaces win
         // outright when either route has any; past that, the smaller file.
@@ -19030,6 +19032,8 @@ fn sketch_open_path(sketch: &Sketch) -> Option<Vec<[f64; 2]>> {
 static SWEEP_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Loft profiles that fell back to a different region because the recorded one was gone.
 static LOFT_REGION_FALLBACKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Sweeps whose path turns tighter than the profile can follow, so the tube passes through itself.
+static SWEEP_TOO_TIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Rebuilds that left the body non-manifold — pinched, or with a surface touching itself.
 static NONMANIFOLD_BODIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -19046,6 +19050,10 @@ fn take_sweep_region_fallbacks() -> u32 {
 
 fn take_loft_region_fallbacks() -> u32 {
     LOFT_REGION_FALLBACKS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn take_sweep_too_tight() -> u32 {
+    SWEEP_TOO_TIGHT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn take_cut_direction_guesses() -> u32 {
@@ -19319,7 +19327,20 @@ fn sweep_sections(
     if fu == [0.0; 3] {
         fu = across(t0);
     }
+    // How far the profile reaches from the path, and in which direction — needed both to MITER a
+    // corner and to tell when the path turns tighter than the tube can physically follow.
+    let reach_toward = |d: V, fu: V, fv: V| -> f64 {
+        r.outer
+            .iter()
+            .map(|p| dot(add(mul(fu, p[0] - cen[0]), mul(fv, p[1] - cen[1])), d))
+            .fold(0.0f64, f64::max)
+    };
     let mut secs: Vec<(Vec<[f64; 3]>, Vec<Vec<[f64; 3]>>)> = Vec::with_capacity(pts.len());
+    let mut impossible: Option<(f64, f64)> = None; // (bend radius, how far the tube reaches inward)
+    let span: f64 = pts.windows(2).map(|w| dist2(w[0], w[1]).sqrt()).sum();
+    // A step far shorter than the rest gives a meaningless angle — two nearly coincident points can
+    // subtend anything — so only steps that are really there get a say in the turn.
+    let step_floor = span / pts.len().max(1) as f64 * 0.25;
     for i in 0..pts.len() {
         let t = tangent(i);
         if t != [0.0; 3] {
@@ -19329,12 +19350,67 @@ fn sweep_sections(
             }
         }
         let fv = norm(cross(t, fu));
+
+        // MITER. The section already sits square to the bisector of the two segments — that is what
+        // a central-difference tangent is — but at its drawn size, so the walls either side of a
+        // corner meet at a neck instead of lining up. A mitred joint needs the section STRETCHED
+        // across the turn by 1/cos(half the turn), exactly as a mitred pipe elbow is cut oval.
+        //
+        // Only across the turn: the width along the turn's axis is untouched, or a corner would
+        // swell in both directions.
+        let (mut turn_dir, mut stretch) = ([0.0; 3], 1.0f64);
+        if i > 0 && i + 1 < pts.len() {
+            let (a, b) = (sub(pts[i], pts[i - 1]), sub(pts[i + 1], pts[i]));
+            let (la, lb) = (dot(a, a).sqrt(), dot(b, b).sqrt());
+            if la > step_floor && lb > step_floor {
+                let (ua, ub) = (mul(a, 1.0 / la), mul(b, 1.0 / lb));
+                let c = dot(ua, ub).clamp(-1.0, 1.0);
+                // cos(θ/2) = √((1+cos θ)/2), so the stretch needs no trigonometry.
+                let half = ((1.0 + c) * 0.5).max(1.0e-12).sqrt();
+                // Which way the path turns — the direction the tangent is swinging towards, which
+                // is also where the centre of the bend lies.
+                let d = norm(sub(ub, ua));
+                if d != [0.0; 3] {
+                    turn_dir = d;
+                    stretch = 1.0 / half;
+                    // ...and whether the tube can follow it at all. The bend's radius is the step
+                    // over the angle it turns through; if the tube reaches further toward the
+                    // centre of that bend than the radius itself, its inner wall would have to
+                    // turn inside out. Nothing can build that — not a finer solver and not a
+                    // better miter — so say so rather than hand back a knot.
+                    let ang = c.acos();
+                    if ang > 1.0e-9 {
+                        let radius = (la + lb) * 0.5 / ang;
+                        let inward = reach_toward(d, fu, fv);
+                        if radius < inward && impossible.is_none_or(|(r0, _)| radius < r0) {
+                            impossible = Some((radius, inward));
+                        }
+                    }
+                }
+            }
+        }
+        // A reversal (the path doubling back on itself) sends the stretch to infinity; there is no
+        // mitre for it, so leave the section alone and let the check above speak.
+        let stretch = if stretch.is_finite() { stretch.min(8.0) } else { 1.0 };
         let place = |p: &[f64; 2]| -> [f64; 3] {
-            add(pts[i], add(mul(fu, p[0] - cen[0]), mul(fv, p[1] - cen[1])))
+            let v = add(mul(fu, p[0] - cen[0]), mul(fv, p[1] - cen[1]));
+            let v = if stretch > 1.0 + 1.0e-12 {
+                add(v, mul(turn_dir, dot(v, turn_dir) * (stretch - 1.0)))
+            } else {
+                v
+            };
+            add(pts[i], v)
         };
         let outer: Vec<[f64; 3]> = r.outer.iter().map(&place).collect();
         let holes: Vec<Vec<[f64; 3]>> = r.holes.iter().map(|h| h.iter().map(&place).collect()).collect();
         secs.push((outer, holes));
+    }
+    if let Some((radius, inward)) = impossible {
+        SWEEP_TOO_TIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            "Sweep: the path turns at radius {radius:.3} but the profile reaches {inward:.3} toward \
+             the inside of that bend — the tube would have to pass through itself."
+        );
     }
     Some(secs)
 }
@@ -19543,6 +19619,7 @@ fn finish_regen_job(
             let loft_holes = hworks_geometry::take_loft_hole_mismatch_count();
             let sweep_regions = take_sweep_region_fallbacks();
             let loft_regions = take_loft_region_fallbacks();
+            let tight_sweeps = take_sweep_too_tight();
             let cut_guesses = take_cut_direction_guesses();
             let gear_fails = take_gear_failures();
             let pinched = take_nonmanifold_bodies();
@@ -19566,6 +19643,11 @@ fn finish_regen_job(
                 warn!("{sweep_regions} sweep(s) fell back to a different profile region.");
                 Some(format!(
                     "⚠ {sweep_regions} sweep(s) used the WRONG profile: the region they recorded no longer exists (the profile sketch was edited), so the first one was swept instead. Reopen the sweep and re-pick its profile."
+                ))
+            } else if tight_sweeps > 0 {
+                warn!("{tight_sweeps} sweep(s) turn tighter than the profile can follow.");
+                Some(format!(
+                    "⚠ {tight_sweeps} sweep(s) PASS THROUGH THEMSELVES: the path turns tighter than the profile reaches out from it, so the inside of the bend would have to fold through itself. No shape can do that — widen the bend or use a smaller profile."
                 ))
             } else if loft_regions > 0 {
                 warn!("{loft_regions} loft profile(s) fell back to a different region.");
@@ -36297,6 +36379,49 @@ mod tests {
         );
     }
 
+    /// A tube that cannot follow its own path says so instead of tying a knot.
+    ///
+    /// A sweep can be asked for a shape that does not exist. If the path turns tighter than the
+    /// profile reaches out from it, the inside of the bend would have to fold through itself --
+    /// badsweep.hcad asks a 20-across tube (reaching 10 from the path) round a bend of radius 5.77,
+    /// so its inner wall would need a radius of minus four. No solver builds that, and no amount of
+    /// mitering helps: a miter squares up a CORNER, it cannot make a tube narrower than it is.
+    ///
+    /// The point is that it used to build anyway -- a self-intersecting body, quietly, that looked
+    /// like a modelling mistake rather than an impossible request.
+    #[test]
+    fn a_sweep_that_cannot_follow_its_path_says_so() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/badsweep.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/badsweep.hcad is a fixture -- force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse badsweep.hcad");
+        let _ = take_sweep_too_tight();
+        let (m, _) = regenerate_mesh(&doc).expect("it still builds something");
+        assert!(!m.indices.is_empty());
+        assert!(take_sweep_too_tight() > 0, "the tube passes through itself and nothing said so");
+
+        // And a sweep that CAN follow its path stays quiet -- or the warning is just noise.
+        let mut ok = Document::with_default_planes();
+        let mut profile = Sketch::default();
+        let c = profile.add_point(0.0, 0.0);
+        profile.add_circle(c, 2.0);
+        let mut p2 = Sketch::default();
+        let a = p2.add_point(0.0, 0.0);
+        let b = p2.add_point(30.0, 0.0);
+        let d = p2.add_point(60.0, 30.0);
+        p2.add_line(a, b, false);
+        p2.add_line(b, d, false);
+        ok.add_feature(FeatureKind::Sweep {
+            profile: LoftProfile { sketch: profile, plane: standard_plane_ref(2), region: 0 },
+            path_sketch: p2,
+            path_plane: xy(),
+            cut: false,
+        });
+        ok.rollback = ok.features.len();
+        let _ = regenerate_mesh(&ok).expect("a tube that fits its path");
+        assert_eq!(take_sweep_too_tight(), 0, "a corner a tube can turn was reported as impossible");
+    }
+
     /// A sweep closes at BOTH ends, including where the path leaves the axes.
     ///
     /// A section is planar however it is framed — two fixed vectors span a plane — but computing
@@ -36377,6 +36502,13 @@ mod tests {
         let vol = tri_vol(&m);
         let expect = std::f64::consts::PI * 4.0 * 40.0;
         eprintln!("swept tube volume {vol:.1} (straight-tube estimate {expect:.1})");
-        assert!(vol > expect * 0.7 && vol < expect * 1.2, "tube volume out of range: {vol:.1}");
+        // A MITRED corner keeps the tube's full bore all the way round: what the outside of the
+        // bend loses, the inside gains, so the volume is the straight-tube figure to a fraction of
+        // a percent. Un-mitred it necks at the corner and comes in 1.3% light -- which the old
+        // 0.7-to-1.2 band was far too loose to notice, so the neck sat there unremarked.
+        assert!(
+            (vol - expect).abs() < expect * 0.005,
+            "tube volume {vol:.1} against {expect:.1} -- a corner that necks means the miter is gone"
+        );
     }
 }
