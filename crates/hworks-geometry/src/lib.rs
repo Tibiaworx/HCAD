@@ -2631,6 +2631,28 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
         }
     }
 
+    // Which surface each topo face lies on, for reporting who holds a rim.
+    let mut face_tag: Vec<u32> = vec![NO_SURF; topo.faces.len()];
+    for t in 0..ntri {
+        let mut tri = [0usize; 3];
+        let mut ok = true;
+        for i in 0..3 {
+            let q = mesh.positions[mesh.indices[t * 3 + i] as usize];
+            match vmap.get(&bevel::weld_key([q[0] as f64, q[1] as f64, q[2] as f64])) {
+                Some(&v) => tri[i] = v,
+                None => ok = false,
+            }
+        }
+        if !ok { continue; }
+        tri.sort_unstable();
+        if tri[0] == tri[1] || tri[1] == tri[2] { continue; }
+        if let Some(&ti) = tmap.get(&tri) {
+            if mesh.tri_surf[t] != NO_SURF {
+                face_tag[topo.tri_face[ti]] = mesh.tri_surf[t];
+            }
+        }
+    }
+
     let mut out: Vec<Band> = Vec::new();
     let mut taken: HashSet<usize> = HashSet::new(); // topo faces already claimed by a band
     for group in &groups {
@@ -2918,6 +2940,36 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
             }
             if seam.len() != 2 {
                 why(&format!("a rim is not walked by exactly one outside loop ({} of 2 found)", seam.len()));
+                // Which rim failed, and what holds it — the two are different problems. A rim
+                // against a ring of plain faces is the surgery's own fillet strips, which carry no
+                // surface for a band to meet; a rim against another band's faces is two exact
+                // surfaces that would have to share a circle.
+                if std::env::var("HCAD_BAND_DEBUG").is_ok() {
+                    if let Some(r) = rims.get(seam.len()) {
+                        let mut holders: std::collections::BTreeSet<usize> = Default::default();
+                        for &v in r.iter() {
+                            for &f in &topo.vert_faces[v] {
+                                if !faces.contains(&f) {
+                                    holders.insert(f);
+                                }
+                            }
+                        }
+                        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+                        for &f in &holders {
+                            let name = match face_tag[f] {
+                                NO_SURF => "untagged".to_string(),
+                                g => match mesh.surfaces[g as usize] {
+                                    Surf::Cylinder { radius, .. } => format!("cyl r={radius:.3}"),
+                                    Surf::Torus { major, minor, .. } => format!("torus {major:.3}/{minor:.3}"),
+                                    Surf::Plane { .. } => "plane".to_string(),
+                                },
+                            };
+                            *kinds.entry(name).or_default() += 1;
+                        }
+                        eprintln!("      rim {} ({} verts) is held by {} face(s): {kinds:?}",
+                            seam.len(), r.len(), holders.len());
+                    }
+                }
                 continue;
             }
             let allowed: HashSet<usize> = faces.iter().copied().chain(seam.iter().map(|s| s.0)).collect();
