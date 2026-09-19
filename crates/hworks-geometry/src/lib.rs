@@ -2604,12 +2604,22 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
 
     // The axis and the "core" each surface is a fixed distance from: the axis line for a cylinder,
     // the centre circle for a torus.
+    // The axis is NORMALISED here, once, because everything below leans on it being a unit
+    // vector: `same` compares two of them with a dot product, `place` splits a point into radial
+    // and axial parts with it, and `band_tube` writes a position back out by scaling it. An axis
+    // is written down by whichever feature drew it and is not always unit to the last bit —
+    // usercylinder's three stacked walls, all radius 50 on one axis, compared as THREE different
+    // cylinders because their dot product came to 1 - 2e-9 against a threshold of 1 - 1e-9. Split
+    // three ways, each patch met the next along a zigzag where the two meshes failed to line up,
+    // and all three were refused for not ending on a circle.
     let frame = |s: &Surf| -> Option<([f64; 3], [f64; 3], f64, f64)> {
-        match *s {
-            Surf::Cylinder { origin, axis, radius } => Some((origin, axis, 0.0, radius)),
-            Surf::Torus { origin, axis, major, minor } => Some((origin, axis, major, minor)),
-            Surf::Plane { .. } => None,
-        }
+        let (origin, axis, major, minor) = match *s {
+            Surf::Cylinder { origin, axis, radius } => (origin, axis, 0.0, radius),
+            Surf::Torus { origin, axis, major, minor } => (origin, axis, major, minor),
+            Surf::Plane { .. } => return None,
+        };
+        let l = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        (l > 1.0e-12).then(|| (origin, [axis[0] / l, axis[1] / l, axis[2] / l], major, minor))
     };
     // Tags that name the SAME surface are one band. A surface is recorded with a point on its axis,
     // and any point on the axis will do — so the same bore picked up a different record from every
@@ -2626,7 +2636,7 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
         let off = [d[0] - n0[0] * al, d[1] - n0[1] * al, d[2] - n0[2] * al];
         (m0 - m1).abs() < tol
             && (r0 - r1).abs() < tol
-            && dot.abs() > 1.0 - 1.0e-9
+            && dot.abs() > 1.0 - 1.0e-6
             && (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt() < tol
             // A cylinder's origin may sit anywhere along the axis; a torus's names the plane its
             // centre circle lies in, so that has to agree too.
@@ -2908,6 +2918,40 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
             };
             let (Some(g0), Some(g1)) = (ring(&loops[0]), ring(&loops[1])) else {
                 why("an end is not a circle");
+                // What shape the end actually is. A rim a little inside the mean is the mesh
+                // being inscribed in the surface and would be worth a tolerance; one that runs
+                // along at two different heights is not a rim at all, and no tolerance will make
+                // it one.
+                if std::env::var("HCAD_BAND_DEBUG").is_ok() {
+                    for (k, lp) in loops.iter().enumerate() {
+                        let n = lp.len().max(1) as f64;
+                        let mut c = [0.0f64; 2];
+                        for &v in lp {
+                            let g = place(v).0;
+                            c[0] += g[0] / n;
+                            c[1] += g[1] / n;
+                        }
+                        let (mut dr_in, mut dr_out, mut dz) = (0.0f64, 0.0f64, 0.0f64);
+                        for &v in lp {
+                            let g = place(v).0;
+                            dr_in = dr_in.max(c[0] - g[0]);
+                            dr_out = dr_out.max(g[0] - c[0]);
+                            dz = dz.max((g[1] - c[1]).abs());
+                        }
+                        // Split between two levels, and how often it crosses: twice is one step,
+                        // many times is a boundary following the diagonals of a strip of quads.
+                        let mut zs: Vec<f64> = lp.iter().map(|&v| place(v).0[1]).collect();
+                        zs.sort_by(f64::total_cmp);
+                        let med = zs[zs.len() / 2];
+                        let hi = |v: usize| (place(v).0[1] - med).abs() > tol;
+                        let stray = lp.iter().filter(|&&v| hi(v)).count();
+                        let flips = (0..lp.len()).filter(|&i| hi(lp[i]) != hi(lp[(i + 1) % lp.len()])).count();
+                        eprintln!(
+                            "      rim {k} ({} verts) r={:.4}: inward {dr_in:.3e}, outward {dr_out:.3e}, along axis {dz:.3e} | {stray} above the level the other {} share, crossing {flips}x (tol {tol:.3e}, sagitta {sagitta:.3e})",
+                            lp.len(), c[0], lp.len() - stray
+                        );
+                    }
+                }
                 continue;
             };
             if ((g0[0] - g1[0]).powi(2) + (g0[1] - g1[1]).powi(2)).sqrt() < tol {
