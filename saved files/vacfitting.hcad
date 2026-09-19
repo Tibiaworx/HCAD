@@ -1,0 +1,163 @@
+(
+    features: [
+        (
+            id: (0),
+            kind: Plane((
+                name: "Front",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (1),
+            kind: Plane((
+                name: "Top",
+                origin: (0.0, 0.0, 0.0),
+                u: (1.0, 0.0, 0.0),
+                v: (0.0, 0.0, -1.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (2),
+            kind: Plane((
+                name: "Right",
+                origin: (0.0, 0.0, 0.0),
+                u: (0.0, 0.0, -1.0),
+                v: (0.0, 1.0, 0.0),
+                offset: None,
+            )),
+            hidden: false,
+        ),
+        (
+            id: (3),
+            kind: Extrude(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 0,
+                            radius: 16.17,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 25.0,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Radius(
+                            center: 0,
+                            value: 16.17,
+                            diameter: true,
+                            label: (0.0, 0.0),
+                        ),
+                        Coincident(1, 0),
+                        Radius(
+                            center: 1,
+                            value: 25.0,
+                            diameter: true,
+                            label: (0.0, 0.0),
+                        ),
+                    ],
+                ),
+                regions: [
+                    0,
+                ],
+                region_pts: [
+                    (18.75, 0.0000000000000003452099717193846),
+                ],
+                plane: (
+                    origin: (0.0, 0.0, 0.0),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: true,
+                ),
+                distance: 3.0,
+                back: 0.0,
+                thin: 0.0,
+                thin_side: 0,
+            ),
+            hidden: false,
+        ),
+        (
+            id: (4),
+            kind: Sketch(
+                sketch: (
+                    points: [
+                        (
+                            x: 0.0,
+                            y: 0.0,
+                            fixed: true,
+                        ),
+                        (
+                            x: 12.91015625,
+                            y: 13.82421875,
+                            fixed: true,
+                        ),
+                        (
+                            x: 12.91015625,
+                            y: 13.82421875,
+                            fixed: false,
+                        ),
+                    ],
+                    entities: [
+                        Point(
+                            at: 0,
+                        ),
+                        Circle(
+                            center: 1,
+                            radius: 15.770724296577656,
+                            construction: false,
+                        ),
+                        Circle(
+                            center: 2,
+                            radius: 19.770724296562044,
+                            construction: false,
+                        ),
+                    ],
+                    constraints: [
+                        Coincident(2, 1),
+                        CircleDistance(
+                            a: 1,
+                            b: 2,
+                            value: 4.0,
+                            mode: 2,
+                            offset: 0.10739865154027939,
+                        ),
+                    ],
+                ),
+                plane: (
+                    origin: (-12.91015625, 2.99609375, 13.82421875),
+                    u: (1.0, 0.0, 0.0),
+                    v: (0.0, 0.0, -1.0),
+                    normal: (-0.0, 1.0, 0.0),
+                    datum: false,
+                ),
+            ),
+            hidden: false,
+        ),
+    ],
+    rollback: 5,
+    next_id: 5,
+)

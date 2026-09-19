@@ -10717,12 +10717,20 @@ fn nearest_within(uv: Vec2, points: &[Vec2], thresh: f32) -> Option<Vec2> {
 /// Snap a circle's `raw` radius to a nearby reference circle's radius (within
 /// `thresh`), so a new circle matches existing round geometry exactly.
 fn snap_radius(raw: f32, circles: &[(Vec2, f32)], thresh: f32) -> f32 {
+    snapped_radius(raw, circles, thresh).unwrap_or(raw)
+}
+
+/// The reference radius a drawn one lands on, or `None` when it landed on nothing.
+///
+/// Separate from [`snap_radius`] because WHETHER it snapped is worth as much as the number: a rim
+/// that snapped to a body edge earns a relation holding it there, and one that did not must not
+/// get one.
+fn snapped_radius(raw: f32, circles: &[(Vec2, f32)], thresh: f32) -> Option<f32> {
     circles
         .iter()
         .map(|&(_, r)| r)
         .filter(|r| (r - raw).abs() <= thresh)
         .min_by(|a, b| (a - raw).abs().total_cmp(&(b - raw).abs()))
-        .unwrap_or(raw)
 }
 
 /// The endpoint indices of a line entity, if `i` is a line.
@@ -10906,6 +10914,7 @@ fn constraint_points(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnCircle { p, center } => vec![*p, *center],
         Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
         Constraint::PointOnArc { p, .. } => vec![*p],
+        Constraint::CircleOnArc { center, .. } => vec![*center],
         Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
         Constraint::RefCircleDistance { center, .. } => vec![*center],
         Constraint::CircleDistance { a, b, .. } => vec![*a, *b],
@@ -10941,6 +10950,7 @@ fn constraint_label(c: &Constraint) -> String {
         Constraint::PointOnCircle { .. } => "On circle".into(),
         Constraint::PointOnLine { .. } => "On edge".into(),
         Constraint::PointOnArc { .. } => "On arc".into(),
+        Constraint::CircleOnArc { radius, .. } => format!("On edge  \u{2300}{:.2}", radius * 2.0),
         Constraint::SlotWidth { value, .. } => format!("Slot width  {value:.2}"),
         Constraint::RefCircleDistance { value, .. } => format!("Edge gap  {value:.2}"),
         Constraint::CircleDistance { value, .. } => format!("Circle gap  {value:.2}"),
@@ -13560,6 +13570,12 @@ fn add_radius_dim(sketch: &mut Sketch, center: usize, radius: f64) -> Option<usi
     {
         return Some(i);
     }
+    // Dimensioning this circle's own size OVERRIDES a rim snap on it. The snap says "as big as
+    // that edge" and the dimension says "this big" — about the same quantity, so keeping both
+    // would over-define the sketch for doing the ordinary thing of snapping a circle to a bore
+    // and then deciding on a size. A dimension on anything ELSE is not in conflict and leaves the
+    // snap alone; that is the whole point of recording it.
+    sketch.constraints.retain(|c| !matches!(c, Constraint::CircleOnArc { center: x, .. } if *x == center));
     sketch.constraints.push(Constraint::Radius { center, value: radius, diameter: true, label: [0.0, 0.0] });
     Some(sketch.constraints.len() - 1)
 }
@@ -15814,13 +15830,21 @@ fn place_point(session: &mut SketchSession, uv: Vec2) {
         }
         Tool::Circle => {
             if let Some(center) = session.pending.take() {
-                let radius = snap_radius(center.distance(uv), &session.reference_circles, snap);
+                let raw = center.distance(uv);
+                let landed = snapped_radius(raw, &session.reference_circles, snap);
+                let radius = landed.unwrap_or(raw);
                 if !circle_is_drawable(session, radius) {
                     session.pending = Some(center); // clicked the centre twice: no circle yet
                     return;
                 }
                 let c = add_circle_center(session, center, snap);
                 session.sketch.add_circle(c, radius as f64);
+                // Drawn ON a body edge, so say so. The snap put the rim there; without a relation
+                // nothing keeps it there, and the next dimension that touches this circle is free
+                // to drag it off the edge it was aimed at.
+                if let Some(r) = landed {
+                    session.sketch.constraints.push(Constraint::CircleOnArc { center: c, radius: r as f64 });
+                }
                 session.dirty = true;
             } else {
                 session.pending = Some(uv);

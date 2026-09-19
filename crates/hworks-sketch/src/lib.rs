@@ -204,6 +204,17 @@ pub enum Constraint {
     /// and radius are baked (projected reference geometry), so this snaps a sketch point
     /// onto a rounded body edge without needing a sketch circle entity.
     PointOnArc { p: usize, cx: f64, cy: f64, radius: f64 },
+    /// The circle centred at `center` has the radius of a body arc/circle — drawn with its rim
+    /// ON a bore or boss edge. `radius` is baked (projected reference geometry), the same way
+    /// [`Constraint::PointOnArc`] bakes one, so no sketch circle is needed to relate to.
+    ///
+    /// This is a RELATION, not a dimension: it carries no label and no offset, because the user
+    /// snapped rather than typed. Without it a rim snap was a one-off placement — the radius
+    /// landed on the edge and nothing held it there, so the next dimension to touch that circle
+    /// was free to drag it off. Dimensioning the gap between a bore-snapped circle and one
+    /// outside it shrank the bore instead of growing the outer circle, leaving a fitting
+    /// narrower than the hole it was drawn in.
+    CircleOnArc { center: usize, radius: f64 },
     /// Driving width dimension for the slot whose centre line runs `a`→`b`: the distance
     /// across its parallel sides equals `value` (so its half-width = value/2). Enforced
     /// after the solve (the slot's radius isn't a point variable). `offset` is the display
@@ -1447,6 +1458,7 @@ fn constraint_point_indices(c: &Constraint) -> Vec<usize> {
         Constraint::PointOnCircle { p, center } => vec![*p, *center],
         Constraint::PointOnLine { p, a, b } => vec![*p, *a, *b],
         Constraint::PointOnArc { p, .. } => vec![*p],
+        Constraint::CircleOnArc { center, .. } => vec![*center],
         Constraint::SlotWidth { a, b, .. } => vec![*a, *b],
         Constraint::RefCircleDistance { center, .. } => vec![*center],
         Constraint::CircleDistance { a, b, .. } => vec![*a, *b],
@@ -1538,6 +1550,7 @@ fn remap_constraint(c: &mut Constraint, m: &[usize]) {
             *b = m[*b];
         }
         Constraint::PointOnArc { p, .. } => *p = m[*p],
+        Constraint::CircleOnArc { center, .. } => *center = m[*center],
         Constraint::SlotWidth { a, b, .. } => {
             *a = m[*a];
             *b = m[*b];
@@ -1979,8 +1992,11 @@ impl Sketch {
             | Constraint::PointOnCircle { .. }
             | Constraint::PointOnLine { .. }
             | Constraint::PointOnArc { .. } => 1,
-            // A driving radius solves only if its circle (radius variable) exists.
-            Constraint::Radius { center, .. } => layout.radius_var(*center).map_or(0, |_| 1),
+            // A driving radius solves only if its circle (radius variable) exists. A snapped
+            // rim is the same shape of thing, minus the label.
+            Constraint::Radius { center, .. } | Constraint::CircleOnArc { center, .. } => {
+                layout.radius_var(*center).map_or(0, |_| 1)
+            }
             // Enforced after the solve: EqualRadius keeps its "a drives b"
             // semantics; slot width isn't a solver variable.
             Constraint::EqualRadius { .. } | Constraint::SlotWidth { .. } => 0,
@@ -2217,6 +2233,15 @@ impl Sketch {
                     let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-12);
                     put_row(&mut r, jac, &mut k, d - *radius, &[(2 * p, ddx / d), (2 * p + 1, ddy / d)]);
                 }
+                Constraint::CircleOnArc { center, radius } => {
+                    // In the solve rather than enforced after it, unlike `Radius`. A rim snap has
+                    // to argue with the dimensions on the same circle inside one system: fixed up
+                    // afterwards instead, the solve would satisfy a rim-to-rim dimension by moving
+                    // this circle and the fix-up would then undo it, leaving the dimension wrong.
+                    if let Some(rv) = layout.radius_var(*center) {
+                        put_row(&mut r, jac, &mut k, x[rv] - *radius, &[(rv, 1.0)]);
+                    }
+                }
                 Constraint::PointOnCircle { p, center } => {
                     // Distance from p to the centre equals the circle's radius (a
                     // solver variable, so the point and the size can co-solve).
@@ -2335,6 +2360,54 @@ impl Sketch {
 
 #[cfg(test)]
 mod tests {
+
+    /// A circle snapped to a body edge stays on it when a dimension is added elsewhere.
+    ///
+    /// vacfitting.hcad: a ring with a 16.17-radius bore, a circle drawn with its rim snapped to
+    /// that bore, a second circle outside it, and a 4.0 rim-to-rim dimension between them. The
+    /// dimension puts BOTH radii in its row, so the solver split the correction evenly -- the
+    /// snapped circle shrank to 15.77 and the fitting came out narrower than the hole it was
+    /// drawn in. The snap had been a one-off placement: the rim landed on the bore and nothing
+    /// held it there.
+    ///
+    /// With the snap recorded, the only way to satisfy the dimension is to grow the outer circle,
+    /// which is what was wanted.
+    #[test]
+    fn a_dimension_grows_the_free_circle_rather_than_dragging_a_snapped_one_off_its_edge() {
+        const BORE: f64 = 16.17;
+        let mut s = Sketch::default();
+        let a = s.add_point(0.0, 0.0);
+        let b = s.add_point(0.0, 0.0);
+        s.add_circle(a, BORE);
+        s.add_circle(b, 19.37);
+        s.constraints.push(Constraint::Coincident(b, a));
+        // The rim snap, as the circle tool now records it.
+        s.constraints.push(Constraint::CircleOnArc { center: a, radius: BORE });
+        // ...then the user dimensions the gap between the two rims.
+        s.constraints.push(Constraint::CircleDistance { a, b, value: 4.0, mode: 2, offset: 0.0 });
+        s.solve();
+
+        let r = |c: usize| {
+            s.entities
+                .iter()
+                .find_map(|e| match e {
+                    SketchEntity::Circle { center, radius, .. } if *center == c => Some(*radius),
+                    _ => None,
+                })
+                .expect("circle")
+        };
+        assert!(
+            (r(a) - BORE).abs() < 1.0e-6,
+            "the snapped circle left the bore: {:.4} against {BORE}",
+            r(a)
+        );
+        assert!(
+            (r(b) - (BORE + 4.0)).abs() < 1.0e-6,
+            "the free circle should have grown to {:.4}, got {:.4}",
+            BORE + 4.0,
+            r(b)
+        );
+    }
 
     /// A spline through unevenly spaced points does not lurch.
     ///
