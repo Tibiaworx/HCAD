@@ -30117,6 +30117,43 @@ mod tests {
         assert!(why.contains("a fillet"), "the reason should name the fillet, got {why:?}");
     }
 
+    /// A bore with a fillet at each mouth exports as one surface of revolution, not as facets.
+    ///
+    /// Swapping a patch of mesh for an exact surface means its rim stops existing — a hundred-odd
+    /// vertices become one circle — so every face still holding one of those vertices has to be a
+    /// face that knows. A flat face that walks the whole rim is handed the circle instead. But
+    /// where a bore runs into the fillet at its mouth, the circle between them is walked by no
+    /// flat face at all: it is shared by two curved patches. Judged one at a time, the wall and
+    /// both fillets are each refused, every one waiting on a rim the others cannot seam either.
+    ///
+    /// barthing.hcad is that shape, and it exported as 7,713 flat faces and 9.8 MB. Chained, the
+    /// three are one generatrix — arc, line, arc — revolved once, ending on the flat faces at the
+    /// far ends, and the rims between them are never boundaries at all.
+    #[test]
+    fn a_bore_filleted_at_both_mouths_exports_as_one_revolved_surface() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/barthing.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/barthing.hcad is a fixture — force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse RON");
+        let (mesh, _) = regenerate_mesh(&doc).expect("barthing.hcad builds");
+        let solid = hworks_geometry::mesh_to_solid(&mesh).expect("it reaches a solid");
+        let step = hworks_geometry::export_step(&solid).expect("and writes STEP");
+
+        let round = step.matches("SURFACE_OF_REVOLUTION").count() / 3;
+        assert!(round >= 3, "expected the wall and both fillets as real surfaces, got {round}");
+
+        // The whole point is that the facets go away with them: a tenth of what it was, not a
+        // handful of faces shaved off.
+        let faces = step.matches("FACE_SURFACE").count();
+        assert!(faces < mesh.indices.len() / 30, "{faces} faces for {} triangles", mesh.indices.len() / 3);
+
+        // And it is still the same part. The tubes are legitimately a little fuller than the
+        // chords they replace, which is the correction `mesh_to_solid` expects — but only just.
+        let want = hworks_geometry::signed_mesh_volume(&mesh).abs();
+        let got = hworks_geometry::signed_mesh_volume(&hworks_geometry::tessellate(&solid, 0.002).mesh).abs();
+        assert!((got - want).abs() <= want * 1.0e-3, "the exported solid encloses {got:.3} against the mesh's {want:.3}");
+    }
+
     /// A fillet must not forget which surfaces the sketch named.
     ///
     /// The mesh kernel builds a fillet one of two ways: CSG booleans, which carry the body's
