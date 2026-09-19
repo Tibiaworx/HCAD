@@ -3138,6 +3138,26 @@ fn band_tube(b: &Band) -> Option<(Vec<truck_modeling::Face>, [truck_modeling::Wi
 }
 
 
+/// A truck plane through `o` whose own normal — `u` × `v` — is `n`.
+///
+/// Which way it faces is the point: truck reads a planar face's outside off its surface, so a
+/// plane built any old way gives an inside-out face.
+fn plane_through(o: [f64; 3], n: [f64; 3]) -> Option<truck_modeling::Plane> {
+    let t = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    let u = [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]];
+    let ul = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+    if ul <= 1.0e-12 {
+        return None;
+    }
+    let u = [u[0] / ul, u[1] / ul, u[2] / ul];
+    let v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+    Some(truck_modeling::Plane::new(
+        Point3::new(o[0], o[1], o[2]),
+        Point3::new(o[0] + u[0], o[1] + u[1], o[2] + u[2]),
+        Point3::new(o[0] + v[0], o[1] + v[1], o[2] + v[2]),
+    ))
+}
+
 /// The shell itself: one planar face per coplanar group when `merge`, otherwise one per triangle.
 ///
 /// Every face is stitched from ONE `Edge` per undirected vertex pair, shared with whichever face
@@ -3283,20 +3303,7 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[Band]) -> Option<KSolid> 
                             }
                         }
                         if ok && !wires.is_empty() {
-                            let o = topo.verts[lps[0].1[0]];
-                            let t = if n[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
-                            let u = [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]];
-                            let ul = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-                            if ul > 1.0e-12 {
-                                let u = [u[0] / ul, u[1] / ul, u[2] / ul];
-                                // v completes a right-handed frame, so the plane's own normal
-                                // (u x v) comes out as the winding's.
-                                let v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
-                                let pl = truck_modeling::Plane::new(
-                                    Point3::new(o[0], o[1], o[2]),
-                                    Point3::new(o[0] + u[0], o[1] + u[1], o[2] + u[2]),
-                                    Point3::new(o[0] + v[0], o[1] + v[1], o[2] + v[2]),
-                                );
+                            if let Some(pl) = plane_through(topo.verts[lps[0].1[0]], n) {
                                 merged = truck_modeling::Face::try_new(wires, pl.into()).ok();
                             }
                         }
@@ -3308,10 +3315,31 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[Band]) -> Option<KSolid> 
                 None => {
                     for &ti in &f.tris {
                         let t = topo.tris[ti];
-                        if let Some(w) = wire!(&t[..]) {
-                            if let Ok(face) = builder::try_attach_plane(&[w]) {
-                                faces.push(face);
-                            }
+                        let Some(w) = wire!(&t[..]) else { continue };
+                        // A triangle ALWAYS lies on a plane — it has three points — so the faceted
+                        // build was supposed to be exact by construction. `try_attach_plane` does
+                        // not find that plane, it derives one and then measures the wire against it
+                        // to truck's absolute 1e-6, and for a needle the derivation is the thing
+                        // that fails: vacfitting.hcad carries six slivers 0.024 mm long and 1e-5 mm
+                        // across, left where a fillet met a chamfer, and truck refused all six.
+                        //
+                        // Each refusal was dropped on the floor, which is how six triangles out of
+                        // 11,554 cost the whole export: six missing faces are six holes, the shell
+                        // is then not closed, `Solid::try_new` refuses it, and every rung of the
+                        // ladder above falls to this one — so the user got "no exportable body"
+                        // for a part that is watertight, with nothing naming the six.
+                        //
+                        // So hand truck the plane rather than asking it to find one. The triangle
+                        // belongs to a coplanar group and lies in that group's plane, which is
+                        // known independently of how thin the triangle is.
+                        match builder::try_attach_plane(std::slice::from_ref(&w)) {
+                            Ok(face) => faces.push(face),
+                            Err(_) => match plane_through(topo.verts[t[0]], f.normal) {
+                                Some(pl) => faces.push(truck_modeling::Face::new(vec![w], pl.into())),
+                                // No plane even for the group: refuse the whole build rather than
+                                // return a shell with a hole in it.
+                                None => return None,
+                            },
                         }
                     }
                 }

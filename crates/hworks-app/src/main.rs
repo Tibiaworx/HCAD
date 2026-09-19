@@ -30117,6 +30117,56 @@ mod tests {
         assert!(why.contains("a fillet"), "the reason should name the fillet, got {why:?}");
     }
 
+    /// A needle triangle must not cost the part its whole STEP export.
+    ///
+    /// vacfitting.hcad is watertight — 11,554 triangles, no boundary edge, no non-manifold edge —
+    /// and it exported as nothing at all: "no exportable body (build a part first)". Six of those
+    /// triangles are slivers about 0.024 mm long and 1e-5 mm across, left where a fillet runs into
+    /// a chamfer. `try_attach_plane` refuses a wire it cannot fit a plane to within truck's
+    /// absolute 1e-6, and for a needle that fit is what fails, so all six were refused — and
+    /// silently skipped. Six missing faces are six holes in the shell, `Solid::try_new` then
+    /// refuses the solid, and since the merged rungs of the ladder fall back to this one, the
+    /// whole export came back empty.
+    ///
+    /// The regression guard is the export itself, not the six triangles: whatever the mesh kernel
+    /// leaves behind, a closed mesh has to reach STEP.
+    #[test]
+    fn a_watertight_part_exports_to_step_however_thin_its_triangles_are() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/vacfitting.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/vacfitting.hcad is a fixture — force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse RON");
+        let (mesh, _) = regenerate_mesh(&doc).expect("vacfitting.hcad builds");
+        assert!(hworks_geometry::is_manifold(&mesh), "the fixture is supposed to be watertight");
+
+        // The needles are the point of the fixture, so say so if a later change happens to smooth
+        // them away: the test would still pass, but it would no longer be testing anything.
+        let needles = mesh
+            .indices
+            .chunks_exact(3)
+            .filter(|t| {
+                let g = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
+                let (a, b, c) = (g(t[0]), g(t[1]), g(t[2]));
+                let area = (b - a).cross(c - a).length() * 0.5;
+                let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+                longest > 1.0e-4 && 2.0 * area / longest < 1.0e-4
+            })
+            .count();
+        assert!(needles > 0, "the fixture no longer has any needle triangles — it cannot guard this");
+
+        let solid = hworks_geometry::mesh_to_solid(&mesh).expect("a watertight mesh must reach a solid");
+        let step = hworks_geometry::export_step(&solid).expect("and that solid must write STEP");
+        assert!(step.matches("FACE_SURFACE").count() > 100, "a part this size is not a handful of faces");
+
+        // And it has to be the SAME part: a hole patched over would export just as happily.
+        let want = hworks_geometry::signed_mesh_volume(&mesh).abs();
+        let got = hworks_geometry::signed_mesh_volume(&hworks_geometry::tessellate(&solid, 0.02).mesh).abs();
+        assert!(
+            (got - want).abs() <= want * 1.0e-3,
+            "the exported solid encloses {got:.3} against the mesh's {want:.3}"
+        );
+    }
+
     /// What a STEP export now yields for one part, both ways: the exact B-rep the export will
     /// reach for when the document allows, against the faceted mesh reconstruction it used to get.
     ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_step_export_route -- --ignored --nocapture
