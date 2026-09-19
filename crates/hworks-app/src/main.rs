@@ -30117,6 +30117,88 @@ mod tests {
         assert!(why.contains("a fillet"), "the reason should name the fillet, got {why:?}");
     }
 
+    /// A fillet must not forget which surfaces the sketch named.
+    ///
+    /// The mesh kernel builds a fillet one of two ways: CSG booleans, which carry the body's
+    /// surface tags through because the boolean does, or mesh SURGERY, which rebuilds the body
+    /// from its topology and — until this — handed back a mesh with no tags at all. Two fillets on
+    /// one part could therefore disagree: vacfitting.hcad's first kept all six cylinders its
+    /// sketches had named, its second dropped every one, and the part reached STEP as 11,554 flat
+    /// facets with no way of knowing a bore was a bore.
+    ///
+    /// Insetting a face's corners slides its vertices ALONG that face, so a strip of a bore is
+    /// still on that bore afterwards — the tag is as true after the surgery as before it. Only the
+    /// rolling ball's own new surface is untagged, which is right: nothing has named it.
+    #[test]
+    fn a_fillet_keeps_the_surfaces_the_sketch_named() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/vacfitting.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/vacfitting.hcad is a fixture — force-add it to git");
+        let full: Document = ron::from_str(&text).expect("parse RON");
+
+        // Feature 7 is the first fillet and feature 8 the second; the tags have to survive BOTH,
+        // and the chamfer after them.
+        let cylinders = |doc: &Document| -> usize {
+            let (m, _) = regenerate_mesh(doc).expect("vacfitting.hcad builds");
+            assert_eq!(m.tri_surf.len(), m.indices.len() / 3, "a tag array out of step with the triangles is no tag array");
+            m.surfaces.iter().filter(|s| matches!(s, hworks_geometry::Surf::Cylinder { .. })).count()
+        };
+        let upto = |n: usize| -> Document {
+            let mut d = full.clone();
+            d.rollback = n;
+            d
+        };
+        let before = cylinders(&upto(7));
+        assert!(before >= 6, "the sketches name six bores; only {before} reached the first fillet");
+        for end in 8..=full.features.len() {
+            let after = cylinders(&upto(end));
+            assert_eq!(after, before, "feature {end} dropped {} of the {before} cylinders", before - after);
+        }
+
+        // And they are still tags on TRIANGLES, not just names in a table.
+        let (m, _) = regenerate_mesh(&upto(full.features.len())).expect("builds");
+        let tagged = m.tri_surf.iter().filter(|&&g| g != hworks_geometry::NO_SURF).count();
+        assert!(tagged > m.indices.len() / 6, "only {tagged} of {} triangles know their surface", m.indices.len() / 3);
+    }
+
+    /// A face flat to a micron is not flat enough for truck, and must not be merged.
+    ///
+    /// truck's tolerance is ABSOLUTE (1e-6 in model units). `build_topo` groups triangles by the
+    /// angle between neighbours, so a group it calls coplanar can be a micron out of plane — on a
+    /// 20 mm wall that is a flatness of 5e-8, flat by any standard an engineer would use, and over
+    /// truck's bar. `Face::try_new` accepts such a face and the triangulator then returns NO
+    /// geometry for it.
+    ///
+    /// That is worse than it sounds, because the export judges the merged build by re-tessellating
+    /// it: vacfitting.hcad lost 18 faces and 94.3 mm² this way, the body read 3.23% short, the
+    /// merged build was condemned as wrong, and the part shipped as one face per triangle — 11,554
+    /// of them and 13 MB, with the one cylinder it had found thrown away alongside.
+    #[test]
+    fn a_face_truck_cannot_call_flat_is_left_as_triangles() {
+        let _guard = counter_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../saved files/vacfitting.hcad");
+        let text = std::fs::read_to_string(&path).expect("saved files/vacfitting.hcad is a fixture — force-add it to git");
+        let doc: Document = ron::from_str(&text).expect("parse RON");
+        let (mesh, _) = regenerate_mesh(&doc).expect("vacfitting.hcad builds");
+        let tris = mesh.indices.len() / 3;
+        let solid = hworks_geometry::mesh_to_solid(&mesh).expect("a watertight mesh must reach a solid");
+        let step = hworks_geometry::export_step(&solid).expect("and write STEP");
+
+        // The merged build has to be the one that ships. One face per triangle is the fallback,
+        // and reaching for it is the symptom.
+        let faces = step.matches("FACE_SURFACE").count();
+        assert!(faces < tris * 3 / 4, "{faces} faces for {tris} triangles — the merge did not survive the judge");
+
+        // With the merge standing, the bore the sketch drew goes out as a real surface.
+        let round = step.matches("SURFACE_OF_REVOLUTION").count() + step.matches("CYLINDRICAL_SURFACE").count();
+        assert!(round > 0, "a part with six bores exported nothing curved");
+
+        // And it is still the same part.
+        let want = hworks_geometry::signed_mesh_volume(&mesh).abs();
+        let got = hworks_geometry::signed_mesh_volume(&hworks_geometry::tessellate(&solid, 0.02).mesh).abs();
+        assert!((got - want).abs() <= want * 1.0e-3, "the exported solid encloses {got:.3} against the mesh's {want:.3}");
+    }
+
     /// A needle triangle must not cost the part its whole STEP export.
     ///
     /// vacfitting.hcad is watertight — 11,554 triangles, no boundary edge, no non-manifold edge —
@@ -30981,6 +31063,37 @@ mod tests {
         eprintln!("\n=== {clean} clean, {} with problems ===", problems.len());
         for p in &problems {
             eprintln!("  {p}");
+        }
+    }
+
+    /// Walks a .hcad one feature at a time, reporting how much of the body still knows what
+    /// surface it lies on. Names the feature that drops a tag rather than leaving the final
+    /// mesh's bare `0 tagged` to be guessed at — which is how the surgery's loss was found:
+    /// vacfitting.hcad carried six cylinders through its first fillet and none through its
+    /// second, and only this walk said which one.
+    ///   HCAD_FILE="...\part.hcad" cargo test -p hworks-app diag_tag_walk -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diag_tag_walk() {
+        let _guard = counter_lock();
+        let path = std::env::var("HCAD_FILE").expect("set HCAD_FILE");
+        let full: Document = ron::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for end in 1..=full.features.len() {
+            let mut doc = full.clone();
+            doc.rollback = end;
+            let kind = format!("{:?}", doc.features[end - 1].kind);
+            let name: String = kind.chars().take_while(|c| c.is_alphanumeric()).collect();
+            match regenerate_mesh(&doc) {
+                None => eprintln!("[{end}] {name:<10} NO BODY"),
+                Some((m, _)) => {
+                    let ntri = m.indices.len() / 3;
+                    let tagged = m.tri_surf.iter().filter(|&&s| s != hworks_geometry::NO_SURF).count();
+                    let cyl = m.surfaces.iter().filter(|s| matches!(s, hworks_geometry::Surf::Cylinder { .. })).count();
+                    let tor = m.surfaces.iter().filter(|s| matches!(s, hworks_geometry::Surf::Torus { .. })).count();
+                    eprintln!("[{end}] {name:<10} {ntri:>6} tris | tri_surf len {:>6} | {tagged:>5} tagged | {} surfaces ({cyl} cyl, {tor} torus)",
+                        m.tri_surf.len(), m.surfaces.len());
+                }
+            }
         }
     }
 

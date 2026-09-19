@@ -2753,13 +2753,18 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
         };
 
         for part in &parts {
+            let why = |g: &str| if std::env::var("HCAD_BAND_DEBUG").is_ok() {
+                eprintln!("  reject [{:?} r={:.3} part of {} tris]: {g}", std::mem::discriminant(&surf), minor, part.len());
+            };
             let tagged: HashSet<usize> = part.iter().copied().collect();
             let faces: HashSet<usize> = part.iter().map(|&ti| topo.tri_face[ti]).collect();
             if faces.iter().any(|f| taken.contains(f)) {
+                why("a face is already claimed by another band");
                 continue;
             }
             // A face split across two patches cannot be swapped out with either.
             if faces.iter().any(|&f| topo.faces[f].tris.iter().any(|t| !tagged.contains(t))) {
+                why("a face is split across two patches");
                 continue;
             }
             let verts: HashSet<usize> = tagged.iter().flat_map(|&ti| topo.tris[ti]).collect();
@@ -2790,6 +2795,8 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                 let d = off_surface(v);
                 d > tol || d < -(tol + sagitta)
             }) {
+                let worst = verts.iter().map(|&v| off_surface(v)).fold(0.0f64, |m, d| if d.abs() > m.abs() { d } else { m });
+                why(&format!("a vertex is {worst:.2e} off the surface (tol {tol:.2e}, sagitta {sagitta:.2e})"));
                 continue;
             }
             // The patch's BOUNDARY: the edges only one of its triangles holds. A plain ring has
@@ -2823,6 +2830,8 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                 n.sort_unstable();
             }
             if adj.is_empty() || adj.values().any(|n| n.len() != 2) {
+                why(&format!("the boundary is not a clean set of rings ({} verts, {} with a degree other than 2)",
+                    adj.len(), adj.values().filter(|n| n.len() != 2).count()));
                 continue;
             }
             let mut loops: Vec<Vec<usize>> = Vec::new();
@@ -2844,6 +2853,7 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                 loops.push(lp);
             }
             if loops.len() != 2 {
+                why(&format!("{} boundary loop(s), not 2", loops.len()));
                 continue;
             }
             // Each end a CIRCLE: one distance from the axis and one along it, all the way round.
@@ -2863,9 +2873,11 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                     .then_some(c)
             };
             let (Some(g0), Some(g1)) = (ring(&loops[0]), ring(&loops[1])) else {
+                why("an end is not a circle");
                 continue;
             };
             if ((g0[0] - g1[0]).powi(2) + (g0[1] - g1[1]).powi(2)).sqrt() < tol {
+                why("the two ends are in the same place");
                 continue;
             }
             // Order the rims so the generatrix runs the same way every time.
@@ -2876,6 +2888,7 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                 gen.swap(0, 1);
             }
             if rims.iter().any(|r| r.len() < 8) {
+                why(&format!("a rim has too few vertices ({:?})", rims.iter().map(|r| r.len()).collect::<Vec<_>>()));
                 continue;
             }
             for r in rims.iter_mut() {
@@ -2904,10 +2917,12 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                 }
             }
             if seam.len() != 2 {
+                why(&format!("a rim is not walked by exactly one outside loop ({} of 2 found)", seam.len()));
                 continue;
             }
             let allowed: HashSet<usize> = faces.iter().copied().chain(seam.iter().map(|s| s.0)).collect();
             if rims.iter().flatten().any(|&v| topo.vert_faces[v].iter().any(|f| !allowed.contains(f))) {
+                why("a rim vertex is held by a face outside the band");
                 continue;
             }
             // What these triangles contribute to the body's volume, as they stand. The exact tube
@@ -2924,6 +2939,7 @@ fn curved_bands(mesh: &TriMesh, topo: &bevel::Topo) -> Vec<Band> {
                         / 6.0
                 })
                 .sum();
+            why("ACCEPTED");
             taken.extend(faces.iter().copied());
             let mut fs: Vec<usize> = faces.into_iter().collect();
             fs.sort_unstable();
@@ -3138,6 +3154,10 @@ fn band_tube(b: &Band) -> Option<(Vec<truck_modeling::Face>, [truck_modeling::Wi
 }
 
 
+/// truck's own absolute tolerance (`truck_base::tolerance::TOLERANCE`). Anything the kernel is
+/// asked to accept has to clear this, in model units, however flat it is in proportion.
+const TRUCK_TOLERANCE: f64 = 1.0e-6;
+
 /// A truck plane through `o` whose own normal — `u` × `v` — is `n`.
 ///
 /// Which way it faces is the point: truck reads a planar face's outside off its surface, so a
@@ -3283,7 +3303,30 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[Band]) -> Option<KSolid> 
                             0.5 * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt()
                         })
                         .sum();
-                    if (loop_area - tri_area).abs() <= tri_area * 1.0e-6 + 1.0e-9 {
+                    // ...and the face must be flat by TRUCK's reckoning, not by ours. Its
+                    // tolerance is ABSOLUTE — `truck_base::tolerance::TOLERANCE`, 1e-6 in model
+                    // units — and a group `build_topo` calls coplanar can be a micron out of
+                    // plane, which on a 20 mm wall is a flatness of 5e-8: flat by any standard an
+                    // engineer would use, and over truck's bar.
+                    //
+                    // A face over it is accepted by `Face::try_new` and then refused by the
+                    // triangulator, which returns NO geometry for it at all. vacfitting.hcad lost
+                    // 18 faces and 94.3 mm² that way — every one of them between 1.0e-6 and
+                    // 5.0e-6 out — and the missing area read as a body 3.23% short, so the merged
+                    // build was condemned and the part went out as 11,554 separate facets.
+                    //
+                    // Its triangles are each exactly planar (three points always are), so a face
+                    // that fails this merges nothing and costs only its own share of the file.
+                    let o = topo.verts[lps[0].1[0]];
+                    let flat = lps
+                        .iter()
+                        .flat_map(|(_, lp)| lp.iter())
+                        .map(|&v| {
+                            let d = [topo.verts[v][0] - o[0], topo.verts[v][1] - o[1], topo.verts[v][2] - o[2]];
+                            (d[0] * n[0] + d[1] * n[1] + d[2] * n[2]).abs()
+                        })
+                        .fold(0.0f64, f64::max);
+                    if flat < TRUCK_TOLERANCE && (loop_area - tri_area).abs() <= tri_area * 1.0e-6 + 1.0e-9 {
                         let mut wires = Vec::with_capacity(lps.len());
                         let mut ok = true;
                         for (li, lp) in &lps {
@@ -3303,7 +3346,7 @@ fn mesh_brep(topo: &bevel::Topo, merge: bool, bands: &[Band]) -> Option<KSolid> 
                             }
                         }
                         if ok && !wires.is_empty() {
-                            if let Some(pl) = plane_through(topo.verts[lps[0].1[0]], n) {
+                            if let Some(pl) = plane_through(o, n) {
                                 merged = truck_modeling::Face::try_new(wires, pl.into()).ok();
                             }
                         }

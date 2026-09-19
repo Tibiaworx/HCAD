@@ -465,10 +465,15 @@ fn emit_sphere_dome(b: &mut Build, boundary: &[V3], center: V3, rad: f64, bands:
 struct Build {
     pos: Vec<V3>,
     idx: Vec<[usize; 3]>,
+    /// Which surface each triangle lies on, parallel to `idx`. `NO_SURF` for the geometry the
+    /// surgery invents — a fillet strip is a new surface nobody has named.
+    tag: Vec<u32>,
+    /// What [`Build::tri`] stamps from here on.
+    cur: u32,
 }
 impl Build {
     fn new() -> Self {
-        Build { pos: Vec::new(), idx: Vec::new() }
+        Build { pos: Vec::new(), idx: Vec::new(), tag: Vec::new(), cur: crate::NO_SURF }
     }
     fn v(&mut self, p: V3) -> usize {
         self.pos.push(p);
@@ -476,6 +481,7 @@ impl Build {
     }
     fn tri(&mut self, a: usize, b: usize, c: usize) {
         self.idx.push([a, b, c]);
+        self.tag.push(self.cur);
     }
     /// Fan-triangulate a convex ring (indices already pushed).
     fn fan(&mut self, ring: &[usize]) {
@@ -485,6 +491,11 @@ impl Build {
     }
     /// Weld coincident vertices, make winding globally consistent + outward, build a `TriMesh`.
     fn finish(self) -> TriMesh {
+        self.finish_with(Vec::new())
+    }
+
+    /// As [`Build::finish`], carrying the surface table the tags index into.
+    fn finish_with(self, surfaces: Vec<crate::Surf>) -> TriMesh {
         // Weld on a 1e-5 grid.
         let key = |p: V3| ((p[0] * 1e5).round() as i64, (p[1] * 1e5).round() as i64, (p[2] * 1e5).round() as i64);
         let mut map: HashMap<(i64, i64, i64), usize> = HashMap::new();
@@ -497,13 +508,17 @@ impl Build {
             });
             remap[i] = id;
         }
-        let mut tris: Vec<[usize; 3]> = self
+        // Tags ride along through the drop, or they would come out indexed against the
+        // triangles this filter removed.
+        let (mut tris, mut tags): (Vec<[usize; 3]>, Vec<u32>) = self
             .idx
             .iter()
-            .map(|t| [remap[t[0]], remap[t[1]], remap[t[2]]])
-            .filter(|t| t[0] != t[1] && t[1] != t[2] && t[2] != t[0])
-            .collect();
+            .zip(self.tag.iter().copied().chain(std::iter::repeat(crate::NO_SURF)))
+            .map(|(t, g)| ([remap[t[0]], remap[t[1]], remap[t[2]]], g))
+            .filter(|(t, _)| t[0] != t[1] && t[1] != t[2] && t[2] != t[0])
+            .unzip();
 
+        // Flips a winding in place; it never reorders, so the tags stay lined up.
         orient_consistently(&verts, &mut tris);
 
         // Flat (per-triangle) normals.
@@ -520,7 +535,10 @@ impl Build {
             }
             indices.extend_from_slice(&[base, base + 1, base + 2]);
         }
-        TriMesh { positions, normals, indices, ..Default::default() }
+        if surfaces.is_empty() || tags.iter().all(|&g| g == crate::NO_SURF) {
+            tags.clear();
+        }
+        TriMesh { positions, normals, indices, surfaces, tri_surf: tags, ..Default::default() }
     }
 }
 
@@ -1227,7 +1245,73 @@ fn covers_a_plane_twice(m: &TriMesh) -> bool {
 /// for deciding whether a folded inset is worth handing over. Taken as a closure because most
 /// bevels don't fold and never ask: answering costs a pass over the body's triangles per chain,
 /// and building each swept tool, which is how sweepability gets decided.
+/// Which surface each topo face lies on, as the input mesh tagged it.
+///
+/// The surgery rebuilds the body from its topology, so without this every tag the model carried
+/// died at the first fillet that took the surgery route rather than the CSG one — and with it the
+/// export's only way of knowing a bore is a bore. vacfitting.hcad reached STEP as 11,554 flat
+/// facets for exactly this reason: its second fillet was a surgery, and the six cylinders the
+/// sketch had named vanished there.
+///
+/// A face keeps a tag only if EVERY tagged triangle on it names the same surface, and an untagged
+/// triangle among them disqualifies the face. A flat strip of a bore is one face and its triangles
+/// all carry that bore; anything less uniform is not a surface this can vouch for.
+fn face_surfaces(mesh: &TriMesh, topo: &Topo) -> Vec<u32> {
+    let mut out = vec![crate::NO_SURF; topo.faces.len()];
+    let ntri = mesh.indices.len() / 3;
+    if mesh.tri_surf.len() != ntri || mesh.surfaces.is_empty() {
+        return out;
+    }
+    // Mesh triangles are not topo triangles — the weld drops the ones it collapses and reorders
+    // the rest — so go by the welded vertex triple, which both agree on.
+    let mut vmap: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    for (i, p) in topo.verts.iter().enumerate() {
+        vmap.insert(weld_key(*p), i);
+    }
+    let mut tmap: HashMap<[usize; 3], usize> = HashMap::new();
+    for (i, t) in topo.tris.iter().enumerate() {
+        let mut k = *t;
+        k.sort_unstable();
+        tmap.insert(k, i);
+    }
+    // `None` = nothing said yet, `Some(None)` = the face is disqualified.
+    let mut seen: Vec<Option<Option<u32>>> = vec![None; topo.faces.len()];
+    for t in 0..ntri {
+        let mut tri = [0usize; 3];
+        let mut ok = true;
+        for i in 0..3 {
+            let p = mesh.positions[mesh.indices[t * 3 + i] as usize];
+            match vmap.get(&weld_key([p[0] as f64, p[1] as f64, p[2] as f64])) {
+                Some(&v) => tri[i] = v,
+                None => ok = false,
+            }
+        }
+        if !ok {
+            continue;
+        }
+        tri.sort_unstable();
+        if tri[0] == tri[1] || tri[1] == tri[2] {
+            continue; // the weld collapsed it; it is not in the topology to be tagged
+        }
+        let Some(&ti) = tmap.get(&tri) else { continue };
+        let fi = topo.tri_face[ti];
+        let g = mesh.tri_surf[t];
+        seen[fi] = Some(match seen[fi] {
+            None => (g != crate::NO_SURF).then_some(g),
+            Some(Some(prev)) if prev == g => Some(g),
+            Some(_) => None,
+        });
+    }
+    for (fi, v) in seen.into_iter().enumerate() {
+        if let Some(Some(g)) = v {
+            out[fi] = g;
+        }
+    }
+    out
+}
+
 fn run_surgery(
+    mesh: &TriMesh,
     topo: &Topo,
     selected: &[bool],
     corner: &HashMap<(usize, usize), V3>,
@@ -1256,6 +1340,7 @@ fn run_surgery(
     let suspect_fold =
         folded > 0.01 * r * r && csg_handover_enabled() && csg_booleans() <= CSG_ROUND_MAX_BOOLEANS;
     let mut b = Build::new();
+    let face_surf = face_surfaces(mesh, topo);
 
     // 0) Terminal-edge splices. At a vertex where exactly ONE selected edge ends (its other
     //    incident edges all sharp, all bordering one shared untouched face `fs`), the fillet
@@ -1377,6 +1462,9 @@ fn run_surgery(
     //    corner — except spliced faces, whose boundary loop gets the arc notch cut in and is
     //    re-triangulated (ear clip; the notch makes the polygon concave).
     for fi in 0..topo.faces.len() {
+        // Everything emitted for this face lies where the face lay: insetting a corner slides a
+        // vertex ALONG the face, so a strip of a bore is still on that bore afterwards.
+        b.cur = face_surf[fi];
         let f = &topo.faces[fi];
         let has_splice = f.loops.iter().any(|lp| lp.iter().any(|w| splices.get(w).is_some_and(|(sf, _)| *sf == fi)));
         if !has_splice {
@@ -1486,6 +1574,9 @@ fn run_surgery(
             }
         }
     }
+
+    // The rest is new geometry — the rolling ball's own surface — which nothing has named.
+    b.cur = crate::NO_SURF;
 
     // 2) Edge strips: only for selected edges. Connect the end ring at v0 to the end ring at
     //    v1 — a welded corner's shared blended arc overrides the edge's own ring there, so
@@ -1729,7 +1820,7 @@ fn run_surgery(
         }
     }
 
-    let out = b.finish();
+    let out = b.finish_with(mesh.surfaces.clone());
     // The suspected fold, confirmed or cleared against what was actually built.
     if suspect_fold && covers_a_plane_twice(&out) {
         return None;
@@ -1781,7 +1872,7 @@ pub fn bevel_feature_edges(mesh: &TriMesh, r: f64, picked: &[Vec<[f64; 3]>]) -> 
 /// a flat (chamfer) profile. `None` if a corner ring can't be resolved (caller → CSG).
 pub fn bevel_mesh_selected(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f64; 3]>]) -> Option<TriMesh> {
     let (topo, selected, corner) = bevel_prep(mesh, r, picked)?;
-    run_surgery(&topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked))
+    run_surgery(mesh, &topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked))
 }
 
 /// Both the surgery mesh and the selectable feature edges from a **single** topology pass — what
@@ -1793,7 +1884,7 @@ pub fn bevel_mesh_and_edges(mesh: &TriMesh, r: f64, seg: usize, picked: &[Vec<[f
     match bevel_prep(mesh, r, picked) {
         Some((topo, selected, corner)) => {
             let edges = emit_feature_edges(&topo, &selected, &corner, r, mesh);
-            let out = run_surgery(&topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked));
+            let out = run_surgery(mesh, &topo, &selected, &corner, r, seg, || crate::fillet::round_mesh_booleans(mesh, r, picked));
             (out, edges)
         }
         None => (None, Vec::new()),
